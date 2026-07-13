@@ -1,0 +1,17 @@
+timestamp_utc=2026-07-13T19:08:31.1004807Z
+branch=main
+start_commit=b2d6f8d647860eac9a3bb4f7ed01acfccebbd4f3
+previous_gate=P2 passed: targeted 39, full 70, Ruff/mypy/UTF-8 passed
+spec_version=state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval
+architecture_sha256=0690c9cf5d8301b644abd87deb01a0a02b3126e30eaa3d18e69b5bb105c57adc
+config_path=configs/model_state_ttt_8b.yaml
+config_sha256=f05e8430532e8f7eb32421091fee2802d663fdd19c92e649641a5795dd8bdb9a
+uv_lock_sha256=c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2
+model_id=Qwen/Qwen3-VL-8B-Instruct
+model_revision=0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
+dataset_fold=not-applicable
+seed=0
+asset_policy=no video or 8B-weight download
+python=3.12.13
+torch=2.9.0+cu128
+transformers=4.57.1

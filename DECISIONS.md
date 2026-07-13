@@ -1,8 +1,9 @@
-# 实施决策（v5 高容量版，P0–P2 已通过）
+# 实施决策（v5 高容量版，P0–P3 已通过）
 
 本文件记录已经冻结的 v5 边界。P0 已冻结规格和仓库基线；P1 已把运行 YAML、强类型配置、
-运行时类型和推荐模块骨架迁移到 v5；P2 已通过数据、因果预处理和合成 A0 工程门禁。模型 hook、
-状态、训练和推理入口仍按后续 Part 实现。详细论证见
+运行时类型和推荐模块骨架迁移到 v5；P2 已通过数据、因果预处理和合成 A0 工程门禁；P3 已实现
+Qwen video boundary、Main Merger 插入点和 DeepStack 保护。状态、训练和推理入口仍按后续 Part
+实现。详细论证见
 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前规范版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
@@ -16,7 +17,8 @@
    均保留未校准状态。任一状态未校准时，配置拒绝正式评估。
 4. P1 类型覆盖 VideoBatch、Query/TimeWindow、空间/时间输出与 cache、四类 soft output、
    typed records、Retriever、ReaderResult 以及完整 per-video runtime ownership。
-5. 推荐模块当前只提供职责边界、类型和显式未实现入口；模块可导入不等于算法已实现。
+5. 除 P3 `qwen_adapter.py` 外，推荐模块当前只提供职责边界、类型和显式未实现入口；模块可导入
+   不等于算法已实现。
 
 ## P2 合成退出决策
 
@@ -28,6 +30,24 @@
 - 合成 A0 的模型 ID 必须以 `synthetic/` 开头，指标不得称为原始 Qwen3-VL-8B 结果；
 - 原始 Qwen3-VL-8B + 官方视频 A0 仍是 P19/P21/P22 的发布前必需证据；
 - P2 工程门禁通过不改变上述科学验证要求。
+
+## P3 已验证边界
+
+1. wrapper 临时拦截内层 `Qwen3VLModel.get_video_features()`；插入点严格位于 Main Merger
+   和 video `masked_scatter` 之间，不 hook image 共用的 `visual.merger`。
+2. Main 输出保留原生 per-video split，并额外暴露 padding view、valid mask、原/合并 grid、
+   token count 和 prefix offset；变长 batch 不把 padding 回传给 Qwen。
+3. DeepStack 三组 packed tensor 保持原对象、顺序、dtype、device 和 mask，并按原实现进入
+   decoder 0/1/2；ViT 8/16/24 不解释为 LLM 层号。
+4. disabled 模式逐张量保持 Main、DeepStack 和 logits bitwise 等价；enabled 模式只变换 video
+   Main，image-only、text-only 和 mixed image/video 路径受隔离测试保护。
+5. 本地 loader 先用 `Qwen3VLConfig.from_pretrained(..., local_files_only=True)` 做轻量 fail-fast
+   预检，通过后才允许加载权重；权重 loader 同样强制 local-only。
+6. Qwen 参数默认冻结并保持 eval，但不切断 Adapter 梯度；hook 带互斥、禁止重入、异常恢复和
+   stale capture 清理，且 inner owner 不被重复注册到 `state_dict`。
+7. P3 证据只来自 Transformers 4.57.1 官方模块的 meta shape 和 tiny 随机权重端到端测试；没有
+   下载视频或 8B 权重，不得表述为真实 8B 集成结果。P5 负责真实 Fast Adapter 及 device/dtype
+   放置，P19 负责真实 8B hook、DeepStack 和分布式复验。
 
 ## 已固定
 

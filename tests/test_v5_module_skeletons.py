@@ -11,7 +11,6 @@ PACKAGE = ROOT / "src" / "ttt_svcbench_qwen"
 
 SKELETONS = (
     ("model", "build_model", "P13"),
-    ("qwen_adapter", "build_qwen_adapter", "P3"),
     ("fast_ttt", "build_fast_ttt_adapter", "P5"),
     ("state_encoder", "build_state_encoders", "P6-P7"),
     ("observation_heads", "build_observation_heads", "P8"),
@@ -48,7 +47,7 @@ def test_recommended_modules_import_and_unimplemented_paths_fail_explicitly(
 
 def test_all_required_p1_module_files_exist() -> None:
     actual = {path.stem for path in PACKAGE.glob("*.py")}
-    expected = {name for name, _, _ in SKELETONS} | {"__init__", "config"}
+    expected = {name for name, _, _ in SKELETONS} | {"__init__", "config", "qwen_adapter"}
 
     assert expected <= actual
 

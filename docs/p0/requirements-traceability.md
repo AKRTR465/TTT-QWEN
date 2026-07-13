@@ -11,11 +11,11 @@
 | ARCH-01-VIDEO-001 | `1.1` | Demo video/grid/pixels | P2 | `tests/test_video_preprocessing.py` | 已定义 | P2 已验证 |
 | ARCH-01-QUERY-001 | `1.2` | Demo query/Q_h | P2、P4 | `tests/test_query_tokens.py`、`tests/test_query_encoder.py` | 已定义 | P2 token 范围已验证；P4 encoder 待实现 |
 | ARCH-01-DYNAMIC-001 | `1.3` | 动态 T 与容量独立 | P1、P2、P7、P12 | 变长输入测试、`tests/test_state_encoder.py` | 已定义 | P2 变长预处理已验证；后续模块待实现 |
-| ARCH-02-FLOW-001 | `2` | 总体数据流 | P3–P18 | `tests/test_end_to_end_demo.py` | 已定义 | 未实现 |
-| ARCH-03-BASE-001 | `3.1` | Qwen 基础配置 | P1、P3 | `tests/test_v5_config_contract.py`、`tests/test_qwen_adapter.py` | 已定义 | 未实现 |
-| ARCH-03-MERGER-001 | `3.2` | PatchEmbed/Main Merger | P2–P3 | `tests/test_video_preprocessing.py`、`tests/test_qwen_adapter.py` | 已定义 | P2 processor 输入已验证；P3 hook 待实现 |
-| ARCH-03-INSERT-001 | `3.3` | State-TTT 插入点 | P3 | `tests/test_qwen_adapter.py` hook 顺序测试 | 已定义 | 未实现 |
-| ARCH-03-DEEPSTACK-001 | `3.4` | DeepStack 原路径 | P3、P13、P20 | `tests/test_qwen_adapter.py` 原模型等价测试 | 已定义 | 未实现 |
+| ARCH-02-FLOW-001 | `2` | 总体数据流 | P3–P18 | `tests/test_end_to_end_demo.py` | 已定义 | P3 Qwen video boundary 已验证；P4–P18 待实现 |
+| ARCH-03-BASE-001 | `3.1` | Qwen 基础配置 | P1、P3 | `tests/test_v5_config_contract.py`、`tests/test_qwen_adapter.py` | 已定义 | P3 config-only local preflight、checkpoint/runtime 断言已验证；真实 8B 留至 P19 |
+| ARCH-03-MERGER-001 | `3.2` | PatchEmbed/Main Merger | P2–P3 | `tests/test_video_preprocessing.py`、`tests/test_qwen_adapter.py` | 已定义 | P2 processor 输入及 P3 官方 meta shape、packed mapping 已验证 |
+| ARCH-03-INSERT-001 | `3.3` | State-TTT 插入点 | P3 | `tests/test_qwen_adapter.py` hook 顺序测试 | 已定义 | P3 已验证 Main Merger→Adapter→video masked scatter |
+| ARCH-03-DEEPSTACK-001 | `3.4` | DeepStack 原路径 | P3、P13、P20 | `tests/test_qwen_adapter.py` 原模型等价测试 | 已定义 | P3 tiny HF 对象/顺序/mask/decoder 0–2 已验证；P13/P20/P19 继续回归 |
 | ARCH-04-FAST-001 | `4.1` | Fast 张量结构 | P5 | `tests/test_fast_ttt.py` | 已定义 | 未实现 |
 | ARCH-04-BOUNDARY-001 | `4.2` | Fast/Slow 参数边界 | P5、P14 | `tests/test_fast_ttt.py`、`tests/test_functional_sgd.py` | 已定义 | 未实现 |
 | ARCH-04-SGD-001 | `4.3` | 单步 SGD/下一 chunk 生效 | P14、P16、P18 | `tests/test_functional_sgd.py`、`tests/test_inference_protocol.py` | 已定义 | 未实现 |
@@ -59,7 +59,7 @@
 | ARCH-14-STAGED-001 | `14 Stage D` | 真实 8B 与分布式 | P19 | P19 服务器集成报告 | 已定义 | 未运行 |
 | ARCH-15-INFER-001 | `15` | 测试时协议 | P18 | `tests/test_inference_protocol.py` | 已定义 | 未实现 |
 | ARCH-16-LEAK-001 | `16` | 数据与防泄漏 | P2、P18、P20、P22 | `tests/test_svcbench_data.py`、P22 clean 审计 | 已定义 | P2 四层 payload guard 已验证；后续协议待复验 |
-| ARCH-17-MODULE-001 | `17` | 推荐模块与职责 | P1、附录 A | `tests/test_v5_config_contract.py`、P1 职责审计 | 已定义 | 未实现 |
+| ARCH-17-MODULE-001 | `17` | 推荐模块与职责 | P1、附录 A | `tests/test_v5_config_contract.py`、P1 职责审计 | 已定义 | P1 职责已验证；P3 `qwen_adapter.py` 已实现，其余模块待实现 |
 | ARCH-18-DEMO-001 | `18.1` | Demo 张量验收 | P20.1 | `tests/test_end_to_end_demo.py` | 已定义 | 未实现 |
 | ARCH-18-UPDATE-001 | `18.2` | 更新边界验收 | P20.2 | `tests/test_functional_sgd.py` | 已定义 | 未实现 |
 | ARCH-18-STATE-001 | `18.3` | 状态与检索验收 | P20.3 | State/Identity/Retriever 回归套件 | 已定义 | 未实现 |

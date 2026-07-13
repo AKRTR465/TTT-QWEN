@@ -5,9 +5,10 @@
 完整架构、训练协议和消融方案见 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前对齐版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
-> 当前施工状态：P0–P2 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
-> 真实 8B A0 仍保留在 P19/P21/P22。P3 现在允许开始；高容量网络、状态算法、训练与推理尚未
-> 实现，对应空壳被调用时会明确抛出 `NotImplementedError`。
+> 当前施工状态：P0–P3 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
+> P3 用官方 HF meta 模块和 tiny 随机权重模型完成 Qwen 接口与 DeepStack 工程验收。真实 8B
+> A0/集成仍保留在 P19/P21/P22；P4 现在允许开始，其余空壳被调用时会明确抛出
+> `NotImplementedError`。
 
 ## 当前固定条件
 
@@ -56,9 +57,10 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | :--- | :--- |
 | v5 YAML、完整解析、固定维度/容量/优化器校验 | P1 已实现并有契约测试 |
 | Video/Query/Encoder/Observation/Record/Retriever/Reader/runtime 类型 | P1 已实现并有 shape/dtype/边界测试 |
-| 推荐模块导入与职责边界 | P1 已实现；实际入口显式 `NotImplementedError` |
+| 推荐模块导入与职责边界 | P1 已实现；除 P3 `qwen_adapter.py` 外，后续实际入口显式 `NotImplementedError` |
 | 数据 schema、防泄漏、因果切分、processor/query token、A0 runner | P2 工程门禁已通过；fold/A0 为明确标注的合成替代 |
-| Qwen hook、Adapter、状态、Reader、loss、训练、推理 | P3–P19 计划设计，尚未实现 |
+| Qwen video boundary、Main Merger 插入点、DeepStack 保护 | P3 已实现；tiny/meta 工程契约已验证，真实 8B 留至 P19 |
+| Fast Adapter、状态、Reader、loss、训练、推理 | P4–P19 计划设计，尚未实现 |
 | 真实 8B、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行 |
 
 ## 环境变量

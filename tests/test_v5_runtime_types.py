@@ -24,7 +24,11 @@ from ttt_svcbench_qwen.query_encoder import (
     TimeWindow,
     TimeWindowMode,
 )
-from ttt_svcbench_qwen.qwen_adapter import QwenVisualOutput, VideoBatch
+from ttt_svcbench_qwen.qwen_adapter import (
+    MergedVideoMetadata,
+    QwenVisualOutput,
+    VideoBatch,
+)
 from ttt_svcbench_qwen.state_bank import (
     HeadType,
     O1Payload,
@@ -42,7 +46,7 @@ from ttt_svcbench_qwen.state_retriever import RetrievalStatus, RetrieverOutput
 
 def make_video_batch() -> VideoBatch:
     return VideoBatch(
-        pixel_values_videos=torch.zeros(2, 4, 1536),
+        pixel_values_videos=torch.zeros(16, 1536),
         video_grid_thw=torch.tensor([[2, 2, 2], [2, 2, 2]], dtype=torch.int64),
         timestamps=torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
         query_time=torch.tensor([1.0, 1.0]),
@@ -54,14 +58,27 @@ def make_video_batch() -> VideoBatch:
 
 def test_video_batch_and_qwen_visual_contracts_validate_shape_dtype_and_ids() -> None:
     batch = make_video_batch()
-    main = torch.zeros(2, 3, 4096)
+    main = torch.zeros(2, 2, 4096)
+    packed_deepstack = torch.zeros(4, 4096)
     output = QwenVisualOutput(
         main_visual_embeddings=main,
-        deepstack_features=(main.clone(), main.clone(), main.clone()),
-        video_grid_thw=batch.video_grid_thw,
+        deepstack_features=(
+            packed_deepstack.clone(),
+            packed_deepstack.clone(),
+            packed_deepstack.clone(),
+        ),
+        visual_valid_mask=torch.ones(2, 2, dtype=torch.bool),
+        metadata=MergedVideoMetadata(
+            video_grid_thw=batch.video_grid_thw,
+            merged_grid_thw=torch.tensor([[2, 1, 1], [2, 1, 1]], dtype=torch.int64),
+            spatial_merge_size=2,
+            token_counts=(2, 2),
+            token_offsets=(0, 2, 4),
+        ),
     )
 
-    assert output.main_visual_embeddings.shape == (2, 3, 4096)
+    assert batch.patch_offsets == (0, 8, 16)
+    assert output.main_visual_embeddings.shape == (2, 2, 4096)
     with pytest.raises(ValueError, match="valid_mask"):
         VideoBatch(
             pixel_values_videos=batch.pixel_values_videos,

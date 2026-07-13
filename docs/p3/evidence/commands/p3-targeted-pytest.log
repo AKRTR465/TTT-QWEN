@@ -1,0 +1,5 @@
+timestamp_utc=2026-07-13T19:13:03.7685335Z
+environment=UV_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+command=uv run pytest -q tests/test_qwen_adapter.py tests/test_v5_runtime_types.py tests/test_v5_module_skeletons.py
+exit_code=0
+result=56 passed in 29.88s

@@ -3,7 +3,7 @@
 > 对齐源：[ARCHITECTURE.md](./ARCHITECTURE.md)  
 > 规范版本：`state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`  
 > 生成日期：2026-07-13  
-> 文档状态：施工分解 / P0–P2 已通过，P3 尚未开始
+> 文档状态：施工分解 / P0–P3 已通过，P4 尚未开始
 > 总原则：本文件只描述施工顺序和验收门禁；任何勾选都必须有代码、测试、日志或实验记录作为证据。
 
 ## 0. 使用方法
@@ -391,35 +391,35 @@
 
 ### 实施过程 TODO
 
-- [ ] 在 `qwen_adapter.py` 封装 Qwen3-VL 加载与配置断言。
-- [ ] 跟踪 `get_video_features()` / visual forward / Main Merger / `inputs_embeds.masked_scatter` 的真实调用链。
-- [ ] 捕获 Main Merger 输出 `V_t[B,N_v,4096]`，保留 batch 到 token 的映射。
-- [ ] 用 Demo 验证 PatchEmbed `[1568,1536]→[1568,1152]`。
-- [ ] 验证 27 个 ViT block 保持 `[1568,1152]`。
-- [ ] 验证 Main Merger 的分组维 `4×1152=4608` 并输出 4096。
-- [ ] 验证 token 数 `1568/4=392`，逻辑网格 `[8,14,14]→[8,7,7]`。
-- [ ] 暴露 `V_t`、merged grid metadata 和原 DeepStack features，接口不复制 Qwen 内部实现。
-- [ ] 把 Adapter hook 放在 Main Merger 输出之后、video placeholder scatter 之前。
-- [ ] 保持 image 路径与非视频输入行为不变。
-- [ ] 保持 DeepStack 三组 `[N_v,4096]` 的顺序、dtype、device、mask 和注入位置不变。
-- [ ] 明确验证三组 DeepStack 特征按顺序进入 Qwen decoder 的前三个对应处理层级；不得把
+- [x] 在 `qwen_adapter.py` 封装 Qwen3-VL 加载与配置断言。
+- [x] 跟踪 `get_video_features()` / visual forward / Main Merger / `inputs_embeds.masked_scatter` 的真实调用链。
+- [x] 捕获 Main Merger 输出 `V_t[B,N_v,4096]`，保留 batch 到 token 的映射。
+- [x] 用 Demo 验证 PatchEmbed `[1568,1536]→[1568,1152]`。
+- [x] 验证 27 个 ViT block 保持 `[1568,1152]`。
+- [x] 验证 Main Merger 的分组维 `4×1152=4608` 并输出 4096。
+- [x] 验证 token 数 `1568/4=392`，逻辑网格 `[8,14,14]→[8,7,7]`。
+- [x] 暴露 `V_t`、merged grid metadata 和原 DeepStack features，接口不复制 Qwen 内部实现。
+- [x] 把 Adapter hook 放在 Main Merger 输出之后、video placeholder scatter 之前。
+- [x] 保持 image 路径与非视频输入行为不变。
+- [x] 保持 DeepStack 三组 `[N_v,4096]` 的顺序、dtype、device、mask 和注入位置不变。
+- [x] 明确验证三组 DeepStack 特征按顺序进入 Qwen decoder 的前三个对应处理层级；不得把
       ViT indexes 8/16/24 误当成 LLM layer indexes。
-- [ ] 加入 adapter-disabled 模式，用于与原 Qwen 输出逐张量比较。
-- [ ] 加入启动断言；checkpoint config 不匹配时 fail fast。
+- [x] 加入 adapter-disabled 模式，用于与原 Qwen 输出逐张量比较。
+- [x] 加入启动断言；checkpoint config 不匹配时 fail fast。
 
 ### 实施后验收项
 
-- [ ] Demo Main Merger 输出严格为 `[1,392,4096]`。
-- [ ] Adapter disabled 时，video embeddings、DeepStack tensors 和模型输出与原模型在容差内一致。
-- [ ] 插入点测试证明发生在 Main Merger 后和 `masked_scatter` 前。
-- [ ] DeepStack 不经过 Adapter、Bank 或新增 token mask。
-- [ ] image-only、text-only 和 video 输入没有被 wrapper 破坏。
-- [ ] 代码与测试中无 `pooler_output` 依赖。
+- [x] Demo Main Merger 输出严格为 `[1,392,4096]`。
+- [x] Adapter disabled 时，video embeddings、DeepStack tensors 和模型输出与原模型在容差内一致。
+- [x] 插入点测试证明发生在 Main Merger 后和 `masked_scatter` 前。
+- [x] DeepStack 不经过 Adapter、Bank 或新增 token mask。
+- [x] image-only、text-only 和 video 输入没有被 wrapper 破坏。
+- [x] 代码与测试中无 `pooler_output` 依赖。
 
 ### 交付物与退出条件
 
-- [ ] 交付 `qwen_adapter.py`、配置断言和原模型等价测试。
-- [ ] DeepStack 等价测试失败时禁止实施 P5/P13。
+- [x] 交付 `qwen_adapter.py`、配置断言和原模型等价测试。
+- [x] DeepStack 等价测试失败时禁止实施 P5/P13。
 
 ---
 
