@@ -16,7 +16,6 @@ SKELETONS = (
     ("observation_heads", "build_observation_heads", "P8"),
     ("state_bank", "build_state_bank", "P9"),
     ("identity_bank", "build_identity_bank", "P10"),
-    ("query_encoder", "build_query_encoder", "P4"),
     ("state_retriever", "build_state_retriever", "P11"),
     ("state_reader", "build_state_reader", "P12"),
     ("input_composer", "compose_inputs", "P13"),
@@ -47,7 +46,12 @@ def test_recommended_modules_import_and_unimplemented_paths_fail_explicitly(
 
 def test_all_required_p1_module_files_exist() -> None:
     actual = {path.stem for path in PACKAGE.glob("*.py")}
-    expected = {name for name, _, _ in SKELETONS} | {"__init__", "config", "qwen_adapter"}
+    expected = {name for name, _, _ in SKELETONS} | {
+        "__init__",
+        "config",
+        "query_encoder",
+        "qwen_adapter",
+    }
 
     assert expected <= actual
 

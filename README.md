@@ -5,9 +5,10 @@
 完整架构、训练协议和消融方案见 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前对齐版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
-> 当前施工状态：P0–P3 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
+> 当前施工状态：P0–P4 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
 > P3 用官方 HF meta 模块和 tiny 随机权重模型完成 Qwen 接口与 DeepStack 工程验收。真实 8B
-> A0/集成仍保留在 P19/P21/P22；P4 现在允许开始，其余空壳被调用时会明确抛出
+> A0/集成仍保留在 P19/P21/P22；P4 已完成 Query Encoder、Operator Router 与 Time Window
+> Resolver 的工程门禁，但尚未训练或校准，P5 允许开始。其余空壳被调用时会明确抛出
 > `NotImplementedError`。
 
 ## 当前固定条件
@@ -26,10 +27,13 @@
 - O1/O2/E1/E2分别使用FiLM MLP、256维identity MLP、5层gated causal TCN和2层GRU；
 - 新增模块合计约156.83M，但在线变化的仍只有约1.18M fast参数；
 - 无标签TTT loss仅由当前chunk内next-tubelet prediction、O2身份一致性和E1/E2事件一致性组成；
-- 问题不再通过关键词规则机械划分；Qwen问题hidden states先经4096→768投影和4层双向
-  Transformer，再由三个768→1024→512输出头形成target/operator/time embedding；
-- 计数操作由9个learned prototypes进行语义路由，低置信度显式落到unsupported；
-- time embedding必须结合合法query_time和问题中的显式数值解析为确定性时间窗口；
+- 问题不再通过关键词规则机械划分；Qwen input embeddings先经4096→768投影、无参sinusoidal
+  position encoding和4层双向Transformer，再由三个768→1024→512 GELU输出头形成
+  target/operator/time embedding；
+- 计数操作由9个learned prototypes和初值1.0的可训练正温度进行语义路由；未校准时
+  eval/inference显式落到unsupported；
+- time embedding必须结合合法query_time、全局pointer和唯一候选受限grammar解析为确定性时间
+  窗口；失败时不猜测、不clamp；
 - State Bank记录通过归一化embedding检索，默认不设top-k；最终整数仍由确定性Reader计算；
 - 16个learned State Query经3层Perceiver Resampler汇总全部命中记录，生成16个4096维
   State Token；它们不是Top-16记录；
@@ -57,10 +61,11 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | :--- | :--- |
 | v5 YAML、完整解析、固定维度/容量/优化器校验 | P1 已实现并有契约测试 |
 | Video/Query/Encoder/Observation/Record/Retriever/Reader/runtime 类型 | P1 已实现并有 shape/dtype/边界测试 |
-| 推荐模块导入与职责边界 | P1 已实现；除 P3 `qwen_adapter.py` 外，后续实际入口显式 `NotImplementedError` |
+| 推荐模块导入与职责边界 | P1 已实现；P3 `qwen_adapter.py`、P4 `query_encoder.py` 已实现，其余后续入口显式 `NotImplementedError` |
 | 数据 schema、防泄漏、因果切分、processor/query token、A0 runner | P2 工程门禁已通过；fold/A0 为明确标注的合成替代 |
 | Qwen video boundary、Main Merger 插入点、DeepStack 保护 | P3 已实现；tiny/meta 工程契约已验证，真实 8B 留至 P19 |
-| Fast Adapter、状态、Reader、loss、训练、推理 | P4–P19 计划设计，尚未实现 |
+| Query Encoder、9-prototype Router、Time Window Resolver | P4 已实现；本地结构/参数/offset/fail-closed 契约已验证，模型尚未训练、阈值尚未校准 |
+| Fast Adapter、状态、Reader、loss、训练、推理 | P5–P19 计划设计，尚未实现 |
 | 真实 8B、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行 |
 
 ## 环境变量

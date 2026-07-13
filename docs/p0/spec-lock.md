@@ -8,7 +8,7 @@
 | SPEC_VERSION | `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval` |
 | 修订日期 | `2026-07-13` |
 | 文档状态 | `DOCUMENT-ONLY / UNVERIFIED` |
-| ARCHITECTURE_SHA256 | `0690c9cf5d8301b644abd87deb01a0a02b3126e30eaa3d18e69b5bb105c57adc` |
+| ARCHITECTURE_SHA256 | `32bd56d926036a7e0fea9bde9b8ab9087f2c379d44d2dacf5fcca6e88caf8c2e` |
 | 基线 Git commit | `7f0185f8136faf88cc59e5ba2ec7309c36f8d013` |
 | UV_LOCK_SHA256 | `c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2` |
 | 基座模型 | `Qwen/Qwen3-VL-8B-Instruct` |
@@ -53,7 +53,7 @@
 
 - Outer Training 使用全量微调、分阶段解冻或 LLM LoRA；
 - 768 与旧 512 主干的净收益，活动槽 16/32/48/64，State Token 8/16/32；
-- Time Window Resolver 的 numeric span decoder；
+- 是否用训练折证据替换或增强 P4 的“双 pointer + 唯一候选受限 grammar” baseline；
 - operator unsupported、record similarity、O1/O2/E1/E2 FSM/match/cooldown/NMS 阈值；
 - E1/E2 overlap 一致性距离；
 - ANN 候选召回的启用规模；

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -29,6 +30,19 @@ RUNTIME_DENYLIST = frozenset(
 _EXPLICIT_TIME_PATTERN = re.compile(
     r"(?<!\w)(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|秒|分钟)(?![A-Za-z])",
     flags=re.IGNORECASE,
+)
+_SHARED_UNIT_RANGE_PATTERNS = (
+    re.compile(
+        r"\b(?:from|between)\s+(?P<start>\d+(?:\.\d+)?)\s+(?:to|and)\s+"
+        r"(?P<end>\d+(?:\.\d+)?)\s*(?P<unit>seconds?|secs?|s|minutes?|mins?|m)"
+        r"(?![A-Za-z])",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"从\s*(?P<start>\d+(?:\.\d+)?)\s*(?:到|至)\s*"
+        r"(?P<end>\d+(?:\.\d+)?)\s*(?P<unit>秒|分钟)",
+        flags=re.IGNORECASE,
+    ),
 )
 
 
@@ -78,10 +92,12 @@ class RuntimeModelInput:
     def __post_init__(self) -> None:
         if not self.question:
             raise ValueError("question must be non-empty")
-        if self.query_time < 0.0:
-            raise ValueError("query_time must be non-negative")
-        if any(value < 0.0 for value in self.explicit_time_values):
-            raise ValueError("explicit time values must be non-negative")
+        if not math.isfinite(self.query_time) or self.query_time < 0.0:
+            raise ValueError("query_time must be finite and non-negative")
+        if any(
+            not math.isfinite(value) or value < 0.0 for value in self.explicit_time_values
+        ):
+            raise ValueError("explicit time values must be finite and non-negative")
         assert_runtime_payload_safe(self.as_payload(), layer="Dataset")
 
     def as_payload(self) -> dict[str, object]:
@@ -145,7 +161,7 @@ class SVCBenchRecord:
         expected_video_id = canonical_video_id(self.source_dataset, self.relative_video_path)
         if self.identity.video_id != expected_video_id:
             raise ValueError("record video_id must match source_dataset/video_path")
-        if self.query_time < 0.0 or not self.question:
+        if not math.isfinite(self.query_time) or self.query_time < 0.0 or not self.question:
             raise ValueError("record query_time/question is invalid")
 
     def runtime_sample(self, video_root: Path) -> RuntimeSample:
@@ -230,8 +246,16 @@ class RuntimeBatch:
             raise ValueError("RuntimeBatch fields must have one entry per batch item")
         if len(self.explicit_time_values) != batch_size:
             raise ValueError("explicit_time_values must have one entry per batch item")
+        if any(
+            not math.isfinite(value) or value < 0.0
+            for values in self.explicit_time_values
+            for value in values
+        ):
+            raise ValueError("explicit_time_values must be finite and non-negative")
         if self.query_time.shape != (batch_size,) or not torch.is_floating_point(self.query_time):
             raise ValueError("query_time must be floating [B]")
+        if not bool(torch.isfinite(self.query_time).all()) or bool(torch.any(self.query_time < 0)):
+            raise ValueError("query_time must be finite and non-negative")
         assert_runtime_payload_safe(self.as_model_payload(), layer="Collator")
 
     def as_model_payload(self) -> dict[str, object]:
@@ -303,14 +327,27 @@ def assert_runtime_payload_safe(payload: Mapping[str, object], *, layer: str) ->
 
 
 def extract_explicit_time_values(question: str) -> tuple[float, ...]:
-    values: list[float] = []
+    positioned_values: dict[int, float] = {}
     for match in _EXPLICIT_TIME_PATTERN.finditer(question):
         value = float(match.group(1))
         unit = match.group(2).lower()
         if unit in {"minute", "minutes", "min", "mins", "m", "分钟"}:
             value *= 60.0
-        values.append(value)
-    return tuple(values)
+        positioned_values[match.start(1)] = value
+    for pattern in _SHARED_UNIT_RANGE_PATTERNS:
+        for match in pattern.finditer(question):
+            unit = match.group("unit").lower()
+            scale = 60.0 if unit in {
+                "minute",
+                "minutes",
+                "min",
+                "mins",
+                "m",
+                "分钟",
+            } else 1.0
+            positioned_values[match.start("start")] = float(match.group("start")) * scale
+            positioned_values[match.start("end")] = float(match.group("end")) * scale
+    return tuple(value for _, value in sorted(positioned_values.items()))
 
 
 def canonical_video_id(source_dataset: str, relative_video_path: str) -> str:

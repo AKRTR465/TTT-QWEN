@@ -171,6 +171,7 @@ query_encoder:
   dropout: 0.1
   output_dim: 512
   bidirectional: true
+  position_encoding: sinusoidal
   pooling: learned_attention
 
 operator_router:
@@ -185,6 +186,8 @@ operator_router:
     - e2-episode
     - unsupported
   output_dim: 512
+  temperature_initial: 1.0
+  temperature_trainable: true
   confidence_threshold: null
   threshold_status: calibration_required
 

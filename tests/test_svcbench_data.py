@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from ttt_svcbench_qwen.data import (
     RUNTIME_ALLOWLIST,
@@ -11,6 +12,9 @@ from ttt_svcbench_qwen.data import (
     DatasetPurpose,
     DatasetSource,
     LoadedAnnotations,
+    RuntimeBatch,
+    RuntimeModelInput,
+    SampleIdentity,
     SVCBenchCollator,
     SVCBenchDataset,
     assert_runtime_payload_safe,
@@ -99,7 +103,36 @@ def test_explicit_time_parser_accepts_only_question_visible_values() -> None:
         3.0,
     )
     assert extract_explicit_time_values("过去 10 秒内发生了几次？") == (10.0,)
+    assert extract_explicit_time_values("from 2 to 8 seconds") == (2.0, 8.0)
+    assert extract_explicit_time_values("从 2 到 8 秒") == (2.0, 8.0)
+    assert extract_explicit_time_values("从2到8秒") == (2.0, 8.0)
     assert extract_explicit_time_values("How many are visible now?") == ()
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -1.0])
+def test_runtime_time_fields_reject_non_finite_and_negative_values(bad_value: float) -> None:
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        RuntimeModelInput(Path("synthetic.mp4"), "question", bad_value, ())
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        RuntimeModelInput(Path("synthetic.mp4"), "question", 1.0, (bad_value,))
+
+    identity = SampleIdentity("query-0", 0, "video-0", "trajectory-0")
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        RuntimeBatch(
+            video=(Path("synthetic.mp4"),),
+            question=("question",),
+            query_time=torch.tensor([bad_value], dtype=torch.float32),
+            explicit_time_values=((),),
+            identities=(identity,),
+        )
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        RuntimeBatch(
+            video=(Path("synthetic.mp4"),),
+            question=("question",),
+            query_time=torch.tensor([1.0]),
+            explicit_time_values=((bad_value,),),
+            identities=(identity,),
+        )
 
 
 def test_group_kfold_keeps_all_query_points_from_each_video_together(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@
 > 对齐源：[ARCHITECTURE.md](./ARCHITECTURE.md)  
 > 规范版本：`state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`  
 > 生成日期：2026-07-13  
-> 文档状态：施工分解 / P0–P3 已通过，P4 尚未开始
+> 文档状态：施工分解 / P0–P4 已通过，P5 允许开始
 > 总原则：本文件只描述施工顺序和验收门禁；任何勾选都必须有代码、测试、日志或实验记录作为证据。
 
 ## 0. 使用方法
@@ -440,57 +440,58 @@
 
 #### P4.1 Query 主干
 
-- [ ] 实现 `Q_h[B,L_q,4096]→Linear 4096→768`。
-- [ ] 实现 4 层 Pre-LN 双向 Transformer Encoder。
-- [ ] 固定 hidden=768、heads=12、head_dim=64、FFN=3072、dropout=0.1。
-- [ ] attention mask 只屏蔽 padding，禁止 causal mask。
-- [ ] 实现 learned-attention pooling：`softmax(w^T tanh(WX_q)+M)`。
-- [ ] 断言 padding 权重严格为 0。
-- [ ] 输出 `h_q[B,768]`。
+- [x] 实现 `Q_h[B,L_q,4096]→Linear 4096→768`。
+- [x] 加入无参数 sinusoidal position encoding，保证词序可见且不改变参数预算。
+- [x] 实现 4 层 Pre-LN 双向 Transformer Encoder。
+- [x] 固定 hidden=768、heads=12、head_dim=64、FFN=3072、GELU、dropout=0.1，且无额外 final LayerNorm。
+- [x] attention mask 只屏蔽 padding，禁止 causal mask。
+- [x] 实现 learned-attention pooling：`softmax(w^T tanh(WX_q)+M)`，最终 scorer 无 bias。
+- [x] 断言 padding 权重严格为 0。
+- [x] 内部得到 `h_q[B,768]`。
 
 #### P4.2 三个 embedding head
 
-- [ ] 分别实现三个独立 `768→1024→512` MLP。
-- [ ] 对 `q_target`、`q_operator`、`q_time` 分别 L2 normalize。
-- [ ] 禁止三个 head 共享最后一层参数。
-- [ ] 验证三者均为 `[B,512]`。
-- [ ] 将职责写入接口：target=对象/事件语义，operator=计数操作，time=时间语义。
+- [x] 分别实现三个独立 `768→1024→512` GELU MLP，且无额外 final LayerNorm。
+- [x] 对 `q_target`、`q_operator`、`q_time` 分别 L2 normalize。
+- [x] 禁止三个 head 共享最后一层参数。
+- [x] 验证三者均为 `[B,512]`。
+- [x] 将职责写入接口：target=对象/事件语义，operator=计数操作，time=时间语义。
 
 #### P4.3 Operator Router
 
-- [ ] 创建 9 个可训练 512 维 prototype：O1-Snap、O1-Delta、O2-Unique、O2-Gain、E1-Action、E1-Transit、E2-Periodic、E2-Episode、unsupported。
-- [ ] 实现归一化余弦 logits 和温度 `tau`。
-- [ ] 训练时输出 9 类监督 logits。
-- [ ] 测试时 hard argmax，并返回 confidence。
-- [ ] 最大置信度低于校准阈值时强制 unsupported。
-- [ ] 建立 operator→head_type 的确定映射。
-- [ ] 不实现关键词规则作为正式路由；规则 Parser 只允许在 Q0 诊断消融中存在。
+- [x] 创建 9 个可训练 512 维 prototype：O1-Snap、O1-Delta、O2-Unique、O2-Gain、E1-Action、E1-Transit、E2-Periodic、E2-Episode、unsupported。
+- [x] 实现归一化余弦 logits 和正的可训练温度 `tau`，初值为 1.0。
+- [x] 训练时输出 9 类监督 logits。
+- [x] 测试时 hard argmax，并返回 confidence。
+- [x] 最大置信度低于校准阈值时强制 unsupported；阈值为 null 时 eval/inference 一律 unsupported。
+- [x] 建立 operator→head_type 的确定映射。
+- [x] 不实现关键词规则作为正式路由；规则 Parser 只允许在 Q0 诊断消融中存在。
 
 #### P4.4 Time Window Resolver
 
-- [ ] 实现 `q_time[512]→MLP 512→256→4`，分类 now/history/recent/explicit_range。
-- [ ] 在 `X_q[B,L_q,768]` 上实现两个 `Linear 768→1` pointer head，预测 numeric span start/end。
-- [ ] 受约束解析问题中显式秒数、区间和单位。
-- [ ] 使用合法 `query_points.time` 作为 query_time。
-- [ ] 无显式窗口时根据 hard operator 使用预定义默认时间语义。
-- [ ] 生成 `TimeWindow(mode,query_time,start_time,end_time,valid)`。
-- [ ] 无法可靠解析时返回 unsupported，不猜窗口。
-- [ ] 保证 end_time 不超过 query_time。
-- [ ] 明确禁止 count 和 occurrence_times 参与解析。
+- [x] 实现 `q_time[512]→MLP 512→256→4`，分类 now/history/recent/explicit_range。
+- [x] 在 `X_q[B,L_q,768]` 上实现两个 `Linear 768→1` pointer head，预测 numeric span start/end。
+- [x] 用全局非 padding pointer 边界与唯一候选 grammar 受约束解析中英文 seconds/minutes、recent 和 range。
+- [x] 使用合法 `query_points.time` 作为 query_time。
+- [x] 无显式窗口时使用固定映射：O1-Snap→now，O1-Delta/O2-Gain→recent（须显式正 duration），O2-Unique/E1/E2→history。
+- [x] 生成 `TimeWindow(mode,query_time,start_time,end_time,valid)`。
+- [x] 语法/窗口错误返回 invalid，未校准/低置信度返回 unsupported；二者都强制 effective operator=unsupported，不猜窗口。
+- [x] 保证 end_time 不超过 query_time。
+- [x] 明确禁止 count 和 occurrence_times 参与解析。
 
 ### 实施后验收项
 
-- [ ] 变长问题和 padding batch 的三个输出 shape 正确且有限。
-- [ ] 双向 mask 测试证明问题 token 可互相注意、padding 不可见。
-- [ ] 将答案/标签 token 注入输入的负向测试会被拒绝。
-- [ ] 9 类 operator 均有单元测试；低置信度返回 unsupported。
-- [ ] TimeWindow 覆盖 now/history/recent/explicit_range、无数值、非法单位、反向区间和未来区间。
-- [ ] 完整 Query Encoder 参数量约 36.03M。
+- [x] 变长问题和 padding batch 的三个输出 shape 正确且有限。
+- [x] 双向 mask 测试证明问题 token 可互相注意、padding 不可见。
+- [x] API denylist、canonical-question/offset 边界及调用方 provenance 声明违规会被拒绝；不声称能识别问题正文中伪装的答案文字。
+- [x] 9 类 operator 均有单元测试；低置信度返回 unsupported。
+- [x] TimeWindow 覆盖 now/history/recent/explicit_range、无数值、非法单位、反向区间和未来区间。
+- [x] 完整 Query Encoder 参数量约 36.03M。
 
 ### 交付物与退出条件
 
-- [ ] 交付 `query_encoder.py`、operator router、Time Resolver 和监督接口。
-- [ ] Router/Resolver 的最终阈值保留为 P21 校准项。
+- [x] 交付 `query_encoder.py`、operator router、Time Resolver 和监督接口。
+- [x] Router/Resolver 的最终阈值保留为 P21 校准项。
 
 ---
 
@@ -1671,7 +1672,7 @@
 - [?] 比较 768 高容量主干与原 512 主干的净收益、显存和延迟。
 - [?] 比较活动槽 16、32、48、64；正式候选基线为 32。
 - [?] 比较 State Token 8、16、32；正式候选基线为 16。
-- [?] 选择 Time Window Resolver numeric span decoder 形式。
+- [?] 比较是否替换或增强 P4 已冻结的“双 pointer + 唯一候选受限 grammar” baseline。
 - [?] 校准 9 类 operator confidence/unsupported threshold。
 - [?] 校准各 head_type 的 record similarity threshold；bootstrap=0.35。
 - [?] 校准 O1/O2/E1/E2 FSM、match、promotion、cooldown/NMS 阈值。

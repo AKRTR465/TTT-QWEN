@@ -1,0 +1,29 @@
+timestamp_utc=2026-07-13T20:16:11.3150600Z
+environment=UV_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+final_candidate_timestamp_utc=2026-07-13T20:20:43.6921761Z
+
+initial_attempt=uv run pytest -q
+initial_exit_code=1
+initial_result=162 passed, 1 failed
+initial_failure=docs/p0/spec-lock.md retained the pre-P4 ARCHITECTURE_SHA256
+resolution=updated spec-lock to 32bd56d926036a7e0fea9bde9b8ab9087f2c379d44d2dacf5fcca6e88caf8c2e
+
+command=uv run pytest -q (final commit candidate rerun)
+exit_code=0
+result=164 passed in 32.21s
+
+command=uv run ruff check .
+exit_code=0
+result=All checks passed!
+
+command=uv run mypy src
+exit_code=0
+result=Success: no issues found in 21 source files
+
+command=git diff --check
+exit_code=0
+result=no output
+
+final_architecture_sha256=32bd56d926036a7e0fea9bde9b8ab9087f2c379d44d2dacf5fcca6e88caf8c2e
+final_config_sha256=ec6b11842294e3ad08ca01e20e01006a0883900c574191507b567ce041538d45
+uv_lock_sha256=c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2

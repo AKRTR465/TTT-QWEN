@@ -675,7 +675,8 @@ INACTIVE
 
 ### 6.6 v5 参数预算
 
-以下预算不含 Qwen3-VL 基座，按带 bias 的标准 Linear、MHA、FFN、GRU 和本文给定层数估算：
+以下预算不含 Qwen3-VL 基座，按标准 Linear、MHA、FFN、GRU 和本文给定层数估算；除
+Query learned-attention 的最终标量 scorer 明确不带 bias 外，其余 Linear 按带 bias 计算：
 
 | 模块 | 约参数量 |
 | :--- | ---: |
@@ -803,12 +804,15 @@ Q_h\in\mathbb R^{B\times L_q\times4096}.
 ~~~text
 Q_h [B,L_q,4096]
 → Linear 4096→768
+→ 无参数 sinusoidal position encoding
 → 4-layer bidirectional Transformer Encoder
-   hidden=768, heads=12, FFN=3072, Pre-LN, dropout=0.1
+   hidden=768, heads=12, FFN=3072, Pre-LN, GELU, dropout=0.1
 → X_q [B,L_q,768]
 ~~~
 
 问题在查询前已经完整可见，因此这里使用双向 attention，只屏蔽 padding，不使用 causal mask。
+sinusoidal position encoding 用来保留词序，不引入额外可训练参数；Transformer Encoder 和三个
+embedding head 后均不再添加额外 final LayerNorm。
 
 随后执行 learned-attention pooling：
 
@@ -826,7 +830,8 @@ h_q
 \in\mathbb R^{B\times768}.
 \]
 
-padding token 的权重必须为 0。
+其中 \(W\) 对应带 bias 的 `768→768` 投影，最终 \(w^\top\) scorer 不带 bias；padding token 的
+权重必须严格为 0。
 
 ### 8.2 三个独立 embedding
 
@@ -834,7 +839,7 @@ padding token 的权重必须为 0。
 q_{\mathrm{target}}
 =\operatorname{norm}
 \left(
-\operatorname{MLP}_{768\rightarrow1024\rightarrow512}^{target}(h_q)
+\operatorname{MLP}_{768\rightarrow1024\rightarrow512,\,GELU}^{target}(h_q)
 \right),
 \]
 
@@ -842,7 +847,7 @@ q_{\mathrm{target}}
 q_{\mathrm{operator}}
 =\operatorname{norm}
 \left(
-\operatorname{MLP}_{768\rightarrow1024\rightarrow512}^{operator}(h_q)
+\operatorname{MLP}_{768\rightarrow1024\rightarrow512,\,GELU}^{operator}(h_q)
 \right),
 \]
 
@@ -850,7 +855,7 @@ q_{\mathrm{operator}}
 q_{\mathrm{time}}
 =\operatorname{norm}
 \left(
-\operatorname{MLP}_{768\rightarrow1024\rightarrow512}^{time}(h_q)
+\operatorname{MLP}_{768\rightarrow1024\rightarrow512,\,GELU}^{time}(h_q)
 \right).
 \]
 
@@ -894,8 +899,11 @@ l_k
 }{\tau}.
 \]
 
-训练时使用监督分类；测试时使用 hard argmax。最大置信度低于校准阈值时必须返回
-unsupported，不能强行分到最相近的合法操作。
+温度使用正的可训练标量：保存 `log_tau`，以 `exp(log_tau)` 取得 τ，并把数值限制在
+`[1e-4,1e4]`；初值固定为 1.0。训练时保留 9 类 raw logits、probability、raw argmax 供监督
+分类；测试时使用 hard argmax。最大置信度低于校准阈值时必须返回 unsupported，不能强行分到
+最相近的合法操作。P21 校准前 `confidence_threshold=null`：训练路径仍保留 raw 结果，但
+eval/inference 路径的 effective operator 一律为 unsupported。
 
 ### 8.4 Time Window Resolver
 
@@ -910,13 +918,27 @@ TimeWindow:
   valid: bool
 ~~~
 
-解析规则：
+解析与完整性规则：
 
 - 合法 query_points.time 作为 query_time；
-- 问题中显式出现的秒数或区间由受约束的 numeric span decoder 提取；
+- `explicit_time_values` 只能由 canonical question 抽取，并按出现顺序换算为秒逐值核对；它只做
+  question-derived 完整性检查，不参与窗口构造，也不是标签；
+- 无显式数字时直接使用 operator 默认语义；有显式数字时，全文受限 grammar 必须得到唯一候选，
+  两个 pointer 再在所有非 padding token 上分别 hard argmax，并完整覆盖该候选首尾 numeric
+  component；错序、只覆盖数字/单位、落在候选外或多候选均判 invalid；
+- baseline grammar 只接受英文 `last/past/previous ... seconds|minutes`、中文
+  `最近/过去/近 ... 秒|分钟`，以及 `from|between ... to|and ...`、`从 ... 到|至 ...` 区间；
+  recent 支持 `and/+` 或 `和/+` 组合单位；
+- `2 minutes and 3 seconds` 的完整性 tuple 是 `(120,3)`，窗口 duration 是 123 秒；共享单位区间
+  `from 2 to 8 seconds` 的完整性 tuple 和窗口端点均为 `(2,8)`；
 - q_time 负责时间语义分类；
-- 无显式窗口时，根据 hard operator 使用预定义默认语义；
-- 无法可靠解析时返回 unsupported，不得猜测时间范围；
+- 默认时间语义固定为：O1-Snap→now；O1-Delta/O2-Gain→recent，但没有显式正 duration 时
+  invalid；O2-Unique、E1-Action、E1-Transit、E2-Periodic、E2-Episode→history；
+- now 为 `(start=null,end=query_time)`，history 为 `[0,query_time]`，recent 为
+  `[query_time-duration,query_time]`，explicit_range 使用显式 `[start,end]`；
+- 负数、零 recent、非法单位、反向区间、未来端点、早于视频起点、metadata mismatch 或不完整
+  pointer span 均返回 `status=invalid`；未校准/低置信度或 mode 不一致返回
+  `status=unsupported`。两者都会把 effective operator 强制降为 unsupported，不得猜测或 clamp；
 - count 和 occurrence_times 不能参与解析。
 
 Time Window Resolver 固定使用：
@@ -928,9 +950,14 @@ q_time [512]
 
 X_q [B,L_q,768]
 → 两个Linear 768→1 pointer head
-→ numeric span start / end
+→ 全局非 padding numeric span start / end
+→ 唯一候选 grammar 与完整边界一致性
 → 确定性数值与单位解析
 ~~~
+
+默认 API 在 `train()` 下保留未校准 raw 路径，在 `eval()` 下自动启用 confidence gate；调用方也可
+显式传入 inference 开关。这里的受限规则只解析时间数值与单位，禁止把关键词规则用作 operator
+路由。
 
 ## 9. Embedding State Retrieval
 
@@ -1603,7 +1630,7 @@ src/ttt_svcbench_qwen/
 - 高容量主干相对原 512 维主干的净收益；
 - 活动槽 32 相对 16、48、64 的容量与开销权衡；
 - State Token 16 相对 8、32 的摘要能力与上下文开销；
-- Time Window Resolver 的 numeric span decoder 形式；
+- 是否用训练折证据替换或增强 P4 已冻结的“双 pointer + 唯一候选受限 grammar” baseline；
 - operator 和 record similarity 的最终校准阈值；
 - E1/E2 overlap loss 使用 MSE、BCE 还是其他一致性距离；
 - Confirmed 数量达到多大时启用 ANN 候选召回；

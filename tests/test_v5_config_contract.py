@@ -137,9 +137,16 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "ffn_dim": 3072,
         "dropout": 0.1,
         "output_dim": 512,
+        "position_encoding": "sinusoidal",
     }
     assert len(config.operator_router.prototypes) == 9
     assert config.operator_router.prototypes[-1] == "unsupported"
+    assert config.operator_router.temperature_initial == 1.0
+    assert config.operator_router.temperature_trainable is True
+    assert config.operator_router.confidence_threshold is None
+    assert config.operator_router.threshold_status is CalibrationStatus.CALIBRATION_REQUIRED
+    assert config.time_resolver.confidence_threshold is None
+    assert config.time_resolver.threshold_status is CalibrationStatus.CALIBRATION_REQUIRED
     assert config.retriever.record_similarity_threshold == 0.35
     assert config.retriever.top_k is None
     assert config.retriever.ann_enabled is False
@@ -218,6 +225,34 @@ def set_nested(*path_and_value: object) -> Mutation:
         (set_nested("retriever", "top_k", 16), "retriever.top_k must be None"),
         (set_nested("model", "vision", "deepstack_visual_indexes", [7, 15, 23]), "deepstack"),
         (set_nested("query_encoder", "num_heads", 10), "num_heads must be 12"),
+        (
+            set_nested("query_encoder", "pooling", "mean"),
+            "query_encoder.pooling must be 'learned_attention'",
+        ),
+        (
+            set_nested("query_encoder", "position_encoding", "none"),
+            "query_encoder.position_encoding must be 'sinusoidal'",
+        ),
+        (
+            set_nested("operator_router", "temperature_initial", 0.5),
+            "temperature_initial must be 1.0",
+        ),
+        (
+            set_nested("operator_router", "confidence_threshold", 0.5),
+            "operator_router.confidence_threshold must be None",
+        ),
+        (
+            set_nested("time_resolver", "hidden_dim", 128),
+            "time_resolver.hidden_dim must be 256",
+        ),
+        (
+            set_nested("time_resolver", "pointer_heads", 1),
+            "time_resolver.pointer_heads must be 2",
+        ),
+        (
+            set_nested("time_resolver", "confidence_threshold", 0.5),
+            "time_resolver.confidence_threshold must be None",
+        ),
     ],
 )
 def test_v3_values_and_illegal_combinations_fail_before_startup(

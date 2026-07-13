@@ -6,12 +6,12 @@
 | 需求 ID | 源章节 | 需求主题 | 实施阶段 | 主要验收位置 | 计划设计 | 已验证实现 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | ARCH-00-GOAL-001 | `0` | 目标与职责分离 | P0、P13、P22 | `tests/test_end_to_end_demo.py`、P22 最终一句话审计 | 已冻结 | 未实现 |
-| ARCH-00-BOUNDARY-001 | `0.1` | 第一版固定边界 | P0–P5、P18、P20 | `tests/test_v5_config_contract.py`、`tests/test_inference_protocol.py` | 已冻结 | 未实现 |
+| ARCH-00-BOUNDARY-001 | `0.1` | 第一版固定边界 | P0–P5、P18、P20 | `tests/test_v5_config_contract.py`、`tests/test_inference_protocol.py` | 已冻结 | P0–P4 固定边界已验证；P5/P18/P20 待实现 |
 | ARCH-00-NOGO-001 | `0.2` | 第一版明确不做 | P0、P20 | `tests/test_leakage_guards.py`、P20 禁止项扫描 | 已冻结 | 未实现 |
 | ARCH-01-VIDEO-001 | `1.1` | Demo video/grid/pixels | P2 | `tests/test_video_preprocessing.py` | 已定义 | P2 已验证 |
-| ARCH-01-QUERY-001 | `1.2` | Demo query/Q_h | P2、P4 | `tests/test_query_tokens.py`、`tests/test_query_encoder.py` | 已定义 | P2 token 范围已验证；P4 encoder 待实现 |
+| ARCH-01-QUERY-001 | `1.2` | Demo query/Q_h | P2、P4 | `tests/test_query_tokens.py`、`tests/test_query_encoder.py` | 已定义 | P2 token 范围及 P4 embedding-only encoder、位置/offset 契约已验证 |
 | ARCH-01-DYNAMIC-001 | `1.3` | 动态 T 与容量独立 | P1、P2、P7、P12 | 变长输入测试、`tests/test_state_encoder.py` | 已定义 | P2 变长预处理已验证；后续模块待实现 |
-| ARCH-02-FLOW-001 | `2` | 总体数据流 | P3–P18 | `tests/test_end_to_end_demo.py` | 已定义 | P3 Qwen video boundary 已验证；P4–P18 待实现 |
+| ARCH-02-FLOW-001 | `2` | 总体数据流 | P3–P18 | `tests/test_end_to_end_demo.py` | 已定义 | P3 Qwen video boundary、P4 Query/Router/Resolver 已验证；P5–P18 待实现 |
 | ARCH-03-BASE-001 | `3.1` | Qwen 基础配置 | P1、P3 | `tests/test_v5_config_contract.py`、`tests/test_qwen_adapter.py` | 已定义 | P3 config-only local preflight、checkpoint/runtime 断言已验证；真实 8B 留至 P19 |
 | ARCH-03-MERGER-001 | `3.2` | PatchEmbed/Main Merger | P2–P3 | `tests/test_video_preprocessing.py`、`tests/test_qwen_adapter.py` | 已定义 | P2 processor 输入及 P3 官方 meta shape、packed mapping 已验证 |
 | ARCH-03-INSERT-001 | `3.3` | State-TTT 插入点 | P3 | `tests/test_qwen_adapter.py` hook 顺序测试 | 已定义 | P3 已验证 Main Merger→Adapter→video masked scatter |
@@ -32,10 +32,10 @@
 | ARCH-07-PAYLOAD-001 | `7.3` | typed payload/semantic | P9–P10 | `tests/test_state_bank.py` 字段/Projector 测试 | 已定义 | 未实现 |
 | ARCH-07-CAPACITY-001 | `7.4` | O2 动态容量 | P10 | `tests/test_identity_bank.py` >256/cache 压力测试 | 已定义 | 未实现 |
 | ARCH-07-GRAD-001 | `7.5` | 梯度边界 | P9、P14 | `tests/test_state_bank.py`、`tests/test_functional_sgd.py` | 已定义 | 未实现 |
-| ARCH-08-POOL-001 | `8.1` | Query 输入与池化 | P4 | `tests/test_query_encoder.py` padding/Bi-Attention | 已定义 | 未实现 |
-| ARCH-08-EMBED-001 | `8.2` | 三个独立 embedding | P4 | `tests/test_query_encoder.py` shape/独立 head | 已定义 | 未实现 |
-| ARCH-08-OPERATOR-001 | `8.3` | 9 prototypes | P4、P21 | `tests/test_query_encoder.py`、P21 Q0–Q3 | 已定义 | 未实现 |
-| ARCH-08-TIME-001 | `8.4` | Time Window Resolver | P4、P21 | `tests/test_query_encoder.py` TimeWindow/数值 span | 已定义 | 未实现 |
+| ARCH-08-POOL-001 | `8.1` | Query 输入与池化 | P4 | `tests/test_query_encoder.py` padding/Bi-Attention | 已定义 | P4 已验证 sinusoidal position、双向 padding-only attention、learned pooling 与参数预算 |
+| ARCH-08-EMBED-001 | `8.2` | 三个独立 embedding | P4 | `tests/test_query_encoder.py` shape/独立 head | 已定义 | P4 已验证三个独立 GELU head、L2 normalize、shape/梯度/隔离 |
+| ARCH-08-OPERATOR-001 | `8.3` | 9 prototypes | P4、P21 | `tests/test_query_encoder.py`、P21 Q0–Q3 | 已定义 | P4 Router/logits/tau/fail-closed 已验证；最终阈值和语义指标待 P21 |
+| ARCH-08-TIME-001 | `8.4` | Time Window Resolver | P4、P21 | `tests/test_query_encoder.py` TimeWindow/数值 span | 已定义 | P4 pointer/唯一候选 grammar/默认窗口/失败策略已验证；最终阈值和替代形式待 P21 |
 | ARCH-09-SOURCE-001 | `9.1` | 检索查询位置 | P11 | `tests/test_state_retriever.py` 禁止源测试 | 已定义 | 未实现 |
 | ARCH-09-COSINE-001 | `9.2` | 归一化余弦 | P11 | `tests/test_state_retriever.py` score shape/数值 | 已定义 | 未实现 |
 | ARCH-09-FILTER-001 | `9.3` | hard filters/no Top-K | P11、P20 | `tests/test_state_retriever.py` empty/unsupported | 已定义 | 未实现 |
@@ -59,7 +59,7 @@
 | ARCH-14-STAGED-001 | `14 Stage D` | 真实 8B 与分布式 | P19 | P19 服务器集成报告 | 已定义 | 未运行 |
 | ARCH-15-INFER-001 | `15` | 测试时协议 | P18 | `tests/test_inference_protocol.py` | 已定义 | 未实现 |
 | ARCH-16-LEAK-001 | `16` | 数据与防泄漏 | P2、P18、P20、P22 | `tests/test_svcbench_data.py`、P22 clean 审计 | 已定义 | P2 四层 payload guard 已验证；后续协议待复验 |
-| ARCH-17-MODULE-001 | `17` | 推荐模块与职责 | P1、附录 A | `tests/test_v5_config_contract.py`、P1 职责审计 | 已定义 | P1 职责已验证；P3 `qwen_adapter.py` 已实现，其余模块待实现 |
+| ARCH-17-MODULE-001 | `17` | 推荐模块与职责 | P1、附录 A | `tests/test_v5_config_contract.py`、P1 职责审计 | 已定义 | P1 职责已验证；P3 `qwen_adapter.py`、P4 `query_encoder.py` 已实现，其余模块待实现 |
 | ARCH-18-DEMO-001 | `18.1` | Demo 张量验收 | P20.1 | `tests/test_end_to_end_demo.py` | 已定义 | 未实现 |
 | ARCH-18-UPDATE-001 | `18.2` | 更新边界验收 | P20.2 | `tests/test_functional_sgd.py` | 已定义 | 未实现 |
 | ARCH-18-STATE-001 | `18.3` | 状态与检索验收 | P20.3 | State/Identity/Retriever 回归套件 | 已定义 | 未实现 |

@@ -20,7 +20,13 @@ from ttt_svcbench_qwen.observation_heads import (
 )
 from ttt_svcbench_qwen.query_encoder import (
     Operator,
+    OperatorRouterOutput,
+    QueryEmbeddingOutput,
     QueryEncoderOutput,
+    TimeResolution,
+    TimeResolutionStatus,
+    TimeResolverLogits,
+    TimeResolverOutput,
     TimeWindow,
     TimeWindowMode,
 )
@@ -92,13 +98,49 @@ def test_video_batch_and_qwen_visual_contracts_validate_shape_dtype_and_ids() ->
 
 
 def test_query_output_and_time_window_contracts_reject_future_time() -> None:
-    output = QueryEncoderOutput(
+    padding_mask = torch.zeros(2, 5, dtype=torch.bool)
+    embeddings = QueryEmbeddingOutput(
+        token_states=torch.zeros(2, 5, 768),
+        pooling_weights=torch.full((2, 5), 0.2),
         q_target=torch.zeros(2, 512),
         q_operator=torch.zeros(2, 512),
         q_time=torch.zeros(2, 512),
-        operator_logits=torch.zeros(2, 9),
-        operator_confidence=torch.zeros(2),
-        padding_mask=torch.zeros(2, 5, dtype=torch.bool),
+        padding_mask=padding_mask,
+    )
+    route = OperatorRouterOutput(
+        logits=torch.zeros(2, 9),
+        confidence=torch.zeros(2),
+        raw_indices=torch.zeros(2, dtype=torch.int64),
+        hard_operators=(Operator.O1_SNAP, Operator.O1_SNAP),
+        head_types=(HeadType.O1, HeadType.O1),
+        confidence_gate_applied=False,
+    )
+    time_logits = TimeResolverLogits(
+        mode_logits=torch.zeros(2, 4),
+        mode_confidence=torch.zeros(2),
+        mode_indices=torch.zeros(2, dtype=torch.int64),
+        span_start_logits=torch.zeros(2, 5),
+        span_end_logits=torch.zeros(2, 5),
+        padding_mask=padding_mask,
+    )
+    now_windows = tuple(
+        TimeResolution(
+            window=TimeWindow(TimeWindowMode.NOW, 2.0, None, 2.0, True),
+            status=TimeResolutionStatus.OK,
+            reason="runtime-contract",
+            mode_confidence=0.0,
+            numeric_span=None,
+            parsed_values_seconds=(),
+            used_operator_default=True,
+        )
+        for _ in range(2)
+    )
+    output = QueryEncoderOutput(
+        embeddings=embeddings,
+        route=route,
+        time=TimeResolverOutput(logits=time_logits, resolutions=now_windows),
+        hard_operators=(Operator.O1_SNAP, Operator.O1_SNAP),
+        head_types=(HeadType.O1, HeadType.O1),
     )
     window = TimeWindow(
         mode=TimeWindowMode.HISTORY,

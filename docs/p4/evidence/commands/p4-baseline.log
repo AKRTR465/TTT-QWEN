@@ -1,0 +1,17 @@
+timestamp_utc=2026-07-13T20:10:46.6664020Z
+branch=main
+start_commit=549d94706123c5b1871e8bbb76165bf9e4aa7196
+previous_gate=P3 passed: targeted 56, full 104, Ruff/mypy/UTF-8 passed
+spec_version=state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval
+architecture_git_blob_sha256=8f72fcd96ce88185c51d682e1d2421b236c0579546ed413da4881ab736c14e00
+config_path=configs/model_state_ttt_8b.yaml
+config_git_blob_sha256=dc09759d910faaa2d8f45ff039a1777ca247587fa4a6c6b7ead84683e091cca2
+uv_lock_worktree_sha256=c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2
+model_id=Qwen/Qwen3-VL-8B-Instruct
+model_revision=0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
+dataset_fold=not-applicable (P4 uses synthetic tensors and question-only fixtures)
+seed=0,1,2,4,7 as recorded by unit tests
+asset_policy=no video or 8B-weight download; pinned tokenizer-only snapshot is allowed
+python=3.12.13
+torch=2.9.0+cu128
+transformers=4.57.1

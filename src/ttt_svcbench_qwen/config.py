@@ -259,12 +259,15 @@ class QueryEncoderConfig(FrozenModel):
     dropout: Probability
     output_dim: PositiveInt
     bidirectional: bool
+    position_encoding: str
     pooling: str
 
 
 class OperatorRouterConfig(FrozenModel):
     prototypes: tuple[str, ...]
     output_dim: PositiveInt
+    temperature_initial: PositiveFloat
+    temperature_trainable: bool
     confidence_threshold: Probability | None
     threshold_status: CalibrationStatus
 
@@ -539,7 +542,48 @@ class ProjectConfig(FrozenModel):
             ("query_encoder.dropout", self.query_encoder.dropout, 0.1),
             ("query_encoder.output_dim", self.query_encoder.output_dim, 512),
             ("query_encoder.bidirectional", self.query_encoder.bidirectional, True),
+            (
+                "query_encoder.position_encoding",
+                self.query_encoder.position_encoding,
+                "sinusoidal",
+            ),
+            ("query_encoder.pooling", self.query_encoder.pooling, "learned_attention"),
             ("operator_router.output_dim", self.operator_router.output_dim, 512),
+            (
+                "operator_router.temperature_initial",
+                self.operator_router.temperature_initial,
+                1.0,
+            ),
+            (
+                "operator_router.temperature_trainable",
+                self.operator_router.temperature_trainable,
+                True,
+            ),
+            (
+                "operator_router.confidence_threshold",
+                self.operator_router.confidence_threshold,
+                None,
+            ),
+            (
+                "operator_router.threshold_status",
+                self.operator_router.threshold_status,
+                CalibrationStatus.CALIBRATION_REQUIRED,
+            ),
+            ("time_resolver.input_dim", self.time_resolver.input_dim, 512),
+            ("time_resolver.hidden_dim", self.time_resolver.hidden_dim, 256),
+            ("time_resolver.mode_count", self.time_resolver.mode_count, 4),
+            ("time_resolver.token_hidden_dim", self.time_resolver.token_hidden_dim, 768),
+            ("time_resolver.pointer_heads", self.time_resolver.pointer_heads, 2),
+            (
+                "time_resolver.confidence_threshold",
+                self.time_resolver.confidence_threshold,
+                None,
+            ),
+            (
+                "time_resolver.threshold_status",
+                self.time_resolver.threshold_status,
+                CalibrationStatus.CALIBRATION_REQUIRED,
+            ),
             ("retriever.semantic_dim", self.retriever.semantic_dim, 512),
             (
                 "retriever.record_similarity_threshold",
