@@ -12,11 +12,14 @@ from ttt_svcbench_qwen.identity_bank import (
 )
 from ttt_svcbench_qwen.inference import PerVideoRuntimeState
 from ttt_svcbench_qwen.observation_heads import (
+    E1RuntimeState,
     E1SoftOutput,
+    E2RuntimeState,
     E2SoftOutput,
     O1SoftOutput,
     O2SoftOutput,
     ObservationOutputs,
+    StreamReplayAudit,
 )
 from ttt_svcbench_qwen.query_encoder import (
     Operator,
@@ -192,11 +195,74 @@ def test_encoder_cache_and_observation_output_contracts() -> None:
         valid_mask=torch.ones(2, 4, dtype=torch.bool),
         cache=cache,
     )
+    slot_mask = torch.zeros(2, 32, dtype=torch.bool)
+    temporal_mask = torch.zeros(2, 4, dtype=torch.bool)
+    slot_timestamps = torch.full((2, 32), -1.0)
+    temporal_timestamps = torch.full((2, 4), -1.0)
+    slot_positions = torch.full((2, 32), -1, dtype=torch.int64)
+    temporal_positions = torch.full((2, 4), -1, dtype=torch.int64)
+    e1_states = tuple(
+        E1RuntimeState(
+            video_id=f"video-{row}",
+            trajectory_id=f"trajectory-{row}",
+            query_signature=torch.zeros(512),
+            projected_history=torch.zeros(0, 512),
+            timestamps=torch.zeros(0, dtype=torch.float64),
+            position_ids=torch.zeros(0, dtype=torch.int64),
+            total_seen=0,
+        )
+        for row in range(2)
+    )
+    e2_states = tuple(
+        E2RuntimeState(
+            video_id=f"video-{row}",
+            trajectory_id=f"trajectory-{row}",
+            query_signature=torch.zeros(512),
+            hidden=torch.zeros(2, 768),
+            checkpoint_hidden=torch.zeros(0, 2, 768),
+            timestamps=torch.zeros(0, dtype=torch.float64),
+            position_ids=torch.zeros(0, dtype=torch.int64),
+            total_seen=0,
+        )
+        for row in range(2)
+    )
     observations = ObservationOutputs(
-        o1=O1SoftOutput(torch.zeros(2, 32, 6)),
-        o2=O2SoftOutput(torch.zeros(2, 32, 256), torch.zeros(2, 32, 2)),
-        e1=E1SoftOutput(torch.zeros(2, 4, 3)),
-        e2=E2SoftOutput(torch.zeros(2, 4, 4), torch.zeros(2, 4, 4)),
+        o1=O1SoftOutput(
+            logits=torch.zeros(2, 32, 6),
+            probabilities=torch.zeros(2, 32, 6),
+            soft_count=torch.zeros(2),
+            valid_mask=slot_mask,
+            timestamps=slot_timestamps,
+            position_ids=slot_positions,
+        ),
+        o2=O2SoftOutput(
+            identity=torch.zeros(2, 32, 256),
+            score_logits=torch.zeros(2, 32, 2),
+            score_probabilities=torch.zeros(2, 32, 2),
+            valid_mask=slot_mask,
+            timestamps=slot_timestamps.clone(),
+            position_ids=slot_positions.clone(),
+        ),
+        e1=E1SoftOutput(
+            logits=torch.zeros(2, 4, 3),
+            probabilities=torch.zeros(2, 4, 3),
+            valid_mask=temporal_mask,
+            timestamps=temporal_timestamps,
+            position_ids=temporal_positions,
+            next_states=e1_states,
+            audit=StreamReplayAudit("e1", (0, 0), (0, 0), (0, 0)),
+        ),
+        e2=E2SoftOutput(
+            event_logits=torch.zeros(2, 4, 4),
+            phase_logits=torch.zeros(2, 4, 4),
+            event_probabilities=torch.zeros(2, 4, 4),
+            phase_probabilities=torch.zeros(2, 4, 4),
+            valid_mask=temporal_mask.clone(),
+            timestamps=temporal_timestamps.clone(),
+            position_ids=temporal_positions.clone(),
+            next_states=e2_states,
+            audit=StreamReplayAudit("e2", (0, 0), (0, 0), (0, 0)),
+        ),
     )
 
     assert spatial.slots.shape == (2, 32, 768)
@@ -274,6 +340,25 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
     )
     bank = StateBankRuntimeState("video-a", "trajectory-a", (), ())
     identities = IdentityBankRuntimeState((), (), (), 0, 0)
+    e1_state = E1RuntimeState(
+        video_id="video-a",
+        trajectory_id="trajectory-a",
+        query_signature=torch.zeros(512),
+        projected_history=torch.zeros(0, 512),
+        timestamps=torch.zeros(0, dtype=torch.float64),
+        position_ids=torch.zeros(0, dtype=torch.int64),
+        total_seen=0,
+    )
+    e2_state = E2RuntimeState(
+        video_id="video-a",
+        trajectory_id="trajectory-a",
+        query_signature=torch.zeros(512),
+        hidden=torch.zeros(2, 768),
+        checkpoint_hidden=torch.zeros(0, 2, 768),
+        timestamps=torch.zeros(0, dtype=torch.float64),
+        position_ids=torch.zeros(0, dtype=torch.int64),
+        total_seen=0,
+    )
     runtime = PerVideoRuntimeState(
         video_id="video-a",
         trajectory_id="trajectory-a",
@@ -281,6 +366,8 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
         optimizer=optimizer,
         slot_state=None,
         temporal_cache=cache,
+        e1_state=e1_state,
+        e2_state=e2_state,
         state_bank=bank,
         identity_bank=identities,
         fsm_state=(),
@@ -297,6 +384,34 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
             optimizer=optimizer,
             slot_state=None,
             temporal_cache=cache,
+            e1_state=None,
+            e2_state=None,
+            state_bank=bank,
+            identity_bank=identities,
+            fsm_state=(),
+            reader_audit=(),
+            released=False,
+        )
+
+    mismatched_e1 = E1RuntimeState(
+        video_id="video-a",
+        trajectory_id="trajectory-a",
+        query_signature=torch.ones(512),
+        projected_history=torch.zeros(0, 512),
+        timestamps=torch.zeros(0, dtype=torch.float64),
+        position_ids=torch.zeros(0, dtype=torch.int64),
+        total_seen=0,
+    )
+    with pytest.raises(ValueError, match="E1 state query signature"):
+        PerVideoRuntimeState(
+            video_id="video-a",
+            trajectory_id="trajectory-a",
+            fast_weights=fast,
+            optimizer=optimizer,
+            slot_state=None,
+            temporal_cache=cache,
+            e1_state=mismatched_e1,
+            e2_state=e2_state,
             state_bank=bank,
             identity_bank=identities,
             fsm_state=(),

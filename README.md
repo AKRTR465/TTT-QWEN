@@ -5,11 +5,11 @@
 完整架构、训练协议和消融方案见 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前对齐版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
-> 当前施工状态：P0–P6 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
+> 当前施工状态：P0–P8 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
 > P3 用官方 HF meta 模块和 tiny 随机权重模型完成 Qwen 接口与 DeepStack 工程验收。真实 8B
 > A0/集成仍保留在 P19/P21/P22；P4 已完成 Query Encoder、Operator Router 与 Time Window
 > Resolver 的工程门禁，但尚未训练或校准。P5 Fast Adapter 已通过纯合成张量工程门禁，
-> P6 空间对象编码器已通过纯合成张量工程门禁，P7 允许开始；其余空壳
+> P6–P8 的空间、时间与四类 soft Observation 路径也已通过纯合成张量工程门禁，P9 允许开始；其余空壳
 > 被调用时会明确抛出 `NotImplementedError`。
 
 ## 当前固定条件
@@ -31,12 +31,20 @@
   使用显式global position id，Q/K/V/O带bias，LayerNorm eps为`1e-5`；
 - P6的`required_slot_counts`只做preserve-existing/reject-excess容量审计，不表示已从视频识别
   真实对象；语义判断和hard state留给P8/P9，模型编排和受管推理生命周期留给P13/P18；
-- O1/O2/E1/E2分别使用FiLM MLP、256维identity MLP、5层gated causal TCN和2层GRU；
+- O1/O2/E1/E2分别使用FiLM MLP、256维identity MLP、5层gated causal TCN和2层GRU；仅O1
+  直接读取q_target，E1/E2读取P7已query-conditioned的H_t；O1固定`1+scale` FiLM，O2在FP32
+  做L2归一化并对有效零范数回退到unit basis；
+- E1使用63-tubelet感受野和无参66-position projected-history（62上下文+4 overlap）；E2使用
+  单向batch-first GRU及5个rollback checkpoint重算4-position overlap；二者runtime都按
+  video/trajectory/query signature隔离；
+- 四个Head输出raw logits及debug probability/mask/timestamp/global position，invalid位置清零；
+  在线只冻结Head参数，不使用`torch.no_grad()`或detach输入，hard state mutation仍禁止；
 - 时间路使用含self且含当前位置总长64的同一full/chunk滑窗；cache保存六层逐层K/V并按
   video/trajectory/query signature隔离，overlap按global position replay/replace，默认detach下一
   chunk cache；主cache严格64，另有不扩大mask的3-position replay margin用于重算固定4-tubelet
   overlap；时间元数据保持FP32/FP64并在cache中统一为FP64；时间路精确48,438,272参数；
-- 当前新增模块分项合计156.703632M（156,703,632），但在线变化的仍只有约1.18M fast参数；
+- P8精确参数为O1 2,632,710、O2 2,103,042、E1 9,584,643、E2 7,094,792；当前新增模块
+  分项合计156.718819M（156,718,819），但在线变化的仍只有约1.18M fast参数；
 - 无标签TTT loss仅由当前chunk内next-tubelet prediction、O2身份一致性和E1/E2事件一致性组成；
 - 问题不再通过关键词规则机械划分；Qwen input embeddings先经4096→768投影、无参sinusoidal
   position encoding和4层双向Transformer，再由三个768→1024→512 GELU输出头形成
@@ -72,14 +80,15 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | :--- | :--- |
 | v5 YAML、完整解析、固定维度/容量/优化器校验 | P1 已实现并有契约测试 |
 | Video/Query/Encoder/Observation/Record/Retriever/Reader/runtime 类型 | P1 已实现并有 shape/dtype/边界测试 |
-| 推荐模块导入与职责边界 | P1 已实现；P3 `qwen_adapter.py`、P4 `query_encoder.py`、P5 `fast_ttt.py` 已通过各自工程门禁，其余后续入口显式 `NotImplementedError` |
+| 推荐模块导入与职责边界 | P1 已实现；P3–P8 对应模块已通过各自工程门禁，其余后续入口显式 `NotImplementedError` |
 | 数据 schema、防泄漏、因果切分、processor/query token、A0 runner | P2 工程门禁已通过；fold/A0 为明确标注的合成替代 |
 | Qwen video boundary、Main Merger 插入点、DeepStack 保护 | P3 已实现；tiny/meta 工程契约已验证，真实 8B 留至 P19 |
 | Query Encoder、9-prototype Router、Time Window Resolver | P4 已实现；本地结构/参数/offset/fail-closed 契约已验证，模型尚未训练、阈值尚未校准 |
 | Fast Adapter、per-video fast state、参数边界 | P5 已通过本地合成张量门禁；显式 functional SGD 编排留至 P14，受管在线生命周期留至 P18，真实 8B 留至 P19 |
 | P6 空间对象编码器 | 已通过本地合成张量工程门禁；真实视频/8B、语义对象 overflow 与端到端 runtime 仍留后续阶段 |
 | P7 时间事件编码器 | 已通过本地合成张量工程门禁；逐层 KV、overlap replay margin、因果滑窗和 runtime 隔离均已验证 |
-| P8–P19 Observation、Bank、Reader、loss、训练、推理 | 计划设计，尚未实现；P8 允许开始 |
+| P8 四类 Observation Decoder | 已通过本地合成张量工程门禁；输出/metadata、因果流式 replay、runtime 隔离、精确参数和 online freeze 均已验证 |
+| P9–P19 Bank、Reader、loss、训练、推理 | 尚未实现；P9 允许开始，P10 禁止提前施工 |
 | 真实 8B、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行 |
 
 ## 环境变量

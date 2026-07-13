@@ -1,0 +1,30 @@
+timestamp_utc=2026-07-13T23:36:30.2652190Z
+command=.venv/Scripts/pytest.exe -q
+exit_code=0
+result=285 passed in 40.52s
+
+command=.venv/Scripts/ruff.exe check .
+exit_code=0
+result=All checks passed!
+
+command=.venv/Scripts/mypy.exe src
+exit_code=0
+result=Success: no issues found in 21 source files
+
+command=.venv/Scripts/python.exe -m ttt_svcbench_qwen.config
+exit_code=0
+result=validated config JSON emitted
+
+command=git diff --check
+exit_code=0
+result=no output
+
+architecture_sha256=edf71c762d742d79fbe9fe8e607c8db2fb2e5df4921e2b9bd32c9d94643fea2b
+final_timestamp_utc=2026-07-13T23:40:56.5140318Z
+final_command=.venv/Scripts/pytest.exe -q after P8 status and evidence writeback
+final_exit_code=0
+final_result=285 passed in 41.85s
+final_ruff=All checks passed!
+final_mypy=Success: no issues found in 21 source files
+final_config_cli=exit_code 0
+final_git_diff_check=no output

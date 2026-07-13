@@ -712,63 +712,63 @@
 
 #### P8.1 O1 当前数量 Decoder
 
-- [ ] 实现 `q_target[512]→Linear 512→1536`，拆为 768 维 FiLM scale 和 768 维 shift。
-- [ ] 对 `A_t[B,32,768]` 执行 LayerNorm + FiLM。
-- [ ] 实现共享逐槽 MLP `768→1024→1024→6`，激活 SiLU。
-- [ ] 六个 logits 命名为 object、target、visible、enter、exit、confidence。
-- [ ] 实现软计数 `sum_i p_object*p_target*p_visible`，只作为训练/诊断软量。
-- [ ] 输出与 slot_valid_mask 对齐。
-- [ ] 定义写入 hard state 所需 current_visible_count、baseline_count、enter/exit/visible、timestamp、confidence 字段。
+- [x] 实现 `q_target[512]→Linear 512→1536`，拆为 768 维 FiLM scale 和 768 维 shift。
+- [x] 对 `A_t[B,32,768]` 执行 LayerNorm + FiLM。
+- [x] 实现共享逐槽 MLP `768→1024→1024→6`，激活 SiLU。
+- [x] 六个 logits 命名为 object、target、visible、enter、exit、confidence。
+- [x] 实现软计数 `sum_i p_object*p_target*p_visible`，只作为训练/诊断软量。
+- [x] 输出与 slot_valid_mask 对齐。
+- [x] 定义写入 hard state 所需 current_visible_count、baseline_count、enter/exit/visible、timestamp、confidence 字段。
 
 #### P8.2 O2 身份 Decoder
 
-- [ ] 实现 LayerNorm + 共享 trunk `768→1024→1024`，激活 SiLU。
-- [ ] identity 分支 `1024→256` 并 L2 normalize。
-- [ ] score 分支 `1024→2`，字段为 novelty 和 match confidence。
-- [ ] 输出 identity `[B,K_a,256]`、score `[B,K_a,2]`。
-- [ ] 为零向量归一化提供数值保护。
-- [ ] 接口明确 O2 不直接修改 unique_count。
+- [x] 实现 LayerNorm + 共享 trunk `768→1024→1024`，激活 SiLU。
+- [x] identity 分支 `1024→256` 并 L2 normalize。
+- [x] score 分支 `1024→2`，字段为 novelty 和 match confidence。
+- [x] 输出 identity `[B,K_a,256]`、score `[B,K_a,2]`。
+- [x] 为零向量归一化提供数值保护。
+- [x] 接口明确 O2 不直接修改 unique_count。
 
 #### P8.3 E1 点事件 Decoder
 
-- [ ] 输入 `H_t[B,T,768]`，执行 LayerNorm + `Linear 768→512`。
-- [ ] 实现 5 个 gated residual causal TCN block。
-- [ ] 固定 kernel=3、dilations=[1,2,4,8,16]、channels=512。
-- [ ] 每个 block 包含 filter/gate dilated Conv1d、1×1 residual projection、LayerNorm 和 SiLU。
-- [ ] 禁止使用 BatchNorm。
-- [ ] 输出 `Linear 512→3`：eventness、completion、transition。
-- [ ] 确保所有 convolution 严格 causal。
+- [x] 输入 `H_t[B,T,768]`，执行 LayerNorm + `Linear 768→512`。
+- [x] 实现 5 个 gated residual causal TCN block。
+- [x] 固定 kernel=3、dilations=[1,2,4,8,16]、channels=512。
+- [x] 每个 block 包含 filter/gate dilated Conv1d、1×1 residual projection、LayerNorm 和 SiLU。
+- [x] 禁止使用 BatchNorm。
+- [x] 输出 `Linear 512→3`：eventness、completion、transition。
+- [x] 确保所有 convolution 严格 causal。
 
 #### P8.4 E2 区间事件 Decoder
 
-- [ ] 对 `H_t[B,T,768]` 执行 LayerNorm。
-- [ ] 实现 2-layer GRU，hidden=768。
-- [ ] event 分支 `768→4`：start、active、end、complete。
-- [ ] phase 分支 `768→4`：阶段分布。
-- [ ] GRU hidden state 按 video/batch 隔离并支持 reset。
-- [ ] 输出 event `[B,T,4]` 和 phase `[B,T,4]`。
+- [x] 对 `H_t[B,T,768]` 执行 LayerNorm。
+- [x] 实现 2-layer GRU，hidden=768。
+- [x] event 分支 `768→4`：start、active、end、complete。
+- [x] phase 分支 `768→4`：阶段分布。
+- [x] GRU hidden state 按 video/batch 隔离并支持 reset。
+- [x] 输出 event `[B,T,4]` 和 phase `[B,T,4]`。
 
 #### P8.5 参数与通用接口
 
-- [ ] 为四个 Decoder 统一返回 soft tensor、valid mask、timestamp 和必要 debug logits。
-- [ ] O1/O2 使用对象槽 mask，E1/E2 使用 tubelet mask。
-- [ ] 统计 O1≈2.63M、O2≈2.10M、E1≈9.58M、E2≈7.09M。
-- [ ] 在线推理时冻结四个 Decoder，但保留到 Fast Adapter 的梯度路径。
+- [x] 为四个 Decoder 统一返回 soft tensor、valid mask、timestamp 和必要 debug logits。
+- [x] O1/O2 使用对象槽 mask，E1/E2 使用 tubelet mask。
+- [x] 统计 O1≈2.63M、O2≈2.10M、E1≈9.58M、E2≈7.09M。
+- [x] 在线推理时冻结四个 Decoder，但保留到 Fast Adapter 的梯度路径。
 
 ### 实施后验收项
 
-- [ ] O1 `[B,32,6]`、O2 identity `[B,32,256]`、O2 score `[B,32,2]`。
-- [ ] E1 `[B,T,3]`、E2 event/phase 均为 `[B,T,4]`。
-- [ ] O2 identity 每个有效向量 L2 norm 约为 1。
-- [ ] E1/E2 的未来输入不影响过去输出。
-- [ ] E2 hidden state reset 与样本隔离通过。
-- [ ] O1/O2 并行读取同一 768 维槽的测试通过。
-- [ ] 参数预算和 online freeze 契约通过。
+- [x] O1 `[B,32,6]`、O2 identity `[B,32,256]`、O2 score `[B,32,2]`。
+- [x] E1 `[B,T,3]`、E2 event/phase 均为 `[B,T,4]`。
+- [x] O2 identity 每个有效向量 L2 norm 约为 1。
+- [x] E1/E2 的未来输入不影响过去输出。
+- [x] E2 hidden state reset 与样本隔离通过。
+- [x] O1/O2 并行读取同一 768 维槽的测试通过。
+- [x] 参数预算和 online freeze 契约通过。
 
 ### 交付物与退出条件
 
-- [ ] 交付 `observation_heads.py`、四类输出 dataclass 和形状/因果/参数测试。
-- [ ] 四个输出契约未稳定前禁止实现 hard count。
+- [x] 交付 `observation_heads.py`、四类输出 dataclass 和形状/因果/参数测试。
+- [x] 四个输出契约未稳定前禁止实现 hard count。
 
 ---
 

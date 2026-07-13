@@ -158,11 +158,104 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "query_dim": 512,
         "parameter_count": 48_438_272,
     }
-    assert config.observation_heads.o1.hidden_dims == (1024, 1024)
-    assert config.observation_heads.o1.output_dim == 6
-    assert config.observation_heads.o2.identity_dim == 256
-    assert config.observation_heads.e1.dilations == (1, 2, 4, 8, 16)
-    assert config.observation_heads.e2.num_layers == 2
+    heads = config.observation_heads
+    assert heads.model_dump(exclude={"o1", "o2", "e1", "e2"}) == {
+        "temporal_input_conditioning": "inherited_query_conditioned_h_t",
+        "raw_logits": True,
+        "debug_probabilities": True,
+        "output_valid_mask": True,
+        "output_timestamps": True,
+        "output_position_ids": True,
+        "invalid_output_policy": "zero_tensors_negative_one_metadata",
+        "online_frozen": True,
+        "online_forward_no_grad": False,
+        "detach_inputs": False,
+        "hard_state_mutation": False,
+    }
+    assert heads.o1.model_dump() == {
+        "input_dim": 768,
+        "query_dim": 512,
+        "film_dim": 1536,
+        "hidden_dims": (1024, 1024),
+        "output_dim": 6,
+        "output_names": ("object", "target", "visible", "enter", "exit", "confidence"),
+        "layer_norm_eps": 1.0e-5,
+        "film_mode": "one_plus_scale_and_shift",
+        "activation": "silu",
+        "dropout": 0.0,
+        "linear_bias": True,
+        "parameter_count": 2_632_710,
+        "threshold_status": CalibrationStatus.CALIBRATION_REQUIRED,
+    }
+    assert heads.o2.model_dump() == {
+        "input_dim": 768,
+        "hidden_dims": (1024, 1024),
+        "identity_dim": 256,
+        "score_dim": 2,
+        "score_names": ("novelty", "match_confidence"),
+        "layer_norm_eps": 1.0e-5,
+        "activation": "silu",
+        "dropout": 0.0,
+        "linear_bias": True,
+        "identity_normalization": "l2_fp32_unit_basis_fallback",
+        "normalization_eps": 1.0e-8,
+        "parameter_count": 2_103_042,
+        "prototype_ema": 0.9,
+        "confirmation_observations": 2,
+        "match_threshold": None,
+        "threshold_status": CalibrationStatus.CALIBRATION_REQUIRED,
+    }
+    assert heads.e1.model_dump() == {
+        "input_dim": 768,
+        "channels": 512,
+        "num_layers": 5,
+        "kernel_size": 3,
+        "dilations": (1, 2, 4, 8, 16),
+        "output_dim": 3,
+        "output_names": ("eventness", "completion", "transition"),
+        "layer_norm_eps": 1.0e-5,
+        "activation": "silu_filter_sigmoid_gate",
+        "strict_causal": True,
+        "batch_norm": False,
+        "dropout": 0.0,
+        "convolution_bias": True,
+        "causal_padding": "left",
+        "receptive_field": 63,
+        "streaming_state_mode": "projected_history",
+        "overlap_tubelets": 4,
+        "history_tubelets": 66,
+        "state_owner_keys": ("video_id", "trajectory_id", "query_signature"),
+        "detach_runtime_default": True,
+        "parameter_count": 9_584_643,
+        "tau_on": 0.7,
+        "tau_off": 0.3,
+        "min_gap_seconds": 0.5,
+        "threshold_status": CalibrationStatus.BOOTSTRAP_CALIBRATION_REQUIRED,
+    }
+    assert heads.e2.model_dump() == {
+        "input_dim": 768,
+        "hidden_dim": 768,
+        "num_layers": 2,
+        "event_output_dim": 4,
+        "phase_output_dim": 4,
+        "event_names": ("start", "active", "end", "complete"),
+        "phase_names": ("inactive", "active", "end_candidate", "completed"),
+        "layer_norm_eps": 1.0e-5,
+        "bidirectional": False,
+        "batch_first": True,
+        "bias": True,
+        "dropout": 0.0,
+        "streaming_state_mode": "hidden_with_rollback_checkpoints",
+        "overlap_tubelets": 4,
+        "checkpoint_tubelets": 5,
+        "state_owner_keys": ("video_id", "trajectory_id", "query_signature"),
+        "detach_runtime_default": True,
+        "parameter_count": 7_094_792,
+        "start_threshold": 0.6,
+        "end_threshold": 0.6,
+        "complete_threshold": 0.7,
+        "threshold_status": CalibrationStatus.BOOTSTRAP_CALIBRATION_REQUIRED,
+    }
     assert config.state_bank.confirmed_store.initial_capacity == 256
     assert config.state_bank.confirmed_store.growth_chunk == 256
     assert config.state_bank.confirmed_store.hard_limit is None
@@ -234,7 +327,13 @@ def test_v5_parameter_budget_matches_architecture_rounding() -> None:
 
     assert budget.spatial_encoder_millions == 24.81536
     assert budget.temporal_encoder_millions == 48.438272
-    assert budget.new_modules_total_millions == 156.703632
+    assert (
+        budget.o1_millions,
+        budget.o2_millions,
+        budget.e1_millions,
+        budget.e2_millions,
+    ) == (2.632710, 2.103042, 9.584643, 7.094792)
+    assert budget.new_modules_total_millions == 156.718819
     assert (
         abs(component_total - budget.new_modules_total_millions)
         <= budget.rounding_tolerance_millions
@@ -374,8 +473,36 @@ def set_nested(*path_and_value: object) -> Mutation:
             "temporal_encoder.parameter_count",
         ),
         (
+            set_nested("observation_heads", "raw_logits", False),
+            "observation_heads.raw_logits",
+        ),
+        (
+            set_nested("observation_heads", "o1", "film_mode", "direct_scale_shift"),
+            "observation_heads.o1.film_mode",
+        ),
+        (
+            set_nested("observation_heads", "o1", "parameter_count", 2_630_000),
+            "observation_heads.o1.parameter_count",
+        ),
+        (
+            set_nested("observation_heads", "o2", "identity_normalization", "l2"),
+            "observation_heads.o2.identity_normalization",
+        ),
+        (
+            set_nested("observation_heads", "e1", "history_tubelets", 62),
+            "observation_heads.e1.history_tubelets",
+        ),
+        (
+            set_nested("observation_heads", "e2", "checkpoint_tubelets", 4),
+            "observation_heads.e2.checkpoint_tubelets",
+        ),
+        (
             set_nested("parameter_budget", "temporal_encoder_millions", 48.49),
             "parameter budget components|temporal encoder budget",
+        ),
+        (
+            set_nested("parameter_budget", "o1_millions", 2.63),
+            "parameter budget components|O1 budget",
         ),
         (
             set_nested("parameter_budget", "new_modules_total_millions", 156.75536),

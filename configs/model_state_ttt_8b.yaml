@@ -121,18 +121,44 @@ temporal_encoder:
   parameter_count: 48438272
 
 observation_heads:
+  temporal_input_conditioning: inherited_query_conditioned_h_t
+  raw_logits: true
+  debug_probabilities: true
+  output_valid_mask: true
+  output_timestamps: true
+  output_position_ids: true
+  invalid_output_policy: zero_tensors_negative_one_metadata
+  online_frozen: true
+  online_forward_no_grad: false
+  detach_inputs: false
+  hard_state_mutation: false
   o1:
     input_dim: 768
     query_dim: 512
     film_dim: 1536
     hidden_dims: [1024, 1024]
     output_dim: 6
+    output_names: [object, target, visible, enter, exit, confidence]
+    layer_norm_eps: 1.0e-5
+    film_mode: one_plus_scale_and_shift
+    activation: silu
+    dropout: 0.0
+    linear_bias: true
+    parameter_count: 2632710
     threshold_status: calibration_required
   o2:
     input_dim: 768
     hidden_dims: [1024, 1024]
     identity_dim: 256
     score_dim: 2
+    score_names: [novelty, match_confidence]
+    layer_norm_eps: 1.0e-5
+    activation: silu
+    dropout: 0.0
+    linear_bias: true
+    identity_normalization: l2_fp32_unit_basis_fallback
+    normalization_eps: 1.0e-8
+    parameter_count: 2103042
     prototype_ema: 0.9
     confirmation_observations: 2
     match_threshold: null
@@ -144,6 +170,21 @@ observation_heads:
     kernel_size: 3
     dilations: [1, 2, 4, 8, 16]
     output_dim: 3
+    output_names: [eventness, completion, transition]
+    layer_norm_eps: 1.0e-5
+    activation: silu_filter_sigmoid_gate
+    strict_causal: true
+    batch_norm: false
+    dropout: 0.0
+    convolution_bias: true
+    causal_padding: left
+    receptive_field: 63
+    streaming_state_mode: projected_history
+    overlap_tubelets: 4
+    history_tubelets: 66
+    state_owner_keys: [video_id, trajectory_id, query_signature]
+    detach_runtime_default: true
+    parameter_count: 9584643
     tau_on: 0.7
     tau_off: 0.3
     min_gap_seconds: 0.5
@@ -154,6 +195,19 @@ observation_heads:
     num_layers: 2
     event_output_dim: 4
     phase_output_dim: 4
+    event_names: [start, active, end, complete]
+    phase_names: [inactive, active, end_candidate, completed]
+    layer_norm_eps: 1.0e-5
+    bidirectional: false
+    batch_first: true
+    bias: true
+    dropout: 0.0
+    streaming_state_mode: hidden_with_rollback_checkpoints
+    overlap_tubelets: 4
+    checkpoint_tubelets: 5
+    state_owner_keys: [video_id, trajectory_id, query_signature]
+    detach_runtime_default: true
+    parameter_count: 7094792
     start_threshold: 0.6
     end_threshold: 0.6
     complete_threshold: 0.7
@@ -264,13 +318,13 @@ parameter_budget:
   spatial_encoder_millions: 24.81536
   temporal_encoder_millions: 48.438272
   query_encoder_millions: 36.03
-  o1_millions: 2.63
-  o2_millions: 2.10
-  e1_millions: 9.58
-  e2_millions: 7.09
+  o1_millions: 2.632710
+  o2_millions: 2.103042
+  e1_millions: 9.584643
+  e2_millions: 7.094792
   semantic_projector_millions: 1.32
   predictor_millions: 2.36
   state_resampler_millions: 14.72
   router_resolver_empty_millions: 0.14
-  new_modules_total_millions: 156.703632
+  new_modules_total_millions: 156.718819
   rounding_tolerance_millions: 0.02

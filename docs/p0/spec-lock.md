@@ -8,7 +8,7 @@
 | SPEC_VERSION | `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval` |
 | 修订日期 | `2026-07-13` |
 | 文档状态 | `DOCUMENT-ONLY / UNVERIFIED` |
-| ARCHITECTURE_SHA256 | `99d261401c5f8b403fee2732aca36ac43910d5603f2c6f60365fa0e0f3b6578a` |
+| ARCHITECTURE_SHA256 | `edf71c762d742d79fbe9fe8e607c8db2fb2e5df4921e2b9bd32c9d94643fea2b` |
 | 基线 Git commit | `7f0185f8136faf88cc59e5ba2ec7309c36f8d013` |
 | UV_LOCK_SHA256 | `c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2` |
 | 基座模型 | `Qwen/Qwen3-VL-8B-Instruct` |
@@ -31,12 +31,21 @@
    sinusoidal、显式 global position、含 self 的 64-position 窗口和逐层 KV cache 实现；固定
    4-tubelet overlap 使用不扩大 mask 的 3-position replay margin 重算，精确 48,438,272 参数。
    P6 的显式 required-slot overflow 只做容量审计，真实对象语义留给 P8/P9。
-5. O1/O2/E1/E2 只产生观测；hard Bank 保存事实，embedding 负责路由和检索，Deterministic
+5. P8 四个 Head 的 LayerNorm `eps=1e-5`、无 dropout、标准层均带 bias；仅 O1 直接读取
+   q_target 并使用 `1+scale` FiLM，E1/E2 读取 P7 已 query-conditioned 的 H_t。O2 有效 identity
+   使用 FP32 L2 和 unit-basis 零范数回退。E1 使用 RF63 与无参 66-position projected-history；
+   E2 使用单向 batch-first GRU 与 5 个 rollback checkpoint；二者 replay 4-position overlap 并按
+   video/trajectory/query signature 隔离。精确参数依次为 2,632,710、2,103,042、9,584,643、
+   7,094,792，当前新增模块分项和为 156,718,819。
+6. 四个 Head 只产生 raw-logit soft observation 和 debug probability/mask/timestamp/global
+   position；invalid 清零，在线只冻结 Head 参数而不使用 `torch.no_grad()` 或 detach 输入。
+   hard Bank 保存事实，embedding
+   负责路由和检索，Deterministic
    Reader 使用完整 hard records 做精确算术。
-6. Query Encoder 产生 target/operator/time 三个 512 维 embedding；operator 为 8 个合法类型加
+7. Query Encoder 产生 target/operator/time 三个 512 维 embedding；operator 为 8 个合法类型加
    unsupported；State Retriever 使用归一化余弦阈值且不做固定 Top-K。
-7. 16 个 State Token 只提供语义摘要；精确 number payload 由 Reader 给出，LLM 只负责表达。
-8. query_time 之后的帧和答案/计数标签字段不进入 Bank、TTT、Retriever、Reader 或生成输入。
+8. 16 个 State Token 只提供语义摘要；精确 number payload 由 Reader 给出，LLM 只负责表达。
+9. query_time 之后的帧和答案/计数标签字段不进入 Bank、TTT、Retriever、Reader 或生成输入。
 
 ## 第一版禁止项
 

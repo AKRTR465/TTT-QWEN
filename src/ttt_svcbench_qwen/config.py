@@ -191,6 +191,13 @@ class O1Config(FrozenModel):
     film_dim: PositiveInt
     hidden_dims: tuple[int, ...]
     output_dim: PositiveInt
+    output_names: tuple[str, ...]
+    layer_norm_eps: PositiveFloat
+    film_mode: str
+    activation: str
+    dropout: Probability
+    linear_bias: bool
+    parameter_count: PositiveInt
     threshold_status: CalibrationStatus
 
 
@@ -199,6 +206,14 @@ class O2Config(FrozenModel):
     hidden_dims: tuple[int, ...]
     identity_dim: PositiveInt
     score_dim: PositiveInt
+    score_names: tuple[str, ...]
+    layer_norm_eps: PositiveFloat
+    activation: str
+    dropout: Probability
+    linear_bias: bool
+    identity_normalization: str
+    normalization_eps: PositiveFloat
+    parameter_count: PositiveInt
     prototype_ema: Probability
     confirmation_observations: PositiveInt
     match_threshold: Probability | None
@@ -212,6 +227,21 @@ class E1Config(FrozenModel):
     kernel_size: PositiveInt
     dilations: tuple[int, ...]
     output_dim: PositiveInt
+    output_names: tuple[str, ...]
+    layer_norm_eps: PositiveFloat
+    activation: str
+    strict_causal: bool
+    batch_norm: bool
+    dropout: Probability
+    convolution_bias: bool
+    causal_padding: str
+    receptive_field: PositiveInt
+    streaming_state_mode: str
+    overlap_tubelets: PositiveInt
+    history_tubelets: PositiveInt
+    state_owner_keys: tuple[str, ...]
+    detach_runtime_default: bool
+    parameter_count: PositiveInt
     tau_on: Probability
     tau_off: Probability
     min_gap_seconds: NonNegativeFloat
@@ -224,6 +254,19 @@ class E2Config(FrozenModel):
     num_layers: PositiveInt
     event_output_dim: PositiveInt
     phase_output_dim: PositiveInt
+    event_names: tuple[str, ...]
+    phase_names: tuple[str, ...]
+    layer_norm_eps: PositiveFloat
+    bidirectional: bool
+    batch_first: bool
+    bias: bool
+    dropout: Probability
+    streaming_state_mode: str
+    overlap_tubelets: PositiveInt
+    checkpoint_tubelets: PositiveInt
+    state_owner_keys: tuple[str, ...]
+    detach_runtime_default: bool
+    parameter_count: PositiveInt
     start_threshold: Probability
     end_threshold: Probability
     complete_threshold: Probability
@@ -231,6 +274,17 @@ class E2Config(FrozenModel):
 
 
 class ObservationHeadsConfig(FrozenModel):
+    temporal_input_conditioning: str
+    raw_logits: bool
+    debug_probabilities: bool
+    output_valid_mask: bool
+    output_timestamps: bool
+    output_position_ids: bool
+    invalid_output_policy: str
+    online_frozen: bool
+    online_forward_no_grad: bool
+    detach_inputs: bool
+    hard_state_mutation: bool
     o1: O1Config
     o2: O2Config
     e1: E1Config
@@ -798,31 +852,136 @@ class ProjectConfig(FrozenModel):
                 raise ValueError(f"{name}.head_dim must equal hidden_dim // num_heads")
 
     def _validate_head_contracts(self) -> None:
+        heads = self.observation_heads
         expected: tuple[tuple[str, object, object], ...] = (
-            ("o1.input_dim", self.observation_heads.o1.input_dim, 768),
-            ("o1.query_dim", self.observation_heads.o1.query_dim, 512),
-            ("o1.film_dim", self.observation_heads.o1.film_dim, 1536),
-            ("o1.hidden_dims", self.observation_heads.o1.hidden_dims, (1024, 1024)),
-            ("o1.output_dim", self.observation_heads.o1.output_dim, 6),
-            ("o2.input_dim", self.observation_heads.o2.input_dim, 768),
-            ("o2.hidden_dims", self.observation_heads.o2.hidden_dims, (1024, 1024)),
-            ("o2.identity_dim", self.observation_heads.o2.identity_dim, 256),
-            ("o2.score_dim", self.observation_heads.o2.score_dim, 2),
-            ("e1.input_dim", self.observation_heads.e1.input_dim, 768),
-            ("e1.channels", self.observation_heads.e1.channels, 512),
-            ("e1.num_layers", self.observation_heads.e1.num_layers, 5),
-            ("e1.kernel_size", self.observation_heads.e1.kernel_size, 3),
-            ("e1.dilations", self.observation_heads.e1.dilations, (1, 2, 4, 8, 16)),
-            ("e1.output_dim", self.observation_heads.e1.output_dim, 3),
-            ("e2.input_dim", self.observation_heads.e2.input_dim, 768),
-            ("e2.hidden_dim", self.observation_heads.e2.hidden_dim, 768),
-            ("e2.num_layers", self.observation_heads.e2.num_layers, 2),
-            ("e2.event_output_dim", self.observation_heads.e2.event_output_dim, 4),
-            ("e2.phase_output_dim", self.observation_heads.e2.phase_output_dim, 4),
+            (
+                "temporal_input_conditioning",
+                heads.temporal_input_conditioning,
+                "inherited_query_conditioned_h_t",
+            ),
+            ("raw_logits", heads.raw_logits, True),
+            ("debug_probabilities", heads.debug_probabilities, True),
+            ("output_valid_mask", heads.output_valid_mask, True),
+            ("output_timestamps", heads.output_timestamps, True),
+            ("output_position_ids", heads.output_position_ids, True),
+            (
+                "invalid_output_policy",
+                heads.invalid_output_policy,
+                "zero_tensors_negative_one_metadata",
+            ),
+            ("online_frozen", heads.online_frozen, True),
+            ("online_forward_no_grad", heads.online_forward_no_grad, False),
+            ("detach_inputs", heads.detach_inputs, False),
+            ("hard_state_mutation", heads.hard_state_mutation, False),
+            ("o1.input_dim", heads.o1.input_dim, 768),
+            ("o1.query_dim", heads.o1.query_dim, 512),
+            ("o1.film_dim", heads.o1.film_dim, 1536),
+            ("o1.hidden_dims", heads.o1.hidden_dims, (1024, 1024)),
+            ("o1.output_dim", heads.o1.output_dim, 6),
+            (
+                "o1.output_names",
+                heads.o1.output_names,
+                ("object", "target", "visible", "enter", "exit", "confidence"),
+            ),
+            ("o1.layer_norm_eps", heads.o1.layer_norm_eps, 1.0e-5),
+            ("o1.film_mode", heads.o1.film_mode, "one_plus_scale_and_shift"),
+            ("o1.activation", heads.o1.activation, "silu"),
+            ("o1.dropout", heads.o1.dropout, 0.0),
+            ("o1.linear_bias", heads.o1.linear_bias, True),
+            ("o1.parameter_count", heads.o1.parameter_count, 2_632_710),
+            ("o2.input_dim", heads.o2.input_dim, 768),
+            ("o2.hidden_dims", heads.o2.hidden_dims, (1024, 1024)),
+            ("o2.identity_dim", heads.o2.identity_dim, 256),
+            ("o2.score_dim", heads.o2.score_dim, 2),
+            ("o2.score_names", heads.o2.score_names, ("novelty", "match_confidence")),
+            ("o2.layer_norm_eps", heads.o2.layer_norm_eps, 1.0e-5),
+            ("o2.activation", heads.o2.activation, "silu"),
+            ("o2.dropout", heads.o2.dropout, 0.0),
+            ("o2.linear_bias", heads.o2.linear_bias, True),
+            (
+                "o2.identity_normalization",
+                heads.o2.identity_normalization,
+                "l2_fp32_unit_basis_fallback",
+            ),
+            ("o2.normalization_eps", heads.o2.normalization_eps, 1.0e-8),
+            ("o2.parameter_count", heads.o2.parameter_count, 2_103_042),
+            ("e1.input_dim", heads.e1.input_dim, 768),
+            ("e1.channels", heads.e1.channels, 512),
+            ("e1.num_layers", heads.e1.num_layers, 5),
+            ("e1.kernel_size", heads.e1.kernel_size, 3),
+            ("e1.dilations", heads.e1.dilations, (1, 2, 4, 8, 16)),
+            ("e1.output_dim", heads.e1.output_dim, 3),
+            (
+                "e1.output_names",
+                heads.e1.output_names,
+                ("eventness", "completion", "transition"),
+            ),
+            ("e1.layer_norm_eps", heads.e1.layer_norm_eps, 1.0e-5),
+            ("e1.activation", heads.e1.activation, "silu_filter_sigmoid_gate"),
+            ("e1.strict_causal", heads.e1.strict_causal, True),
+            ("e1.batch_norm", heads.e1.batch_norm, False),
+            ("e1.dropout", heads.e1.dropout, 0.0),
+            ("e1.convolution_bias", heads.e1.convolution_bias, True),
+            ("e1.causal_padding", heads.e1.causal_padding, "left"),
+            ("e1.receptive_field", heads.e1.receptive_field, 63),
+            ("e1.streaming_state_mode", heads.e1.streaming_state_mode, "projected_history"),
+            ("e1.overlap_tubelets", heads.e1.overlap_tubelets, 4),
+            ("e1.history_tubelets", heads.e1.history_tubelets, 66),
+            (
+                "e1.state_owner_keys",
+                heads.e1.state_owner_keys,
+                ("video_id", "trajectory_id", "query_signature"),
+            ),
+            ("e1.detach_runtime_default", heads.e1.detach_runtime_default, True),
+            ("e1.parameter_count", heads.e1.parameter_count, 9_584_643),
+            ("e2.input_dim", heads.e2.input_dim, 768),
+            ("e2.hidden_dim", heads.e2.hidden_dim, 768),
+            ("e2.num_layers", heads.e2.num_layers, 2),
+            ("e2.event_output_dim", heads.e2.event_output_dim, 4),
+            ("e2.phase_output_dim", heads.e2.phase_output_dim, 4),
+            ("e2.event_names", heads.e2.event_names, ("start", "active", "end", "complete")),
+            (
+                "e2.phase_names",
+                heads.e2.phase_names,
+                ("inactive", "active", "end_candidate", "completed"),
+            ),
+            ("e2.layer_norm_eps", heads.e2.layer_norm_eps, 1.0e-5),
+            ("e2.bidirectional", heads.e2.bidirectional, False),
+            ("e2.batch_first", heads.e2.batch_first, True),
+            ("e2.bias", heads.e2.bias, True),
+            ("e2.dropout", heads.e2.dropout, 0.0),
+            (
+                "e2.streaming_state_mode",
+                heads.e2.streaming_state_mode,
+                "hidden_with_rollback_checkpoints",
+            ),
+            ("e2.overlap_tubelets", heads.e2.overlap_tubelets, 4),
+            ("e2.checkpoint_tubelets", heads.e2.checkpoint_tubelets, 5),
+            (
+                "e2.state_owner_keys",
+                heads.e2.state_owner_keys,
+                ("video_id", "trajectory_id", "query_signature"),
+            ),
+            ("e2.detach_runtime_default", heads.e2.detach_runtime_default, True),
+            ("e2.parameter_count", heads.e2.parameter_count, 7_094_792),
         )
         for path, actual, required in expected:
             if actual != required:
                 raise ValueError(f"observation_heads.{path} must be {required!r}; got {actual!r}")
+
+        e1_receptive_field = 1 + (heads.e1.kernel_size - 1) * sum(heads.e1.dilations)
+        if heads.e1.receptive_field != e1_receptive_field:
+            raise ValueError("observation_heads.e1 receptive field does not match its dilations")
+        if heads.e1.history_tubelets != (
+            e1_receptive_field - 1 + heads.e1.overlap_tubelets
+        ):
+            raise ValueError(
+                "observation_heads.e1 streaming history must cover context and overlap"
+            )
+        if heads.e2.checkpoint_tubelets != heads.e2.overlap_tubelets + 1:
+            raise ValueError(
+                "observation_heads.e2 rollback checkpoints must cover overlap plus anchor"
+            )
 
     def _validate_state_and_query_contracts(self) -> None:
         prototypes = (
@@ -896,9 +1055,18 @@ class ProjectConfig(FrozenModel):
         exact_temporal_millions = self.temporal_encoder.parameter_count / 1_000_000
         if abs(exact_temporal_millions - budget.temporal_encoder_millions) > 1.0e-9:
             raise ValueError("temporal encoder budget must use the exact P7 parameter count")
-        exact_total_millions = 156_703_632 / 1_000_000
+        exact_head_budgets = (
+            (self.observation_heads.o1.parameter_count, budget.o1_millions, "O1"),
+            (self.observation_heads.o2.parameter_count, budget.o2_millions, "O2"),
+            (self.observation_heads.e1.parameter_count, budget.e1_millions, "E1"),
+            (self.observation_heads.e2.parameter_count, budget.e2_millions, "E2"),
+        )
+        for parameter_count, millions, name in exact_head_budgets:
+            if abs(parameter_count / 1_000_000 - millions) > 1.0e-9:
+                raise ValueError(f"{name} budget must use the exact P8 parameter count")
+        exact_total_millions = 156_718_819 / 1_000_000
         if abs(exact_total_millions - budget.new_modules_total_millions) > 1.0e-9:
-            raise ValueError("new module budget must use the frozen P7 component total")
+            raise ValueError("new module budget must use the frozen P8 component total")
 
 
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:

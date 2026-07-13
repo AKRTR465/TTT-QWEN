@@ -67,8 +67,8 @@ ${OUTPUT_ROOT}/
 | P4 | Query/Operator/Time Resolver 已定义 | 已通过：无参位置编码、36.03M Query、9 prototypes、pointer/grammar fail-closed 与本地 tokenizer offset 已验证；模型未训练、阈值留至 P21 |
 | P5 | Fast Adapter 与参数收集已定义 | 已通过：定向 106 tests；全量 191 tests、Ruff、mypy、严格 UTF-8 和 `git diff --check` 均绿色；仅合成张量，P14/P18/P19 边界仍保留 |
 | P6 | 空间对象编码器可执行契约已冻结 | 已通过：P3–P6 联合定向 204 tests；全量 239 tests、Ruff、mypy、严格 UTF-8 和 `git diff --check` 均绿色；仅合成张量，语义 overflow/P18/P19 边界保留 |
-| P7 | 时间事件编码器已定义 | 未实现 |
-| P8 | 四类 Observation Decoder 已定义 | 未实现 |
+| P7 | 时间事件编码器已定义 | 已通过：P3–P7 联合定向 236 tests；全量 271 tests、Ruff、mypy、严格 UTF-8、配置 CLI 和 `git diff --check` 均绿色；仅合成张量，真实视频/8B 留至 P19 |
+| P8 | 四类 Observation Decoder 已定义 | 已通过：P5–P8 相邻定向 123 tests；全量 285 tests、Ruff、mypy、严格 UTF-8、配置 CLI 和 `git diff --check` 均绿色；仅 Meta/小型合成张量，hard Bank/FSM 留至 P9–P10 |
 | P9 | Semantic Projector、State Bank、FSM 已定义 | 未实现 |
 | P10 | Identity Bank 与 Hot Cache 已定义 | 未实现 |
 | P11 | Embedding State Retriever 已定义 | 未实现 |

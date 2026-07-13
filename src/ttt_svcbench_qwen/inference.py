@@ -14,6 +14,7 @@ from typing import NoReturn
 from ttt_svcbench_qwen.data import assert_runtime_payload_safe
 from ttt_svcbench_qwen.fast_ttt import FastWeightsState, OptimizerRuntimeState
 from ttt_svcbench_qwen.identity_bank import IdentityBankRuntimeState
+from ttt_svcbench_qwen.observation_heads import E1RuntimeState, E2RuntimeState
 from ttt_svcbench_qwen.state_bank import HeadType, StateBankRuntimeState
 from ttt_svcbench_qwen.state_encoder import SpatialSlotRuntimeState, TemporalCache
 from ttt_svcbench_qwen.state_reader import ReaderResult
@@ -27,6 +28,8 @@ class PerVideoRuntimeState:
     optimizer: OptimizerRuntimeState
     slot_state: SpatialSlotRuntimeState | None
     temporal_cache: TemporalCache
+    e1_state: E1RuntimeState | None
+    e2_state: E2RuntimeState | None
     state_bank: StateBankRuntimeState
     identity_bank: IdentityBankRuntimeState
     fsm_state: tuple[tuple[HeadType, str], ...]
@@ -48,6 +51,19 @@ class PerVideoRuntimeState:
             raise ValueError("temporal cache video_ids do not match runtime ownership")
         if self.temporal_cache.trajectory_ids != (self.trajectory_id,):
             raise ValueError("temporal cache trajectory_ids do not match runtime ownership")
+        for name, state in (("E1", self.e1_state), ("E2", self.e2_state)):
+            if state is None:
+                continue
+            if state.video_id != self.video_id or state.trajectory_id != self.trajectory_id:
+                raise ValueError(f"{name} state does not match runtime ownership")
+            if (
+                state.query_signature.dtype != self.temporal_cache.hidden.dtype
+                or state.query_signature.device != self.temporal_cache.hidden.device
+                or not state.query_signature.equal(self.temporal_cache.query_signatures[0])
+            ):
+                raise ValueError(f"{name} state query signature does not match temporal cache")
+            if state.total_seen != int(self.temporal_cache.total_seen[0].item()):
+                raise ValueError(f"{name} state position does not match temporal cache")
 
 
 @dataclass(frozen=True, slots=True)
