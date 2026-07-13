@@ -11,7 +11,6 @@ PACKAGE = ROOT / "src" / "ttt_svcbench_qwen"
 
 SKELETONS = (
     ("model", "build_model", "P13"),
-    ("fast_ttt", "build_fast_ttt_adapter", "P5"),
     ("state_encoder", "build_state_encoders", "P6-P7"),
     ("observation_heads", "build_observation_heads", "P8"),
     ("state_bank", "build_state_bank", "P9"),
@@ -49,6 +48,7 @@ def test_all_required_p1_module_files_exist() -> None:
     expected = {name for name, _, _ in SKELETONS} | {
         "__init__",
         "config",
+        "fast_ttt",
         "query_encoder",
         "qwen_adapter",
     }

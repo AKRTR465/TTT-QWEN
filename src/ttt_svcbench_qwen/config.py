@@ -126,7 +126,10 @@ class FastTTTConfig(FrozenModel):
     bottleneck_dim: PositiveInt
     output_dim: PositiveInt
     residual_scale: PositiveFloat
+    rms_norm_eps: PositiveFloat
+    slow_projection_bias: bool
     fast_bias: bool
+    fast_initialization: str
     fast_matrix_count: PositiveInt
     online_parameter_count: PositiveInt
     update_order: str
@@ -459,7 +462,10 @@ class ProjectConfig(FrozenModel):
             ("fast_ttt.bottleneck_dim", self.fast_ttt.bottleneck_dim, 768),
             ("fast_ttt.output_dim", self.fast_ttt.output_dim, 4096),
             ("fast_ttt.residual_scale", self.fast_ttt.residual_scale, 0.1),
+            ("fast_ttt.rms_norm_eps", self.fast_ttt.rms_norm_eps, 1.0e-6),
+            ("fast_ttt.slow_projection_bias", self.fast_ttt.slow_projection_bias, True),
             ("fast_ttt.fast_bias", self.fast_ttt.fast_bias, False),
+            ("fast_ttt.fast_initialization", self.fast_ttt.fast_initialization, "xavier_uniform"),
             ("fast_ttt.fast_matrix_count", self.fast_ttt.fast_matrix_count, 2),
             ("fast_ttt.online_parameter_count", self.fast_ttt.online_parameter_count, 1_179_648),
             (

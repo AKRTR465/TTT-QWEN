@@ -57,7 +57,10 @@ fast_ttt:
   bottleneck_dim: 768
   output_dim: 4096
   residual_scale: 0.1
+  rms_norm_eps: 1.0e-6
+  slow_projection_bias: true
   fast_bias: false
+  fast_initialization: xavier_uniform
   fast_matrix_count: 2
   online_parameter_count: 1179648
   update_order: observe_state_then_update_for_next_chunk

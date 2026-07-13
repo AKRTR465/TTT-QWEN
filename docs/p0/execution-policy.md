@@ -65,7 +65,7 @@ ${OUTPUT_ROOT}/
 | P2 | 数据、预处理、因果切分与 A0 已定义 | 已通过工程门禁：用户批准合成 fold/A0；真实 8B A0 延至 P19/P21/P22 |
 | P3 | Qwen 接口、插入点和 DeepStack 保护已定义 | 已通过：定向 56 tests；全量 104 tests、Ruff、mypy、UTF-8 均绿色；tiny/meta 工程证据，真实 8B 留至 P19 |
 | P4 | Query/Operator/Time Resolver 已定义 | 已通过：无参位置编码、36.03M Query、9 prototypes、pointer/grammar fail-closed 与本地 tokenizer offset 已验证；模型未训练、阈值留至 P21 |
-| P5 | Fast Adapter 与参数收集已定义 | 未实现 |
+| P5 | Fast Adapter 与参数收集已定义 | 已通过：定向 106 tests；全量 191 tests、Ruff、mypy、严格 UTF-8 和 `git diff --check` 均绿色；仅合成张量，P14/P18/P19 边界仍保留 |
 | P6 | 空间对象编码器已定义 | 未实现 |
 | P7 | 时间事件编码器已定义 | 未实现 |
 | P8 | 四类 Observation Decoder 已定义 | 未实现 |

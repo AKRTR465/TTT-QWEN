@@ -1,9 +1,10 @@
-# 实施决策（v5 高容量版，P0–P4 已通过）
+# 实施决策（v5 高容量版，P0–P5 已通过）
 
 本文件记录已经冻结的 v5 边界。P0 已冻结规格和仓库基线；P1 已把运行 YAML、强类型配置、
 运行时类型和推荐模块骨架迁移到 v5；P2 已通过数据、因果预处理和合成 A0 工程门禁；P3 已实现
 Qwen video boundary、Main Merger 插入点和 DeepStack 保护；P4 已实现 Query Encoder、Operator
-Router 和 Time Window Resolver。状态、训练和推理入口仍按后续 Part 实现。详细论证见
+Router 和 Time Window Resolver；P5 已通过 Fast Adapter 的本地合成张量工程门禁。
+状态编码、训练和推理入口仍按后续 Part 实现。详细论证见
 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前规范版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
@@ -17,7 +18,8 @@ Router 和 Time Window Resolver。状态、训练和推理入口仍按后续 Par
    均保留未校准状态。任一状态未校准时，配置拒绝正式评估。
 4. P1 类型覆盖 VideoBatch、Query/TimeWindow、空间/时间输出与 cache、四类 soft output、
    typed records、Retriever、ReaderResult 以及完整 per-video runtime ownership。
-5. 除 P3 `qwen_adapter.py` 和 P4 `query_encoder.py` 外，推荐模块当前只提供职责边界、类型和显式
+5. P3 `qwen_adapter.py`、P4 `query_encoder.py` 和 P5 `fast_ttt.py` 已通过各自工程门禁。其余推荐
+   模块当前只提供职责边界、类型和显式
    未实现入口；模块可导入不等于算法已实现。
 
 ## P2 合成退出决策
@@ -46,8 +48,8 @@ Router 和 Time Window Resolver。状态、训练和推理入口仍按后续 Par
 6. Qwen 参数默认冻结并保持 eval，但不切断 Adapter 梯度；hook 带互斥、禁止重入、异常恢复和
    stale capture 清理，且 inner owner 不被重复注册到 `state_dict`。
 7. P3 证据只来自 Transformers 4.57.1 官方模块的 meta shape 和 tiny 随机权重端到端测试；没有
-   下载视频或 8B 权重，不得表述为真实 8B 集成结果。P5 负责真实 Fast Adapter 及 device/dtype
-   放置，P19 负责真实 8B hook、DeepStack 和分布式复验。
+   下载视频或 8B 权重，不得表述为真实 8B 集成结果。P5 已验证本地 Fast Adapter 参数、
+   runtime state 和 device/dtype 边界；P19 仍负责真实 8B hook、DeepStack 和分布式复验。
 
 ## P4 已验证边界
 
@@ -76,6 +78,33 @@ Router 和 Time Window Resolver。状态、训练和推理入口仍按后续 Par
    分离，pointer target 使用 inclusive start/end，且只允许成对非负索引或成对 `-100` ignore。
 9. P4 仅验证工程结构、参数、失败策略和本地 pinned tokenizer offsets；没有训练 Router/Resolver，
    没有下载视频或 8B 权重，不能据此声明 operator/time 语义准确率。最终阈值仍由 P21 校准。
+
+## P5 已验证工程边界
+
+1. Fast Adapter 固定为 RMSNorm(`eps=1e-6`) + 带 bias 的 `4096→768` 慢投影、两块无 bias
+   `768×768` fast matrix、SiLU、带 bias 的 `768→4096` 慢投影和比例 0.1 的残差；两块
+   meta-learned `W0` 使用 Xavier uniform 初始化。
+2. checkpointed 参数精确为 7,480,064：慢参数 6,300,416，meta-fast `W0` 1,179,648。
+   online 参数集合只允许按稳定顺序返回每个视频的 `(W_t^(1),W_t^(2))`，精确为 1,179,648。
+3. `state_dict` 保存 RMSNorm、两个慢投影及 `W0`，不保存 per-video `W_t`、active binding 或
+   forward audit。reset 始终从当前 checkpointed `W0` 创建独立 snapshot 和独立 `W_t`，并把
+   fast version、update count、skip count 清零。
+4. 在线 batch 必须每行绑定一个 fast state；不同视频行的 `W_t` storage 相互隔离，padding 行为
+   由 valid mask 控制且无效位置残差为零。不同 batch 行可以有不同 fast version，但同一 batch
+   不能混合 online 与 differentiable state。
+5. 显式传入 per-row `fast_state` 是 P14/测试的 functional 边界：online state 使用 detached leaf
+   `W_t`，slow/`W0` 在该图中 detach，前向只保留输入和 `W_t` 的梯度。differentiable state 从
+   `W0` 可微克隆并保留慢参数梯度，供后续 Meta-TTT outer training 使用；这不扩大在线可更新
+   参数集合。
+6. P18 正式在线推理使用 module-local `use_fast_state()` 受管生命周期兼容 P3 调用：拒绝 stale
+   module grad，进入时冻结 checkpointed 参数的 `requires_grad`，退出时恢复，并保证
+   exception-safe、非重入。video ID/batch order 对齐、并发串行化或实例隔离，以及受管调用必须
+   产生 `last_audit.used_runtime_state=True` 的系统级证明仍属于 P18，P5 不提前认领。
+7. forward audit 按 batch 行记录 fast version、update count、valid token count、两块 `W_t` norm、
+   输入 norm 和实际缩放后残差 norm；这些值全部 detach，只用于审计，不参与 loss。
+8. P5 只冻结 Adapter、state/reset、参数分组和数值边界；实际 loss、gradient clip 和一步 SGD 仍由
+   P14 实现，正式受管推理协议仍由 P18 实现。P5 本地验收不得被表述为真实 8B、真实视频、
+   在线收益、并发安全或 Meta-TTT 训练结果。
 
 ## 已固定
 

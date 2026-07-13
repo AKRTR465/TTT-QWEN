@@ -1,0 +1,16 @@
+timestamp_utc=2026-07-13T20:50:45.861626+00:00
+environment=UV_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+command=uv run python - (two-row synthetic online runtime audit)
+exit_code=0
+output_shape=(2, 3, 4096)
+output_dtype=torch.float32
+output_device=cpu
+padding_identity=True
+cross_video_w_t_storage_isolated=True
+online_gradients_finite=True
+module_gradient_count=0
+forward_state_unchanged=True
+audit_versions=(0, 0)
+audit_valid_tokens=(2, 1)
+context_registered_parameters_frozen=True
+context_requires_grad_restored=True

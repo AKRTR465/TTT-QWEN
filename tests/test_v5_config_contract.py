@@ -88,7 +88,10 @@ def test_v5_fast_and_inner_sgd_contract() -> None:
     fast = load_config().fast_ttt
 
     assert (fast.input_dim, fast.bottleneck_dim, fast.output_dim) == (4096, 768, 4096)
+    assert fast.rms_norm_eps == 1.0e-6
+    assert fast.slow_projection_bias is True
     assert fast.fast_bias is False
+    assert fast.fast_initialization == "xavier_uniform"
     assert fast.residual_scale == 0.1
     assert fast.fast_matrix_count == 2
     assert fast.online_parameter_count == 2 * 768 * 768 == 1_179_648
@@ -219,6 +222,18 @@ def set_nested(*path_and_value: object) -> Mutation:
     ("mutate", "message"),
     [
         (set_nested("fast_ttt", "bottleneck_dim", 512), "bottleneck_dim must be 768"),
+        (
+            set_nested("fast_ttt", "rms_norm_eps", 1.0e-5),
+            "fast_ttt.rms_norm_eps must be 1e-06",
+        ),
+        (
+            set_nested("fast_ttt", "slow_projection_bias", False),
+            "fast_ttt.slow_projection_bias must be True",
+        ),
+        (
+            set_nested("fast_ttt", "fast_initialization", "zeros"),
+            "fast_ttt.fast_initialization must be 'xavier_uniform'",
+        ),
         (set_nested("spatial_encoder", "active_slots", 16), "active_slots must be 32"),
         (set_nested("state_resampler", "num_queries", 8), "num_queries must be 16"),
         (set_nested("fast_ttt", "optimizer", "momentum", 0.9), "momentum must be 0.0"),

@@ -315,6 +315,11 @@ U_t=P_{\mathrm{in}}\operatorname{RMSNorm}(V_t),
 P_{\mathrm{in}}\in\mathbb R^{4096\times768}.
 \]
 
+RMSNorm 固定使用 `eps=1e-6`。输入、输出慢投影都是带 bias 的标准 Linear；只有下述两个
+fast matrix 明确不带 bias。meta-learned 初值
+\(W_0^{(1)},W_0^{(2)}\) 使用 Xavier uniform 初始化，之后由 Outer Training 学习并随 checkpoint
+保存；初始化方法不是测试时更新规则。
+
 Fast MLP：
 
 \[
@@ -346,6 +351,11 @@ Demo 中：
 Z_t\in\mathbb R^{1\times392\times4096}.
 \]
 
+变长 batch 使用 `valid_mask[B,N_v]` 标记真实 Main Merger token。无效 padding 位置的 Adapter
+残差必须严格置零，因此这些位置满足 \(Z_t=V_t\)。在线 batch 的每一行必须绑定一个独立的
+per-video fast state；不同 batch 行、同一行的两块 \(W_t\) 以及各自的 \(W_0\) snapshot 均不得
+共享 storage，也不得把一个视频的 fast version 或更新计数广播到另一行。
+
 ### 4.2 Fast 与 Slow 参数
 
 测试时只允许更新：
@@ -361,8 +371,14 @@ Z_t\in\mathbb R^{1\times392\times4096}.
 \approx1.18\text{M}.
 \]
 
-输入/输出慢投影和 RMSNorm 约为 6.30M 参数，因此整个 Adapter 约为 7.48M，其中只有
-1.18M 进入测试时 SGD。
+带 bias 的输入/输出慢投影和 RMSNorm 精确包含 6,300,416 个参数，因此整个 Adapter 精确包含
+7,480,064 个 checkpointed 参数；其中只有 1,179,648 个临时 \(W_t\) 元素进入测试时 SGD。
+
+`state_dict` 只保存 RMSNorm、\(P_{\mathrm{in}}\)、\(P_{\mathrm{out}}\) 和 meta-learned
+\(W_0^{(1)},W_0^{(2)}\)。每个视频从当前 \(W_0\) 创建 storage-independent snapshot，再克隆出
+临时 \(W_t\)；临时 \(W_t\)、active binding 和 forward audit 均不注册为 Parameter/Buffer，不能
+进入 checkpoint。`collect_fast_parameters()` 固定按
+\((W_t^{(1)},W_t^{(2)})\) 返回，禁止混入 \(W_0\)、慢投影或 RMSNorm。
 
 以下参数在线冻结：
 
@@ -373,7 +389,28 @@ Z_t\in\mathbb R^{1\times392\times4096}.
 - Query Encoder、Retriever、Reader；
 - Qwen LLM。
 
-冻结参数仍可位于 autograd 路径上，使 TTT 梯度穿过它们到达 fast weights。
+梯度边界分为两种且同一 batch 不得混用：
+
+- online/inference state：\(W_t\) 是 detached、可求梯度的 leaf tensor；全部 checkpointed
+  Adapter 参数临时冻结且不得携带旧梯度。慢参数的数值仍参与前向，但只允许梯度到达输入和
+  两块 \(W_t\)，P14 才负责消费这些梯度执行一步 SGD；
+- differentiable/meta state：\(W_t\) 从 \(W_0\) 可微克隆，慢参数不 detach，使后续 outer loss
+  能回传到 \(W_0\)、RMSNorm 和两个慢投影。该模式用于后续 Meta-TTT 训练，不代表在线允许更新
+  慢参数。
+
+online 路径的 detach 只切断 checkpointed 参数梯度，不能把整个 Adapter 包在 `no_grad()` 中；
+因此冻结参数的数值仍位于到 fast weights 的 autograd 计算路径上。
+
+直接向 Fast Adapter 传入与 batch 行一一对应的 `fast_state` sequence，是 P14 和单元测试使用的
+functional 边界：online state 下 slow/\(W_0\) 在该计算图中 detach，只有输入与每行两块
+\(W_t\) 获得梯度；它本身不是 P18 的正式在线生命周期管理器。
+
+P18 正式推理通过受管的 `use_fast_state()` 生命周期兼容 P3 既有
+`adapter(embeddings, valid_mask, metadata)` 签名。该 module-local binding 负责拒绝 stale module
+gradient，在线期间冻结 checkpointed 参数的 `requires_grad`，并在 exception-safe、非重入的
+context 退出时恢复原标志。P18 仍必须另外证明 video ID 与 batch row/order 对齐、并发调用被正确
+串行化或隔离，以及每次受管调用的 `last_audit.used_runtime_state=True`；这些系统级性质不能由 P5
+模块测试代替，也不能把 bridge 当作全局或并发 fast-state store。
 
 ### 4.3 单步 SGD 与生效顺序
 
@@ -680,8 +717,8 @@ Query learned-attention 的最终标量 scorer 明确不带 bias 外，其余 Li
 
 | 模块 | 约参数量 |
 | :--- | ---: |
-| Fast TTT Adapter（含慢投影） | 7.48M |
-| 其中在线 fast matrices | 1.18M |
+| Fast TTT Adapter（含慢投影） | 7.48M（精确 7,480,064） |
+| 其中在线 fast matrices | 1.18M（精确 1,179,648） |
 | 空间对象编码器 | 24.88M |
 | 时间事件编码器 | 48.49M |
 | Query Embedding Encoder | 36.03M |

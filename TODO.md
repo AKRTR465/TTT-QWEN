@@ -3,7 +3,7 @@
 > 对齐源：[ARCHITECTURE.md](./ARCHITECTURE.md)  
 > 规范版本：`state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`  
 > 生成日期：2026-07-13  
-> 文档状态：施工分解 / P0–P4 已通过，P5 允许开始
+> 文档状态：施工分解 / P0–P5 已通过，P6 允许开始
 > 总原则：本文件只描述施工顺序和验收门禁；任何勾选都必须有代码、测试、日志或实验记录作为证据。
 
 ## 0. 使用方法
@@ -510,36 +510,36 @@
 
 ### 实施过程 TODO
 
-- [ ] 在 `fast_ttt.py` 实现输入 `V_t[B,N_v,4096]`。
-- [ ] 实现 RMSNorm 和 `P_in:4096→768`，得到 `U_t`。
-- [ ] 实现无 bias `W_t^(1):768×768`。
-- [ ] 实现 SiLU。
-- [ ] 实现无 bias `W_t^(2):768×768`。
-- [ ] 实现 `P_out:768→4096`。
-- [ ] 实现 `Z_t=V_t+0.1*P_out(W2*SiLU(W1*U_t))`。
-- [ ] 输出保持 `[B,N_v,4096]`、dtype 和 device。
-- [ ] 保存 meta-learned `W0`，支持 per-video 克隆和 reset。
-- [ ] 实现 `collect_fast_parameters()`，只返回两个矩阵且顺序稳定。
-- [ ] 实现 slow/fast 参数分组和在线冻结断言。
-- [ ] 为 state_dict/checkpoint 明确保存 `W0` 而非某个视频临时 `W_t`。
-- [ ] 统计完整 Adapter 参数约 7.48M，慢部分约 6.30M。
-- [ ] 增加 forward hooks/审计字段，记录 fast 参数 norm、输出残差 norm 和更新版本号。
+- [x] 在 `fast_ttt.py` 实现输入 `V_t[B,N_v,4096]`。
+- [x] 实现 RMSNorm 和 `P_in:4096→768`，得到 `U_t`。
+- [x] 实现无 bias `W_t^(1):768×768`。
+- [x] 实现 SiLU。
+- [x] 实现无 bias `W_t^(2):768×768`。
+- [x] 实现 `P_out:768→4096`。
+- [x] 实现 `Z_t=V_t+0.1*P_out(W2*SiLU(W1*U_t))`。
+- [x] 输出保持 `[B,N_v,4096]`、dtype 和 device。
+- [x] 保存 meta-learned `W0`，支持 per-video 克隆和 reset。
+- [x] 实现 `collect_fast_parameters()`，只返回两个矩阵且顺序稳定。
+- [x] 实现 slow/fast 参数分组和在线冻结断言。
+- [x] 为 state_dict/checkpoint 明确保存 `W0` 而非某个视频临时 `W_t`。
+- [x] 统计完整 Adapter 参数约 7.48M，慢部分约 6.30M。
+- [x] 增加 forward hooks/审计字段，记录 fast 参数 norm、输出残差 norm 和更新版本号。
 
 ### 实施后验收项
 
-- [ ] Demo 输入 `[1,392,4096]` 输出同 shape。
-- [ ] 两个 fast matrix shape 均为 `[768,768]`，无 bias。
-- [ ] 在线参数精确等于 `2×768²=1,179,648`。
-- [ ] fast 参数集合中没有 `P_in`、`P_out`、RMSNorm 或其他模块。
-- [ ] reset 后 fast weights 与 `W0` 逐元素一致。
-- [ ] 两个不同 video runtime 的 fast weights 不共享 storage。
-- [ ] forward/backward 后 fast weights 能获得有限梯度。
-- [ ] Adapter 参数预算在允许舍入误差内匹配 7.48M。
+- [x] Demo 输入 `[1,392,4096]` 输出同 shape。
+- [x] 两个 fast matrix shape 均为 `[768,768]`，无 bias。
+- [x] 在线参数精确等于 `2×768²=1,179,648`。
+- [x] fast 参数集合中没有 `P_in`、`P_out`、RMSNorm 或其他模块。
+- [x] reset 后 fast weights 与 `W0` 逐元素一致。
+- [x] 两个不同 video runtime 的 fast weights 不共享 storage。
+- [x] forward/backward 后 fast weights 能获得有限梯度。
+- [x] Adapter 参数预算在允许舍入误差内匹配 7.48M。
 
 ### 交付物与退出条件
 
-- [ ] 交付 `fast_ttt.py`、fast state/reset API、参数边界测试和数值审计。
-- [ ] 在线参数计数不精确等于 1,179,648 时禁止进入 P14。
+- [x] 交付 `fast_ttt.py`、fast state/reset API、参数边界测试和数值审计。
+- [x] 在线参数计数不精确等于 1,179,648 时禁止进入 P14。
 
 ## P6. 空间对象编码器
 

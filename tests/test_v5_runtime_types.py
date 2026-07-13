@@ -237,8 +237,11 @@ def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
 
 
 def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank() -> None:
-    matrix = torch.zeros(768, 768)
-    fast = FastWeightsState(matrix, matrix, matrix, matrix, 0, 0, 0)
+    w0_1 = torch.zeros(768, 768)
+    w0_2 = torch.ones(768, 768)
+    w_t_1 = w0_1.clone().requires_grad_(True)
+    w_t_2 = w0_2.clone().requires_grad_(True)
+    fast = FastWeightsState(w0_1, w0_2, w_t_1, w_t_2, 0, 0, 0)
     optimizer = OptimizerRuntimeState("sgd", 1.0e-4, 0.0, 0.0, 1, 1.0, 0, None)
     cache = TemporalCache(
         hidden=torch.zeros(1, 0, 768),

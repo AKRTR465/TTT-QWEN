@@ -5,11 +5,11 @@
 完整架构、训练协议和消融方案见 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前对齐版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
-> 当前施工状态：P0–P4 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
+> 当前施工状态：P0–P5 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
 > P3 用官方 HF meta 模块和 tiny 随机权重模型完成 Qwen 接口与 DeepStack 工程验收。真实 8B
 > A0/集成仍保留在 P19/P21/P22；P4 已完成 Query Encoder、Operator Router 与 Time Window
-> Resolver 的工程门禁，但尚未训练或校准，P5 允许开始。其余空壳被调用时会明确抛出
-> `NotImplementedError`。
+> Resolver 的工程门禁，但尚未训练或校准。P5 Fast Adapter 已通过纯合成张量工程门禁，
+> P6 允许开始；其余空壳被调用时会明确抛出 `NotImplementedError`。
 
 ## 当前固定条件
 
@@ -21,6 +21,8 @@
 - 第一版不修改DeepStack；
 - Fast TTT Adapter为4096→768→768→4096；在线仅更新两个768×768 fast矩阵，共1,179,648
   个参数，约1.18M；
+- Fast Adapter使用`eps=1e-6`的RMSNorm、带bias的慢投影和Xavier-uniform `W0`；checkpoint
+  保存`W0`而不保存per-video `W_t`，batched online forward要求每行状态storage相互隔离；
 - Inner loop固定使用无momentum、无weight decay的单步SGD，不使用Surprise Gate；
 - 空间对象路使用两阶段、768维Recurrent Slot Attention，默认32个活动槽；时间事件路使用
   6层、768维因果Transformer；
@@ -61,11 +63,12 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | :--- | :--- |
 | v5 YAML、完整解析、固定维度/容量/优化器校验 | P1 已实现并有契约测试 |
 | Video/Query/Encoder/Observation/Record/Retriever/Reader/runtime 类型 | P1 已实现并有 shape/dtype/边界测试 |
-| 推荐模块导入与职责边界 | P1 已实现；P3 `qwen_adapter.py`、P4 `query_encoder.py` 已实现，其余后续入口显式 `NotImplementedError` |
+| 推荐模块导入与职责边界 | P1 已实现；P3 `qwen_adapter.py`、P4 `query_encoder.py`、P5 `fast_ttt.py` 已通过各自工程门禁，其余后续入口显式 `NotImplementedError` |
 | 数据 schema、防泄漏、因果切分、processor/query token、A0 runner | P2 工程门禁已通过；fold/A0 为明确标注的合成替代 |
 | Qwen video boundary、Main Merger 插入点、DeepStack 保护 | P3 已实现；tiny/meta 工程契约已验证，真实 8B 留至 P19 |
 | Query Encoder、9-prototype Router、Time Window Resolver | P4 已实现；本地结构/参数/offset/fail-closed 契约已验证，模型尚未训练、阈值尚未校准 |
-| Fast Adapter、状态、Reader、loss、训练、推理 | P5–P19 计划设计，尚未实现 |
+| Fast Adapter、per-video fast state、参数边界 | P5 已通过本地合成张量门禁；显式 functional SGD 编排留至 P14，受管在线生命周期留至 P18，真实 8B 留至 P19 |
+| 状态编码、Bank、Reader、loss、训练、推理 | P6–P19 计划设计，尚未实现 |
 | 真实 8B、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行 |
 
 ## 环境变量
