@@ -644,6 +644,9 @@
 
 - 文档中的“帧级状态”实际是 tubelet 级；Demo 每个位置覆盖 2 个采样帧。
 - temporal cache 最多保留最近 64 个 tubelet，必须按视频隔离并 reset。
+- P2 固定 4-tubelet overlap；主 cache 长度仍为 64，但允许额外保存紧邻主 cache 之前最多 3 个
+  replay-only per-layer K/V，仅用于按当前 adapted token 重算 overlap，不能扩大 64-token mask。
+- timestamp/query_time 必须使用独立于模型 FP16/BF16 的 FP32/FP64；cache timestamp 统一为 FP64。
 - strict causal mask 必须在带 cache 和无 cache 两条路径一致。
 - 时间长度 T 来自输入 grid，不能和 12 个 heads 或 16 个 State Token 混淆。
 
@@ -651,44 +654,44 @@
 
 #### P7.1 空间池化
 
-- [ ] 恢复 `[B,T,H_m,W_m,4096]` 并展平为 `[B,T,N_spatial,4096]`。
-- [ ] Demo 验证 `[B,392,4096]→[B,8,49,4096]`。
-- [ ] 实现 LayerNorm + `Linear 4096→768`。
-- [ ] 使用 q_target 条件化的多头空间 attention pooling。
-- [ ] 对无效空间 token 使用 mask。
-- [ ] 输出池化状态 `[B,T,768]`。
+- [x] 恢复 `[B,T,H_m,W_m,4096]` 并展平为 `[B,T,N_spatial,4096]`。
+- [x] Demo 验证 `[B,392,4096]→[B,8,49,4096]`。
+- [x] 实现 LayerNorm + `Linear 4096→768`。
+- [x] 使用 q_target 条件化的多头空间 attention pooling。
+- [x] 对无效空间 token 使用 mask。
+- [x] 输出池化状态 `[B,T,768]`。
 
 #### P7.2 六层严格因果 Transformer
 
-- [ ] 加入 tubelet 时间位置编码，明确相对/绝对位置与 cache offset 的一致规则。
-- [ ] 实现 6 层 Pre-LN Transformer。
-- [ ] 固定 hidden=768、heads=12、head_dim=64、intermediate=3072、dropout=0.1。
-- [ ] 实现 strict causal attention mask。
-- [ ] 处理尾 chunk padding，padding 不作为 Key/Value 或 loss target。
-- [ ] 输出 `H_t[B,T,768]`。
+- [x] 加入 tubelet 时间位置编码，明确相对/绝对位置与 cache offset 的一致规则。
+- [x] 实现 6 层 Pre-LN Transformer。
+- [x] 固定 hidden=768、heads=12、head_dim=64、intermediate=3072、dropout=0.1。
+- [x] 实现 strict causal attention mask。
+- [x] 处理尾 chunk padding，padding 不作为 Key/Value 或 loss target。
+- [x] 输出 `H_t[B,T,768]`。
 
 #### P7.3 Temporal cache
 
-- [ ] 为每个 video/batch sample 保存最近 64 个有效 tubelet 状态或 KV。
-- [ ] cache 追加时保存时间戳和有效性。
-- [ ] 超过 64 时按时间顺序淘汰最旧位置。
-- [ ] 新视频和 trajectory reset 时清空。
-- [ ] 禁止 batch 样本交换 cache。
-- [ ] 禁止 query_time 之后的 cache 内容进入当前 forward。
+- [x] 为每个 video/batch sample 保存最近 64 个有效 tubelet 状态或 KV。
+- [x] cache 追加时保存时间戳和有效性。
+- [x] 超过 64 时按时间顺序淘汰最旧位置。
+- [x] 新视频和 trajectory reset 时清空。
+- [x] 禁止 batch 样本交换 cache。
+- [x] 禁止 query_time 之后的 cache 内容进入当前 forward。
 
 ### 实施后验收项
 
-- [ ] Demo 输出严格为 `H_t[1,8,768]`。
-- [ ] 改变未来 tubelet 不会影响过去位置输出。
-- [ ] chunked+cache 与等价完整因果 forward 在容差内一致。
-- [ ] cache 长度不超过 64，reset 和 batch 隔离测试通过。
-- [ ] T<2、变长 T、尾 padding 和空有效位置均安全处理。
-- [ ] 参数量约 48.49M。
+- [x] Demo 输出严格为 `H_t[1,8,768]`。
+- [x] 改变未来 tubelet 不会影响过去位置输出。
+- [x] chunked+cache 与等价完整因果 forward 在容差内一致。
+- [x] cache 长度不超过 64，reset 和 batch 隔离测试通过。
+- [x] T<2、变长 T、尾 padding 和空有效位置均安全处理。
+- [x] 参数量精确为 48,438,272（48.438272M）。
 
 ### 交付物与退出条件
 
-- [ ] 交付 `state_encoder.py` 中时间路、cache API、causal/padding 测试。
-- [ ] 任何未来信息可影响历史输出时立即阻断后续施工。
+- [x] 交付 `state_encoder.py` 中时间路、cache API、causal/padding 测试。
+- [x] 任何未来信息可影响历史输出时立即阻断后续施工。
 
 ---
 

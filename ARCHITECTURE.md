@@ -602,6 +602,21 @@ P6 到此为止：可以提供无状态的 grid 恢复 helper，但不实现 P7 
 
 ### 5.2 时间事件路
 
+P7 的显式输入边界为：
+
+- adapted merger tokens `Z_t: [B,N_max,4096]`、`visual_valid_mask` 和 merged-grid metadata；
+- `tubelet_valid_mask: bool[B,T_max]`、tubelet timestamps 和显式全局
+  `position_ids: int[B,T_max]`；
+- 合法 `query_time: [B]` 与 `q_target: [B,512]`；
+- 每行 `video_id`、`trajectory_id` 和稳定的 query signature；
+- 可选的逐样本 previous temporal cache，以及默认开启的 `detach_cache`。
+
+timestamps 用于 query-time 因果审计，global position id 用于位置编码、滑窗 mask 和 overlap
+对齐；二者不得互相冒充。输入 timestamp/query_time 使用独立于模型 FP16/BF16 的 FP32 或
+FP64，cache 内 timestamp 统一保存为 FP64。有效 timestamp 必须有限、非负、严格递增且不超过
+本行 `query_time`，cache 中也执行同一检查。检测到未来时间、owner 不匹配或不可解释的倒退时
+fail closed，不静默过滤。
+
 每个时间 tubelet 对应 \(7\times7=49\) 个 merger token：
 
 \[
@@ -610,7 +625,10 @@ P6 到此为止：可以提供无状态的 grid 恢复 helper，但不实现 P7 
 [B,8,49,4096].
 \]
 
-先执行 LayerNorm + 4096 → 768 投影，再使用 q_target 条件化的多头空间注意力池化：
+先执行 `LayerNorm(4096,eps=1e-5)` 和带 bias 的 `Linear(4096→768)`，再使用
+q_target 条件化的多头空间注意力池化。`q_target` 先经带 bias 的 `512→768` 投影；空间
+attention 的 Q/K/V/O 都是带 bias 的 `768→768` 投影，12 heads、head dim 64。无效空间 token
+不参与 Key/Value；整条无效 tubelet 的输出严格为零，不能让 all-masked softmax 产生 NaN：
 
 \[
 [B,8,49,4096]
@@ -618,7 +636,9 @@ P6 到此为止：可以提供无状态的 grid 恢复 helper，但不实现 P7 
 [B,8,768].
 \]
 
-加入 tubelet 时间位置编码后，使用六层 Pre-Norm 严格因果 Transformer：
+随后按显式 global position id 加入无参数 absolute sinusoidal tubelet position encoding。位置编码
+没有 learned table、缩放参数或 modulo/clamp，chunk 边界不能把 position id 重置为 0。再使用六层
+参数互不共享的 Pre-LayerNorm 严格因果 Transformer：
 
 | 参数 | 值 |
 | :--- | :--- |
@@ -627,9 +647,48 @@ P6 到此为止：可以提供无状态的 grid 恢复 helper，但不实现 P7 
 | attention heads | 12 |
 | head dimension | 64 |
 | intermediate size | 3072 |
+| LayerNorm epsilon | 1e-5 |
+| FFN activation | GELU |
 | dropout | 0.1 |
-| mask | strict causal |
-| temporal cache | 最近 64 个 tubelet |
+| Q/K/V/O bias | true |
+| mask | causal，包含当前位置 |
+| causal window | 含当前位置共 64 个 tubelet |
+| temporal cache | 六层逐层 K/V，最近 64 个有效 tubelet |
+
+每层使用两个 Pre-LayerNorm、带 bias 的 Q/K/V/O 和 `768→3072→768` GELU FFN；六层之后
+不增加额外 final LayerNorm。对绝对 query/key 位置 \(p_q,p_k\)，full forward 和 cache forward
+必须使用同一个窗口：
+
+\[
+p_q-63 \le p_k \le p_q.
+\]
+
+因此“strict causal”在本项目中表示禁止未来、允许 self，不表示严格下三角。padding 既不作为
+Key/Value，也不进入 cache 或 loss target。只在 chunk 结束时裁 cache、却允许 chunk 后部看到
+`64 + chunk_prefix` 个位置是不合规的；滑窗条件必须在 attention mask 本身执行。
+
+cache 保存每一层的 K/V，而不是把上一 chunk 的最终 `hidden` 重新送入六层。主 attention cache
+始终只含最近 64 个位置；最终 hidden 可以与 timestamps、valid mask 一起保留用于输出兼容和审计，
+但不能替代 layer-wise K/V。每个 cache row 还保存 absolute position ids、`total_seen`、`video_id`、
+`trajectory_id` 和 query signature；owner 必须与当前 batch row 完全一致，batch 内禁止交换或共享
+可变 runtime。
+
+P2 的固定 overlap 是 4 个 tubelet。为了在主 cache 已满后仍能按当前 adapted embeddings 重算
+overlap，runtime 另外保存紧邻主 cache 之前、最多 3 个位置的 replay-only per-layer K/V margin
+（`overlap-1`）。该 margin 不进入 `H_t`、不计入主 `cache_length`，也不会扩大 attention mask；每个
+query 仍只能选择上式定义的 64 个位置。它只补足 overlap 首位置重算时已经从主 cache 淘汰、但仍在
+其合法 64-window 内的三个 key/value。
+
+P2 的相邻 chunk 含重叠 tubelet。重叠位置按 global position id 执行 replay/replace：结合上述
+replay margin，先移除被当前 chunk 重放的同位置旧 K/V，再以当前 adapted token 重算并替换，不能
+把重叠前缀作为新位置重复追加。无法由主 cache 加 replay margin 解释的历史倒退必须 reset 或 fail
+closed。追加后主 cache 只保留按全局位置排序的最近 64 个有效 tubelet；新 video、trajectory 或
+query signature 都需要空 cache。
+
+`detach_cache=True` 是运行时默认值：只 detach/clone 交给下一 chunk 的 K/V 和 hidden，当前
+`H_t` 仍保留到 adapted embeddings、q_target 和 fast weights 的梯度；Outer Training 若显式使用
+`False`，必须同时承担有界 autograd graph。full/chunk 数值等价验收在 `eval()` 下进行，因为训练态
+dropout 0.1 不承诺逐元素相同。
 
 输出：
 
@@ -643,8 +702,9 @@ Demo 中 \(T=8\)：
 H_t\in\mathbb R^{1\times8\times768}.
 \]
 
-每个时间位置覆盖 2 个采样帧；文档中的“帧级状态”严格说是 tubelet 级状态。跨 chunk
-temporal cache 按视频隔离，并在新视频开始时清空。
+每个时间位置覆盖 2 个采样帧；文档中的“帧级状态”严格说是 tubelet 级状态。T 来自每行
+merged grid，不得与 12 个 attention heads 或 16 个 State Token 混淆。全无效 row 安全返回零
+输出并保持/生成合法空 cache；`T=1`、变长 T 和尾 padding 都遵循同一 mask/cache 契约。
 
 ## 6. 四个 Observation Head
 
@@ -802,7 +862,7 @@ Query learned-attention 的最终标量 scorer 明确不带 bias 外，其余 Li
 | Fast TTT Adapter（含慢投影） | 7.48M（精确 7,480,064） |
 | 其中在线 fast matrices | 1.18M（精确 1,179,648） |
 | 空间对象编码器 | 24.81536M（精确 24,815,360） |
-| 时间事件编码器 | 48.49M |
+| 时间事件编码器 | 48.438272M（精确 48,438,272） |
 | Query Embedding Encoder | 36.03M |
 | O1 Decoder | 2.63M |
 | O2 Decoder | 2.10M |
@@ -812,13 +872,19 @@ Query learned-attention 的最终标量 scorer 明确不带 bias 外，其余 Li
 | TTT Temporal Predictor | 2.36M |
 | 16-token State Resampler | 14.72M |
 | Operator Router、Time Resolver、empty record | 约 0.14M |
-| **新增模块合计** | **当前分项和 156.75536M，约 156.76M** |
+| **新增模块合计** | **当前分项和 156.703632M（156,703,632）** |
 
 空间对象编码器的精确审计式为：输入 LayerNorm 8,192 + 输入 Linear 3,146,496 + 单一
 q projection 393,984 + shared seed 768 + 两个独立 Stage。每个 Stage 为 Q/K/V/O 2,362,368 +
 GRUCell 3,543,552 + FFN 4,722,432 + 三个 LayerNorm 4,608，共 10,632,960；因此总计
 24,815,360。固定 sinusoidal code、occupancy confidence、mask、runtime 和 capacity audit 都不增加
 模型参数。
+
+时间事件编码器的精确审计式为：输入 LayerNorm 8,192 + 输入 Linear 3,146,496 + q_target
+projection 393,984 + 空间 pooling MHA 2,362,368 + 六个独立 Transformer layer。每层为
+Q/K/V/O 2,362,368 + GELU FFN 4,722,432 + 两个 LayerNorm 3,072，共 7,087,872；因此总计
+48,438,272。absolute sinusoidal position、causal/sliding mask、逐层 KV cache、owner metadata、
+overlap replay margin/replay-replace 和 detach runtime 都是零参数。
 
 新增模块约占 8B 基座的 2%。测试时真正变化的参数只有两个 768 × 768 fast matrix，即
 1,179,648 个参数；其余新增参数只在 Outer Training 中学习，在线推理时冻结。

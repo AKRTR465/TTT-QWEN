@@ -11,14 +11,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import NoReturn
 
-import torch
-from torch import Tensor
-
 from ttt_svcbench_qwen.data import assert_runtime_payload_safe
 from ttt_svcbench_qwen.fast_ttt import FastWeightsState, OptimizerRuntimeState
 from ttt_svcbench_qwen.identity_bank import IdentityBankRuntimeState
 from ttt_svcbench_qwen.state_bank import HeadType, StateBankRuntimeState
-from ttt_svcbench_qwen.state_encoder import TemporalCache
+from ttt_svcbench_qwen.state_encoder import SpatialSlotRuntimeState, TemporalCache
 from ttt_svcbench_qwen.state_reader import ReaderResult
 
 
@@ -28,7 +25,7 @@ class PerVideoRuntimeState:
     trajectory_id: str
     fast_weights: FastWeightsState
     optimizer: OptimizerRuntimeState
-    slot_state: Tensor | None
+    slot_state: SpatialSlotRuntimeState | None
     temporal_cache: TemporalCache
     state_bank: StateBankRuntimeState
     identity_bank: IdentityBankRuntimeState
@@ -43,13 +40,14 @@ class PerVideoRuntimeState:
             raise ValueError("State Bank video_id does not match runtime ownership")
         if self.state_bank.trajectory_id != self.trajectory_id:
             raise ValueError("State Bank trajectory_id does not match runtime ownership")
-        if self.slot_state is not None:
-            if self.slot_state.ndim != 2 or self.slot_state.shape[-1] != 768:
-                raise ValueError("per-video slot_state must be [K_a, 768]")
-            if not torch.is_floating_point(self.slot_state):
-                raise TypeError("per-video slot_state must use a floating dtype")
-        if self.video_id not in self.temporal_cache.video_ids:
-            raise ValueError("temporal cache must belong to the current video")
+        if self.slot_state is not None and self.slot_state.video_id != self.video_id:
+            raise ValueError("spatial slot state video_id does not match runtime ownership")
+        if self.temporal_cache.hidden.shape[0] != 1:
+            raise ValueError("per-video temporal cache must have batch size 1")
+        if self.temporal_cache.video_ids != (self.video_id,):
+            raise ValueError("temporal cache video_ids do not match runtime ownership")
+        if self.temporal_cache.trajectory_ids != (self.trajectory_id,):
+            raise ValueError("temporal cache trajectory_ids do not match runtime ownership")
 
 
 @dataclass(frozen=True, slots=True)

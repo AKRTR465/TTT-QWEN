@@ -165,9 +165,24 @@ class TemporalEncoderConfig(FrozenModel):
     head_dim: PositiveInt
     ffn_dim: PositiveInt
     dropout: Probability
+    position_encoding: str
+    layer_norm_eps: PositiveFloat
+    activation: str
+    pre_norm: bool
+    attention_projection_bias: bool
     strict_causal: bool
+    causal_includes_self: bool
+    causal_window_includes_current: bool
     cache_tubelets: PositiveInt
+    cache_mode: str
+    position_id_mode: str
+    overlap_policy: str
+    overlap_tubelets: PositiveInt
+    replay_context_tubelets: PositiveInt
+    cache_owner_keys: tuple[str, ...]
+    detach_cache_default: bool
     query_dim: PositiveInt
+    parameter_count: PositiveInt
 
 
 class O1Config(FrozenModel):
@@ -535,9 +550,76 @@ class ProjectConfig(FrozenModel):
             ("temporal_encoder.head_dim", self.temporal_encoder.head_dim, 64),
             ("temporal_encoder.ffn_dim", self.temporal_encoder.ffn_dim, 3072),
             ("temporal_encoder.dropout", self.temporal_encoder.dropout, 0.1),
+            (
+                "temporal_encoder.position_encoding",
+                self.temporal_encoder.position_encoding,
+                "absolute_sinusoidal",
+            ),
+            (
+                "temporal_encoder.layer_norm_eps",
+                self.temporal_encoder.layer_norm_eps,
+                1.0e-5,
+            ),
+            ("temporal_encoder.activation", self.temporal_encoder.activation, "gelu"),
+            ("temporal_encoder.pre_norm", self.temporal_encoder.pre_norm, True),
+            (
+                "temporal_encoder.attention_projection_bias",
+                self.temporal_encoder.attention_projection_bias,
+                True,
+            ),
             ("temporal_encoder.strict_causal", self.temporal_encoder.strict_causal, True),
+            (
+                "temporal_encoder.causal_includes_self",
+                self.temporal_encoder.causal_includes_self,
+                True,
+            ),
+            (
+                "temporal_encoder.causal_window_includes_current",
+                self.temporal_encoder.causal_window_includes_current,
+                True,
+            ),
             ("temporal_encoder.cache_tubelets", self.temporal_encoder.cache_tubelets, 64),
+            (
+                "temporal_encoder.cache_mode",
+                self.temporal_encoder.cache_mode,
+                "layerwise_kv",
+            ),
+            (
+                "temporal_encoder.position_id_mode",
+                self.temporal_encoder.position_id_mode,
+                "explicit_global",
+            ),
+            (
+                "temporal_encoder.overlap_policy",
+                self.temporal_encoder.overlap_policy,
+                "replay_replace",
+            ),
+            (
+                "temporal_encoder.overlap_tubelets",
+                self.temporal_encoder.overlap_tubelets,
+                4,
+            ),
+            (
+                "temporal_encoder.replay_context_tubelets",
+                self.temporal_encoder.replay_context_tubelets,
+                3,
+            ),
+            (
+                "temporal_encoder.cache_owner_keys",
+                self.temporal_encoder.cache_owner_keys,
+                ("video_id", "trajectory_id", "query_signature"),
+            ),
+            (
+                "temporal_encoder.detach_cache_default",
+                self.temporal_encoder.detach_cache_default,
+                True,
+            ),
             ("temporal_encoder.query_dim", self.temporal_encoder.query_dim, 512),
+            (
+                "temporal_encoder.parameter_count",
+                self.temporal_encoder.parameter_count,
+                48_438_272,
+            ),
             ("state_bank.semantic_dim", self.state_bank.semantic_dim, 512),
             ("state_bank.identity_dim", self.state_bank.identity_dim, 256),
             (
@@ -811,6 +893,12 @@ class ProjectConfig(FrozenModel):
         exact_spatial_millions = 24_815_360 / 1_000_000
         if abs(exact_spatial_millions - budget.spatial_encoder_millions) > 1.0e-9:
             raise ValueError("spatial encoder budget must use the exact P6 parameter count")
+        exact_temporal_millions = self.temporal_encoder.parameter_count / 1_000_000
+        if abs(exact_temporal_millions - budget.temporal_encoder_millions) > 1.0e-9:
+            raise ValueError("temporal encoder budget must use the exact P7 parameter count")
+        exact_total_millions = 156_703_632 / 1_000_000
+        if abs(exact_total_millions - budget.new_modules_total_millions) > 1.0e-9:
+            raise ValueError("new module budget must use the frozen P7 component total")
 
 
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:

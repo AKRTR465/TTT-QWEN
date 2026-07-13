@@ -170,13 +170,25 @@ def test_encoder_cache_and_observation_output_contracts() -> None:
     )
     cache = TemporalCache(
         hidden=torch.zeros(2, 4, 768),
-        timestamps=torch.zeros(2, 4),
+        layer_keys=tuple(torch.zeros(2, 12, 4, 64) for _ in range(6)),
+        layer_values=tuple(torch.zeros(2, 12, 4, 64) for _ in range(6)),
+        replay_layer_keys=tuple(torch.zeros(2, 12, 0, 64) for _ in range(6)),
+        replay_layer_values=tuple(torch.zeros(2, 12, 0, 64) for _ in range(6)),
+        timestamps=torch.arange(4, dtype=torch.float64).repeat(2, 1),
+        replay_timestamps=torch.empty(2, 0, dtype=torch.float64),
+        position_ids=torch.arange(4, dtype=torch.int64).repeat(2, 1),
+        replay_position_ids=torch.empty(2, 0, dtype=torch.int64),
         valid_mask=torch.ones(2, 4, dtype=torch.bool),
+        replay_valid_mask=torch.empty(2, 0, dtype=torch.bool),
         video_ids=("video-a", "video-b"),
+        trajectory_ids=("trajectory-a", "trajectory-b"),
+        query_signatures=torch.zeros(2, 512),
+        total_seen=torch.full((2,), 4, dtype=torch.int64),
     )
     temporal = TemporalEncoderOutput(
         hidden=torch.zeros(2, 4, 768),
-        timestamps=torch.zeros(2, 4),
+        timestamps=torch.arange(4, dtype=torch.float32).repeat(2, 1),
+        position_ids=torch.arange(4, dtype=torch.int64).repeat(2, 1),
         valid_mask=torch.ones(2, 4, dtype=torch.bool),
         cache=cache,
     )
@@ -245,9 +257,20 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
     optimizer = OptimizerRuntimeState("sgd", 1.0e-4, 0.0, 0.0, 1, 1.0, 0, None)
     cache = TemporalCache(
         hidden=torch.zeros(1, 0, 768),
-        timestamps=torch.zeros(1, 0),
+        layer_keys=tuple(torch.zeros(1, 12, 0, 64) for _ in range(6)),
+        layer_values=tuple(torch.zeros(1, 12, 0, 64) for _ in range(6)),
+        replay_layer_keys=tuple(torch.zeros(1, 12, 0, 64) for _ in range(6)),
+        replay_layer_values=tuple(torch.zeros(1, 12, 0, 64) for _ in range(6)),
+        timestamps=torch.zeros(1, 0, dtype=torch.float64),
+        replay_timestamps=torch.zeros(1, 0, dtype=torch.float64),
+        position_ids=torch.zeros(1, 0, dtype=torch.int64),
+        replay_position_ids=torch.zeros(1, 0, dtype=torch.int64),
         valid_mask=torch.zeros(1, 0, dtype=torch.bool),
+        replay_valid_mask=torch.zeros(1, 0, dtype=torch.bool),
         video_ids=("video-a",),
+        trajectory_ids=("trajectory-a",),
+        query_signatures=torch.zeros(1, 512),
+        total_seen=torch.zeros(1, dtype=torch.int64),
     )
     bank = StateBankRuntimeState("video-a", "trajectory-a", (), ())
     identities = IdentityBankRuntimeState((), (), (), 0, 0)

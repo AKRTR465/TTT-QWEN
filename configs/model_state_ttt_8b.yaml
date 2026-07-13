@@ -101,9 +101,24 @@ temporal_encoder:
   head_dim: 64
   ffn_dim: 3072
   dropout: 0.1
+  position_encoding: absolute_sinusoidal
+  layer_norm_eps: 1.0e-5
+  activation: gelu
+  pre_norm: true
+  attention_projection_bias: true
   strict_causal: true
+  causal_includes_self: true
+  causal_window_includes_current: true
   cache_tubelets: 64
+  cache_mode: layerwise_kv
+  position_id_mode: explicit_global
+  overlap_policy: replay_replace
+  overlap_tubelets: 4
+  replay_context_tubelets: 3
+  cache_owner_keys: [video_id, trajectory_id, query_signature]
+  detach_cache_default: true
   query_dim: 512
+  parameter_count: 48438272
 
 observation_heads:
   o1:
@@ -247,7 +262,7 @@ parameter_budget:
   fast_ttt_adapter_millions: 7.48
   online_fast_matrices_millions: 1.179648
   spatial_encoder_millions: 24.81536
-  temporal_encoder_millions: 48.49
+  temporal_encoder_millions: 48.438272
   query_encoder_millions: 36.03
   o1_millions: 2.63
   o2_millions: 2.10
@@ -257,5 +272,5 @@ parameter_budget:
   predictor_millions: 2.36
   state_resampler_millions: 14.72
   router_resolver_empty_millions: 0.14
-  new_modules_total_millions: 156.75536
+  new_modules_total_millions: 156.703632
   rounding_tolerance_millions: 0.02

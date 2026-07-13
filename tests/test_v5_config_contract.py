@@ -131,8 +131,33 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "log_overflow": True,
     }
     assert spatial.num_heads * spatial.head_dim == spatial.hidden_dim
-    assert config.temporal_encoder.num_layers == 6
-    assert config.temporal_encoder.cache_tubelets == 64
+    assert config.temporal_encoder.model_dump() == {
+        "input_dim": 4096,
+        "hidden_dim": 768,
+        "num_layers": 6,
+        "num_heads": 12,
+        "head_dim": 64,
+        "ffn_dim": 3072,
+        "dropout": 0.1,
+        "position_encoding": "absolute_sinusoidal",
+        "layer_norm_eps": 1.0e-5,
+        "activation": "gelu",
+        "pre_norm": True,
+        "attention_projection_bias": True,
+        "strict_causal": True,
+        "causal_includes_self": True,
+        "causal_window_includes_current": True,
+        "cache_tubelets": 64,
+        "cache_mode": "layerwise_kv",
+        "position_id_mode": "explicit_global",
+        "overlap_policy": "replay_replace",
+        "overlap_tubelets": 4,
+        "replay_context_tubelets": 3,
+        "cache_owner_keys": ("video_id", "trajectory_id", "query_signature"),
+        "detach_cache_default": True,
+        "query_dim": 512,
+        "parameter_count": 48_438_272,
+    }
     assert config.observation_heads.o1.hidden_dims == (1024, 1024)
     assert config.observation_heads.o1.output_dim == 6
     assert config.observation_heads.o2.identity_dim == 256
@@ -208,7 +233,8 @@ def test_v5_parameter_budget_matches_architecture_rounding() -> None:
     )
 
     assert budget.spatial_encoder_millions == 24.81536
-    assert budget.new_modules_total_millions == 156.75536
+    assert budget.temporal_encoder_millions == 48.438272
+    assert budget.new_modules_total_millions == 156.703632
     assert (
         abs(component_total - budget.new_modules_total_millions)
         <= budget.rounding_tolerance_millions
@@ -288,7 +314,71 @@ def set_nested(*path_and_value: object) -> Mutation:
             "parameter budget|spatial encoder budget",
         ),
         (
-            set_nested("parameter_budget", "new_modules_total_millions", 156.83),
+            set_nested("temporal_encoder", "position_encoding", "learned_absolute"),
+            "temporal_encoder.position_encoding",
+        ),
+        (
+            set_nested("temporal_encoder", "layer_norm_eps", 1.0e-6),
+            "temporal_encoder.layer_norm_eps",
+        ),
+        (
+            set_nested("temporal_encoder", "activation", "relu"),
+            "temporal_encoder.activation",
+        ),
+        (
+            set_nested("temporal_encoder", "pre_norm", False),
+            "temporal_encoder.pre_norm",
+        ),
+        (
+            set_nested("temporal_encoder", "attention_projection_bias", False),
+            "temporal_encoder.attention_projection_bias",
+        ),
+        (
+            set_nested("temporal_encoder", "causal_includes_self", False),
+            "temporal_encoder.causal_includes_self",
+        ),
+        (
+            set_nested("temporal_encoder", "causal_window_includes_current", False),
+            "temporal_encoder.causal_window_includes_current",
+        ),
+        (
+            set_nested("temporal_encoder", "cache_mode", "final_hidden"),
+            "temporal_encoder.cache_mode",
+        ),
+        (
+            set_nested("temporal_encoder", "position_id_mode", "chunk_local"),
+            "temporal_encoder.position_id_mode",
+        ),
+        (
+            set_nested("temporal_encoder", "overlap_policy", "append_duplicates"),
+            "temporal_encoder.overlap_policy",
+        ),
+        (
+            set_nested("temporal_encoder", "overlap_tubelets", 3),
+            "temporal_encoder.overlap_tubelets",
+        ),
+        (
+            set_nested("temporal_encoder", "replay_context_tubelets", 2),
+            "temporal_encoder.replay_context_tubelets",
+        ),
+        (
+            set_nested("temporal_encoder", "cache_owner_keys", ["video_id"]),
+            "temporal_encoder.cache_owner_keys",
+        ),
+        (
+            set_nested("temporal_encoder", "detach_cache_default", False),
+            "temporal_encoder.detach_cache_default",
+        ),
+        (
+            set_nested("temporal_encoder", "parameter_count", 48_487_424),
+            "temporal_encoder.parameter_count",
+        ),
+        (
+            set_nested("parameter_budget", "temporal_encoder_millions", 48.49),
+            "parameter budget components|temporal encoder budget",
+        ),
+        (
+            set_nested("parameter_budget", "new_modules_total_millions", 156.75536),
             "parameter budget components",
         ),
         (set_nested("state_resampler", "num_queries", 8), "num_queries must be 16"),

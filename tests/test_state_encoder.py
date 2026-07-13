@@ -19,6 +19,8 @@ from ttt_svcbench_qwen.state_encoder import (
     SpatialEncoderOutput,
     SpatialObjectEncoder,
     SpatialSlotRuntimeState,
+    StateEncoders,
+    TemporalEventEncoder,
     build_spatial_encoder,
     build_state_encoders,
     restore_merged_grid,
@@ -1044,11 +1046,16 @@ def test_mask_device_mismatch_fails_on_cuda() -> None:
         )
 
 
-def test_spatial_builder_requires_config_and_joint_builder_remains_p7() -> None:
+def test_spatial_and_joint_builders_require_config_and_p7_builder_is_implemented() -> None:
     with pytest.raises((TypeError, ValueError), match="config|ProjectConfig"):
         build_spatial_encoder()  # type: ignore[call-arg]
-    with pytest.raises(NotImplementedError, match="P7"):
-        build_state_encoders(load_config())
+    with pytest.raises((TypeError, ValueError), match="config|ProjectConfig"):
+        build_state_encoders()  # type: ignore[call-arg]
+    with torch.device("meta"):
+        encoders = build_state_encoders(load_config())
+    assert isinstance(encoders, StateEncoders)
+    assert isinstance(encoders.spatial, SpatialObjectEncoder)
+    assert isinstance(encoders.temporal, TemporalEventEncoder)
 
     source = (ROOT / "src" / "ttt_svcbench_qwen" / "state_encoder.py").read_text(
         encoding="utf-8"

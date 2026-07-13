@@ -1,0 +1,12 @@
+timestamp_utc=2026-07-13T22:52:50.3677002Z
+environment=UV_OFFLINE=1
+command=uv run python - (meta-device P7 component audit)
+exit_code=0
+total=48438272
+spatial_pool=5911040
+input_norm_projection=3154688
+query_projection=393984
+pool_qkvo=2362368
+layers=7087872,7087872,7087872,7087872,7087872,7087872
+position_parameters=0
+configured=48438272

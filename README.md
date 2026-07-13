@@ -27,11 +27,16 @@
 - Inner loop固定使用无momentum、无weight decay的单步SGD，不使用Surprise Gate；
 - 空间对象路使用两个参数不共享的768维Recurrent Slot Stage，默认32个活动槽；单一q投影和
   shared seed结合固定非持久sinusoidal slot code，attention先做slot轴竞争再按token归一，精确
-  24,815,360参数；时间事件路使用6层、768维因果Transformer；
+  24,815,360参数；时间事件路使用6层、768维Pre-LN GELU因果Transformer，absolute sinusoidal
+  使用显式global position id，Q/K/V/O带bias，LayerNorm eps为`1e-5`；
 - P6的`required_slot_counts`只做preserve-existing/reject-excess容量审计，不表示已从视频识别
   真实对象；语义判断和hard state留给P8/P9，模型编排和受管推理生命周期留给P13/P18；
 - O1/O2/E1/E2分别使用FiLM MLP、256维identity MLP、5层gated causal TCN和2层GRU；
-- 当前新增模块分项合计156.75536M，约156.76M，但在线变化的仍只有约1.18M fast参数；
+- 时间路使用含self且含当前位置总长64的同一full/chunk滑窗；cache保存六层逐层K/V并按
+  video/trajectory/query signature隔离，overlap按global position replay/replace，默认detach下一
+  chunk cache；主cache严格64，另有不扩大mask的3-position replay margin用于重算固定4-tubelet
+  overlap；时间元数据保持FP32/FP64并在cache中统一为FP64；时间路精确48,438,272参数；
+- 当前新增模块分项合计156.703632M（156,703,632），但在线变化的仍只有约1.18M fast参数；
 - 无标签TTT loss仅由当前chunk内next-tubelet prediction、O2身份一致性和E1/E2事件一致性组成；
 - 问题不再通过关键词规则机械划分；Qwen input embeddings先经4096→768投影、无参sinusoidal
   position encoding和4层双向Transformer，再由三个768→1024→512 GELU输出头形成
@@ -73,7 +78,8 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | Query Encoder、9-prototype Router、Time Window Resolver | P4 已实现；本地结构/参数/offset/fail-closed 契约已验证，模型尚未训练、阈值尚未校准 |
 | Fast Adapter、per-video fast state、参数边界 | P5 已通过本地合成张量门禁；显式 functional SGD 编排留至 P14，受管在线生命周期留至 P18，真实 8B 留至 P19 |
 | P6 空间对象编码器 | 已通过本地合成张量工程门禁；真实视频/8B、语义对象 overflow 与端到端 runtime 仍留后续阶段 |
-| P7–P19 时间状态、Bank、Reader、loss、训练、推理 | 计划设计，尚未实现；P7 允许开始 |
+| P7 时间事件编码器 | 已通过本地合成张量工程门禁；逐层 KV、overlap replay margin、因果滑窗和 runtime 隔离均已验证 |
+| P8–P19 Observation、Bank、Reader、loss、训练、推理 | 计划设计，尚未实现；P8 允许开始 |
 | 真实 8B、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行 |
 
 ## 环境变量

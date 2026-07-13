@@ -1,0 +1,34 @@
+initial_candidate_timestamp_utc=2026-07-13T22:52:50.3677002Z
+environment=UV_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+
+command=uv run pytest -q (candidate before P7 status/evidence writeback)
+exit_code=0
+result=271 passed in 37.31s
+
+command=uv run ruff check .
+exit_code=0
+result=All checks passed!
+
+command=uv run mypy src
+exit_code=0
+result=Success: no issues found in 21 source files
+
+command=uv run python -m ttt_svcbench_qwen.config
+exit_code=0
+result=validated config JSON emitted; temporal parameter_count=48438272; overlap=4; replay_context=3
+
+command=git diff --check
+exit_code=0
+result=no output
+
+final_candidate_timestamp_utc=2026-07-13T22:57:43.7360378Z
+final_command=uv run pytest -q (after P7 checklist, status, and evidence writeback)
+final_exit_code=0
+final_result=271 passed in 37.04s
+final_ruff=All checks passed!
+final_mypy=Success: no issues found in 21 source files
+final_config_cli=exit_code 0
+final_git_diff_check=no output
+architecture_sha256=99d261401c5f8b403fee2732aca36ac43910d5603f2c6f60365fa0e0f3b6578a
+config_sha256=f857b79bac8cda206d124daf2f0da048775feb48d7bab568f76c803474f5db73
+uv_lock_sha256=c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2
