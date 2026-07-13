@@ -1,0 +1,6 @@
+paths:
+  model_root_env: QWEN_MODEL_ROOT
+  svcbench_root_env: SVCBENCH_ROOT
+  hf_home_env: HF_HOME
+  output_root_env: OUTPUT_ROOT
+
