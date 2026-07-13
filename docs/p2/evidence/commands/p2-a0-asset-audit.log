@@ -1,0 +1,16 @@
+captured_at_utc: 2026-07-13T17:59:23.3234498Z
+mode: audit-only; UV_OFFLINE=1; HF_HUB_OFFLINE=1; TRANSFORMERS_OFFLINE=1
+exit_code: 0
+process_env_ready=false
+process_env_missing=['QWEN_MODEL_ROOT', 'SVCBENCH_ROOT']
+annotation_only_ready=false
+annotation_only_missing=['QWEN_MODEL_ROOT', 'SVCBENCH_ROOT/data/videos']
+flat_annotations_exist=True
+official_video_directory=data/videos
+videos_exist=False
+local_only_constructor_guard=local Qwen model root does not exist: F:\missing-qwen3-vl-8b
+svcbench_checkout_total_file_bytes=6714173
+vcbench_data.jsonl_bytes=421830
+vcbench_eval.jsonl_bytes=1293297
+hf_tokenizer_cache_total_file_bytes=11491943
+a0_run_status=not_run_missing_original_8b_and_videos

@@ -1,0 +1,18 @@
+captured_at_utc: 2026-07-13T17:59:23.3234498Z
+mode: local tensor-only; UV_OFFLINE=1; HF_HUB_OFFLINE=1; TRANSFORMERS_OFFLINE=1
+exit_code: 0
+processor_class=transformers.models.qwen3_vl.video_processing_qwen3_vl.Qwen3VLVideoProcessor
+checkpoint_revision=0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
+configured_size=shortest_edge:4096,longest_edge:25165824
+demo_input_shape=[1, 16, 3, 224, 224]
+demo_grid=[[8, 14, 14]]
+demo_raw_qwen_pixels_shape=[1568, 1536]
+demo_project_pixels_shape=[1, 1568, 1536]
+demo_patch_dim=1536
+demo_token_count=1568
+variable_input_shape=[1, 7, 3, 160, 288]
+variable_grid=[[4, 10, 18]]
+variable_project_pixels_shape=[1, 720, 1536]
+bare_default_grid=[[8, 12, 12]]
+bare_default_pixels_shape=[1152, 1536]
+interpretation=the checkpoint pixel budget must be explicit; the bare Transformers default resizes the demo to 192x192

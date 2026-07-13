@@ -1,0 +1,29 @@
+captured_at_utc: 2026-07-13T17:59:23.3234498Z
+mode: local annotation-only; UV_OFFLINE=1
+exit_code: 0
+dataset_revision=a0f0ec08bbc962111dc9761a828267bd032a0f8d
+grouped_format=grouped
+grouped_rows=1000
+grouped_expanded_queries=4576
+grouped_unique_videos=406
+grouped_sha256=942b4b6cc2c0d8d339c8ab4605edff03ee5e81784310f24b282faab88211f9ee
+flat_format=flat
+flat_queries=4576
+flat_unique_videos=406
+flat_sha256=c2a47e24e5d53a9976f285779affb0da48a77235793de0803bd9a058e361d097
+grouped_flat_semantic_match=false
+occurrence_point_list_rows=621
+occurrence_start_end_rows=379
+runtime_allowlist=explicit_time_values,query_time,question,video
+runtime_denylist=answer,count,counting_subtype,counting_type,occurrence_times
+official_clean_fold_guard=official clean data cannot be split for training or calibration
+common_trajectory_query_keys=4432
+grouped_only_trajectory_query_keys=144
+flat_only_trajectory_query_keys=144
+shared_key_video_id_mismatches=1638
+shared_key_question_mismatches=963
+shared_key_query_time_mismatches=2050
+shared_key_count_mismatches=718
+shared_key_counting_type_mismatches=8
+shared_key_counting_subtype_mismatches=24
+interpretation=the official README selects the flat file for evaluation; grouped and flat are not interchangeable snapshots

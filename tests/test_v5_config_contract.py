@@ -57,6 +57,33 @@ def test_v5_base_and_deepstack_contract() -> None:
     assert all(model.online_freeze.model_dump().values())
 
 
+def test_p2_data_and_checkpoint_video_processor_contract() -> None:
+    config = load_config()
+
+    assert config.data.video_directory == "data/videos"
+    assert config.data.group_key_fields == ("source_dataset", "video_path")
+    assert config.data.group_k_folds == 5
+    assert config.data.fold_seed == 42
+    assert config.data.runtime_allowlist == (
+        "video",
+        "question",
+        "query_time",
+        "explicit_time_values",
+    )
+    assert config.data.runtime_denylist == (
+        "answer",
+        "count",
+        "occurrence_times",
+        "counting_type",
+        "counting_subtype",
+    )
+    video = config.video_preprocessing
+    assert (video.frames_per_chunk, video.stride_frames, video.sample_fps) == (16, 8, 2.0)
+    assert video.causal_boundary == "right_closed"
+    assert (video.processor_shortest_edge, video.processor_longest_edge) == (4096, 25_165_824)
+    assert (video.patch_size, video.temporal_patch_size, video.spatial_merge_size) == (16, 2, 2)
+
+
 def test_v5_fast_and_inner_sgd_contract() -> None:
     fast = load_config().fast_ttt
 

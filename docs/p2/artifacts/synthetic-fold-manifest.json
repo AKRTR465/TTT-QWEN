@@ -1,0 +1,96 @@
+{
+  "dataset_name": "synthetic-p2-training",
+  "dataset_revision": "fixture-v1",
+  "annotation_sha256": "9935f8f627c68b5fb71c554836fb48eca6cfed89cde1f10fae67c61b8245d7ca",
+  "seed": 42,
+  "group_key": "source_dataset/video_path",
+  "folds": [
+    {
+      "fold_index": 0,
+      "train_query_ids": [
+        "train-002:0",
+        "train-002:1",
+        "train-003:0",
+        "train-003:1",
+        "train-004:0",
+        "train-004:1",
+        "train-005:0",
+        "train-005:1"
+      ],
+      "validation_query_ids": [
+        "train-000:0",
+        "train-000:1",
+        "train-001:0",
+        "train-001:1"
+      ],
+      "train_video_ids": [
+        "synthetic/video-2.mp4",
+        "synthetic/video-3.mp4",
+        "synthetic/video-4.mp4",
+        "synthetic/video-5.mp4"
+      ],
+      "validation_video_ids": [
+        "synthetic/video-0.mp4",
+        "synthetic/video-1.mp4"
+      ]
+    },
+    {
+      "fold_index": 1,
+      "train_query_ids": [
+        "train-000:0",
+        "train-000:1",
+        "train-001:0",
+        "train-001:1",
+        "train-003:0",
+        "train-003:1",
+        "train-004:0",
+        "train-004:1"
+      ],
+      "validation_query_ids": [
+        "train-002:0",
+        "train-002:1",
+        "train-005:0",
+        "train-005:1"
+      ],
+      "train_video_ids": [
+        "synthetic/video-0.mp4",
+        "synthetic/video-1.mp4",
+        "synthetic/video-3.mp4",
+        "synthetic/video-4.mp4"
+      ],
+      "validation_video_ids": [
+        "synthetic/video-2.mp4",
+        "synthetic/video-5.mp4"
+      ]
+    },
+    {
+      "fold_index": 2,
+      "train_query_ids": [
+        "train-000:0",
+        "train-000:1",
+        "train-001:0",
+        "train-001:1",
+        "train-002:0",
+        "train-002:1",
+        "train-005:0",
+        "train-005:1"
+      ],
+      "validation_query_ids": [
+        "train-003:0",
+        "train-003:1",
+        "train-004:0",
+        "train-004:1"
+      ],
+      "train_video_ids": [
+        "synthetic/video-0.mp4",
+        "synthetic/video-1.mp4",
+        "synthetic/video-2.mp4",
+        "synthetic/video-5.mp4"
+      ],
+      "validation_video_ids": [
+        "synthetic/video-3.mp4",
+        "synthetic/video-4.mp4"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+captured_at_utc: 2026-07-13T18:23:34.7506712Z
+mode: UV_OFFLINE=1; HF_HUB_OFFLINE=1; TRANSFORMERS_OFFLINE=1
+command_1: uv sync --frozen
+command_1_exit_code: 0
+command_1_result: Checked 74 packages in 6ms
+command_2: uv run pytest -q
+command_2_exit_code: 0
+command_2_result: 70 passed in 20.61s
+command_3: uv run ruff check .
+command_3_exit_code: 0
+command_3_result: All checks passed!
+command_4: uv run mypy src
+command_4_exit_code: 0
+command_4_result: Success: no issues found in 21 source files
+gate_interpretation=P2 passed under the user-approved synthetic engineering exit; real 8B A0 remains required at P19/P21/P22

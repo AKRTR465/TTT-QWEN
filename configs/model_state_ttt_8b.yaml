@@ -6,6 +6,30 @@ paths:
   hf_home_env: HF_HOME
   output_root_env: OUTPUT_ROOT
 
+data:
+  grouped_annotation_file: data/vcbench_data.jsonl
+  flat_annotation_file: data/vcbench_eval.jsonl
+  video_directory: data/videos
+  group_key_fields: [source_dataset, video_path]
+  group_k_folds: 5
+  fold_seed: 42
+  runtime_allowlist: [video, question, query_time, explicit_time_values]
+  runtime_denylist: [answer, count, occurrence_times, counting_type, counting_subtype]
+  official_clean_selection_forbidden: true
+
+video_preprocessing:
+  sample_fps: 2.0
+  frames_per_chunk: 16
+  stride_frames: 8
+  causal_boundary: right_closed
+  processor_shortest_edge: 4096
+  processor_longest_edge: 25165824
+  patch_size: 16
+  temporal_patch_size: 2
+  spatial_merge_size: 2
+  pad_value: 0.0
+  full_tubelet_required_for_state: true
+
 model:
   base_model: Qwen/Qwen3-VL-8B-Instruct
   revision: 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b

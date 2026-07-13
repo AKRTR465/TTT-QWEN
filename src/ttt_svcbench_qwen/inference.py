@@ -7,12 +7,14 @@ Forbidden: training labels, cross-video state, future frames, or repeated update
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import NoReturn
 
 import torch
 from torch import Tensor
 
+from ttt_svcbench_qwen.data import assert_runtime_payload_safe
 from ttt_svcbench_qwen.fast_ttt import FastWeightsState, OptimizerRuntimeState
 from ttt_svcbench_qwen.identity_bank import IdentityBankRuntimeState
 from ttt_svcbench_qwen.state_bank import HeadType, StateBankRuntimeState
@@ -66,3 +68,9 @@ def run_inference(*_args: object, **_kwargs: object) -> NoReturn:
     """P18 owns reset, causal chunk order, one-time prefill, and release."""
 
     raise NotImplementedError("Inference protocol implementation is deferred to P18")
+
+
+def assert_inference_runtime_payload(payload: Mapping[str, object]) -> None:
+    """P2 leakage guard applied before any inference/model handoff."""
+
+    assert_runtime_payload_safe(payload, layer="Inference")

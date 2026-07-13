@@ -1,0 +1,20 @@
+captured_at_utc: 2026-07-13T18:18:03.8829222Z
+human_decision: user approved synthetic fake data for missing P2 assets to unblock P3
+scientific_scope: engineering dry-run only; not an original Qwen3-VL-8B result
+synthetic_training_fixture_sha256=9935f8f627c68b5fb71c554836fb48eca6cfed89cde1f10fae67c61b8245d7ca
+synthetic_training_fixture_bytes=1470
+synthetic_fold_manifest_sha256=d83699e4c99166c3cc6c0de692a4ff7de4a291e83fbd798abaf379eec35a0507
+synthetic_fold_manifest_bytes=2225
+synthetic_fold_count=3
+synthetic_fold_seed=42
+synthetic_fold_video_overlap=0
+synthetic_a0_report_sha256=b11be8702d7ca6717c08606edb9c832c33d873c038621225a93b68c18c4304e9
+synthetic_a0_report_bytes=1332
+synthetic_a0_model_id=synthetic/p2-a0-engineering-fixture
+synthetic_a0_state_modules_enabled=false
+synthetic_a0_ttt_enabled=false
+synthetic_a0_query_count=2
+synthetic_a0_failure_case_count=1
+tiny_runtime_video_bytes=1128
+tiny_runtime_video_persisted=false
+real_qwen3vl8b_a0_status=deferred_to_P19_P21_P22

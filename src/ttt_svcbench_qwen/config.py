@@ -53,6 +53,32 @@ class PathsConfig(FrozenModel):
     output_root_env: str
 
 
+class DataConfig(FrozenModel):
+    grouped_annotation_file: str
+    flat_annotation_file: str
+    video_directory: str
+    group_key_fields: tuple[str, ...]
+    group_k_folds: PositiveInt
+    fold_seed: NonNegativeInt
+    runtime_allowlist: tuple[str, ...]
+    runtime_denylist: tuple[str, ...]
+    official_clean_selection_forbidden: bool
+
+
+class VideoPreprocessingConfig(FrozenModel):
+    sample_fps: PositiveFloat
+    frames_per_chunk: PositiveInt
+    stride_frames: PositiveInt
+    causal_boundary: str
+    processor_shortest_edge: PositiveInt
+    processor_longest_edge: PositiveInt
+    patch_size: PositiveInt
+    temporal_patch_size: PositiveInt
+    spatial_merge_size: PositiveInt
+    pad_value: float
+    full_tubelet_required_for_state: bool
+
+
 class VisionConfig(FrozenModel):
     depth: PositiveInt
     hidden_size: PositiveInt
@@ -315,6 +341,8 @@ class ProjectConfig(FrozenModel):
 
     spec_version: str
     paths: PathsConfig
+    data: DataConfig
+    video_preprocessing: VideoPreprocessingConfig
     model: ModelConfig
     fast_ttt: FastTTTConfig
     spatial_encoder: SpatialEncoderConfig
@@ -339,6 +367,70 @@ class ProjectConfig(FrozenModel):
             ("paths.svcbench_root_env", self.paths.svcbench_root_env, "SVCBENCH_ROOT"),
             ("paths.hf_home_env", self.paths.hf_home_env, "HF_HOME"),
             ("paths.output_root_env", self.paths.output_root_env, "OUTPUT_ROOT"),
+            (
+                "data.grouped_annotation_file",
+                self.data.grouped_annotation_file,
+                "data/vcbench_data.jsonl",
+            ),
+            (
+                "data.flat_annotation_file",
+                self.data.flat_annotation_file,
+                "data/vcbench_eval.jsonl",
+            ),
+            ("data.video_directory", self.data.video_directory, "data/videos"),
+            ("data.group_key_fields", self.data.group_key_fields, ("source_dataset", "video_path")),
+            ("data.group_k_folds", self.data.group_k_folds, 5),
+            ("data.fold_seed", self.data.fold_seed, 42),
+            (
+                "data.runtime_allowlist",
+                self.data.runtime_allowlist,
+                ("video", "question", "query_time", "explicit_time_values"),
+            ),
+            (
+                "data.runtime_denylist",
+                self.data.runtime_denylist,
+                ("answer", "count", "occurrence_times", "counting_type", "counting_subtype"),
+            ),
+            (
+                "data.official_clean_selection_forbidden",
+                self.data.official_clean_selection_forbidden,
+                True,
+            ),
+            ("video_preprocessing.sample_fps", self.video_preprocessing.sample_fps, 2.0),
+            ("video_preprocessing.frames_per_chunk", self.video_preprocessing.frames_per_chunk, 16),
+            ("video_preprocessing.stride_frames", self.video_preprocessing.stride_frames, 8),
+            (
+                "video_preprocessing.causal_boundary",
+                self.video_preprocessing.causal_boundary,
+                "right_closed",
+            ),
+            (
+                "video_preprocessing.processor_shortest_edge",
+                self.video_preprocessing.processor_shortest_edge,
+                4096,
+            ),
+            (
+                "video_preprocessing.processor_longest_edge",
+                self.video_preprocessing.processor_longest_edge,
+                25_165_824,
+            ),
+            ("video_preprocessing.patch_size", self.video_preprocessing.patch_size, 16),
+            (
+                "video_preprocessing.temporal_patch_size",
+                self.video_preprocessing.temporal_patch_size,
+                2,
+            ),
+            (
+                "video_preprocessing.spatial_merge_size",
+                self.video_preprocessing.spatial_merge_size,
+                2,
+            ),
+            ("video_preprocessing.pad_value", self.video_preprocessing.pad_value, 0.0),
+            (
+                "video_preprocessing.full_tubelet_required_for_state",
+                self.video_preprocessing.full_tubelet_required_for_state,
+                True,
+            ),
             ("model.base_model", self.model.base_model, BASE_MODEL_ID),
             ("model.revision", self.model.revision, BASE_MODEL_REVISION),
             ("model.transformers_version", self.model.transformers_version, TRANSFORMERS_VERSION),
@@ -482,11 +574,31 @@ class ProjectConfig(FrozenModel):
                 raise ValueError(f"{path} must be {expected!r}; got {actual!r}")
 
         self._validate_attention_dimensions()
+        self._validate_video_preprocessing_contract()
         self._validate_head_contracts()
         self._validate_state_and_query_contracts()
         self._validate_calibration_gate()
         self._validate_parameter_budget()
         return self
+
+    def _validate_video_preprocessing_contract(self) -> None:
+        video = self.video_preprocessing
+        vision = self.model.vision
+        if video.patch_size != vision.patch_size:
+            raise ValueError("video_preprocessing.patch_size must match model.vision.patch_size")
+        if video.temporal_patch_size != vision.temporal_patch_size:
+            raise ValueError(
+                "video_preprocessing.temporal_patch_size must match "
+                "model.vision.temporal_patch_size"
+            )
+        if video.spatial_merge_size != vision.spatial_merge_size:
+            raise ValueError(
+                "video_preprocessing.spatial_merge_size must match model.vision.spatial_merge_size"
+            )
+        if video.frames_per_chunk % video.temporal_patch_size != 0:
+            raise ValueError("frames_per_chunk must be divisible by temporal_patch_size")
+        if video.stride_frames > video.frames_per_chunk:
+            raise ValueError("stride_frames cannot exceed frames_per_chunk")
 
     def _validate_attention_dimensions(self) -> None:
         attention = (

@@ -1,0 +1,2 @@
+{"id":"0000","source_dataset":"RoomTour3D","video_path":"demo-a.mp4","question":"How many pillows were visible in the last 5 seconds?","counting_type":"O1","counting_subtype":"O1-Snap","occurrence_times":[1.0,2.0],"query_points":{"time":[1.0,2.0],"count":[2,4]}}
+{"id":"0001","source_dataset":"simulated","video_path":"demo-b.mp4","question":"How many objects are visible now?","counting_type":"O1","counting_subtype":"O1-Snap","occurrence_times":[3.0],"query_points":{"time":[3.0],"count":[1]}}

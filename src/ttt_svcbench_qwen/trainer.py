@@ -7,10 +7,12 @@ Forbidden: duplicating module algorithms, hidden labels in support loss, or clea
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import NoReturn
 
+from ttt_svcbench_qwen.data import assert_runtime_payload_safe
 from ttt_svcbench_qwen.losses import TrainingLossOutput
 
 
@@ -38,3 +40,9 @@ def build_trainer(*_args: object, **_kwargs: object) -> NoReturn:
     """P15-P19 own the stage-specific training orchestration."""
 
     raise NotImplementedError("Trainer implementation is deferred to P15-P19")
+
+
+def assert_trainer_runtime_payload(payload: Mapping[str, object]) -> None:
+    """P2 leakage guard applied before any trainer/model handoff."""
+
+    assert_runtime_payload_safe(payload, layer="Trainer")

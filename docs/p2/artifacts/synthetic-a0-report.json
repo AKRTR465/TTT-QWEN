@@ -1,0 +1,49 @@
+{
+  "model_id": "synthetic/p2-a0-engineering-fixture",
+  "model_revision": "fixture-v1",
+  "state_modules_enabled": false,
+  "ttt_enabled": false,
+  "prompt_template": "SYNTHETIC ENGINEERING DRY-RUN: {question} Answer with ONLY one integer.",
+  "generation_parameters": {
+    "do_sample": false,
+    "max_new_tokens": 8,
+    "synthetic": true
+  },
+  "metrics": {
+    "query_count": 2,
+    "valid_prediction_count": 1,
+    "valid_prediction_rate": 0.5,
+    "exact_count_accuracy": 0.5,
+    "count_mae_on_valid_predictions": 0,
+    "answer_accuracy": 0.5,
+    "mean_latency_seconds": 0.01,
+    "median_latency_seconds": 0.01,
+    "peak_gpu_memory_bytes": 0
+  },
+  "predictions": [
+    {
+      "query_id": "0000",
+      "trajectory_id": "0000",
+      "video_id": "RoomTour3D/demo-a.mp4",
+      "query_time": 1.0,
+      "raw_answer": "2",
+      "predicted_count": 2,
+      "ground_truth_count": 2,
+      "expected_answer": "2",
+      "latency_seconds": 0.01,
+      "peak_gpu_memory_bytes": 0
+    },
+    {
+      "query_id": "0001",
+      "trajectory_id": "0000",
+      "video_id": "RoomTour3D/demo-a.mp4",
+      "query_time": 2.0,
+      "raw_answer": "not-an-integer",
+      "predicted_count": null,
+      "ground_truth_count": 4,
+      "expected_answer": "4",
+      "latency_seconds": 0.01,
+      "peak_gpu_memory_bytes": 0
+    }
+  ]
+}

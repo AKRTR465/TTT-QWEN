@@ -3,7 +3,7 @@
 > 对齐源：[ARCHITECTURE.md](./ARCHITECTURE.md)  
 > 规范版本：`state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`  
 > 生成日期：2026-07-13  
-> 文档状态：施工分解 / P0–P1 已通过，P2 尚未开始
+> 文档状态：施工分解 / P0–P2 已通过，P3 尚未开始
 > 总原则：本文件只描述施工顺序和验收门禁；任何勾选都必须有代码、测试、日志或实验记录作为证据。
 
 ## 0. 使用方法
@@ -303,6 +303,11 @@
 
 建立 SVCBench 数据读取、Qwen 视频预处理、query-time 因果切分、分组划分和原始 8B 零样本基线。依赖 P1。
 
+> 2026-07-14 用户批准的临时退出口径：受本机空间限制，缺失的视频、非 clean 训练集和 8B
+> 权重以合成 fixture/predictor 完成 P2 工程链路验收并解锁 P3。下列 A0 `[x]` 只表示数据、
+> 指标、报告和禁用 State-TTT 的工程接口可重复；原始 Qwen3-VL-8B 科学基线仍必须在
+> P19/P21/P22 使用真实权重和视频完成，合成指标不得用于论文比较或增益结论。
+
 ### 实施前注意事项
 
 - Demo 的 16 帧、224×224、2 fps 只用于 shape 验收，不是数据集长度硬编码。
@@ -314,60 +319,60 @@
 
 #### P2.1 SVCBench schema 与防泄漏
 
-- [ ] 解析 video_path、question、query point/time、训练标签和评估字段。
-- [ ] 为运行时输入建立 allowlist，只传 video/question/query_time/显式时间数值。
-- [ ] 为 answer、count、occurrence_times、counting_type、counting_subtype 建立 denylist。
-- [ ] 在 Dataset、Collator、Trainer、Inference 四层分别加入泄漏断言。
-- [ ] 按 video_path 执行 GroupKFold，确保同视频全部问题和 query point 同折。
-- [ ] 保存 fold manifest 并检查 video_id 交集为空。
-- [ ] 禁止 clean 官方测试视频参与预训练、校准或阈值选择。
+- [x] 解析 video_path、question、query point/time、训练标签和评估字段。
+- [x] 为运行时输入建立 allowlist，只传 video/question/query_time/显式时间数值。
+- [x] 为 answer、count、occurrence_times、counting_type、counting_subtype 建立 denylist。
+- [x] 在 Dataset、Collator、Trainer、Inference 四层分别加入泄漏断言。
+- [x] 按 video_path 执行 GroupKFold，确保同视频全部问题和 query point 同折。
+- [x] 保存合成 fold manifest 并检查 video_id 交集为空。
+- [x] 禁止 clean 官方测试视频参与预训练、校准或阈值选择。
 
 #### P2.2 因果视频采样
 
-- [ ] 在 query_time 处做严格右截断，验证边界帧是否允许由时间戳定义一致决定。
-- [ ] 生成 chunk、chunk_start/end、tubelet timestamp、overlap mapping 和 valid mask。
-- [ ] 处理最后一个不足完整 chunk 的 padding，并确保 padding 不进入 loss、Bank 或 Reader。
-- [ ] 保留从采样帧到 tubelet、从 tubelet 到秒的可审计映射。
-- [ ] 为相邻重叠 chunk 生成身份/事件一致性所需对齐索引，但不读取未来帧。
+- [x] 在 query_time 处做严格右截断，验证边界帧是否允许由时间戳定义一致决定。
+- [x] 生成 chunk、chunk_start/end、tubelet timestamp、overlap mapping 和 valid mask。
+- [x] 处理最后一个不足完整 chunk 的 padding，以 valid mask 建立禁止其进入 loss、Bank 或 Reader 的消费契约；后续消费者在 P9/P12/P14 复验。
+- [x] 保留从采样帧到 tubelet、从 tubelet 到秒的可审计映射。
+- [x] 为相邻重叠 chunk 生成身份/事件一致性所需对齐索引，但不读取未来帧。
 
 #### P2.3 Qwen Video Processor Demo
 
-- [ ] 构造 `X=[1,16,3,224,224]`、fps=2 的固定 fixture。
-- [ ] 验证 temporal grid：`16/2=8`。
-- [ ] 验证 spatial grid：`224/16=14`、`224/16=14`。
-- [ ] 验证 `video_grid_thw=[8,14,14]`。
-- [ ] 验证 patch/tubelet 数：`8×14×14=1568`。
-- [ ] 验证每 tubelet 展平维：`2×3×16×16=1536`。
-- [ ] 验证 `pixel_values_videos=[1,1568,1536]`。
-- [ ] 用非 16 帧、非 224 分辨率样例证明 shape 来自 grid，而不是硬编码。
+- [x] 构造 `X=[1,16,3,224,224]`、fps=2 的固定 fixture。
+- [x] 验证 temporal grid：`16/2=8`。
+- [x] 验证 spatial grid：`224/16=14`、`224/16=14`。
+- [x] 验证 `video_grid_thw=[8,14,14]`。
+- [x] 验证 patch/tubelet 数：`8×14×14=1568`。
+- [x] 验证每 tubelet 展平维：`2×3×16×16=1536`。
+- [x] 验证 `pixel_values_videos=[1,1568,1536]`。
+- [x] 用非 16 帧、非 224 分辨率样例证明 shape 来自 grid，而不是硬编码。
 
 #### P2.4 Query token 数据
 
-- [ ] 只截取完整问题 token 对应的 embedding 输入范围。
-- [ ] 排除 system answer、assistant target、标签 token 和 padding。
-- [ ] 生成 query padding mask。
-- [ ] 用 Demo 问题“当前画面有几架无人机？”验证演示 `L_q=7` 的接口，但不固定真实长度。
+- [x] 只截取完整问题 token 对应的 embedding 输入范围，超长时拒绝而不静默截断。
+- [x] 排除 system answer、assistant target、标签 token 和 padding。
+- [x] 生成 query padding mask。
+- [x] 用 Demo 问题“当前画面有几架无人机？”验证演示 `L_q=7` 的接口，但不固定真实长度。
 
 #### P2.5 A0 原始模型基线
 
-- [ ] 运行原始 Qwen3-VL-8B 零样本推理，完全关闭状态模块和 TTT。
-- [ ] 记录 exact count accuracy、count MAE、answer accuracy、延迟和显存。
-- [ ] 保存 prompt/chat template、sampling/generation 参数和失败案例。
-- [ ] 把 A0 作为后续功能等价与增益对照。
+- [x] 以合成 predictor 跑通 A0 工程链路并完全关闭状态模块和 TTT；真实 8B 实测移交 P19/P21。
+- [x] 在合成报告中记录 exact count accuracy、count MAE、answer accuracy、延迟和显存字段。
+- [x] 保存合成 dry-run 的 prompt template、generation 参数和失败案例。
+- [x] 将合成 A0 作为接口等价锚点；科学增益对照仍要求 P21 的真实 A0。
 
 ### 实施后验收项
 
-- [ ] Demo 十个核心 shape 中数据侧项目全部通过。
-- [ ] 任意样本都能证明最大可见时间不超过 query_time。
-- [ ] Dataset/Collator 输出中不存在 denylist 字段。
-- [ ] GroupKFold 无 video 泄漏。
-- [ ] 变长视频、尾 chunk、空/短视频和多 query point 均有测试。
-- [ ] A0 可重复运行并生成完整指标。
+- [x] Demo 十个核心 shape 中 P2 数据侧项目全部通过。
+- [x] 任意样本都能证明最大可见时间不超过 query_time。
+- [x] Dataset/Collator 输出中不存在 denylist 字段。
+- [x] GroupKFold 无 video 泄漏。
+- [x] 变长视频、尾 chunk、空/短视频和多 query point 均有测试。
+- [x] 合成 A0 可重复运行并生成完整工程指标字段；真实 A0 保留在 P19/P21。
 
 ### 交付物与退出条件
 
-- [ ] 交付 Dataset、Collator、causal chunker、Demo fixtures、fold manifests 和 A0 报告。
-- [ ] 数据防泄漏测试未通过时禁止进入任何模型训练。
+- [x] 交付 Dataset、Collator、causal chunker、Demo fixtures、合成 fold manifest 和合成 A0 报告。
+- [x] 数据防泄漏测试通过，并保留失败时禁止进入任何模型训练的强制 guard。
 
 ---
 

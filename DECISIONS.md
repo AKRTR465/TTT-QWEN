@@ -1,8 +1,8 @@
-# 实施决策（v5 高容量版，P1 配置/类型/骨架阶段）
+# 实施决策（v5 高容量版，P0–P2 已通过）
 
 本文件记录已经冻结的 v5 边界。P0 已冻结规格和仓库基线；P1 已把运行 YAML、强类型配置、
-运行时类型和推荐模块骨架迁移到 v5。所有真实模型、状态、训练和推理入口仍未实现，并明确
-抛出 `NotImplementedError`。详细论证见
+运行时类型和推荐模块骨架迁移到 v5；P2 已通过数据、因果预处理和合成 A0 工程门禁。模型 hook、
+状态、训练和推理入口仍按后续 Part 实现。详细论证见
 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前规范版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
@@ -17,6 +17,17 @@
 4. P1 类型覆盖 VideoBatch、Query/TimeWindow、空间/时间输出与 cache、四类 soft output、
    typed records、Retriever、ReaderResult 以及完整 per-video runtime ownership。
 5. 推荐模块当前只提供职责边界、类型和显式未实现入口；模块可导入不等于算法已实现。
+
+## P2 合成退出决策
+
+2026-07-14，用户明确批准：为节省本机空间，P2 缺失的视频、非 clean 训练集和 8B 权重可由
+合成 fixture/predictor 完成工程链路验收，以便在全部代码门禁通过后开始 P3。
+
+- 合成 fold 只验证分组、seed、manifest 和 video_id 零交集；不用于阈值或训练结论；
+- 合成 A0 只验证禁用 State-TTT、指标聚合、prompt/generation 参数、失败案例和报告序列化；
+- 合成 A0 的模型 ID 必须以 `synthetic/` 开头，指标不得称为原始 Qwen3-VL-8B 结果；
+- 原始 Qwen3-VL-8B + 官方视频 A0 仍是 P19/P21/P22 的发布前必需证据；
+- P2 工程门禁通过不改变上述科学验证要求。
 
 ## 已固定
 

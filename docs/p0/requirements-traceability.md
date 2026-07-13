@@ -8,12 +8,12 @@
 | ARCH-00-GOAL-001 | `0` | 目标与职责分离 | P0、P13、P22 | `tests/test_end_to_end_demo.py`、P22 最终一句话审计 | 已冻结 | 未实现 |
 | ARCH-00-BOUNDARY-001 | `0.1` | 第一版固定边界 | P0–P5、P18、P20 | `tests/test_v5_config_contract.py`、`tests/test_inference_protocol.py` | 已冻结 | 未实现 |
 | ARCH-00-NOGO-001 | `0.2` | 第一版明确不做 | P0、P20 | `tests/test_leakage_guards.py`、P20 禁止项扫描 | 已冻结 | 未实现 |
-| ARCH-01-VIDEO-001 | `1.1` | Demo video/grid/pixels | P2 | `tests/test_video_preprocessing.py` | 已定义 | 未实现 |
-| ARCH-01-QUERY-001 | `1.2` | Demo query/Q_h | P2、P4 | `tests/test_query_encoder.py`、`tests/test_leakage_guards.py` | 已定义 | 未实现 |
-| ARCH-01-DYNAMIC-001 | `1.3` | 动态 T 与容量独立 | P1、P2、P7、P12 | 变长输入测试、`tests/test_state_encoder.py` | 已定义 | 未实现 |
+| ARCH-01-VIDEO-001 | `1.1` | Demo video/grid/pixels | P2 | `tests/test_video_preprocessing.py` | 已定义 | P2 已验证 |
+| ARCH-01-QUERY-001 | `1.2` | Demo query/Q_h | P2、P4 | `tests/test_query_tokens.py`、`tests/test_query_encoder.py` | 已定义 | P2 token 范围已验证；P4 encoder 待实现 |
+| ARCH-01-DYNAMIC-001 | `1.3` | 动态 T 与容量独立 | P1、P2、P7、P12 | 变长输入测试、`tests/test_state_encoder.py` | 已定义 | P2 变长预处理已验证；后续模块待实现 |
 | ARCH-02-FLOW-001 | `2` | 总体数据流 | P3–P18 | `tests/test_end_to_end_demo.py` | 已定义 | 未实现 |
 | ARCH-03-BASE-001 | `3.1` | Qwen 基础配置 | P1、P3 | `tests/test_v5_config_contract.py`、`tests/test_qwen_adapter.py` | 已定义 | 未实现 |
-| ARCH-03-MERGER-001 | `3.2` | PatchEmbed/Main Merger | P2–P3 | `tests/test_video_preprocessing.py`、`tests/test_qwen_adapter.py` | 已定义 | 未实现 |
+| ARCH-03-MERGER-001 | `3.2` | PatchEmbed/Main Merger | P2–P3 | `tests/test_video_preprocessing.py`、`tests/test_qwen_adapter.py` | 已定义 | P2 processor 输入已验证；P3 hook 待实现 |
 | ARCH-03-INSERT-001 | `3.3` | State-TTT 插入点 | P3 | `tests/test_qwen_adapter.py` hook 顺序测试 | 已定义 | 未实现 |
 | ARCH-03-DEEPSTACK-001 | `3.4` | DeepStack 原路径 | P3、P13、P20 | `tests/test_qwen_adapter.py` 原模型等价测试 | 已定义 | 未实现 |
 | ARCH-04-FAST-001 | `4.1` | Fast 张量结构 | P5 | `tests/test_fast_ttt.py` | 已定义 | 未实现 |
@@ -52,13 +52,13 @@
 | ARCH-13-STATE-001 | `13.1` | State Loss | P14–P15 | `tests/test_losses.py` task-specific supervision | 已定义 | 未实现 |
 | ARCH-13-ANSWER-001 | `13.2` | Answer Loss/三指标 | P14–P15 | `tests/test_losses.py` 指标分离 | 已定义 | 未实现 |
 | ARCH-13-OUTER-001 | `13.3` | Meta-TTT Outer Loss | P14、P16–P17 | `tests/test_losses.py` after-update gradient | 已定义 | 未实现 |
-| ARCH-14-STAGE0-001 | `14 Stage 0` | 数据与 A0 基线 | P2 | P2 A0/fold/leakage 审计 | 已定义 | 未运行 |
+| ARCH-14-STAGE0-001 | `14 Stage 0` | 数据与 A0 基线 | P2 | P2 A0/fold/leakage 审计 | 已定义 | P2 合成工程门禁已验证；真实 8B A0 延至 P19/P21/P22 |
 | ARCH-14-STAGEA-001 | `14 Stage A` | 显式状态 Warm-up | P15 | P15 A2 训练记录 | 已定义 | 未运行 |
 | ARCH-14-STAGEB-001 | `14 Stage B` | 单步 Meta-TTT | P16 | P16 A3 after-update 记录 | 已定义 | 未运行 |
 | ARCH-14-STAGEC-001 | `14 Stage C` | 身份/事件一致性 | P17 | P17 A4/A5 训练记录 | 已定义 | 未运行 |
 | ARCH-14-STAGED-001 | `14 Stage D` | 真实 8B 与分布式 | P19 | P19 服务器集成报告 | 已定义 | 未运行 |
 | ARCH-15-INFER-001 | `15` | 测试时协议 | P18 | `tests/test_inference_protocol.py` | 已定义 | 未实现 |
-| ARCH-16-LEAK-001 | `16` | 数据与防泄漏 | P2、P18、P20、P22 | `tests/test_leakage_guards.py`、P22 clean 审计 | 已定义 | 未实现 |
+| ARCH-16-LEAK-001 | `16` | 数据与防泄漏 | P2、P18、P20、P22 | `tests/test_svcbench_data.py`、P22 clean 审计 | 已定义 | P2 四层 payload guard 已验证；后续协议待复验 |
 | ARCH-17-MODULE-001 | `17` | 推荐模块与职责 | P1、附录 A | `tests/test_v5_config_contract.py`、P1 职责审计 | 已定义 | 未实现 |
 | ARCH-18-DEMO-001 | `18.1` | Demo 张量验收 | P20.1 | `tests/test_end_to_end_demo.py` | 已定义 | 未实现 |
 | ARCH-18-UPDATE-001 | `18.2` | 更新边界验收 | P20.2 | `tests/test_functional_sgd.py` | 已定义 | 未实现 |

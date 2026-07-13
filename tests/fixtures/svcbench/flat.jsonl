@@ -1,0 +1,2 @@
+{"q_id":"0000","query_index":0,"id":"0000","source_dataset":"RoomTour3D","video_path":"demo-a.mp4","question":"How many pillows are visible at this moment?","counting_type":"O1","counting_subtype":"O1-Snap","query_time":1.0,"count":2}
+{"q_id":"0001","query_index":1,"id":"0000","source_dataset":"RoomTour3D","video_path":"demo-a.mp4","question":"How many pillows are visible at this moment?","counting_type":"O1","counting_subtype":"O1-Snap","query_time":2.0,"count":4}
