@@ -147,6 +147,12 @@ class SpatialEncoderConfig(FrozenModel):
     active_slots: PositiveInt
     max_active_slots: PositiveInt
     query_dim: PositiveInt
+    layer_norm_eps: PositiveFloat
+    slot_initialization: str
+    attention_normalization: str
+    attention_epsilon: PositiveFloat
+    confidence_mode: str
+    overflow_policy: str
     slot_valid_mask: bool
     log_overflow: bool
 
@@ -494,6 +500,32 @@ class ProjectConfig(FrozenModel):
             ("spatial_encoder.active_slots", self.spatial_encoder.active_slots, 32),
             ("spatial_encoder.max_active_slots", self.spatial_encoder.max_active_slots, 64),
             ("spatial_encoder.query_dim", self.spatial_encoder.query_dim, 512),
+            ("spatial_encoder.layer_norm_eps", self.spatial_encoder.layer_norm_eps, 1.0e-5),
+            (
+                "spatial_encoder.slot_initialization",
+                self.spatial_encoder.slot_initialization,
+                "shared_seed_plus_fixed_sinusoidal_codes",
+            ),
+            (
+                "spatial_encoder.attention_normalization",
+                self.spatial_encoder.attention_normalization,
+                "softmax_slots_then_normalize_tokens",
+            ),
+            (
+                "spatial_encoder.attention_epsilon",
+                self.spatial_encoder.attention_epsilon,
+                1.0e-8,
+            ),
+            (
+                "spatial_encoder.confidence_mode",
+                self.spatial_encoder.confidence_mode,
+                "attention_occupancy",
+            ),
+            (
+                "spatial_encoder.overflow_policy",
+                self.spatial_encoder.overflow_policy,
+                "preserve_existing_reject_excess",
+            ),
             ("spatial_encoder.slot_valid_mask", self.spatial_encoder.slot_valid_mask, True),
             ("spatial_encoder.log_overflow", self.spatial_encoder.log_overflow, True),
             ("temporal_encoder.input_dim", self.temporal_encoder.input_dim, 4096),
@@ -776,6 +808,9 @@ class ProjectConfig(FrozenModel):
         exact_fast_millions = self.fast_ttt.online_parameter_count / 1_000_000
         if abs(exact_fast_millions - budget.online_fast_matrices_millions) > 1.0e-9:
             raise ValueError("online fast parameter budget must use the exact matrix count")
+        exact_spatial_millions = 24_815_360 / 1_000_000
+        if abs(exact_spatial_millions - budget.spatial_encoder_millions) > 1.0e-9:
+            raise ValueError("spatial encoder budget must use the exact P6 parameter count")
 
 
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:

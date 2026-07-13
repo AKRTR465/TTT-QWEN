@@ -1,0 +1,6 @@
+timestamp_utc=2026-07-13T21:48:22.0991067Z
+environment=UV_OFFLINE=1
+command=uv run pytest -q tests/test_state_encoder.py::test_float16_invalid_slot_forward_backward_has_only_finite_gradients
+exit_code=0
+result=1 passed in 23.66s
+scope=FP16 invalid-slot forward/backward input and all Stage parameter gradients finite

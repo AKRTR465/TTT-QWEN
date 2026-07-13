@@ -11,7 +11,7 @@ PACKAGE = ROOT / "src" / "ttt_svcbench_qwen"
 
 SKELETONS = (
     ("model", "build_model", "P13"),
-    ("state_encoder", "build_state_encoders", "P6-P7"),
+    ("state_encoder", "build_state_encoders", "P7"),
     ("observation_heads", "build_observation_heads", "P8"),
     ("state_bank", "build_state_bank", "P9"),
     ("identity_bank", "build_identity_bank", "P10"),

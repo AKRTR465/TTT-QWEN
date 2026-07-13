@@ -3,7 +3,7 @@
 > 对齐源：[ARCHITECTURE.md](./ARCHITECTURE.md)  
 > 规范版本：`state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`  
 > 生成日期：2026-07-13  
-> 文档状态：施工分解 / P0–P5 已通过，P6 允许开始
+> 文档状态：施工分解 / P0–P6 已通过，P7 允许开始
 > 总原则：本文件只描述施工顺序和验收门禁；任何勾选都必须有代码、测试、日志或实验记录作为证据。
 
 ## 0. 使用方法
@@ -83,7 +83,7 @@
 | Main Merger 输出 | `[1,392,4096]` | 空间 `2×2` merge，时间长度仍为 8 |
 | Fast Adapter | `4096→768→768→4096` | 完整约 7.48M |
 | 在线 fast matrices | 两个无 bias `768×768` | 1,179,648，约 1.18M |
-| 空间对象编码器 | 2-stage slot attention，dim=768，32 slots | 约 24.88M |
+| 空间对象编码器 | 2-stage slot attention，dim=768，32 slots | 精确 24,815,360，约 24.81536M |
 | 时间事件编码器 | 6-layer causal Transformer，dim=768 | 约 48.49M |
 | Query Encoder | `4096→768` + 4-layer Bi-Transformer + 3 heads | 约 36.03M |
 | O1 | FiLM + `768→1024→1024→6` | 约 2.63M |
@@ -94,7 +94,7 @@
 | TTT Predictor | `768→1536→768` | 约 2.36M |
 | State Resampler | 16 queries，3 layers，`512→4096` | 约 14.72M |
 | Router/Resolver/empty record | 9 prototypes 等 | 约 0.14M |
-| 新增模块总计 | 不含 8B 基座 | 约 156.83M |
+| 新增模块总计 | 不含 8B 基座 | 当前分项和 156.75536M，约 156.76M |
 
 - [ ] 参数审计同时报告：新增模块约占 8B 基座的 2%，但在线实际变化的只有约 1.18M fast 参数。
 
@@ -550,59 +550,87 @@
 ### 实施前注意事项
 
 - 32 是当前 chunk 的 GPU 活动工作集，不是整段视频身份上限、Bank 容量或最大计数。
-- 槽初始化必须共享且受 q_target 条件化，禁止把 `[32,768]` 永久可学习向量当作身份。
-- 两个 Slot Stage 参数不共享；同一 Stage 内 3 次 refinement 共享参数。
-- 槽不足不能静默覆盖高置信度对象。
+- 槽初始化固定为 shared seed + 单一 `q_target:512→768` 投影 +
+  `sinusoidal(slot_index,dim)/sqrt(768)`；固定 code 必须是 `persistent=False` buffer，禁止把
+  `[32,768]` 永久可学习向量当作身份。
+- 两个 Slot Stage 的 Q/K/V/O、三个 LayerNorm、GRUCell 和 FFN 参数/storage 不共享；同一
+  Stage 内 3 次 refinement 复用同一对象。
+- P6 的 overflow 是显式 `required_slot_counts` 的结构容量审计，不是从视频识别真实对象数；
+  语义对象、新对象和长期生命周期分别留给 P8/P9。
+- P6 当前实现候选只允许使用合成张量做工程门禁，不得声称真实视频、真实 8B、语义 overflow
+  准确率或在线收益。
 
 ### 实施过程 TODO
 
 #### P6.1 网格恢复与投影
 
-- [ ] 使用 merged grid metadata 将 `Z_t[B,N_v,4096]` 恢复为 `[B,T,H_m,W_m,4096]`。
-- [ ] Demo 验证 `[1,392,4096]→[1,8,7,7,4096]`。
-- [ ] 展平空间为 `[B,T,49,4096]`，禁止假定所有输入都固定 49。
-- [ ] 实现 per-token LayerNorm + `Linear 4096→768`。
-- [ ] 传播 tubelet/spatial valid mask。
+- [x] forward 显式接收 `Z_t[B,N_max,4096]`、`visual_valid_mask[B,N_max]`、merged grid
+  metadata、`tubelet_valid_mask[B,T_max]`、`q_target[B,512]` 和逐样本 runtime。
+- [x] 使用 merged grid metadata 将每行前 `T_i×H_i×W_i` 个有效 token 恢复为
+  `[T_i,H_i,W_i,4096]`，校验 token count/offset/mask 一致。
+- [x] Demo 验证 `[1,392,4096]→[1,8,7,7,4096]`。
+- [x] batch 内支持异构 `T_i/H_i/W_i`；展平空间为 `[B,T_max,S_max,4096]` 时同步构造 bool
+  mask，禁止假定所有输入固定 49。
+- [x] 实现 per-token `LayerNorm(4096,eps=1e-5)` + 带 bias `Linear 4096→768`。
+- [x] 传播 tubelet/spatial valid mask；无效位置不得进入 attention、confidence 或 recurrent
+  update。
 
 #### P6.2 Query-conditioned Recurrent Slot Attention
 
-- [ ] 实现共享槽初始化，并用 `q_target:512→768` 条件化。
-- [ ] 为每个时间片用上一时间片槽作为当前 recurrent 初始化。
-- [ ] 实现 Stage 1：12-head slot attention，head_dim=64。
-- [ ] 实现 Stage 1 GRUCell，hidden=768。
-- [ ] 实现 Stage 1 FFN `768→3072→768`。
-- [ ] 在 Stage 1 使用 Pre-LayerNorm、SiLU 和 residual。
-- [ ] Stage 1 每个时间片执行 3 次共享参数 refinement。
-- [ ] 独立实现同结构 Stage 2，确认参数对象与 Stage 1 不共享。
-- [ ] 将 q_target 同时用于共享槽初始化和 attention query 条件化。
-- [ ] 在所有 refinement 中正确使用 spatial mask 和 slot_valid_mask。
+- [x] 实现一个共享可学习 seed、一个全模块唯一的带 bias `q_target:512→768` 投影，以及按
+  `sinusoidal/sqrt(768)` 确定的非持久 fixed slot code。
+- [x] 首个有效 tubelet 用 shared/query/fixed 初始化；后续有效 tubelet 用上一有效 tubelet 槽作为
+  recurrent 初始化，无效 tubelet 原样 carry。
+- [x] 实现 Stage 1：12-head、head_dim=64 的完整带 bias Q/K/V/O 投影。
+- [x] 自定义经典 Slot Attention 归一化：logits 先在 slot 轴 softmax，再对每槽有效 token 权重
+  以 `eps=1e-8` 归一；不得直接采用标准 MHA forward 的 token-axis softmax。
+- [x] 实现 Stage 1 GRUCell，hidden=768。
+- [x] 实现 Stage 1 FFN `768→3072→768`。
+- [x] 在 Stage 1 使用三个 `eps=1e-5` Pre-LayerNorm、SiLU 和 FFN residual。
+- [x] Stage 1 每个时间片执行 3 次共享参数 refinement。
+- [x] 独立实现同结构 Stage 2，确认参数对象与 Stage 1 不共享。
+- [x] Stage 2 复用同一个空间输入 `X`，以 Stage 1 输出作初始化。
+- [x] 将同一个 q projection 同时用于共享槽初始化和每次 attention query 条件化。
+- [x] 在所有 refinement 中正确使用 spatial mask 和 slot_valid_mask。
 
 #### P6.3 活动槽生命周期
 
-- [ ] 正式基线初始化 32 个活动槽。
-- [ ] 配置允许最大 64，不在 forward 中创建不可追踪的新参数。
-- [ ] 维护 per-video slot recurrent state，并在新视频 reset。
-- [ ] batch 内每个样本维护独立 slot state 和 slot_valid_mask。
-- [ ] 检测槽不足并增加 `active_slot_overflow_count`。
-- [ ] 定义溢出时的显式策略，至少保证不静默覆盖高置信度槽。
-- [ ] 输出 `A_t[B,K_a,768]` 和必要的 slot confidence/validity metadata。
+- [x] 正式基线初始化 32 个活动槽。
+- [x] 配置允许最大 64，不在 forward 中创建不可追踪的新参数。
+- [x] 维护 per-video slot recurrent runtime，并在新视频 reset；runtime 不注册为参数、
+  不进入 `state_dict`。
+- [x] batch 内每个样本维护独立 slot state、slot_valid_mask、occupancy confidence、overflow
+  counter/audit；previous runtime 不被原地修改，next runtime 每行使用独立新 storage。
+- [x] `detach_runtime=True` 只 detach 下一 chunk runtime，当前 `A_t` 保留到 adapted embeddings/
+  fast weights 的梯度；`False` 保留跨 chunk 图。
+- [x] occupancy confidence 使用无参 assignment mass 公式：token 再归一化前的有效 mass / 有效
+  token 数，再对 heads 求均值；范围 `[0,1]`，无效槽为 0。
+- [x] 显式接收非负整数 `required_slot_counts[B]`；每个 forward 只累计一次
+  `max(required_slot_counts-32,0)` 并记录 overflow event。
+- [x] overflow 时仍计算原 32 槽，不替换、不扩容；required 值只影响 audit，不能改变 slot 数值。
+- [x] 输出最后一个有效 tubelet 的 `A_t[B,K_a,768]` 及 confidence/validity/runtime/audit；无有效
+  tubelet 且无 previous runtime 时 fail closed。
 
 ### 实施后验收项
 
-- [ ] Demo 输出严格为 `A_t[1,32,768]`。
-- [ ] 12 heads × 64 head_dim = 768。
-- [ ] Stage 内 refinement 参数共享、Stage 间参数不共享的对象身份测试通过。
-- [ ] q_target 改变时槽条件化输出可观察变化；padding q 不污染输出。
-- [ ] 不同 batch/video 的 recurrent slot state 隔离。
-- [ ] reset 后首时间片行为可重复。
-- [ ] overflow 会被记录且无 silent overwrite。
-- [ ] 参数量约 24.88M。
-- [ ] 16/32/48/64 只作为 P21 消融配置，正式基线仍为 32。
+- [x] Demo 输出严格为 `A_t[1,32,768]`。
+- [x] 12 heads × 64 head_dim = 768。
+- [x] Stage 内 refinement 参数共享、Stage 间参数不共享的对象身份测试通过。
+- [x] q_target 改变时槽条件化输出可观察变化；padding q 不污染输出。
+- [x] 异构 grid、padding token、无效 tubelet 和 slot mask 测试通过。
+- [x] 不同 batch/video 的 recurrent slot state 和 storage 隔离。
+- [x] reset 后首时间片行为可重复。
+- [x] `detach_runtime` 两种模式的梯度测试证明当前输出不截断 fast 路径。
+- [x] required=31/32/>32 时 overflow 精确记录且 slot 数值不变，无 silent overwrite。
+- [x] 参数量精确为 24,815,360；fixed slot code、confidence、runtime 和 audit 均为零参数。
+- [x] 16/32/48/64 只作为 P21 消融配置，正式基线仍为 32。
 
 ### 交付物与退出条件
 
-- [ ] 交付 `state_encoder.py` 中空间路、slot runtime state、overflow audit 和单元测试。
-- [ ] recurrent state 隔离或 overflow 保护失败时禁止接入 O1/O2。
+- [x] 交付 `state_encoder.py` 中空间路、slot runtime state、overflow audit 和单元测试。
+- [x] recurrent state 隔离或 overflow 保护失败时禁止接入 O1/O2。
+- [x] P6 只可提供无状态 grid helper；不得提前实现 P7 temporal pooling/Transformer/cache、P8/P9
+  对象语义/hard state、P13 模型编排或 P18 受管推理生命周期。
 
 ---
 

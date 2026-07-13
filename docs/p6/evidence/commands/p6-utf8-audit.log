@@ -1,0 +1,5 @@
+timestamp_utc=2026-07-13T21:52:09.1481818Z
+scope=git ls-files --cached --others --exclude-standard with *.py,*.md,*.toml,*.yaml,*.yml,*.json,*.jsonl,*.txt,*.log
+decoder=System.Text.UTF8Encoding(false,true)
+exit_code=0
+result=UTF-8 strict decode passed: 113 tracked/untracked text files

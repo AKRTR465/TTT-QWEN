@@ -450,7 +450,21 @@ context 退出时恢复原标志。P18 仍必须另外证明 video ID 与 batch 
 
 ### 5.1 空间对象路
 
-Demo 的 adapted video token 可恢复为：
+P6 的显式输入边界为：
+
+- adapted merger tokens `Z_t: [B,N_max,4096]`；
+- `visual_valid_mask: bool[B,N_max]`；
+- `merged_grid_thw: int[B,3]` 和与之对齐的 token count/offset metadata；
+- `tubelet_valid_mask: bool[B,T_max]`；
+- `q_target: [B,512]`；
+- 可选的逐样本 previous slot runtime；
+- 仅用于容量审计的 `required_slot_counts: int[B]`。
+
+每个 batch row 必须先按自己的
+`N_i=T_i H_i W_i=prod(merged_grid_thw[i])` 切出有效 token，再恢复为
+`[T_i,H_i,W_i,4096]`。batch 内允许 `T_i/H_i/W_i` 不同；实现可以在内部按时间和空间补齐，
+但必须同时生成对应的 bool mask，不能把 Demo 的 49 个空间位置写死。Demo 的 adapted video token
+恢复为：
 
 \[
 Z_t:
@@ -459,21 +473,66 @@ Z_t:
 [1,8,7,7,4096].
 \]
 
-先将每个 merger token 投影到 768 维：
+逐样本展平空间后，先将每个 merger token 投影到 768 维：
 
 \[
-[B,8,49,4096]
-\xrightarrow{\operatorname{LayerNorm}+\operatorname{Linear}}
-[B,8,49,768].
+[B,T_i,H_iW_i,4096]
+\xrightarrow{\operatorname{LayerNorm}_{\epsilon=10^{-5}}+\operatorname{Linear}_{4096\to768}}
+[B,T_i,H_iW_i,768].
 \]
 
-空间对象路使用两阶段 Query-conditioned Recurrent Slot Attention。每个时间片依次读取 49 个
-空间 token，并用上一时间片的槽作为当前初始化：
+LayerNorm 和 Linear 都是 checkpointed Outer Training 参数，Linear 带 bias。无效 token 和无效
+tubelet 不得进入 attention、occupancy confidence 或 recurrent update。
+
+空间对象路使用两阶段 Query-conditioned Recurrent Slot Attention。首次有效 tubelet 的槽初始化为：
+
+\[
+S_0=s_{\mathrm{shared}}+P_q(q_{\mathrm{target}})
++\frac{\operatorname{SinusoidalCode}(k,d)}{\sqrt{768}}.
+\]
+
+其中 `s_shared: [1,1,768]` 是所有槽共享的唯一可学习 seed，`P_q` 是全模块唯一的带 bias
+`512→768` 投影。固定 sinusoidal slot code 按 slot index 和 feature dimension 确定，作为
+`persistent=False` buffer 注册，没有可学习缩放、不计参数、不进入 `state_dict`。后续有效 tubelet
+使用上一有效 tubelet 的槽作为 recurrent 初始化；`P_q(q_target)` 仍在每次 refinement 中条件化
+attention query。
+
+对每个 Stage、每次 refinement，令当前槽为 `S`、当前时间片有效空间 token 为 `X`：
+
+\[
+\begin{aligned}
+Q &= W_Q\left(\operatorname{LN}_{\mathrm{slot}}(S)+P_q(q_{\mathrm{target}})\right),\\
+K &= W_K\operatorname{LN}_{\mathrm{input}}(X),\\
+V &= W_V\operatorname{LN}_{\mathrm{input}}(X),\\
+L &= QK^\top/\sqrt{64}.
+\end{aligned}
+\]
+
+Q/K/V/O 都是带 bias 的完整 `768→768` 投影。这里不能直接使用标准 MHA forward 的
+token-axis softmax；归一化固定为经典 Slot Attention：
+
+1. 对 slot 轴执行 softmax，使每个有效 token 在有效槽之间竞争；
+2. 将无效 token 和无效槽的 assignment 严格置零；
+3. 对每个槽沿有效 token 轴再次归一化，分母 epsilon 固定为 `1e-8`；
+4. 聚合 V、拼接 12 个 head，并经过 O projection。
+
+随后执行：
+
+\[
+S' = \operatorname{GRUCell}(U,S),
+\qquad
+S'' = S' + W_2\operatorname{SiLU}
+\left(W_1\operatorname{LN}_{\mathrm{ffn}}(S')\right),
+\]
+
+其中 GRU hidden size=768，FFN 为 `768→3072→768`，三个 LayerNorm 的 eps 都是 `1e-5`。
+每个时间片的递归关系为：
 
 \[
 A_{t,\tau}
 =\operatorname{SlotStage}_2
 \left(
+X_{t,\tau},q_{\mathrm{target}},
 \operatorname{SlotStage}_1
 (X_{t,\tau},q_{\mathrm{target}},A_{t,\tau-1})
 \right).
@@ -486,9 +545,11 @@ A_{t,\tau}
 - 每个时间片 3 次共享参数的 slot refinement；
 - GRUCell hidden size = 768；
 - slot FFN = 768 → 3072 → 768；
-- Pre-LayerNorm、SiLU、residual；
-- q_target 通过 512 → 768 投影条件化共享槽初始化和 attention query；
-- 两个 Stage 参数不共享，stage 内的 3 次 refinement 共享参数。
+- 三个 Pre-LayerNorm、SiLU、FFN residual；
+- q_target 通过上述同一个 512 → 768 投影条件化共享槽初始化和 attention query；
+- 两个 Stage 的 Q/K/V/O、三个 LayerNorm、GRUCell 和 FFN 参数及 storage 均不共享；
+- stage 内的 3 次 refinement 重复调用同一个 Stage 对象，不复制参数；
+- Stage 2 复用同一个 `X`，并以 Stage 1 输出作为初始化。
 
 输出：
 
@@ -496,6 +557,10 @@ A_{t,\tau}
 A_t\in\mathbb R^{B\times K_a\times768},
 \qquad K_a=32.
 \]
+
+`A_t` 取当前 chunk 最后一个有效 tubelet 的 Stage 2 输出；无效 tubelet 原样 carry previous
+state。有 previous state 但当前 row 无有效 tubelet 时保留原状态并写 skip audit；既无 previous
+state 又无有效 tubelet 时必须 fail closed，不能静默生成伪观测。
 
 Demo：
 
@@ -511,12 +576,29 @@ A_t\in\mathbb R^{1\times32\times768}.
 
 实现约束：
 
-- 槽初始化使用共享、query-conditioned 参数，不能使用独立的 \([32,768]\) 永久身份参数；
-- batch 内使用 slot_valid_mask；
-- 槽不足时记录 active_slot_overflow_count；
-- 禁止静默覆盖高置信度活动对象；
+- 槽初始化使用共享、query-conditioned seed 和固定非持久 code，不能使用独立的
+  \([32,768]\) 永久可学习身份参数；
+- batch 内使用 `slot_valid_mask`，无效槽保持原值，occupancy confidence 严格为 0；
+- occupancy confidence 不增加参数：对每个 head、每个槽求 token 再归一化前的有效 assignment
+  mass，除以有效 token 数，再对 12 个 head 求均值；结果位于 `[0,1]`，使用最后一个有效
+  tubelet 的值；
+- `required_slot_counts` 是调用方提供的结构容量需求，不是 P6 从视频预测的对象数。每个 forward
+  只审计一次 `excess=max(required_slot_counts-K_a,0)`；仍计算已有 `K_a` 个槽，累计 excess 并另记
+  overflow event，不替换、不扩容，且 required 值不得改变槽数值；
+- 真实对象语义、新对象判断和长期记录生命周期属于 P8/P9，P6 不得把 capacity audit 表述为
+  semantic overflow 检测；
 - 默认 max_active_slots = 64；
-- 后续消融比较 16、32、48、64，但正式基线固定 32。
+- 后续消融比较 16、32、48、64，但正式基线固定 32，forward 不动态创建参数。
+
+slot runtime 按 video 和 batch row 隔离，至少包含槽、valid mask、confidence、累计
+overflow 及其审计计数。forward 不原地修改 previous runtime，每一行 next runtime 使用新的、
+彼此不共享的 storage；runtime 不注册为参数、不进入 `state_dict`。`detach_runtime=True` 只 detach
+交给下一 chunk 的 runtime，当前 `A_t` 仍保留到 adapted embeddings 和 fast weights 的 autograd
+路径；`detach_runtime=False` 保留跨 chunk 图，供 Outer Training 使用。
+
+P6 到此为止：可以提供无状态的 grid 恢复 helper，但不实现 P7 的时间空间池化、因果 Transformer
+或 cache；不实现 P8/P9 的对象语义与 hard state，也不承担 P13 的模型编排或 P18 的完整受管
+推理生命周期。
 
 ### 5.2 时间事件路
 
@@ -719,7 +801,7 @@ Query learned-attention 的最终标量 scorer 明确不带 bias 外，其余 Li
 | :--- | ---: |
 | Fast TTT Adapter（含慢投影） | 7.48M（精确 7,480,064） |
 | 其中在线 fast matrices | 1.18M（精确 1,179,648） |
-| 空间对象编码器 | 24.88M |
+| 空间对象编码器 | 24.81536M（精确 24,815,360） |
 | 时间事件编码器 | 48.49M |
 | Query Embedding Encoder | 36.03M |
 | O1 Decoder | 2.63M |
@@ -730,7 +812,13 @@ Query learned-attention 的最终标量 scorer 明确不带 bias 外，其余 Li
 | TTT Temporal Predictor | 2.36M |
 | 16-token State Resampler | 14.72M |
 | Operator Router、Time Resolver、empty record | 约 0.14M |
-| **新增模块合计** | **约 156.83M** |
+| **新增模块合计** | **当前分项和 156.75536M，约 156.76M** |
+
+空间对象编码器的精确审计式为：输入 LayerNorm 8,192 + 输入 Linear 3,146,496 + 单一
+q projection 393,984 + shared seed 768 + 两个独立 Stage。每个 Stage 为 Q/K/V/O 2,362,368 +
+GRUCell 3,543,552 + FFN 4,722,432 + 三个 LayerNorm 4,608，共 10,632,960；因此总计
+24,815,360。固定 sinusoidal code、occupancy confidence、mask、runtime 和 capacity audit 都不增加
+模型参数。
 
 新增模块约占 8B 基座的 2%。测试时真正变化的参数只有两个 768 × 768 fast matrix，即
 1,179,648 个参数；其余新增参数只在 Outer Training 中学习，在线推理时冻结。

@@ -1,0 +1,17 @@
+timestamp_utc=2026-07-13T21:06:34.3111732Z
+branch=main
+start_commit=700578e219f5a774a9e5647e3f3fb93b8a9afedc
+previous_gate=P5 passed: targeted 106, full 191, Ruff/mypy/UTF-8 passed
+spec_version=state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval
+architecture_git_blob_sha256=83e968fadc69961aebbd615e1d2146aa21ab25982fbcb5104d919c90934fa7df
+config_path=configs/model_state_ttt_8b.yaml
+config_git_blob_sha256=04f8a0014e354d927f3f8ef342723cabdaff67e25d969af782d72a5a69b78df8
+uv_lock_worktree_sha256=c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2
+model_id=Qwen/Qwen3-VL-8B-Instruct
+model_revision=0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
+dataset_fold=not-applicable (P6 uses synthetic tensors only)
+seed=13,17,19,23,37 and other deterministic unit-test seeds
+asset_policy=no video, dataset, or 8B-weight download; existing pinned tokenizer may be reused by full regression
+python=3.12.13
+torch=2.9.0+cu128
+transformers=4.57.1

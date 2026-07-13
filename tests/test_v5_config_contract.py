@@ -109,9 +109,28 @@ def test_v5_fast_and_inner_sgd_contract() -> None:
 def test_v5_encoder_head_and_capacity_contracts() -> None:
     config = load_config()
 
-    assert config.spatial_encoder.hidden_dim == 768
-    assert config.spatial_encoder.active_slots == 32
-    assert config.spatial_encoder.max_active_slots == 64
+    spatial = config.spatial_encoder
+    assert spatial.model_dump() == {
+        "input_dim": 4096,
+        "hidden_dim": 768,
+        "stages": 2,
+        "num_heads": 12,
+        "head_dim": 64,
+        "refinements_per_stage": 3,
+        "ffn_dim": 3072,
+        "active_slots": 32,
+        "max_active_slots": 64,
+        "query_dim": 512,
+        "layer_norm_eps": 1.0e-5,
+        "slot_initialization": "shared_seed_plus_fixed_sinusoidal_codes",
+        "attention_normalization": "softmax_slots_then_normalize_tokens",
+        "attention_epsilon": 1.0e-8,
+        "confidence_mode": "attention_occupancy",
+        "overflow_policy": "preserve_existing_reject_excess",
+        "slot_valid_mask": True,
+        "log_overflow": True,
+    }
+    assert spatial.num_heads * spatial.head_dim == spatial.hidden_dim
     assert config.temporal_encoder.num_layers == 6
     assert config.temporal_encoder.cache_tubelets == 64
     assert config.observation_heads.o1.hidden_dims == (1024, 1024)
@@ -188,7 +207,12 @@ def test_v5_parameter_budget_matches_architecture_rounding() -> None:
         )
     )
 
-    assert abs(component_total - 156.83) <= budget.rounding_tolerance_millions
+    assert budget.spatial_encoder_millions == 24.81536
+    assert budget.new_modules_total_millions == 156.75536
+    assert (
+        abs(component_total - budget.new_modules_total_millions)
+        <= budget.rounding_tolerance_millions
+    )
     assert budget.online_fast_matrices_millions == 1.179648
 
 
@@ -235,6 +259,38 @@ def set_nested(*path_and_value: object) -> Mutation:
             "fast_ttt.fast_initialization must be 'xavier_uniform'",
         ),
         (set_nested("spatial_encoder", "active_slots", 16), "active_slots must be 32"),
+        (
+            set_nested("spatial_encoder", "layer_norm_eps", 1.0e-6),
+            "spatial_encoder.layer_norm_eps",
+        ),
+        (
+            set_nested("spatial_encoder", "slot_initialization", "learned_slot_bank"),
+            "spatial_encoder.slot_initialization",
+        ),
+        (
+            set_nested("spatial_encoder", "attention_normalization", "softmax_tokens"),
+            "spatial_encoder.attention_normalization",
+        ),
+        (
+            set_nested("spatial_encoder", "attention_epsilon", 1.0e-6),
+            "spatial_encoder.attention_epsilon",
+        ),
+        (
+            set_nested("spatial_encoder", "confidence_mode", "learned_head"),
+            "spatial_encoder.confidence_mode",
+        ),
+        (
+            set_nested("spatial_encoder", "overflow_policy", "replace_low_confidence"),
+            "spatial_encoder.overflow_policy",
+        ),
+        (
+            set_nested("parameter_budget", "spatial_encoder_millions", 24.88),
+            "parameter budget|spatial encoder budget",
+        ),
+        (
+            set_nested("parameter_budget", "new_modules_total_millions", 156.83),
+            "parameter budget components",
+        ),
         (set_nested("state_resampler", "num_queries", 8), "num_queries must be 16"),
         (set_nested("fast_ttt", "optimizer", "momentum", 0.9), "momentum must be 0.0"),
         (set_nested("retriever", "top_k", 16), "retriever.top_k must be None"),

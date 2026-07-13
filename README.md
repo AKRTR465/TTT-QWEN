@@ -5,11 +5,12 @@
 完整架构、训练协议和消融方案见 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前对齐版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
-> 当前施工状态：P0–P5 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
+> 当前施工状态：P0–P6 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
 > P3 用官方 HF meta 模块和 tiny 随机权重模型完成 Qwen 接口与 DeepStack 工程验收。真实 8B
 > A0/集成仍保留在 P19/P21/P22；P4 已完成 Query Encoder、Operator Router 与 Time Window
 > Resolver 的工程门禁，但尚未训练或校准。P5 Fast Adapter 已通过纯合成张量工程门禁，
-> P6 允许开始；其余空壳被调用时会明确抛出 `NotImplementedError`。
+> P6 空间对象编码器已通过纯合成张量工程门禁，P7 允许开始；其余空壳
+> 被调用时会明确抛出 `NotImplementedError`。
 
 ## 当前固定条件
 
@@ -24,10 +25,13 @@
 - Fast Adapter使用`eps=1e-6`的RMSNorm、带bias的慢投影和Xavier-uniform `W0`；checkpoint
   保存`W0`而不保存per-video `W_t`，batched online forward要求每行状态storage相互隔离；
 - Inner loop固定使用无momentum、无weight decay的单步SGD，不使用Surprise Gate；
-- 空间对象路使用两阶段、768维Recurrent Slot Attention，默认32个活动槽；时间事件路使用
-  6层、768维因果Transformer；
+- 空间对象路使用两个参数不共享的768维Recurrent Slot Stage，默认32个活动槽；单一q投影和
+  shared seed结合固定非持久sinusoidal slot code，attention先做slot轴竞争再按token归一，精确
+  24,815,360参数；时间事件路使用6层、768维因果Transformer；
+- P6的`required_slot_counts`只做preserve-existing/reject-excess容量审计，不表示已从视频识别
+  真实对象；语义判断和hard state留给P8/P9，模型编排和受管推理生命周期留给P13/P18；
 - O1/O2/E1/E2分别使用FiLM MLP、256维identity MLP、5层gated causal TCN和2层GRU；
-- 新增模块合计约156.83M，但在线变化的仍只有约1.18M fast参数；
+- 当前新增模块分项合计156.75536M，约156.76M，但在线变化的仍只有约1.18M fast参数；
 - 无标签TTT loss仅由当前chunk内next-tubelet prediction、O2身份一致性和E1/E2事件一致性组成；
 - 问题不再通过关键词规则机械划分；Qwen input embeddings先经4096→768投影、无参sinusoidal
   position encoding和4层双向Transformer，再由三个768→1024→512 GELU输出头形成
@@ -68,7 +72,8 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | Qwen video boundary、Main Merger 插入点、DeepStack 保护 | P3 已实现；tiny/meta 工程契约已验证，真实 8B 留至 P19 |
 | Query Encoder、9-prototype Router、Time Window Resolver | P4 已实现；本地结构/参数/offset/fail-closed 契约已验证，模型尚未训练、阈值尚未校准 |
 | Fast Adapter、per-video fast state、参数边界 | P5 已通过本地合成张量门禁；显式 functional SGD 编排留至 P14，受管在线生命周期留至 P18，真实 8B 留至 P19 |
-| 状态编码、Bank、Reader、loss、训练、推理 | P6–P19 计划设计，尚未实现 |
+| P6 空间对象编码器 | 已通过本地合成张量工程门禁；真实视频/8B、语义对象 overflow 与端到端 runtime 仍留后续阶段 |
+| P7–P19 时间状态、Bank、Reader、loss、训练、推理 | 计划设计，尚未实现；P7 允许开始 |
 | 真实 8B、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行 |
 
 ## 环境变量

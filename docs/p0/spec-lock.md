@@ -8,7 +8,7 @@
 | SPEC_VERSION | `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval` |
 | 修订日期 | `2026-07-13` |
 | 文档状态 | `DOCUMENT-ONLY / UNVERIFIED` |
-| ARCHITECTURE_SHA256 | `83e968fadc69961aebbd615e1d2146aa21ab25982fbcb5104d919c90934fa7df` |
+| ARCHITECTURE_SHA256 | `a7ea6aa94e5726ec848e48f7e14550c269b7c1df01b7174c0dd396d04836661b` |
 | 基线 Git commit | `7f0185f8136faf88cc59e5ba2ec7309c36f8d013` |
 | UV_LOCK_SHA256 | `c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2` |
 | 基座模型 | `Qwen/Qwen3-VL-8B-Instruct` |
@@ -25,7 +25,10 @@
    fast matrix，共 1,179,648 个在线参数。
 3. Inner optimizer 是 learning rate `1e-4`、momentum `0`、weight decay `0`、每个有效 chunk
    最多一步、clip `1.0` 的 SGD；更新从下一 chunk 生效，每视频从 `W0` reset。
-4. 空间路为 2-stage、dim 768、32 slots；时间路为 6-layer causal Transformer、dim 768。
+4. 空间路为两个参数不共享的 Slot Stage、dim 768、32 slots：单一 q projection、shared seed、
+   fixed non-persistent sinusoidal code、slot-axis competition 后 token normalization，精确
+   24,815,360 参数；时间路为 6-layer causal Transformer、dim 768。P6 的显式 required-slot
+   overflow 只做容量审计，真实对象语义留给 P8/P9。
 5. O1/O2/E1/E2 只产生观测；hard Bank 保存事实，embedding 负责路由和检索，Deterministic
    Reader 使用完整 hard records 做精确算术。
 6. Query Encoder 产生 target/operator/time 三个 512 维 embedding；operator 为 8 个合法类型加

@@ -1,0 +1,12 @@
+timestamp_utc=2026-07-13T21:47:51.349507+00:00
+environment=UV_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+command=uv run python - (heterogeneous two-row runtime/capacity audit)
+exit_code=0
+heterogeneous_grid_shapes=((2, 2, 3), (1, 1, 2))
+valid_tubelets=(1, 1)
+overflow_slots_unchanged=True
+excess_slot_counts=(5, 33)
+overflow_events=(True, True)
+cumulative_overflow=[5, 33]
+next_state_storage_isolated=True
+next_state_detached=True
