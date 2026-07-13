@@ -1,9 +1,22 @@
-# 实施决策（v5 高容量版，文档阶段）
+# 实施决策（v5 高容量版，P1 配置/类型/骨架阶段）
 
-本文件记录开始编码前已经确定的v5边界。当前仅保留实施文档，源码、运行配置和测试仍维持
-原状态。详细论证见
+本文件记录已经冻结的 v5 边界。P0 已冻结规格和仓库基线；P1 已把运行 YAML、强类型配置、
+运行时类型和推荐模块骨架迁移到 v5。所有真实模型、状态、训练和推理入口仍未实现，并明确
+抛出 `NotImplementedError`。详细论证见
 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前规范版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
+
+## P1 已验证边界
+
+1. `configs/model_state_ttt_8b.yaml` 是唯一活跃 v5 运行配置；旧 v3 的 512 bottleneck、16 slots、
+   8 State Token 契约已从活跃配置和测试移除。
+2. `config.py` 使用 immutable/extra-forbid Pydantic schema；固定维度、容量、9 个 operator、
+   DeepStack 索引、单步 SGD 和约 156.83M 参数预算在启动前校验。
+3. Retriever 的 0.35 只是 bootstrap；Time Resolver、operator、O1/O2/E1/E2 FSM 和匹配阈值
+   均保留未校准状态。任一状态未校准时，配置拒绝正式评估。
+4. P1 类型覆盖 VideoBatch、Query/TimeWindow、空间/时间输出与 cache、四类 soft output、
+   typed records、Retriever、ReaderResult 以及完整 per-video runtime ownership。
+5. 推荐模块当前只提供职责边界、类型和显式未实现入口；模块可导入不等于算法已实现。
 
 ## 已固定
 

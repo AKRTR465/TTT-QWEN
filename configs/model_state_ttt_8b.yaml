@@ -1,99 +1,225 @@
+spec_version: state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval
+
+paths:
+  model_root_env: QWEN_MODEL_ROOT
+  svcbench_root_env: SVCBENCH_ROOT
+  hf_home_env: HF_HOME
+  output_root_env: OUTPUT_ROOT
+
 model:
   base_model: Qwen/Qwen3-VL-8B-Instruct
+  revision: 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
   transformers_version: 4.57.1
-  vision_hidden_size: 1152
-  vision_depth: 27
-  vision_output_size: 4096
-  deepstack_visual_indexes: [8, 16, 24]
-  llm_hidden_size: 4096
-  llm_layers: 36
-  freeze_vision_online: true
-  freeze_merger_online: true
-  freeze_deepstack_online: true
-  freeze_llm_online: true
-
-video:
-  fps: 2.0
-  frames_per_chunk: 16
-  stride_frames: 8
-  strict_query_cut: true
+  vision:
+    depth: 27
+    hidden_size: 1152
+    num_heads: 16
+    patch_size: 16
+    temporal_patch_size: 2
+    spatial_merge_size: 2
+    output_size: 4096
+    deepstack_visual_indexes: [8, 16, 24]
+  llm:
+    num_layers: 36
+    hidden_size: 4096
+  online_freeze:
+    vision: true
+    merger: true
+    deepstack: true
+    llm: true
 
 fast_ttt:
-  bottleneck_dim: 512
-  mlp_layers: 2
+  input_dim: 4096
+  bottleneck_dim: 768
+  output_dim: 4096
   residual_scale: 0.1
+  fast_bias: false
+  fast_matrix_count: 2
+  online_parameter_count: 1179648
   update_order: observe_state_then_update_for_next_chunk
-  optimizer: sgd
-  learning_rate: 1.0e-4
-  momentum: 0.0
-  weight_decay: 0.0
-  steps_per_chunk: 1
-  grad_clip_norm: 1.0
-  reset_per_video: true
+  optimizer:
+    name: sgd
+    learning_rate: 1.0e-4
+    momentum: 0.0
+    weight_decay: 0.0
+    steps_per_chunk: 1
+    grad_clip_norm: 1.0
+    reset_per_video: true
 
-ttt_loss:
-  temporal_prediction_weight: 1.0
-  identity_overlap_weight: 0.5
-  event_overlap_weight: 0.5
-  o1_unlabeled_weight: 0.0
-  auxiliary_outer_weight: 0.1
+spatial_encoder:
+  input_dim: 4096
+  hidden_dim: 768
+  stages: 2
+  num_heads: 12
+  head_dim: 64
+  refinements_per_stage: 3
+  ffn_dim: 3072
+  active_slots: 32
+  max_active_slots: 64
+  query_dim: 512
+  slot_valid_mask: true
+  log_overflow: true
 
 temporal_encoder:
-  hidden_size: 512
-  num_layers: 2
-  num_heads: 8
-  intermediate_size: 2048
+  input_dim: 4096
+  hidden_dim: 768
+  num_layers: 6
+  num_heads: 12
+  head_dim: 64
+  ffn_dim: 3072
   dropout: 0.1
-  causal: true
+  strict_causal: true
+  cache_tubelets: 64
+  query_dim: 512
 
-o1:
-  active_slot_budget: 16
-  max_active_slots: 32
-  slot_dim: 512
-  shared_query_conditioned_init: true
-  use_slot_valid_mask: true
-  log_active_slot_overflow: true
+observation_heads:
+  o1:
+    input_dim: 768
+    query_dim: 512
+    film_dim: 1536
+    hidden_dims: [1024, 1024]
+    output_dim: 6
+    threshold_status: calibration_required
+  o2:
+    input_dim: 768
+    hidden_dims: [1024, 1024]
+    identity_dim: 256
+    score_dim: 2
+    prototype_ema: 0.9
+    confirmation_observations: 2
+    match_threshold: null
+    threshold_status: calibration_required
+  e1:
+    input_dim: 768
+    channels: 512
+    num_layers: 5
+    kernel_size: 3
+    dilations: [1, 2, 4, 8, 16]
+    output_dim: 3
+    tau_on: 0.7
+    tau_off: 0.3
+    min_gap_seconds: 0.5
+    threshold_status: bootstrap_calibration_required
+  e2:
+    input_dim: 768
+    hidden_dim: 768
+    num_layers: 2
+    event_output_dim: 4
+    phase_output_dim: 4
+    start_threshold: 0.6
+    end_threshold: 0.6
+    complete_threshold: 0.7
+    threshold_status: bootstrap_calibration_required
 
-o2:
-  identity_dim: 128
-  prototype_ema: 0.9
-  confirmation_observations: 2
+state_bank:
+  semantic_dim: 512
+  identity_dim: 256
+  semantic_projector:
+    input_dim: 768
+    hidden_dim: 1024
+    output_dim: 512
   confirmed_store:
-    initial_capacity: 128
-    growth_chunk: 128
+    initial_capacity: 256
+    growth_chunk: 256
     hard_limit: null
     storage_device: cpu
     storage_dtype: float32
-    gpu_hot_capacity: 128
+    gpu_hot_capacity: 256
   candidate_store:
-    initial_capacity: 32
-    growth_chunk: 32
-    hard_limit: 256
+    initial_capacity: 64
+    growth_chunk: 64
+    hard_limit: 512
     ttl_chunks: 8
     overflow_policy: prune_stale_then_low_confidence
-  matching:
-    search_full_confirmed_store: true
-    exact_search_threshold: 2048
-    ann_enabled: false
+  event_history_capacity: 512
+  isolation_keys: [video_id, trajectory_id, head_type]
+  hard_updates_no_grad: true
+  detach_before_write: true
+  included_in_state_dict: false
 
-e1:
-  hidden_size: 256
-  tcn_dilations: [1, 2, 4]
-  tau_on: 0.7
-  tau_off: 0.3
-  min_gap_seconds: 0.5
-  recent_event_capacity: 256
+query_encoder:
+  input_dim: 4096
+  hidden_dim: 768
+  num_layers: 4
+  num_heads: 12
+  head_dim: 64
+  ffn_dim: 3072
+  dropout: 0.1
+  output_dim: 512
+  bidirectional: true
+  pooling: learned_attention
 
-e2:
-  hidden_size: 512
-  phase_states: 4
-  start_threshold: 0.6
-  end_threshold: 0.6
-  complete_threshold: 0.7
-  recent_event_capacity: 256
+operator_router:
+  prototypes:
+    - o1-snap
+    - o1-delta
+    - o2-unique
+    - o2-gain
+    - e1-action
+    - e1-transit
+    - e2-periodic
+    - e2-episode
+    - unsupported
+  output_dim: 512
+  confidence_threshold: null
+  threshold_status: calibration_required
 
-state_reader:
-  state_token_count: 8
-  state_token_dim: 4096
-  serialize_exact_number: true
-  direct_numeric_audit: true
+time_resolver:
+  modes: [now, history, recent, explicit_range]
+  input_dim: 512
+  hidden_dim: 256
+  mode_count: 4
+  token_hidden_dim: 768
+  pointer_heads: 2
+  confidence_threshold: null
+  threshold_status: calibration_required
+
+retriever:
+  semantic_dim: 512
+  record_similarity_threshold: 0.35
+  threshold_status: bootstrap_calibration_required
+  top_k: null
+  ann_enabled: false
+
+state_resampler:
+  num_queries: 16
+  num_layers: 3
+  num_heads: 8
+  head_dim: 64
+  ffn_dim: 2048
+  hidden_dim: 512
+  output_dim: 4096
+  empty_record_embedding: true
+
+predictor:
+  input_dim: 768
+  hidden_dim: 1536
+  output_dim: 768
+
+loss:
+  pred_weight: 1.0
+  identity_weight: 0.5
+  event_weight: 0.5
+  o1_unlabeled_weight: 0.0
+  auxiliary_outer_weight: 0.1
+
+evaluation:
+  formal_evaluation_enabled: false
+  official_clean_tuning_forbidden: true
+
+parameter_budget:
+  fast_ttt_adapter_millions: 7.48
+  online_fast_matrices_millions: 1.179648
+  spatial_encoder_millions: 24.88
+  temporal_encoder_millions: 48.49
+  query_encoder_millions: 36.03
+  o1_millions: 2.63
+  o2_millions: 2.10
+  e1_millions: 9.58
+  e2_millions: 7.09
+  semantic_projector_millions: 1.32
+  predictor_millions: 2.36
+  state_resampler_millions: 14.72
+  router_resolver_empty_millions: 0.14
+  new_modules_total_millions: 156.83
+  rounding_tolerance_millions: 0.02

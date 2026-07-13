@@ -1,0 +1,4 @@
+captured_at_utc: 2026-07-13T17:11:38.0136856Z
+command: strict UTF-8 decode of tracked and untracked text artifacts
+exit_code: 0
+strict_utf8_files: 54

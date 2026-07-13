@@ -1,0 +1,5 @@
+captured_at_utc: 2026-07-13T17:11:38.0136856Z
+command: uv run pytest -q
+exit_code: 0
+...............................................                          [100%]
+47 passed in 5.58s

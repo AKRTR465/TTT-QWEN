@@ -3,7 +3,7 @@
 > 对齐源：[ARCHITECTURE.md](./ARCHITECTURE.md)  
 > 规范版本：`state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`  
 > 生成日期：2026-07-13  
-> 文档状态：施工分解 / P0 已通过，P1 尚未开始
+> 文档状态：施工分解 / P0–P1 已通过，P2 尚未开始
 > 总原则：本文件只描述施工顺序和验收门禁；任何勾选都必须有代码、测试、日志或实验记录作为证据。
 
 ## 0. 使用方法
@@ -171,8 +171,8 @@
 
 ### 实施前注意事项
 
-- 当前仓库只有环境检查和旧 v3 YAML/契约测试，不代表 v5 已实现。
-- 当前 `configs/model_state_ttt_8b.yaml` 仍包含 512 bottleneck、16 slots、8 State Token 等旧值；在 P1 前不得拿它启动 v5 实验。
+- P0 开始时仓库只有环境检查和旧 v3 YAML/契约测试，不代表 v5 已实现。
+- P1 迁移前 `configs/model_state_ttt_8b.yaml` 包含 512 bottleneck、16 slots、8 State Token 等旧值；该基线不得用于 v5 实验。
 - `__pycache__` 或历史字节码不能作为源码存在的证据。
 - 本阶段不写模型逻辑，只冻结边界和验证起点。
 
@@ -223,77 +223,77 @@
 
 #### P1.1 文件骨架
 
-- [ ] 创建 `src/ttt_svcbench_qwen/model.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/qwen_adapter.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/fast_ttt.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/state_encoder.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/observation_heads.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/state_bank.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/identity_bank.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/query_encoder.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/state_retriever.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/state_reader.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/input_composer.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/losses.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/functional_sgd.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/trainer.py`。
-- [ ] 创建 `src/ttt_svcbench_qwen/inference.py`。
-- [ ] 保留 `config.py` 为配置加载、验证和环境摘要入口。
-- [ ] 每个文件写清唯一职责、输入输出类型和禁止依赖。
+- [x] 创建 `src/ttt_svcbench_qwen/model.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/qwen_adapter.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/fast_ttt.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/state_encoder.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/observation_heads.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/state_bank.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/identity_bank.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/query_encoder.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/state_retriever.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/state_reader.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/input_composer.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/losses.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/functional_sgd.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/trainer.py`。
+- [x] 创建 `src/ttt_svcbench_qwen/inference.py`。
+- [x] 保留 `config.py` 为配置加载、验证和环境摘要入口。
+- [x] 每个文件写清唯一职责、输入输出类型和禁止依赖。
 
 #### P1.2 配置 schema
 
-- [ ] 增加 `spec_version` 并固定为 v5 规范名。
-- [ ] 配置并校验基座 checkpoint、Transformers 版本和 27/1152/16/36/4096 等关键值。
-- [ ] 配置 Fast Adapter：input=4096、bottleneck=768、residual=0.1、fast_bias=false。
-- [ ] 配置 Inner SGD：SGD、`1e-4`、momentum=0、weight_decay=0、steps=1、clip=1.0、reset_per_video=true。
-- [ ] 配置空间路：dim=768、stages=2、heads=12、head_dim=64、refinements=3、FFN=3072、slots=32、max=64。
-- [ ] 配置时间路：dim=768、layers=6、heads=12、head_dim=64、FFN=3072、dropout=0.1、strict causal、cache=64。
-- [ ] 配置 O1/O2/E1/E2 的全部层宽、输出维度、TCN kernel/dilation 和 GRU 层数。
-- [ ] 配置 State Bank：semantic_dim=512、Confirmed 256/增长 256/无硬上限、Candidate 64/上限 512、Hot Cache 256、event history 512。
-- [ ] 配置 Query Encoder：input=4096、hidden=768、layers=4、heads=12、FFN=3072、dropout=0.1、output=512。
-- [ ] 配置 9 个 operator prototype 和 unsupported。
-- [ ] 配置 Retriever bootstrap：`record_similarity_threshold=0.35`、`top_k=null`、
+- [x] 增加 `spec_version` 并固定为 v5 规范名。
+- [x] 配置并校验基座 checkpoint、Transformers 版本和 27/1152/16/36/4096 等关键值。
+- [x] 配置 Fast Adapter：input=4096、bottleneck=768、residual=0.1、fast_bias=false。
+- [x] 配置 Inner SGD：SGD、`1e-4`、momentum=0、weight_decay=0、steps=1、clip=1.0、reset_per_video=true。
+- [x] 配置空间路：dim=768、stages=2、heads=12、head_dim=64、refinements=3、FFN=3072、slots=32、max=64。
+- [x] 配置时间路：dim=768、layers=6、heads=12、head_dim=64、FFN=3072、dropout=0.1、strict causal、cache=64。
+- [x] 配置 O1/O2/E1/E2 的全部层宽、输出维度、TCN kernel/dilation 和 GRU 层数。
+- [x] 配置 State Bank：semantic_dim=512、Confirmed 256/增长 256/无硬上限、Candidate 64/上限 512、Hot Cache 256、event history 512。
+- [x] 配置 Query Encoder：input=4096、hidden=768、layers=4、heads=12、FFN=3072、dropout=0.1、output=512。
+- [x] 配置 9 个 operator prototype 和 unsupported。
+- [x] 配置 Retriever bootstrap：`record_similarity_threshold=0.35`、`top_k=null`、
       `ann_enabled=false`，并标记阈值需校准。
-- [ ] 配置 State Resampler：queries=16、layers=3、heads=8、FFN=2048、hidden=512、output=4096。
-- [ ] 配置 Predictor `768→1536→768`。
-- [ ] 配置 loss 权重：pred=1.0、id=0.5、event=0.5、O1-unlabeled=0、auxiliary-outer=0.1。
-- [ ] 为 Time Resolver、FSM 和匹配阈值添加“未校准”状态，未校准时禁止正式评估。
+- [x] 配置 State Resampler：queries=16、layers=3、heads=8、FFN=2048、hidden=512、output=4096。
+- [x] 配置 Predictor `768→1536→768`。
+- [x] 配置 loss 权重：pred=1.0、id=0.5、event=0.5、O1-unlabeled=0、auxiliary-outer=0.1。
+- [x] 为 Time Resolver、FSM 和匹配阈值添加“未校准”状态，未校准时禁止正式评估。
 
 #### P1.3 运行时类型
 
-- [ ] 定义视频 batch：像素、`video_grid_thw`、时间戳、query_time、valid mask、video_id、trajectory_id。
-- [ ] 定义 Query 输出：`q_target`、`q_operator`、`q_time`、operator logits/confidence、padding mask。
-- [ ] 定义 `TimeWindow`：mode=now|history|recent|explicit_range，query_time=float，
+- [x] 定义视频 batch：像素、`video_grid_thw`、时间戳、query_time、valid mask、video_id、trajectory_id。
+- [x] 定义 Query 输出：`q_target`、`q_operator`、`q_time`、operator logits/confidence、padding mask。
+- [x] 定义 `TimeWindow`：mode=now|history|recent|explicit_range，query_time=float，
       start_time=float|null，end_time=float，valid=bool。
-- [ ] 定义空间/时间 encoder 输出和缓存结构。
-- [ ] 定义 O1/O2/E1/E2 soft output，字段名与输出契约逐一对应。
-- [ ] 定义统一 State Record 和各类型 payload。
-- [ ] 定义 Retriever 输出：selected ids、scores、mask、status、`N_s`、`N_ret`。
-- [ ] 定义 ReaderResult：status、exact_count、number_token_ids、selected_record_ids、operator、time_window、audit_fields。
-- [ ] 定义 per-video runtime state，覆盖 fast weights、optimizer state、slot state、temporal cache、Bank、FSM 和 Reader audit。
+- [x] 定义空间/时间 encoder 输出和缓存结构。
+- [x] 定义 O1/O2/E1/E2 soft output，字段名与输出契约逐一对应。
+- [x] 定义统一 State Record 和各类型 payload。
+- [x] 定义 Retriever 输出：selected ids、scores、mask、status、`N_s`、`N_ret`。
+- [x] 定义 ReaderResult：status、exact_count、number_token_ids、selected_record_ids、operator、time_window、audit_fields。
+- [x] 定义 per-video runtime state，覆盖 fast weights、optimizer state、slot state、temporal cache、Bank、FSM 和 Reader audit。
 
 #### P1.4 配置与参数契约测试
 
-- [ ] 将旧 v3 配置测试迁移为 v5，删除所有过期断言。
-- [ ] 断言两个 fast matrix 均为 `768×768`，总数 1,179,648。
-- [ ] 断言新增模块预算与 `ARCHITECTURE.md` 允许的舍入误差一致。
-- [ ] 断言 top_k 为 null、ANN 关闭、O1 unlabeled loss 权重为 0。
-- [ ] 断言 DeepStack online freeze 和原索引不变。
-- [ ] 断言非法组合在启动前失败，例如 hidden 不能被 heads 整除、State Token 不为 16、momentum 非 0。
+- [x] 将旧 v3 配置测试迁移为 v5，删除所有过期断言。
+- [x] 断言两个 fast matrix 均为 `768×768`，总数 1,179,648。
+- [x] 断言新增模块预算与 `ARCHITECTURE.md` 允许的舍入误差一致。
+- [x] 断言 top_k 为 null、ANN 关闭、O1 unlabeled loss 权重为 0。
+- [x] 断言 DeepStack online freeze 和原索引不变。
+- [x] 断言非法组合在启动前失败，例如 hidden 不能被 heads 整除、State Token 不为 16、momentum 非 0。
 
 ### 实施后验收项
 
-- [ ] 一个 v5 YAML 能通过强校验并打印完整解析配置。
-- [ ] 一个故意混入 v3 值的 YAML 会明确失败，而不是静默使用默认值。
-- [ ] 所有推荐模块均可导入，但尚未实现的路径显式报 `NotImplementedError`，不能返回假结果。
-- [ ] 配置测试准确覆盖 768 bottleneck、32 slots、16 State Token 和新容量。
-- [ ] 全仓不存在仍声称“当前 v5 使用 512 fast bottleneck”的活跃配置或测试。
+- [x] 一个 v5 YAML 能通过强校验并打印完整解析配置。
+- [x] 一个故意混入 v3 值的 YAML 会明确失败，而不是静默使用默认值。
+- [x] 所有推荐模块均可导入，但尚未实现的路径显式报 `NotImplementedError`，不能返回假结果。
+- [x] 配置测试准确覆盖 768 bottleneck、32 slots、16 State Token 和新容量。
+- [x] 全仓不存在仍声称“当前 v5 使用 512 fast bottleneck”的活跃配置或测试。
 
 ### 交付物与退出条件
 
-- [ ] 交付 v5 YAML、强类型配置、模块骨架和 v5 契约测试。
-- [ ] P1 通过后，后续阶段只能从配置读取固定维度，禁止散落 magic numbers。
+- [x] 交付 v5 YAML、强类型配置、模块骨架和 v5 契约测试。
+- [x] P1 通过后，后续阶段只能从配置读取固定维度，禁止散落 magic numbers。
 
 ---
 

@@ -5,8 +5,9 @@
 完整架构、训练协议和消融方案见 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前对齐版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
-> 当前v5变更仅为实施文档：尚未修改模型源码、运行YAML或测试契约。下列高容量网络与embedding检索条目
-> 表示计划实现边界，不表示当前仓库已经具备对应运行能力。
+> 当前施工状态：P0 已完成规格/基线冻结；P1 已迁移 v5 运行 YAML、强类型配置、运行时类型契约
+> 和模块骨架。高容量网络、状态算法、训练与推理尚未实现；对应空壳被调用时会明确抛出
+> `NotImplementedError`，不能把可导入模块误报为可运行模型。
 
 ## 当前固定条件
 
@@ -38,12 +39,26 @@
 ## 本机安装
 
 ~~~powershell
-uv sync
-uv run python -m ttt_svcbench_qwen.config
+uv sync --frozen
+uv run python -m ttt_svcbench_qwen.config --config configs/model_state_ttt_8b.yaml
 uv run pytest
 ~~~
 
 uv会在根目录创建 .venv，并依据 uv.lock 安装依赖。
+
+配置加载使用 Pydantic 强校验并拒绝未知键、旧 v3 固定值和非法组合。当前所有 FSM、匹配、
+operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration_required` 状态，因此
+`formal_evaluation_enabled` 必须保持 false，直至 P21 使用训练折或独立校准集完成冻结。
+
+## 已验证实现与计划设计
+
+| 范围 | 状态 |
+| :--- | :--- |
+| v5 YAML、完整解析、固定维度/容量/优化器校验 | P1 已实现并有契约测试 |
+| Video/Query/Encoder/Observation/Record/Retriever/Reader/runtime 类型 | P1 已实现并有 shape/dtype/边界测试 |
+| 推荐模块导入与职责边界 | P1 已实现；实际入口显式 `NotImplementedError` |
+| 数据预处理、Qwen hook、Adapter、状态、Reader、loss、训练、推理 | P2–P19 计划设计，尚未实现 |
+| 真实 8B、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行 |
 
 ## 环境变量
 

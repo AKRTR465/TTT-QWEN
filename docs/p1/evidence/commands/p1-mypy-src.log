@@ -1,0 +1,4 @@
+captured_at_utc: 2026-07-13T17:11:38.0136856Z
+command: uv run mypy src
+exit_code: 0
+Success: no issues found in 17 source files
