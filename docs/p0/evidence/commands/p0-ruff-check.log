@@ -1,0 +1,4 @@
+captured_at_utc: 2026-07-13T16:50:05.4197640Z
+command: uv run ruff check .
+exit_code: 0
+All checks passed!
