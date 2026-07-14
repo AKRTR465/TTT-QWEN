@@ -1,0 +1,11 @@
+timestamp_utc=2026-07-14T01:42:47.6223741Z
+branch=main
+baseline_commit=78e7fd930595173aa31e1f4d30a57edf6099c2f0
+baseline_part=P9
+asset_policy=small deterministic synthetic tensors only
+downloaded_video_dataset_or_8b_weights=false
+python=3.12.13
+torch=2.9.0+cu128
+transformers=4.57.1
+architecture_sha256=65cbbdd69f34aa14b504830f343e7bd03fc3656e8bbbb4ee5fd368b7ad108caf
+uv_lock_sha256=c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2

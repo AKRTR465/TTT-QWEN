@@ -225,7 +225,12 @@ class O2Config(FrozenModel):
     parameter_count: PositiveInt
     prototype_ema: Probability
     confirmation_observations: PositiveInt
-    match_threshold: Probability | None
+    match_threshold: Probability
+    novelty_threshold: Probability
+    match_confidence_threshold: Probability
+    reliability_threshold: Probability
+    candidate_low_confidence_threshold: Probability
+    match_ambiguity_margin: PositiveFloat
     threshold_status: CalibrationStatus
 
 
@@ -339,7 +344,13 @@ class ConfirmedStoreConfig(FrozenModel):
     hard_limit: PositiveInt | None
     storage_device: str
     storage_dtype: str
+    exact_search: bool
+    ann_enabled: bool
     gpu_hot_capacity: PositiveInt
+    hot_cache_enabled: bool
+    hot_cache_device: str
+    hot_cache_dtype: str
+    eviction_policy: str
 
 
 class CandidateStoreConfig(FrozenModel):
@@ -347,7 +358,14 @@ class CandidateStoreConfig(FrozenModel):
     growth_chunk: PositiveInt
     hard_limit: PositiveInt
     ttl_chunks: PositiveInt
+    match_threshold: Probability
+    reliability_threshold: Probability
+    low_confidence_threshold: Probability
+    ttl_refresh_policy: str
+    ttl_aging_policy: str
+    promotion_policy: str
     overflow_policy: str
+    prune_order: tuple[str, ...]
 
 
 class StateBankConfig(FrozenModel):
@@ -372,6 +390,9 @@ class StateBankConfig(FrozenModel):
     aggregate_update_mode: str
     committed_position_policy: str
     o2_p9_policy: str
+    o2_lifecycle_owner: str
+    o2_candidate_retrieval_eligible: bool
+    o2_confirmed_retrieval_eligible: bool
     dynamic_view_padding: str
     n_state_definition: str
 
@@ -836,9 +857,49 @@ class ProjectConfig(FrozenModel):
                 None,
             ),
             (
+                "state_bank.confirmed_store.storage_device",
+                self.state_bank.confirmed_store.storage_device,
+                "cpu",
+            ),
+            (
+                "state_bank.confirmed_store.storage_dtype",
+                self.state_bank.confirmed_store.storage_dtype,
+                "float32",
+            ),
+            (
+                "state_bank.confirmed_store.exact_search",
+                self.state_bank.confirmed_store.exact_search,
+                True,
+            ),
+            (
+                "state_bank.confirmed_store.ann_enabled",
+                self.state_bank.confirmed_store.ann_enabled,
+                False,
+            ),
+            (
                 "state_bank.confirmed_store.gpu_hot_capacity",
                 self.state_bank.confirmed_store.gpu_hot_capacity,
                 256,
+            ),
+            (
+                "state_bank.confirmed_store.hot_cache_enabled",
+                self.state_bank.confirmed_store.hot_cache_enabled,
+                True,
+            ),
+            (
+                "state_bank.confirmed_store.hot_cache_device",
+                self.state_bank.confirmed_store.hot_cache_device,
+                "cuda",
+            ),
+            (
+                "state_bank.confirmed_store.hot_cache_dtype",
+                self.state_bank.confirmed_store.hot_cache_dtype,
+                "bfloat16",
+            ),
+            (
+                "state_bank.confirmed_store.eviction_policy",
+                self.state_bank.confirmed_store.eviction_policy,
+                "lru_position_then_identity_id",
             ),
             (
                 "state_bank.candidate_store.initial_capacity",
@@ -846,9 +907,66 @@ class ProjectConfig(FrozenModel):
                 64,
             ),
             (
+                "state_bank.candidate_store.growth_chunk",
+                self.state_bank.candidate_store.growth_chunk,
+                64,
+            ),
+            (
                 "state_bank.candidate_store.hard_limit",
                 self.state_bank.candidate_store.hard_limit,
                 512,
+            ),
+            (
+                "state_bank.candidate_store.ttl_chunks",
+                self.state_bank.candidate_store.ttl_chunks,
+                8,
+            ),
+            (
+                "state_bank.candidate_store.match_threshold",
+                self.state_bank.candidate_store.match_threshold,
+                0.8,
+            ),
+            (
+                "state_bank.candidate_store.reliability_threshold",
+                self.state_bank.candidate_store.reliability_threshold,
+                0.5,
+            ),
+            (
+                "state_bank.candidate_store.low_confidence_threshold",
+                self.state_bank.candidate_store.low_confidence_threshold,
+                0.5,
+            ),
+            (
+                "state_bank.candidate_store.ttl_refresh_policy",
+                self.state_bank.candidate_store.ttl_refresh_policy,
+                "reset_to_full_on_reliable_match",
+            ),
+            (
+                "state_bank.candidate_store.ttl_aging_policy",
+                self.state_bank.candidate_store.ttl_aging_policy,
+                "match_first_then_unmatched_decrement_once_per_new_committed_position_remove_at_zero_end",
+            ),
+            (
+                "state_bank.candidate_store.promotion_policy",
+                self.state_bank.candidate_store.promotion_policy,
+                "two_reliable_distinct_consecutive_committed_positions",
+            ),
+            (
+                "state_bank.candidate_store.overflow_policy",
+                self.state_bank.candidate_store.overflow_policy,
+                "expire_then_low_confidence_then_reject",
+            ),
+            (
+                "state_bank.candidate_store.prune_order",
+                self.state_bank.candidate_store.prune_order,
+                (
+                    "expired",
+                    "low_confidence",
+                    "confidence_asc",
+                    "last_position_id_asc",
+                    "candidate_id_asc",
+                    "reject_new",
+                ),
             ),
             ("state_bank.event_history_capacity", self.state_bank.event_history_capacity, 512),
             ("state_bank.hard_updates_no_grad", self.state_bank.hard_updates_no_grad, True),
@@ -912,6 +1030,21 @@ class ProjectConfig(FrozenModel):
                 "state_bank.o2_p9_policy",
                 self.state_bank.o2_p9_policy,
                 "generic_crud_only_p10_owns_lifecycle",
+            ),
+            (
+                "state_bank.o2_lifecycle_owner",
+                self.state_bank.o2_lifecycle_owner,
+                "identity_bank_p10",
+            ),
+            (
+                "state_bank.o2_candidate_retrieval_eligible",
+                self.state_bank.o2_candidate_retrieval_eligible,
+                False,
+            ),
+            (
+                "state_bank.o2_confirmed_retrieval_eligible",
+                self.state_bank.o2_confirmed_retrieval_eligible,
+                True,
             ),
             (
                 "state_bank.dynamic_view_padding",
@@ -1142,6 +1275,31 @@ class ProjectConfig(FrozenModel):
             ),
             ("o2.normalization_eps", heads.o2.normalization_eps, 1.0e-8),
             ("o2.parameter_count", heads.o2.parameter_count, 2_103_042),
+            ("o2.prototype_ema", heads.o2.prototype_ema, 0.9),
+            ("o2.confirmation_observations", heads.o2.confirmation_observations, 2),
+            ("o2.match_threshold", heads.o2.match_threshold, 0.8),
+            ("o2.novelty_threshold", heads.o2.novelty_threshold, 0.5),
+            (
+                "o2.match_confidence_threshold",
+                heads.o2.match_confidence_threshold,
+                0.5,
+            ),
+            ("o2.reliability_threshold", heads.o2.reliability_threshold, 0.5),
+            (
+                "o2.candidate_low_confidence_threshold",
+                heads.o2.candidate_low_confidence_threshold,
+                0.5,
+            ),
+            (
+                "o2.match_ambiguity_margin",
+                heads.o2.match_ambiguity_margin,
+                1.0e-6,
+            ),
+            (
+                "o2.threshold_status",
+                heads.o2.threshold_status,
+                CalibrationStatus.BOOTSTRAP_CALIBRATION_REQUIRED,
+            ),
             ("e1.input_dim", heads.e1.input_dim, 768),
             ("e1.channels", heads.e1.channels, 512),
             ("e1.num_layers", heads.e1.num_layers, 5),
@@ -1281,6 +1439,14 @@ class ProjectConfig(FrozenModel):
             raise ValueError("time_resolver.modes must contain the frozen 4 modes")
         if self.state_bank.isolation_keys != ("video_id", "trajectory_id", "head_type"):
             raise ValueError("state_bank.isolation_keys must isolate video, trajectory, and head")
+        o2 = self.observation_heads.o2
+        candidate = self.state_bank.candidate_store
+        if candidate.match_threshold != o2.match_threshold:
+            raise ValueError("O2 and Candidate identity match thresholds must agree")
+        if candidate.reliability_threshold != o2.reliability_threshold:
+            raise ValueError("O2 and Candidate reliability thresholds must agree")
+        if candidate.low_confidence_threshold != o2.candidate_low_confidence_threshold:
+            raise ValueError("O2 and Candidate low-confidence thresholds must agree")
         projector = self.state_bank.semantic_projector
         if projector.head_type_count != len(projector.head_types):
             raise ValueError("semantic projector head_type_count must match head_types")

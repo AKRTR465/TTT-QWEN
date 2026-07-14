@@ -877,56 +877,56 @@
 
 #### P10.1 Candidate store
 
-- [ ] 初始容量 64。
-- [ ] 支持增长，但强制安全上限 512。
-- [ ] 保存 256 维 normalized prototype、观测次数、TTL、置信度、最近观测时间和关联 record_id。
-- [ ] 未匹配 observation 创建或更新 Candidate。
-- [ ] 依据连续可靠观测阈值晋升 Confirmed。
-- [ ] TTL 过期和置信度清理有确定顺序与审计字段。
-- [ ] 达到 512 时执行显式 prune/overflow 处理并增加 `candidate_overflow`，禁止 silent overwrite。
+- [x] 初始容量 64。
+- [x] 支持增长，但强制安全上限 512。
+- [x] 保存 256 维 normalized prototype、观测次数、TTL、置信度、最近观测时间和关联 record_id。
+- [x] 未匹配 observation 创建或更新 Candidate。
+- [x] 依据连续可靠观测阈值晋升 Confirmed。
+- [x] TTL 过期和置信度清理有确定顺序与审计字段。
+- [x] 达到 512 时先执行显式 prune；仍无空位时拒绝新项并增加 `candidate_overflow`，禁止 silent overwrite。
 
 #### P10.2 Confirmed CPU store
 
-- [ ] 初始分配 256 个位置。
-- [ ] 每次按 256 分块增长。
-- [ ] 不设置语义硬上限。
-- [ ] 使用 CPU FP32 分块张量保存完整记录。
-- [ ] 字段包含 identity_id、256 维 prototype、first_seen、last_seen、observation_count、semantic record link。
-- [ ] 连续出现超过 256 个身份时扩容并保留全部旧记录。
-- [ ] 轨迹释放时释放 CPU storage。
+- [x] 初始分配 256 个位置。
+- [x] 每次按 256 分块增长。
+- [x] 不设置语义硬上限。
+- [x] 使用 CPU FP32 分块张量保存完整记录。
+- [x] 字段包含 identity_id、256 维 prototype、first_seen、last_seen、observation_count、semantic record link。
+- [x] 连续出现超过 256 个身份时扩容并保留全部旧记录。
+- [x] 轨迹释放时释放 CPU storage。
 
 #### P10.3 匹配与 prototype 更新
 
-- [ ] 对有效 O2 identity 做 exact matching。
-- [ ] 使用 match confidence/novelty 和可配置阈值区分更新、Candidate、新身份。
-- [ ] prototype 更新规则可配置并记录旧值/新值。
-- [ ] Candidate 只有首次晋升为 Confirmed 时 `unique_count+1`。
-- [ ] 已 Confirmed 实体再次出现只更新 last_seen/observation_count/prototype。
-- [ ] 防止同一 observation 匹配多个 Confirmed；冲突必须审计。
+- [x] 对有效 O2 identity 做 exact matching。
+- [x] 使用 match confidence/novelty 和可配置阈值区分更新、Candidate、新身份。
+- [x] prototype 更新规则可配置并记录旧值/新值。
+- [x] Candidate 只有首次晋升为 Confirmed 时 `unique_count+1`。
+- [x] 已 Confirmed 实体再次出现只更新 last_seen/observation_count/prototype。
+- [x] 防止同一 observation 匹配多个 Confirmed；冲突必须审计。
 
 #### P10.4 GPU Hot Cache
 
-- [ ] 默认容量 256。
-- [ ] 只缓存 Confirmed 的加速副本，不成为真值来源。
-- [ ] 定义换入/换出策略和 CPU→GPU dtype/device 转换。
-- [ ] cache miss 必须回退完整 CPU store exact search。
-- [ ] Hot Cache 换出不删除 CPU record、不改变 unique_count。
-- [ ] 缓存开启/关闭时 Reader 结果和匹配结果一致。
+- [x] 默认容量 256。
+- [x] 只缓存 Confirmed 的加速副本，不成为真值来源。
+- [x] 定义换入/换出策略和 CPU→GPU dtype/device 转换。
+- [x] cache miss 必须回退完整 CPU store exact search。
+- [x] Hot Cache 换出不删除 CPU record、不改变 unique_count。
+- [x] 缓存开启/关闭时 Reader 结果和匹配结果一致。
 
 ### 实施后验收项
 
-- [ ] 第 257 个 Confirmed 身份触发扩容且前 256 个逐条可读。
-- [ ] 同一身份重复 100 次只增加一次 unique_count。
-- [ ] Candidate 过期、低置信度清理和上限溢出均有测试。
-- [ ] CPU store 与 Hot Cache 开/关、换入/换出结果一致。
-- [ ] 不同 video/batch 的 identity_id、store 和 cache 隔离。
-- [ ] identity duplicate rate 和 missed-new-identity rate 可计算。
-- [ ] ANN 未被启用。
+- [x] 第 257 个 Confirmed 身份触发扩容且前 256 个逐条可读。
+- [x] 同一身份重复 100 次只增加一次 unique_count。
+- [x] Candidate 过期、低置信度清理和上限溢出均有测试。
+- [x] CPU store 与 Hot Cache 开/关、换入/换出结果一致。
+- [x] 不同 video/batch 的 identity_id、store 和 cache 隔离。
+- [x] identity duplicate rate 和 missed-new-identity rate 可计算。
+- [x] ANN 未被启用。
 
 ### 交付物与退出条件
 
-- [ ] 交付 `identity_bank.py`、容量/匹配/cache API 和 >256 身份压力测试。
-- [ ] 任意扩容或 cache 操作改变 exact count 时阻断 Retriever/Reader。
+- [x] 交付 `identity_bank.py`、容量/匹配/cache API 和 >256 身份压力测试。
+- [x] 任意扩容或 cache 操作改变 exact count 时阻断 Retriever/Reader。
 
 ---
 

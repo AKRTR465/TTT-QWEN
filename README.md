@@ -5,12 +5,13 @@
 完整架构、训练协议和消融方案见 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前对齐版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
-> 当前施工状态：P0–P9 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
+> 当前施工状态：P0–P10 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
 > P3 用官方 HF meta 模块和 tiny 随机权重模型完成 Qwen 接口与 DeepStack 工程验收。真实 8B
 > A0/集成仍保留在 P19/P21/P22；P4 已完成 Query Encoder、Operator Router 与 Time Window
 > Resolver 的工程门禁，但尚未训练或校准。P5 Fast Adapter 已通过纯合成张量工程门禁，
 > P6–P9 的空间、时间、四类 soft Observation、Semantic Projector、hard Bank 与事件 FSM 也已通过
-> 纯合成张量工程门禁，P10 允许开始；其余空壳
+> 纯合成张量工程门禁；P10 的 Candidate/Confirmed、CPU exact matching 和非权威 Hot Cache 已用
+> 小型合成 identity 向量通过工程门禁，P11 允许开始；其余空壳
 > 被调用时会明确抛出 `NotImplementedError`。
 
 ## 当前固定条件

@@ -3,12 +3,13 @@ from __future__ import annotations
 import pytest
 import torch
 
+from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.fast_ttt import FastWeightsState, OptimizerRuntimeState
 from ttt_svcbench_qwen.identity_bank import (
     CandidateIdentity,
     ConfirmedIdentity,
     HotCacheEntry,
-    IdentityBankRuntimeState,
+    build_identity_bank,
 )
 from ttt_svcbench_qwen.inference import PerVideoRuntimeState
 from ttt_svcbench_qwen.observation_heads import (
@@ -272,12 +273,17 @@ def test_encoder_cache_and_observation_output_contracts() -> None:
 
 def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
     prototype = torch.zeros(256)
+    prototype[0] = 1.0
     semantic = torch.zeros(512)
     semantic[0] = 1.0
     candidate = CandidateIdentity("candidate-1", prototype, 1, 8, 0.8)
     confirmed = ConfirmedIdentity("identity-1", prototype, 0.0, 2.0, 3)
-    hot = HotCacheEntry("identity-1", prototype, 2.0)
-    identities = IdentityBankRuntimeState((candidate,), (confirmed,), (hot,), 1, 0)
+    hot = HotCacheEntry("identity-1", prototype, 2)
+    identities = build_identity_bank(load_config()).reset(
+        "video-a",
+        "trajectory-a",
+        hot_cache_enabled=False,
+    )
     record = StateRecord(
         record_id="record-1",
         video_id="video-a",
@@ -310,7 +316,10 @@ def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
         audit_fields=(("source", "hard-records"),),
     )
 
-    assert identities.unique_count == 1
+    assert identities.unique_count == 0
+    assert candidate.observation_count == 1
+    assert confirmed.observation_count == 3
+    assert hot.last_accessed == 2.0
     assert bank.records[0].payload.current_visible_count == 2
     assert retrieval.n_retrieved.item() == 1
     assert reader.exact_count == 2
@@ -341,7 +350,12 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
         total_seen=torch.zeros(1, dtype=torch.int64),
     )
     bank = StateBankRuntimeState("video-a", "trajectory-a", (), ())
-    identities = IdentityBankRuntimeState((), (), (), 0, 0)
+    identity_operator = build_identity_bank(load_config())
+    identities = identity_operator.reset(
+        "video-a",
+        "trajectory-a",
+        hot_cache_enabled=False,
+    )
     e1_state = E1RuntimeState(
         video_id="video-a",
         trajectory_id="trajectory-a",
@@ -389,6 +403,43 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
             e2_state=None,
             state_bank=bank,
             identity_bank=identities,
+            reader_audit=(),
+            released=False,
+        )
+
+    mismatched_identities = identity_operator.reset(
+        "video-b",
+        "trajectory-a",
+        hot_cache_enabled=False,
+    )
+    with pytest.raises(ValueError, match="Identity Bank video_id"):
+        PerVideoRuntimeState(
+            video_id="video-a",
+            trajectory_id="trajectory-a",
+            fast_weights=fast,
+            optimizer=optimizer,
+            slot_state=None,
+            temporal_cache=cache,
+            e1_state=e1_state,
+            e2_state=e2_state,
+            state_bank=bank,
+            identity_bank=mismatched_identities,
+            reader_audit=(),
+            released=False,
+        )
+
+    with pytest.raises(ValueError, match="Identity Bank and per-video release"):
+        PerVideoRuntimeState(
+            video_id="video-a",
+            trajectory_id="trajectory-a",
+            fast_weights=fast,
+            optimizer=optimizer,
+            slot_state=None,
+            temporal_cache=cache,
+            e1_state=e1_state,
+            e2_state=e2_state,
+            state_bank=bank,
+            identity_bank=identity_operator.release(identities),
             reader_audit=(),
             released=False,
         )

@@ -1,11 +1,13 @@
-# 实施决策（v5 高容量版，P0–P9 已通过）
+# 实施决策（v5 高容量版，P0–P10 已通过）
 
 本文件记录已经冻结的 v5 边界。P0 已冻结规格和仓库基线；P1 已把运行 YAML、强类型配置、
 运行时类型和推荐模块骨架迁移到 v5；P2 已通过数据、因果预处理和合成 A0 工程门禁；P3 已实现
 Qwen video boundary、Main Merger 插入点和 DeepStack 保护；P4 已实现 Query Encoder、Operator
 Router 和 Time Window Resolver；P5 已通过 Fast Adapter 的本地合成张量工程门禁；P6/P7/P8/P9
 已通过空间对象编码器、时间事件编码器、四类 Observation Decoder、Semantic Projector、类型化
-State Bank 与事件 FSM 的本地合成张量工程门禁。Identity Bank、Reader、训练和推理入口仍按后续 Part 实现。详细论证见
+State Bank 与事件 FSM 的本地合成张量工程门禁；P10 已通过 Identity Bank 动态容量、exact
+matching、Candidate→Confirmed 生命周期和非权威 Hot Cache 的本地合成张量工程门禁。Retriever、
+Reader、训练和推理入口仍按后续 Part 实现。详细论证见
 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前规范版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
@@ -220,6 +222,43 @@ State Bank 与事件 FSM 的本地合成张量工程门禁。Identity Bank、Rea
    autograd 中计算。P8 overlap 的已提交 position 不 replay hard state、不重复计数，只做幂等审计。
 9. P9 唯一新增模型参数是 Semantic Projector 1,316,864；按当前其余分项口径，新增模块分项和为
    156,715,683。Bank、FSM、dynamic view、audit 和 snapshot 都是零参数。
+
+## P10 实施前冻结边界
+
+1. O2 identity 匹配只使用归一化 256 维向量的 CPU FP32 全量 cosine；Candidate/Confirmed
+   `match_threshold=0.80`，novelty、match confidence、reliability、Candidate low-confidence
+   threshold 都是 0.50，边界使用 `>=`，near-tie margin 为 `1e-6`。这些值仅是
+   `bootstrap_calibration_required`，P21 复校。
+2. match intent 固定为 match confidence 高且 novelty 低，new intent 固定为 novelty 高且 match
+   confidence 低；双高、双低、top-2 差不超过 margin、new intent 与已有 Confirmed 高 cosine 冲突
+   都 fail closed。每个 observation 只有一个 global top-1，每个 identity 在同 position 最多更新一次；
+   多 observation 争用时按 cosine、match confidence、slot index、identity ID 确定唯一胜者。
+3. Candidate promotion 需要两个不同且连续的 committed position 都有可靠观测；same-position replay
+   幂等且不计数。prototype 在 FP32 中执行 `normalize(0.9*old+0.1*observation)`，eps `1e-8`、
+   零范数回退第一个 unit basis，旧值、新值和决策元数据必须可审计。
+4. Candidate 创建/可靠匹配后 TTL=8。每个新 committed position 先匹配，未匹配 Candidate 再减 1，
+   归零时在该 position 末尾删除；同 position 不 tick。容量 64 起、按 64 增长至 512；满容量依次
+   expiry、low-confidence prune，prune tie-break 为
+   `(confidence asc,last_position_id asc,candidate_id asc)`，仍满则拒绝且增加 overflow audit/counter。
+5. Identity Bank owner 是 `(video_id,trajectory_id)`，head 隐含 O2；identity/capacity/count 的唯一真值
+   属于 Identity Bank，512 维 semantic record 真值属于 Structured State Bank。跨 Bank 更新必须是
+   functional transaction，失败不得半提交；两个 runtime、snapshot、batch owner 之间不共享 storage。
+6. Candidate/Confirmed 都保存 owner 内单调 ID、FP32 unit prototype、first/last seen、position、计数和
+   `semantic_record_id`；Candidate 另存 TTL/confidence/reliable streak，Confirmed 另存 prototype
+   version。Confirmed first_seen 继承 Candidate 首次可靠观测，O2 StateRecord timestamp 固定为
+   first_seen。promotion invalidate Candidate record 后 append 新 Confirmed record，旧 ID 只作 tombstone；
+   Candidate 不可语义检索，只有 valid Confirmed record 可检索，检索实现仍留 P11。
+7. Confirmed CPU FP32 store 从 256 起按 256 分块、无语义硬上限；它始终执行完整 exact search，
+   `ann_enabled=false`。CUDA BF16 Hot Cache 默认开启、容量 256，仅为派生副本；命中不能提前接受，
+   miss 在 CPU exact 后换入，prototype version 不一致视为 miss。换出按
+   `(last_accessed_position asc,identity_id asc)` LRU，不能改变 CPU record 或 `unique_count`；CPU-only
+   测试可替代 cache device，但 cache 开关结果必须一致。
+8. `unique_count` 只在 Candidate 首次 promotion 后增加，且始终等于 Confirmed logical size；扩容、
+   重复观测、cache touch/evict/miss 均不能改变它。Confirmed allocation 或 StateRecord 写入失败时整个
+   promotion 回滚。
+9. Bank/runtime 不接收真值标签。离线 evaluator 定义 duplicate rate 为同一 GT 的额外 Confirmed IDs
+   除以有 GT 映射的 Confirmed IDs，missed-new rate 为未被任何 Confirmed 覆盖的 GT identities 除以
+   GT identities；分母为零返回 `not_applicable`。
 
 ## 已固定
 

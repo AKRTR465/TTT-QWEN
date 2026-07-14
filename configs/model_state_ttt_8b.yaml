@@ -170,8 +170,13 @@ observation_heads:
     parameter_count: 2103042
     prototype_ema: 0.9
     confirmation_observations: 2
-    match_threshold: null
-    threshold_status: calibration_required
+    match_threshold: 0.8
+    novelty_threshold: 0.5
+    match_confidence_threshold: 0.5
+    reliability_threshold: 0.5
+    candidate_low_confidence_threshold: 0.5
+    match_ambiguity_margin: 1.0e-6
+    threshold_status: bootstrap_calibration_required
   e1:
     input_dim: 768
     channels: 512
@@ -262,13 +267,26 @@ state_bank:
     hard_limit: null
     storage_device: cpu
     storage_dtype: float32
+    exact_search: true
+    ann_enabled: false
     gpu_hot_capacity: 256
+    hot_cache_enabled: true
+    hot_cache_device: cuda
+    hot_cache_dtype: bfloat16
+    eviction_policy: lru_position_then_identity_id
   candidate_store:
     initial_capacity: 64
     growth_chunk: 64
     hard_limit: 512
     ttl_chunks: 8
-    overflow_policy: prune_stale_then_low_confidence
+    match_threshold: 0.8
+    reliability_threshold: 0.5
+    low_confidence_threshold: 0.5
+    ttl_refresh_policy: reset_to_full_on_reliable_match
+    ttl_aging_policy: match_first_then_unmatched_decrement_once_per_new_committed_position_remove_at_zero_end
+    promotion_policy: two_reliable_distinct_consecutive_committed_positions
+    overflow_policy: expire_then_low_confidence_then_reject
+    prune_order: [expired, low_confidence, confidence_asc, last_position_id_asc, candidate_id_asc, reject_new]
   event_history_capacity: 512
   isolation_keys: [video_id, trajectory_id, head_type]
   hard_updates_no_grad: true
@@ -285,6 +303,9 @@ state_bank:
   aggregate_update_mode: functional_replace
   committed_position_policy: idempotent_ignore_and_audit
   o2_p9_policy: generic_crud_only_p10_owns_lifecycle
+  o2_lifecycle_owner: identity_bank_p10
+  o2_candidate_retrieval_eligible: false
+  o2_confirmed_retrieval_eligible: true
   dynamic_view_padding: batch_max
   n_state_definition: owner_head_present_records_before_filters
 

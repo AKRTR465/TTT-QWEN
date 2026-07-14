@@ -11,7 +11,6 @@ PACKAGE = ROOT / "src" / "ttt_svcbench_qwen"
 
 SKELETONS = (
     ("model", "build_model", "P13"),
-    ("identity_bank", "build_identity_bank", "P10"),
     ("state_retriever", "build_state_retriever", "P11"),
     ("state_reader", "build_state_reader", "P12"),
     ("input_composer", "compose_inputs", "P13"),
@@ -46,6 +45,7 @@ def test_all_required_p1_module_files_exist() -> None:
         "__init__",
         "config",
         "fast_ttt",
+        "identity_bank",
         "query_encoder",
         "qwen_adapter",
         "state_encoder",

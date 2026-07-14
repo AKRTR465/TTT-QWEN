@@ -19,7 +19,7 @@ def test_p0_spec_lock_matches_architecture_and_baseline() -> None:
     architecture_hash = hashlib.sha256(architecture_path.read_bytes()).hexdigest()
 
     assert "state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval" in architecture
-    assert "> 修订日期：2026-07-13" in architecture
+    assert "> 修订日期：2026-07-14" in architecture
     assert "> 状态：DOCUMENT-ONLY / UNVERIFIED" in architecture
     assert f"ARCHITECTURE_SHA256 | `{architecture_hash}`" in spec_lock
     assert "7f0185f8136faf88cc59e5ba2ec7309c36f8d013" in spec_lock

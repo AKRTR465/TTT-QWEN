@@ -46,6 +46,12 @@ class PerVideoRuntimeState:
             raise ValueError("State Bank trajectory_id does not match runtime ownership")
         if self.state_bank.released != self.released:
             raise ValueError("State Bank and per-video release state must agree")
+        if self.identity_bank.video_id != self.video_id:
+            raise ValueError("Identity Bank video_id does not match runtime ownership")
+        if self.identity_bank.trajectory_id != self.trajectory_id:
+            raise ValueError("Identity Bank trajectory_id does not match runtime ownership")
+        if self.identity_bank.released != self.released:
+            raise ValueError("Identity Bank and per-video release state must agree")
         if self.slot_state is not None and self.slot_state.video_id != self.video_id:
             raise ValueError("spatial slot state video_id does not match runtime ownership")
         if self.temporal_cache.hidden.shape[0] != 1:

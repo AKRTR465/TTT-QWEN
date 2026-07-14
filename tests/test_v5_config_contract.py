@@ -211,8 +211,13 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "parameter_count": 2_103_042,
         "prototype_ema": 0.9,
         "confirmation_observations": 2,
-        "match_threshold": None,
-        "threshold_status": CalibrationStatus.CALIBRATION_REQUIRED,
+        "match_threshold": 0.8,
+        "novelty_threshold": 0.5,
+        "match_confidence_threshold": 0.5,
+        "reliability_threshold": 0.5,
+        "candidate_low_confidence_threshold": 0.5,
+        "match_ambiguity_margin": 1.0e-6,
+        "threshold_status": CalibrationStatus.BOOTSTRAP_CALIBRATION_REQUIRED,
     }
     assert heads.e1.model_dump() == {
         "input_dim": 768,
@@ -320,15 +325,50 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "aggregate_update_mode": "functional_replace",
         "committed_position_policy": "idempotent_ignore_and_audit",
         "o2_p9_policy": "generic_crud_only_p10_owns_lifecycle",
+        "o2_lifecycle_owner": "identity_bank_p10",
+        "o2_candidate_retrieval_eligible": False,
+        "o2_confirmed_retrieval_eligible": True,
         "dynamic_view_padding": "batch_max",
         "n_state_definition": "owner_head_present_records_before_filters",
     }
-    assert bank.confirmed_store.initial_capacity == 256
-    assert bank.confirmed_store.growth_chunk == 256
-    assert bank.confirmed_store.hard_limit is None
-    assert bank.confirmed_store.gpu_hot_capacity == 256
-    assert bank.candidate_store.initial_capacity == 64
-    assert bank.candidate_store.hard_limit == 512
+    assert bank.confirmed_store.model_dump() == {
+        "initial_capacity": 256,
+        "growth_chunk": 256,
+        "hard_limit": None,
+        "storage_device": "cpu",
+        "storage_dtype": "float32",
+        "exact_search": True,
+        "ann_enabled": False,
+        "gpu_hot_capacity": 256,
+        "hot_cache_enabled": True,
+        "hot_cache_device": "cuda",
+        "hot_cache_dtype": "bfloat16",
+        "eviction_policy": "lru_position_then_identity_id",
+    }
+    assert bank.candidate_store.model_dump() == {
+        "initial_capacity": 64,
+        "growth_chunk": 64,
+        "hard_limit": 512,
+        "ttl_chunks": 8,
+        "match_threshold": 0.8,
+        "reliability_threshold": 0.5,
+        "low_confidence_threshold": 0.5,
+        "ttl_refresh_policy": "reset_to_full_on_reliable_match",
+        "ttl_aging_policy": (
+            "match_first_then_unmatched_decrement_once_per_new_committed_position_"
+            "remove_at_zero_end"
+        ),
+        "promotion_policy": "two_reliable_distinct_consecutive_committed_positions",
+        "overflow_policy": "expire_then_low_confidence_then_reject",
+        "prune_order": (
+            "expired",
+            "low_confidence",
+            "confidence_asc",
+            "last_position_id_asc",
+            "candidate_id_asc",
+            "reject_new",
+        ),
+    }
 
 
 def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
@@ -560,6 +600,42 @@ def set_nested(*path_and_value: object) -> Mutation:
             "observation_heads.o2.identity_normalization",
         ),
         (
+            set_nested("observation_heads", "o2", "prototype_ema", 0.8),
+            "o2.prototype_ema",
+        ),
+        (
+            set_nested("observation_heads", "o2", "confirmation_observations", 3),
+            "o2.confirmation_observations",
+        ),
+        (
+            set_nested("observation_heads", "o2", "match_threshold", 0.75),
+            "o2.match_threshold",
+        ),
+        (
+            set_nested("observation_heads", "o2", "novelty_threshold", 0.6),
+            "o2.novelty_threshold",
+        ),
+        (
+            set_nested("observation_heads", "o2", "match_confidence_threshold", 0.6),
+            "o2.match_confidence_threshold",
+        ),
+        (
+            set_nested("observation_heads", "o2", "reliability_threshold", 0.6),
+            "o2.reliability_threshold",
+        ),
+        (
+            set_nested("observation_heads", "o2", "candidate_low_confidence_threshold", 0.4),
+            "o2.candidate_low_confidence_threshold",
+        ),
+        (
+            set_nested("observation_heads", "o2", "match_ambiguity_margin", 1.0e-5),
+            "o2.match_ambiguity_margin",
+        ),
+        (
+            set_nested("observation_heads", "o2", "threshold_status", "calibrated"),
+            "o2.threshold_status",
+        ),
+        (
             set_nested("observation_heads", "e1", "history_tubelets", 62),
             "observation_heads.e1.history_tubelets",
         ),
@@ -590,6 +666,55 @@ def set_nested(*path_and_value: object) -> Mutation:
         (
             set_nested("state_bank", "record_time_metadata_policy", "timestamp_or_time_range"),
             "state_bank.record_time_metadata_policy",
+        ),
+        (
+            set_nested("state_bank", "confirmed_store", "exact_search", False),
+            "state_bank.confirmed_store.exact_search",
+        ),
+        (
+            set_nested("state_bank", "confirmed_store", "ann_enabled", True),
+            "state_bank.confirmed_store.ann_enabled",
+        ),
+        (
+            set_nested("state_bank", "confirmed_store", "hot_cache_dtype", "float32"),
+            "state_bank.confirmed_store.hot_cache_dtype",
+        ),
+        (
+            set_nested("state_bank", "confirmed_store", "eviction_policy", "fifo"),
+            "state_bank.confirmed_store.eviction_policy",
+        ),
+        (
+            set_nested("state_bank", "candidate_store", "ttl_chunks", 7),
+            "state_bank.candidate_store.ttl_chunks",
+        ),
+        (
+            set_nested("state_bank", "candidate_store", "match_threshold", 0.75),
+            "state_bank.candidate_store.match_threshold",
+        ),
+        (
+            set_nested("state_bank", "candidate_store", "low_confidence_threshold", 0.4),
+            "state_bank.candidate_store.low_confidence_threshold",
+        ),
+        (
+            set_nested("state_bank", "candidate_store", "overflow_policy", "overwrite"),
+            "state_bank.candidate_store.overflow_policy",
+        ),
+        (
+            set_nested(
+                "state_bank",
+                "candidate_store",
+                "prune_order",
+                ["low_confidence", "expired", "reject_new"],
+            ),
+            "state_bank.candidate_store.prune_order",
+        ),
+        (
+            set_nested("state_bank", "o2_lifecycle_owner", "state_bank_p9"),
+            "state_bank.o2_lifecycle_owner",
+        ),
+        (
+            set_nested("state_bank", "o2_candidate_retrieval_eligible", True),
+            "state_bank.o2_candidate_retrieval_eligible",
         ),
         (
             set_nested("parameter_budget", "temporal_encoder_millions", 48.49),

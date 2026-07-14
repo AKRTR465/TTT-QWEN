@@ -1,0 +1,12 @@
+timestamp_utc=2026-07-14T01:42:47.6223741Z
+command=.venv\Scripts\python.exe -m pytest tests\test_identity_bank.py -q
+exit_code=0
+result=15 passed in 45.68s
+
+command=.venv\Scripts\python.exe -m pytest tests\test_state_bank.py tests\test_v5_config_contract.py tests\test_v5_runtime_types.py -q
+exit_code=0
+result=109 passed in 34.75s
+
+fixtures=CPU synthetic unit identity/semantic vectors
+largest_identity_fixture=513x256 float32 approximately 0.50 MiB
+external_downloads=none

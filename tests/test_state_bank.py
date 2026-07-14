@@ -24,6 +24,7 @@ from ttt_svcbench_qwen.state_bank import (
     O1Payload,
     SemanticProjector,
     StateRecord,
+    StateRecordKind,
     StructuredStateBank,
     build_state_bank,
     semantic_projector_parameter_count,
@@ -483,6 +484,123 @@ def test_functional_crud_tombstones_snapshot_clear_and_release(
             operation()
 
 
+def test_o2_lifecycle_bridge_links_records_and_freezes_confirmed_first_seen(
+    bank: StructuredStateBank,
+) -> None:
+    prototype = torch.zeros(256)
+    prototype[3] = 1.0
+    candidate = CandidateIdentity(
+        candidate_id="candidate-bridge",
+        identity_prototype=prototype,
+        observation_count=1,
+        ttl_remaining=8,
+        confidence=0.8,
+        first_seen=1.0,
+        last_seen=1.0,
+        first_seen_position_id=4,
+        last_seen_position_id=4,
+        last_reliable_chunk_index=0,
+        reliable_streak=1,
+        semantic_record_id=None,
+    )
+    fresh = bank.reset("video-o2-bridge", "trajectory-o2-bridge")
+    with_candidate, candidate_record = bank.append_o2_candidate(
+        fresh,
+        semantic_embedding=_unit_semantic(3, requires_grad=True),
+        candidate=candidate,
+        confidence=0.8,
+    )
+    assert not fresh.records
+    assert candidate_record.timestamp == 1.0
+    assert isinstance(candidate_record.payload, CandidateIdentity)
+    assert candidate_record.payload.semantic_record_id == candidate_record.record_id
+    assert not candidate_record.payload.identity_prototype.requires_grad
+
+    updated_candidate = replace(
+        candidate_record.payload,
+        observation_count=2,
+        last_seen=2.0,
+        last_seen_position_id=8,
+        last_reliable_chunk_index=1,
+        reliable_streak=2,
+    )
+    candidate_updated = bank.update_o2_candidate(
+        with_candidate,
+        candidate=updated_candidate,
+        semantic_embedding=_unit_semantic(4),
+        confidence=0.9,
+        audit_timestamp=2.0,
+    )
+    assert candidate_updated.records[0].timestamp == 1.0
+    assert with_candidate.records[0].confidence == 0.8
+
+    confirmed_draft = ConfirmedIdentity(
+        identity_id="identity-bridge",
+        identity_prototype=updated_candidate.identity_prototype,
+        first_seen=updated_candidate.first_seen,
+        last_seen=updated_candidate.last_seen,
+        observation_count=updated_candidate.observation_count,
+        semantic_record_id=None,
+        prototype_version=0,
+        first_seen_position_id=updated_candidate.first_seen_position_id,
+        last_seen_position_id=updated_candidate.last_seen_position_id,
+    )
+    promoted, confirmed_record = bank.promote_o2_candidate(
+        candidate_updated,
+        candidate_record.record_id,
+        semantic_embedding=_unit_semantic(5),
+        confirmed=confirmed_draft,
+        confidence=0.9,
+        audit_timestamp=2.0,
+    )
+    assert candidate_updated.records[0].valid is True
+    assert promoted.records[0].valid is False
+    assert isinstance(confirmed_record.payload, ConfirmedIdentity)
+    assert confirmed_record.payload.semantic_record_id == confirmed_record.record_id
+    assert confirmed_record.timestamp == confirmed_draft.first_seen == 1.0
+    view = bank.view((promoted,), HeadType.O2)
+    assert view.record_kinds == ((StateRecordKind.O2_CANDIDATE, StateRecordKind.O2_CONFIRMED),)
+    assert view.retrieval_eligible_mask.tolist() == [[False, True]]
+
+    updated_confirmed = replace(
+        confirmed_record.payload,
+        last_seen=3.0,
+        last_seen_position_id=12,
+        observation_count=3,
+        prototype_version=1,
+    )
+    confirmed_updated = bank.update_o2_confirmed(
+        promoted,
+        confirmed=updated_confirmed,
+        semantic_embedding=_unit_semantic(6),
+        confidence=0.95,
+        audit_timestamp=3.0,
+    )
+    stored_confirmed = confirmed_updated.records[1]
+    assert stored_confirmed.timestamp == 1.0
+    assert isinstance(stored_confirmed.payload, ConfirmedIdentity)
+    assert stored_confirmed.payload.last_seen == 3.0
+    assert stored_confirmed.payload.prototype_version == 1
+
+    with pytest.raises(ValueError, match="cannot change first_seen"):
+        bank.update_o2_confirmed(
+            promoted,
+            confirmed=replace(confirmed_record.payload, first_seen=0.5),
+            semantic_embedding=_unit_semantic(6),
+            confidence=0.95,
+            audit_timestamp=3.0,
+        )
+    with pytest.raises(ValueError, match="cannot be promoted"):
+        bank.promote_o2_candidate(
+            promoted,
+            candidate_record.record_id,
+            semantic_embedding=_unit_semantic(5),
+            confirmed=confirmed_draft,
+            confidence=0.9,
+            audit_timestamp=2.0,
+        )
+
+
 def test_dynamic_batched_view_keeps_present_and_record_valid_masks_separate(
     bank: StructuredStateBank,
 ) -> None:
@@ -531,6 +649,16 @@ def test_dynamic_batched_view_keeps_present_and_record_valid_masks_separate(
     assert view.embeddings.shape == (3, 2, SEMANTIC_DIM)
     assert view.present_mask.tolist() == [[True, True], [True, False], [False, False]]
     assert view.record_valid_mask.tolist() == [[False, True], [True, False], [False, False]]
+    assert view.record_kinds == (
+        (StateRecordKind.O2_CANDIDATE, StateRecordKind.O2_CONFIRMED),
+        (StateRecordKind.O2_CANDIDATE, None),
+        (None, None),
+    )
+    assert view.retrieval_eligible_mask.tolist() == [
+        [False, True],
+        [False, False],
+        [False, False],
+    ]
     assert view.n_state.tolist() == [2, 1, 0]
     assert view.record_ids[0] == tuple(record.record_id for record in first.records)
     assert torch.count_nonzero(view.embeddings[~view.present_mask]) == 0
@@ -548,6 +676,7 @@ def test_dynamic_batched_view_keeps_present_and_record_valid_masks_separate(
         )
     )
     assert empty_view.embeddings.shape == (2, 0, SEMANTIC_DIM)
+    assert empty_view.retrieval_eligible_mask.shape == (2, 0)
     with pytest.raises(ValueError, match="owners must be unique"):
         bank.view((first, first))
 

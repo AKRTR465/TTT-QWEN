@@ -33,6 +33,16 @@ class HeadType(StrEnum):
     E2 = "e2"
 
 
+class StateRecordKind(StrEnum):
+    """Distinguish lifecycle subtypes that share one coarse observation head."""
+
+    O1_AGGREGATE = "o1_aggregate"
+    O2_CANDIDATE = "o2_candidate"
+    O2_CONFIRMED = "o2_confirmed"
+    E1_AGGREGATE = "e1_aggregate"
+    E2_AGGREGATE = "e2_aggregate"
+
+
 class E2Phase(StrEnum):
     INACTIVE = "inactive"
     ACTIVE = "active"
@@ -373,6 +383,8 @@ class StateBankView:
     n_state: Tensor
     record_ids: tuple[tuple[str | None, ...], ...]
     head_types: tuple[tuple[HeadType | None, ...], ...]
+    record_kinds: tuple[tuple[StateRecordKind | None, ...], ...]
+    retrieval_eligible_mask: Tensor
 
     def __post_init__(self) -> None:
         if (
@@ -406,10 +418,22 @@ class StateBankView:
             or self.n_state.device != self.embeddings.device
         ):
             raise ValueError("StateBankView n_state must be int64 [B]")
-        if len(self.record_ids) != shape[0] or len(self.head_types) != shape[0]:
+        if (
+            len(self.record_ids) != shape[0]
+            or len(self.head_types) != shape[0]
+            or len(self.record_kinds) != shape[0]
+        ):
             raise ValueError("StateBankView owner metadata must match batch size")
-        if any(len(row) != shape[1] for row in self.record_ids + self.head_types):
+        if any(
+            len(row) != shape[1] for row in self.record_ids + self.head_types + self.record_kinds
+        ):
             raise ValueError("StateBankView owner metadata must match padded record width")
+        if (
+            self.retrieval_eligible_mask.shape != shape
+            or self.retrieval_eligible_mask.dtype != torch.bool
+            or self.retrieval_eligible_mask.device != self.embeddings.device
+        ):
+            raise ValueError("StateBankView retrieval eligibility must be bool [B, N]")
         if self.embeddings.device.type != "meta":
             if bool(torch.any(self.record_valid_mask & ~self.present_mask)):
                 raise ValueError("StateBankView valid records must also be present")
@@ -417,6 +441,15 @@ class StateBankView:
                 raise ValueError("StateBankView embeddings must be finite")
             if bool(torch.any(self.embeddings[~self.present_mask] != 0.0)):
                 raise ValueError("StateBankView padding embeddings must be zero")
+            expected_retrieval = self.present_mask & self.record_valid_mask
+            for row, kinds in enumerate(self.record_kinds):
+                for column, kind in enumerate(kinds):
+                    if kind in (None, StateRecordKind.O2_CANDIDATE):
+                        expected_retrieval[row, column] = False
+            if not torch.equal(self.retrieval_eligible_mask, expected_retrieval):
+                raise ValueError(
+                    "retrieval eligibility must exclude invalid and O2 Candidate records"
+                )
             if not torch.equal(self.n_state, self.present_mask.sum(dim=1)):
                 raise ValueError("StateBankView n_state must count stored records")
             if bool(torch.any(self.timestamps[~self.present_mask] != -1.0)) or bool(
@@ -568,12 +601,7 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
         ):
             raise ValueError(f"{head_type.value} partition already has its aggregate record")
         issued = state.issued_record_ids
-        next_sequence = state.next_record_sequence
-        while True:
-            record_id = f"record-{next_sequence:08d}"
-            next_sequence += 1
-            if record_id not in issued:
-                break
+        record_id, next_sequence = _next_available_record_id(state)
         record = StateRecord(
             record_id=record_id,
             video_id=state.video_id,
@@ -693,6 +721,202 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
         )
 
     @torch.no_grad()  # type: ignore[untyped-decorator]
+    def append_o2_candidate(
+        self,
+        state: StateBankRuntimeState,
+        *,
+        semantic_embedding: Tensor,
+        candidate: CandidateIdentity,
+        confidence: float,
+    ) -> tuple[StateBankRuntimeState, StateRecord]:
+        """Append one linked Candidate record without exposing ID allocation to P10."""
+
+        _require_live_state(state)
+        if type(candidate) is not CandidateIdentity:
+            raise TypeError("append_o2_candidate requires a CandidateIdentity payload")
+        expected_record_id, _ = _next_available_record_id(state)
+        linked_payload = cast(
+            CandidateIdentity,
+            _with_semantic_record_link(candidate, expected_record_id),
+        )
+        next_state = self.append_record(
+            state,
+            head_type=HeadType.O2,
+            semantic_embedding=semantic_embedding,
+            timestamp=candidate.first_seen,
+            time_range=None,
+            valid=True,
+            confidence=confidence,
+            payload=linked_payload,
+        )
+        record = next_state.records[_find_record_index(next_state, expected_record_id)]
+        return next_state, _clone_record(record)
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def update_o2_candidate(
+        self,
+        state: StateBankRuntimeState,
+        *,
+        semantic_embedding: Tensor,
+        confidence: float,
+        candidate: CandidateIdentity,
+        audit_timestamp: float,
+        details: tuple[tuple[str, AuditValue], ...] = (),
+    ) -> StateBankRuntimeState:
+        """Functionally update one Candidate while preserving its first-seen record time."""
+
+        record_id = _require_semantic_record_link(candidate)
+        prior = _require_o2_payload(state, record_id, CandidateIdentity)
+        linked_payload = cast(CandidateIdentity, _with_semantic_record_link(candidate, record_id))
+        replacement = StateRecord(
+            record_id=prior.record_id,
+            video_id=prior.video_id,
+            trajectory_id=prior.trajectory_id,
+            head_type=HeadType.O2,
+            semantic_embedding=_hard_semantic(
+                semantic_embedding,
+                self.config.semantic_projector,
+            ),
+            timestamp=prior.timestamp,
+            time_range=None,
+            valid=True,
+            confidence=confidence,
+            payload=linked_payload,
+        )
+        return cast(
+            StateBankRuntimeState,
+            self.update_record(
+                state,
+                replacement,
+                action="o2_candidate_update",
+                details=details,
+                audit_timestamp=audit_timestamp,
+            ),
+        )
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def invalidate_o2_candidate(
+        self,
+        state: StateBankRuntimeState,
+        record_id: str,
+        *,
+        audit_timestamp: float,
+        reason: str,
+    ) -> StateBankRuntimeState:
+        """Invalidate exactly one Candidate link; invalid records remain terminal tombstones."""
+
+        _require_o2_payload(state, record_id, CandidateIdentity)
+        return cast(
+            StateBankRuntimeState,
+            self.invalidate_record(
+                state,
+                record_id,
+                audit_timestamp=audit_timestamp,
+                reason=reason,
+            ),
+        )
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def promote_o2_candidate(
+        self,
+        state: StateBankRuntimeState,
+        candidate_record_id: str,
+        *,
+        semantic_embedding: Tensor,
+        confirmed: ConfirmedIdentity,
+        confidence: float,
+        audit_timestamp: float,
+        reason: str = "candidate_promoted",
+    ) -> tuple[StateBankRuntimeState, StateRecord]:
+        """Atomically invalidate a Candidate and append a new linked Confirmed record."""
+
+        candidate_record = _require_o2_payload(state, candidate_record_id, CandidateIdentity)
+        if not candidate_record.valid:
+            raise ValueError("invalidated O2 Candidate records cannot be promoted")
+        if type(confirmed) is not ConfirmedIdentity:
+            raise TypeError("promotion requires a ConfirmedIdentity payload")
+        if audit_timestamp < confirmed.first_seen:
+            raise ValueError("promotion timestamp cannot precede first_seen")
+        invalidated = self.invalidate_o2_candidate(
+            state,
+            candidate_record_id,
+            audit_timestamp=audit_timestamp,
+            reason=reason,
+        )
+        confirmed_record_id, _ = _next_available_record_id(invalidated)
+        linked_payload = cast(
+            ConfirmedIdentity,
+            _with_semantic_record_link(confirmed, confirmed_record_id),
+        )
+        promoted = self.append_record(
+            invalidated,
+            head_type=HeadType.O2,
+            semantic_embedding=semantic_embedding,
+            timestamp=confirmed.first_seen,
+            time_range=None,
+            valid=True,
+            confidence=confidence,
+            payload=linked_payload,
+        )
+        promoted = _append_runtime_audit(
+            promoted,
+            action="o2_candidate_promoted",
+            record_id=confirmed_record_id,
+            timestamp=audit_timestamp,
+            details=(("candidate_record_id", candidate_record_id),),
+        )
+        record = promoted.records[_find_record_index(promoted, confirmed_record_id)]
+        return promoted, _clone_record(record)
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def update_o2_confirmed(
+        self,
+        state: StateBankRuntimeState,
+        *,
+        semantic_embedding: Tensor,
+        confidence: float,
+        confirmed: ConfirmedIdentity,
+        audit_timestamp: float,
+        details: tuple[tuple[str, AuditValue], ...] = (),
+    ) -> StateBankRuntimeState:
+        """Update Confirmed evidence without changing its first-seen retrieval timestamp."""
+
+        record_id = _require_semantic_record_link(confirmed)
+        prior = _require_o2_payload(state, record_id, ConfirmedIdentity)
+        prior_payload = cast(ConfirmedIdentity, prior.payload)
+        if (
+            prior.timestamp != prior_payload.first_seen
+            or confirmed.first_seen != prior_payload.first_seen
+        ):
+            raise ValueError("Confirmed updates cannot change first_seen")
+        linked_payload = cast(ConfirmedIdentity, _with_semantic_record_link(confirmed, record_id))
+        replacement = StateRecord(
+            record_id=prior.record_id,
+            video_id=prior.video_id,
+            trajectory_id=prior.trajectory_id,
+            head_type=HeadType.O2,
+            semantic_embedding=_hard_semantic(
+                semantic_embedding,
+                self.config.semantic_projector,
+            ),
+            timestamp=prior.timestamp,
+            time_range=None,
+            valid=True,
+            confidence=confidence,
+            payload=linked_payload,
+        )
+        return cast(
+            StateBankRuntimeState,
+            self.update_record(
+                state,
+                replacement,
+                action="o2_confirmed_update",
+                details=details,
+                audit_timestamp=audit_timestamp,
+            ),
+        )
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
     def records_for(
         self,
         state: StateBankRuntimeState,
@@ -759,6 +983,7 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             (batch_size, max_records), dtype=torch.bool, device=reference.device
         )
         valid_mask = torch.zeros_like(present_mask)
+        retrieval_eligible_mask = torch.zeros_like(present_mask)
         timestamps = torch.full(
             (batch_size, max_records), -1.0, dtype=torch.float64, device=reference.device
         )
@@ -768,17 +993,24 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
         n_state = torch.zeros(batch_size, dtype=torch.int64, device=reference.device)
         record_ids: list[tuple[str | None, ...]] = []
         head_types: list[tuple[HeadType | None, ...]] = []
+        record_kinds: list[tuple[StateRecordKind | None, ...]] = []
         for row, records in enumerate(rows):
             count = len(records)
             n_state[row] = count
             ids: list[str | None] = [None] * max_records
             heads: list[HeadType | None] = [None] * max_records
+            kinds: list[StateRecordKind | None] = [None] * max_records
             for column, record in enumerate(records):
+                kind = _record_kind(record)
                 embeddings[row, column] = record.semantic_embedding
                 present_mask[row, column] = True
                 valid_mask[row, column] = record.valid
+                retrieval_eligible_mask[row, column] = (
+                    record.valid and kind is not StateRecordKind.O2_CANDIDATE
+                )
                 ids[column] = record.record_id
                 heads[column] = record.head_type
+                kinds[column] = kind
                 if record.timestamp is not None:
                     timestamps[row, column] = record.timestamp
                 else:
@@ -788,6 +1020,7 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
                     )
             record_ids.append(tuple(ids))
             head_types.append(tuple(heads))
+            record_kinds.append(tuple(kinds))
         return StateBankView(
             embeddings=embeddings,
             present_mask=present_mask,
@@ -797,6 +1030,8 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             n_state=n_state,
             record_ids=tuple(record_ids),
             head_types=tuple(head_types),
+            record_kinds=tuple(record_kinds),
+            retrieval_eligible_mask=retrieval_eligible_mask,
         )
 
     @torch.no_grad()  # type: ignore[untyped-decorator]
@@ -1431,23 +1666,45 @@ def _payload_tensors(payload: StatePayload) -> tuple[Tensor, ...]:
     return ()
 
 
+def _record_kind(record: StateRecord) -> StateRecordKind:
+    payload = record.payload
+    if isinstance(payload, O1Payload):
+        return StateRecordKind.O1_AGGREGATE
+    if isinstance(payload, CandidateIdentity):
+        return StateRecordKind.O2_CANDIDATE
+    if isinstance(payload, ConfirmedIdentity):
+        return StateRecordKind.O2_CONFIRMED
+    if isinstance(payload, E1Payload):
+        return StateRecordKind.E1_AGGREGATE
+    if isinstance(payload, E2Payload):
+        return StateRecordKind.E2_AGGREGATE
+    raise TypeError("StateRecord carries an unsupported payload type")
+
+
 def _record_tensors(record: StateRecord) -> tuple[Tensor, ...]:
     return (record.semantic_embedding, *_payload_tensors(record.payload))
 
 
-def _shares_storage(left: Tensor, right: Tensor) -> bool:
-    if left.numel() == 0 or right.numel() == 0:
-        return False
-    if left.device.type == "meta" or right.device.type == "meta":
-        return left is right
-    return int(left.untyped_storage().data_ptr()) == int(right.untyped_storage().data_ptr())
-
-
 def _assert_tensor_groups_isolated(groups: Sequence[tuple[Tensor, ...]], name: str) -> None:
-    for left_index, left_group in enumerate(groups):
-        for right_group in groups[left_index + 1 :]:
-            if any(_shares_storage(left, right) for left in left_group for right in right_group):
-                raise ValueError(f"{name} must not share mutable tensor storage")
+    seen: set[tuple[str, int | None, int]] = set()
+    for group in groups:
+        group_keys: set[tuple[str, int | None, int]] = set()
+        for tensor in group:
+            if tensor.numel() == 0:
+                continue
+            key = (
+                ("meta", None, id(tensor))
+                if tensor.device.type == "meta"
+                else (
+                    tensor.device.type,
+                    tensor.device.index,
+                    int(tensor.untyped_storage().data_ptr()),
+                )
+            )
+            group_keys.add(key)
+        if seen.intersection(group_keys):
+            raise ValueError(f"{name} must not share mutable tensor storage")
+        seen.update(group_keys)
 
 
 def _normalize_head_types(
@@ -1481,20 +1738,14 @@ def _hard_semantic(embedding: Tensor, config: SemanticProjectorConfig) -> Tensor
 
 def _clone_payload(payload: StatePayload) -> StatePayload:
     if isinstance(payload, CandidateIdentity):
-        return CandidateIdentity(
-            candidate_id=payload.candidate_id,
+        return replace(
+            payload,
             identity_prototype=payload.identity_prototype.detach().clone(),
-            observation_count=payload.observation_count,
-            ttl_remaining=payload.ttl_remaining,
-            confidence=payload.confidence,
         )
     if isinstance(payload, ConfirmedIdentity):
-        return ConfirmedIdentity(
-            identity_id=payload.identity_id,
+        return replace(
+            payload,
             identity_prototype=payload.identity_prototype.detach().clone(),
-            first_seen=payload.first_seen,
-            last_seen=payload.last_seen,
-            observation_count=payload.observation_count,
         )
     return payload
 
@@ -1539,6 +1790,47 @@ def _find_record_index(state: StateBankRuntimeState, record_id: str) -> int:
     if len(matches) != 1:
         raise ValueError("State Bank record ID does not identify exactly one record")
     return matches[0]
+
+
+def _next_available_record_id(state: StateBankRuntimeState) -> tuple[str, int]:
+    issued = set(state.issued_record_ids)
+    next_sequence = state.next_record_sequence
+    while True:
+        record_id = f"record-{next_sequence:08d}"
+        next_sequence += 1
+        if record_id not in issued:
+            return record_id, next_sequence
+
+
+def _with_semantic_record_link(
+    payload: CandidateIdentity | ConfirmedIdentity,
+    record_id: str,
+) -> CandidateIdentity | ConfirmedIdentity:
+    if not record_id:
+        raise ValueError("O2 semantic record link must be non-empty")
+    existing = getattr(payload, "semantic_record_id", None)
+    if existing not in (None, record_id):
+        raise ValueError("O2 payload semantic record link cannot be reassigned")
+    return replace(payload, semantic_record_id=record_id)
+
+
+def _require_semantic_record_link(payload: CandidateIdentity | ConfirmedIdentity) -> str:
+    record_id = getattr(payload, "semantic_record_id", None)
+    if not isinstance(record_id, str) or not record_id:
+        raise ValueError("O2 update payload requires a semantic record link")
+    return record_id
+
+
+def _require_o2_payload(
+    state: StateBankRuntimeState,
+    record_id: str,
+    payload_type: type[CandidateIdentity] | type[ConfirmedIdentity],
+) -> StateRecord:
+    _require_live_state(state)
+    record = state.records[_find_record_index(state, record_id)]
+    if record.head_type is not HeadType.O2 or type(record.payload) is not payload_type:
+        raise ValueError(f"O2 record must carry {payload_type.__name__}")
+    return record
 
 
 def _find_aggregate_record(state: StateBankRuntimeState, head_type: HeadType) -> StateRecord | None:

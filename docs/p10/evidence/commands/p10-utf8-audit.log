@@ -1,0 +1,6 @@
+timestamp_utc=2026-07-14T01:42:47.6223741Z
+policy=UTF-8 strict decode with errors=strict
+scope=151 tracked/untracked repository files present during final P10 gate
+exit_code=0
+result=strict UTF-8: 151 files passed
+binary_or_large_asset_downloads=none
