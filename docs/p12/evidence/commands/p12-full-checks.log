@@ -1,0 +1,30 @@
+timestamp_utc=2026-07-14T05:53:44.0267083Z
+command=.venv/Scripts/python.exe -m pytest -q
+exit_code=0
+result=442 passed in 74.42s
+
+command=.venv/Scripts/ruff.exe check .
+exit_code=0
+result=All checks passed!
+
+command=.venv/Scripts/ruff.exe format --check on 13 changed Python files
+exit_code=0
+result=13 files already formatted
+
+command=.venv/Scripts/mypy.exe src
+exit_code=0
+result=Success: no issues found in 21 source files
+
+command=.venv/Scripts/python.exe -m ttt_svcbench_qwen.config --config configs/model_state_ttt_8b.yaml
+exit_code=0
+result=validated config JSON emitted
+
+command=git diff --check
+exit_code=0
+result=no output
+
+architecture_sha256=ae8f738cff76c1ca49b19a515521b89f0d392eb2d5832dff02dcf1478f302c18
+uv_lock_sha256=c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2
+downloads=none
+post_evidence_pytest=442 passed in 74.42s
+post_evidence_quality=ruff,mypy,config all passed

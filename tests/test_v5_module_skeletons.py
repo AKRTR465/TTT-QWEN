@@ -11,7 +11,6 @@ PACKAGE = ROOT / "src" / "ttt_svcbench_qwen"
 
 SKELETONS = (
     ("model", "build_model", "P13"),
-    ("state_reader", "build_state_reader", "P12"),
     ("input_composer", "compose_inputs", "P13"),
     ("losses", "compute_losses", "P14"),
     ("functional_sgd", "functional_sgd_step", "P14"),
@@ -48,6 +47,7 @@ def test_all_required_p1_module_files_exist() -> None:
         "query_encoder",
         "qwen_adapter",
         "state_encoder",
+        "state_reader",
         "state_retriever",
     }
 

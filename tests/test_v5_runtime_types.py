@@ -302,17 +302,30 @@ def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
         payload=O1Payload(2, 1, (0, 1)),
     )
     bank = StateBankRuntimeState("video-a", "trajectory-a", (record,), ())
+    window = TimeWindow(TimeWindowMode.HISTORY, 2.0, 0.0, 2.0, True)
+    resolution = TimeResolution(
+        window=window,
+        status=TimeResolutionStatus.OK,
+        reason="synthetic-ok",
+        mode_confidence=1.0,
+        numeric_span=None,
+        parsed_values_seconds=(),
+        used_operator_default=True,
+    )
     retrieval = RetrieverOutput(
         selected_record_ids=(("record-1",),),
         selected_scores=((0.5,),),
         selected_records=((record,),),
         candidate_record_ids=(("record-1",),),
+        candidate_records=((record,),),
         state_embeddings=semantic.reshape(1, 1, 512),
         scores=torch.tensor([[0.5]]),
         present_mask=torch.tensor([[True]]),
         selected_mask=torch.tensor([[True]]),
         status=(RetrievalStatus.OK,),
         reason=(RetrievalReason.MATCHED,),
+        hard_operators=(Operator.O1_SNAP,),
+        time_resolutions=(resolution,),
         n_state=torch.tensor([1]),
         n_retrieved=torch.tensor([1]),
         audit=(
@@ -331,9 +344,10 @@ def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
         ),
         video_ids=("video-a",),
         trajectory_ids=("trajectory-a",),
+        bank_video_ids=("video-a",),
+        bank_trajectory_ids=("trajectory-a",),
         bank_versions=(bank.version,),
     )
-    window = TimeWindow(TimeWindowMode.HISTORY, 2.0, 0.0, 2.0, True)
     reader = ReaderResult(
         status=ReaderStatus.OK,
         exact_count=2,
@@ -341,7 +355,28 @@ def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
         selected_record_ids=("record-1",),
         operator=Operator.O1_SNAP,
         time_window=window,
-        audit_fields=(("source", "hard-records"),),
+        audit_fields=(
+            ("source", "retrieved_typed_records"),
+            ("operator", "o1-snap"),
+            ("retrieval_status", "ok"),
+            ("retrieval_reason", "matched"),
+            ("n_state", 1),
+            ("n_retrieved", 1),
+            ("input_record_count", 1),
+            ("bank_version", bank.version),
+            ("time_resolution_status", "ok"),
+            ("window_start", 0.0),
+            ("window_end", 2.0),
+            ("reader_reason", "exact_typed_payload_arithmetic"),
+            ("arithmetic", "o1_current_visible_count"),
+            ("contributing_count", 1),
+            ("operand_current_visible_count", 2),
+            ("operand_baseline_count", 1),
+            ("operand_baseline_initialized", True),
+            ("operand_baseline_position_id", None),
+            ("computed_exact_count", 2),
+            ("number_text", "2"),
+        ),
     )
 
     assert identities.unique_count == 0

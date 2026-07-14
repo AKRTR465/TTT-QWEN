@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from enum import StrEnum
 
 import torch
@@ -107,17 +107,22 @@ class RetrieverOutput:
     selected_scores: tuple[tuple[float, ...], ...]
     selected_records: tuple[tuple[StateRecord, ...], ...]
     candidate_record_ids: tuple[tuple[str | None, ...], ...]
+    candidate_records: tuple[tuple[StateRecord | None, ...], ...]
     state_embeddings: Tensor
     scores: Tensor
     present_mask: Tensor
     selected_mask: Tensor
     status: tuple[RetrievalStatus, ...]
     reason: tuple[RetrievalReason, ...]
+    hard_operators: tuple[Operator, ...]
+    time_resolutions: tuple[TimeResolution, ...]
     n_state: Tensor
     n_retrieved: Tensor
     audit: tuple[RetrievalFilterAudit, ...]
     video_ids: tuple[str, ...]
     trajectory_ids: tuple[str, ...]
+    bank_video_ids: tuple[str, ...]
+    bank_trajectory_ids: tuple[str, ...]
     bank_versions: tuple[int, ...]
 
     def __post_init__(self) -> None:
@@ -149,17 +154,24 @@ class RetrieverOutput:
             self.selected_scores,
             self.selected_records,
             self.candidate_record_ids,
+            self.candidate_records,
             self.status,
             self.reason,
+            self.hard_operators,
+            self.time_resolutions,
             self.audit,
             self.video_ids,
             self.trajectory_ids,
+            self.bank_video_ids,
+            self.bank_trajectory_ids,
             self.bank_versions,
         )
         if any(len(values) != batch_size for values in metadata):
             raise ValueError("Retriever metadata must contain one entry per batch item")
-        if any(len(row) != width for row in self.candidate_record_ids):
-            raise ValueError("candidate_record_ids must align to the padded score width")
+        if any(len(row) != width for row in self.candidate_record_ids) or any(
+            len(row) != width for row in self.candidate_records
+        ):
+            raise ValueError("candidate record snapshots must align to the padded score width")
         for counts, name in ((self.n_state, "n_state"), (self.n_retrieved, "n_retrieved")):
             if (
                 counts.shape != (batch_size,)
@@ -183,14 +195,29 @@ class RetrieverOutput:
             raise ValueError("Retriever n_retrieved must count selected records")
         if bool(torch.any(self.n_retrieved > self.n_state)):
             raise ValueError("Retriever requires 0 <= N_ret <= N_s")
-        if any(not value for value in self.video_ids + self.trajectory_ids):
+        if any(
+            not value
+            for value in self.video_ids
+            + self.trajectory_ids
+            + self.bank_video_ids
+            + self.bank_trajectory_ids
+        ):
             raise ValueError("Retriever owner identifiers must be non-empty")
         if len(set(zip(self.video_ids, self.trajectory_ids, strict=True))) != batch_size:
             raise ValueError("Retriever batch owners must be unique")
         if any(type(version) is not int or version < 0 for version in self.bank_versions):
             raise ValueError("Retriever bank versions must be non-negative integers")
+        if any(not isinstance(operator, Operator) for operator in self.hard_operators):
+            raise TypeError("Retriever hard_operators must preserve one Operator per row")
+        if any(not isinstance(resolution, TimeResolution) for resolution in self.time_resolutions):
+            raise TypeError("Retriever time_resolutions must preserve one TimeResolution per row")
         for row in range(batch_size):
             self._validate_row(row)
+
+    def validate_integrity(self) -> None:
+        """Revalidate mutable tensor-backed snapshot contents before downstream consumption."""
+
+        self.__post_init__()
 
     def _validate_row(self, row: int) -> None:
         n_state = int(self.n_state[row].item())
@@ -198,6 +225,8 @@ class RetrieverOutput:
         ids = self.selected_record_ids[row]
         selected_scores = self.selected_scores[row]
         records = self.selected_records[row]
+        operator = self.hard_operators[row]
+        expected_head = OPERATOR_TO_HEAD_TYPE[operator]
         if (
             len(ids) != n_retrieved
             or len(selected_scores) != n_retrieved
@@ -212,10 +241,39 @@ class RetrieverOutput:
             for record in records
         ):
             raise ValueError("Retriever selected records cannot cross owner boundaries")
+        if expected_head is None and records:
+            raise ValueError("unsupported Retriever operators cannot retain selected records")
+        if expected_head is not None and any(
+            record.head_type is not expected_head for record in records
+        ):
+            raise ValueError("Retriever selected records must match the preserved operator head")
         present_ids = self.candidate_record_ids[row]
+        candidate_records = self.candidate_records[row]
+        candidate_by_id: dict[str, StateRecord] = {}
         for column, record_id in enumerate(present_ids):
             if (record_id is not None) != bool(self.present_mask[row, column]):
                 raise ValueError("Retriever candidate IDs must align to present_mask")
+            candidate = candidate_records[column]
+            if (candidate is not None) != (record_id is not None):
+                raise ValueError("Retriever candidate typed snapshots must align to candidate IDs")
+            if candidate is None:
+                continue
+            if (
+                candidate.record_id != record_id
+                or candidate.video_id != self.bank_video_ids[row]
+                or candidate.trajectory_id != self.bank_trajectory_ids[row]
+            ):
+                raise ValueError("Retriever candidate typed snapshot metadata is inconsistent")
+            if (
+                candidate.semantic_embedding.dtype != self.state_embeddings.dtype
+                or candidate.semantic_embedding.device != self.state_embeddings.device
+                or not torch.equal(
+                    candidate.semantic_embedding,
+                    self.state_embeddings[row, column],
+                )
+            ):
+                raise ValueError("Retriever candidate typed snapshot semantics are inconsistent")
+            candidate_by_id[candidate.record_id] = candidate
         live_candidate_ids = tuple(record_id for record_id in present_ids if record_id is not None)
         if len(set(live_candidate_ids)) != len(live_candidate_ids):
             raise ValueError("Retriever candidate record IDs must be unique per row")
@@ -223,6 +281,11 @@ class RetrieverOutput:
         mask_ids = tuple(present_ids[column] for column in selected_columns)
         if set(mask_ids) != set(ids):
             raise ValueError("Retriever selected IDs must exactly match selected_mask")
+        if any(
+            not _snapshot_values_equal(record, candidate_by_id[record.record_id])
+            for record in records
+        ):
+            raise ValueError("Retriever selected typed records must match the candidate snapshot")
         score_by_id = {
             present_ids[column]: float(self.scores[row, column].detach().item())
             for column in selected_columns
@@ -269,6 +332,10 @@ class RetrieverOutput:
         }
         if reason not in allowed_reasons[status]:
             raise ValueError("Retriever reason is inconsistent with its structured status")
+        query_owner = (self.video_ids[row], self.trajectory_ids[row])
+        bank_owner = (self.bank_video_ids[row], self.bank_trajectory_ids[row])
+        if (reason is RetrievalReason.OWNER_MISMATCH) == (query_owner == bank_owner):
+            raise ValueError("Retriever owner-mismatch reason must match query/Bank provenance")
         if self.audit[row].n_state != n_state or self.audit[row].selected_count != n_retrieved:
             raise ValueError("Retriever audit counts must align to output counts")
 
@@ -423,17 +490,25 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
             selected_scores=tuple(selected_scores),
             selected_records=tuple(selected_records),
             candidate_record_ids=state_view.record_ids,
+            candidate_records=tuple(
+                tuple(clone_state_record(record) if record is not None else None for record in row)
+                for row in state_view.cloned_records
+            ),
             state_embeddings=state_view.embeddings.detach().clone(),
             scores=scores,
             present_mask=state_view.present_mask.detach().clone(),
             selected_mask=selected_mask,
             status=tuple(statuses),
             reason=tuple(reasons),
+            hard_operators=operators,
+            time_resolutions=resolutions,
             n_state=state_view.n_state.detach().clone(),
             n_retrieved=n_retrieved,
             audit=tuple(audits),
             video_ids=query_video_ids,
             trajectory_ids=query_trajectory_ids,
+            bank_video_ids=state_view.video_ids,
+            bank_trajectory_ids=state_view.trajectory_ids,
             bank_versions=state_view.bank_versions,
         )
 
@@ -809,3 +884,26 @@ def _empty_reason(audit: RetrievalFilterAudit, owner_record_count: int) -> Retri
     if audit.below_similarity_count == audit.n_state:
         return RetrievalReason.BELOW_SIMILARITY
     return RetrievalReason.NO_MATCH
+
+
+def _snapshot_values_equal(left: object, right: object) -> bool:
+    """Compare frozen typed-record snapshots, including every tensor-backed payload field."""
+
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, Tensor) and isinstance(right, Tensor):
+        return bool(torch.equal(left, right))
+    if isinstance(left, tuple) and isinstance(right, tuple):
+        return len(left) == len(right) and all(
+            _snapshot_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if is_dataclass(left) and not isinstance(left, type):
+        return all(
+            _snapshot_values_equal(
+                getattr(left, field.name),
+                getattr(right, field.name),
+            )
+            for field in fields(left)
+        )
+    return bool(left == right)

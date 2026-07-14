@@ -3,7 +3,7 @@
 > 对齐源：[ARCHITECTURE.md](./ARCHITECTURE.md)  
 > 规范版本：`state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`  
 > 生成日期：2026-07-13  
-> 文档状态：施工分解 / P0–P11 已通过，P12 允许开始
+> 文档状态：施工分解 / P0–P12 已通过，P13 允许开始
 > 总原则：本文件只描述施工顺序和验收门禁；任何勾选都必须有代码、测试、日志或实验记录作为证据。
 
 ## 0. 使用方法
@@ -94,7 +94,7 @@
 | TTT Predictor | `768→1536→768` | 约 2.36M |
 | State Resampler | 16 queries，3 layers，`512→4096` | 约 14.72M |
 | Router/Resolver/empty record | 9 prototypes 等 | 约 0.14M |
-| 新增模块总计 | 不含 8B 基座 | 当前分项和 156.75536M，约 156.76M |
+| 新增模块总计 | 不含 8B 基座 | 当前分项和 156.715683M（156,715,683），约 156.72M |
 
 - [ ] 参数审计同时报告：新增模块约占 8B 基座的 2%，但在线实际变化的只有约 1.18M fast 参数。
 
@@ -1012,57 +1012,57 @@
 
 #### P12.1 State Resampler
 
-- [ ] 创建 `Q_state[16,512]` learned queries。
-- [ ] batch 广播并加 `q_target[:,None,:]`，得到 `[B,16,512]`。
-- [ ] 将检索 semantic records 作为 K/V `[B,N_ret,512]`。
-- [ ] 实现 3 层 Perceiver/Q-Former 风格 Resampler。
-- [ ] 每层先执行 16 queries 间 8-head self-attention。
-- [ ] 每层再执行 queries 对 records 的 8-head cross-attention。
-- [ ] 每层实现 FFN `512→2048→512`。
-- [ ] 每个子层使用 Pre-LayerNorm + residual。
-- [ ] 正确使用 record mask，attention 权重 shape 为 `[B,16,N_ret]`。
-- [ ] 核对 cross-attention 计算为 `softmax(QK^T/sqrt(d)+M)V`，mask 后不得把无效 record
+- [x] 创建 `Q_state[16,512]` learned queries。
+- [x] batch 广播并加 `q_target[:,None,:]`，得到 `[B,16,512]`。
+- [x] 将检索 semantic records 作为 K/V `[B,N_ret,512]`。
+- [x] 实现 3 层 Perceiver/Q-Former 风格 Resampler。
+- [x] 每层先执行 16 queries 间 8-head self-attention。
+- [x] 每层再执行 queries 对 records 的 8-head cross-attention。
+- [x] 每层实现 FFN `512→2048→512`。
+- [x] 每个子层使用 Pre-LayerNorm + residual。
+- [x] 正确使用 record mask，attention 权重 shape 为 `[B,16,N_ret]`。
+- [x] 核对 cross-attention 计算为 `softmax(QK^T/sqrt(d)+M)V`，mask 后不得把无效 record
       分配注意力质量。
-- [ ] 输出 `H_state[B,16,512]`。
-- [ ] 实现 `P_state:512→4096`，输出 `R_t[B,16,4096]`。
-- [ ] N_ret=0 时注入显式 `empty_record_embedding`。
-- [ ] 记录 cross-attention selected mass 供解释审计。
-- [ ] 验证 State Token 编码当前问题相关对象/事件语义、状态置信度、时间背景和自然语言解释所需软信息。
-- [ ] 参数量约 14.72M。
+- [x] 输出 `H_state[B,16,512]`。
+- [x] 实现 `P_state:512→4096`，输出 `R_t[B,16,4096]`。
+- [x] N_ret=0 时注入显式 `empty_record_embedding`；unsupported/invalid 输出零 token 与 false valid mask。
+- [x] 记录 cross-attention selected mass 供解释审计。
+- [x] 验证 q_target 与全部 selected semantic records 均可向 State Token 传递软信息/梯度；语义质量留 P15/P21。
+- [x] 精确参数量 14,722,048（约 14.72M）。
 
 #### P12.2 Deterministic Reader
 
-- [ ] 输入只接受 hard operator、resolved TimeWindow、retrieved typed records。
-- [ ] O1-Snap 返回 current_visible_count。
-- [ ] O1-Delta 返回 current_visible_count - baseline_count。
-- [ ] O2-Unique 返回 query_time 前 Confirmed 身份数。
-- [ ] O2-Gain 返回时间窗口内 first_seen 身份数。
-- [ ] E1-Action/E1-Transit 返回 query_time 前符合类型的完成事件数。
-- [ ] E2-Periodic/E2-Episode 返回 query_time 前符合类型的完整区间数。
-- [ ] unsupported 不生成伪造整数。
-- [ ] empty 可靠查询返回 exact_count=0。
-- [ ] invalid 时间/状态返回 exact_count=null。
-- [ ] 输出 status=ok|empty|unsupported|invalid。
-- [ ] 输出 exact_count、selected_record_ids、operator、time_window 和 audit_fields。
-- [ ] 使用真实 tokenizer 把 exact_count 序列化为 `number_token_ids[L_num]`。
-- [ ] 支持 number token ids→文本→整数的双向审计。
-- [ ] 防止 LLM 或调用方覆盖 Reader exact_count。
+- [x] 输入只接受同一 RetrieverOutput 绑定的 hard operator、resolved TimeWindow、retrieved typed records，并重验 selected/candidate typed snapshot 完整性。
+- [x] O1-Snap 返回 current_visible_count。
+- [x] O1-Delta 按 `fixed_baseline_v1` 返回 signed current_visible_count - baseline_count，不 clamp。
+- [x] O2-Unique 返回 query_time 前唯一 Confirmed identity 数。
+- [x] O2-Gain 返回 first_seen 落在闭区间内的唯一 Confirmed identity 数。
+- [x] E1-Action/E1-Transit：history 读 cumulative，其他窗口按 retained completion time 闭区间计数；不安全截断返回 invalid。
+- [x] E2-Periodic/E2-Episode 按 completion end 落在闭区间内统计完整区间，不计 active incomplete interval。
+- [x] unsupported 不生成伪造整数。
+- [x] empty 可靠查询返回 exact_count=0。
+- [x] invalid 时间/状态返回 exact_count=null。
+- [x] 输出 status=ok|empty|unsupported|invalid。
+- [x] 输出 exact_count、selected_record_ids、operator、time_window 和 records→operands audit_fields。
+- [x] 使用本地 pinned Qwen tokenizer 把 exact_count 序列化为 `number_token_ids[L_num]`，并验证四文件 SHA256 manifest。
+- [x] 支持 number token ids→文本→整数→同 IDs 的双向审计。
+- [x] 以同一 RetrieverOutput 重算完整 ReaderResult，防止 LLM 或调用方同步覆盖 exact_count/number IDs。
 
 ### 实施后验收项
 
-- [ ] 命中 0、3、30、300 条时 State Token 始终 `[B,16,4096]`。
-- [ ] 空检索输出有限、无 NaN，且 empty embedding 可训练。
-- [ ] 16 tokens 与任何 16 条 record 不存在位置一一对应假设。
-- [ ] 每个 hard operator 均有独立算术 fixture 和边界测试。
-- [ ] Reader exact_count 与手工类型化记录计算完全一致。
-- [ ] number token 来自 Reader，替换 ground-truth count 的负向测试会失败。
-- [ ] State Token 修改不会改变 Reader exact_count。
-- [ ] Reader 参数中不存在学习型计数器。
+- [x] 命中 0、3、30、300 条时 State Token 始终 `[B,16,4096]`。
+- [x] 空检索输出有限、无 NaN，且 empty embedding 可训练。
+- [x] 16 tokens 与任何 16 条 record 不存在位置一一对应假设；`N_s>N_ret` 非连续 selected 已覆盖。
+- [x] 每个 hard operator 均有独立算术 fixture 和边界测试。
+- [x] Reader exact_count 与手工类型化记录及审计 operands 计算完全一致。
+- [x] number token 来自 Reader，替换 ground-truth count 的负向测试会失败。
+- [x] State Token 修改不会改变 Reader exact_count。
+- [x] Reader 参数中不存在学习型计数器。
 
 ### 交付物与退出条件
 
-- [ ] 交付 State Resampler、`state_reader.py`、数字序列化和 operator 算术测试。
-- [ ] exact count 与 record audit 无法双向核对时禁止进入 LLM Composer。
+- [x] 交付 State Resampler、`state_reader.py`、数字序列化和 operator 算术测试。
+- [x] exact count 与 record audit 无法双向核对时禁止进入 LLM Composer。
 
 ---
 

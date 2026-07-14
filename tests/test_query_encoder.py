@@ -11,6 +11,7 @@ from torch import Tensor, nn
 from ttt_svcbench_qwen.config import QueryEncoderConfig, load_config
 from ttt_svcbench_qwen.data import RUNTIME_DENYLIST, extract_explicit_time_values
 from ttt_svcbench_qwen.query_encoder import (
+    OPERATOR_TO_EVENT_KIND,
     OPERATOR_TO_HEAD_TYPE,
     Operator,
     OperatorRouter,
@@ -29,7 +30,7 @@ from ttt_svcbench_qwen.query_encoder import (
     time_resolver_parameter_count,
 )
 from ttt_svcbench_qwen.query_tokens import QuestionTokenBatch, QuestionTokenSpan
-from ttt_svcbench_qwen.state_bank import HeadType
+from ttt_svcbench_qwen.state_bank import E1EventKind, E2EventKind, HeadType
 
 
 def make_char_token_batch(questions: tuple[str, ...]) -> QuestionTokenBatch:
@@ -319,6 +320,17 @@ def test_operator_router_covers_all_nine_classes_and_head_mapping() -> None:
     assert output.head_types[4:6] == (HeadType.E1, HeadType.E1)
     assert output.head_types[6:8] == (HeadType.E2, HeadType.E2)
     assert output.head_types[8] is None
+    assert tuple(OPERATOR_TO_EVENT_KIND[operator] for operator in Operator) == (
+        None,
+        None,
+        None,
+        None,
+        E1EventKind.ACTION,
+        E1EventKind.TRANSIT,
+        E2EventKind.PERIODIC,
+        E2EventKind.EPISODE,
+        None,
+    )
     assert torch.allclose(output.logits, scaled.logits)
     assert torch.equal(output.confidence, torch.softmax(output.logits, dim=-1).max(dim=-1).values)
     assert router.temperature.item() > 0.0
@@ -623,9 +635,7 @@ def test_time_parser_rejects_pointer_order_outside_span_and_explicit_value_misma
         partial_pointer = make_time_logits(
             query_input,
             (TimeWindowMode.RECENT,),
-            pointer_char_spans=(
-                (partial_start, partial_start + len(partial_text)),
-            ),
+            pointer_char_spans=((partial_start, partial_start + len(partial_text)),),
         )
         partial_result = resolver.resolve(
             partial_pointer,
@@ -677,12 +687,16 @@ def test_explicit_time_component_metadata_rejects_missing_extra_reordered_or_agg
         pointer_char_spans=((numeric_start, numeric_start + len(numeric_text)),),
     )
 
-    resolution = TimeWindowResolver(load_config().time_resolver).resolve(
-        logits,
-        query_input,
-        (Operator.O1_DELTA,),
-        apply_confidence_gate=False,
-    ).resolutions[0]
+    resolution = (
+        TimeWindowResolver(load_config().time_resolver)
+        .resolve(
+            logits,
+            query_input,
+            (Operator.O1_DELTA,),
+            apply_confidence_gate=False,
+        )
+        .resolutions[0]
+    )
 
     assert resolution.status is TimeResolutionStatus.INVALID
     assert resolution.reason == "explicit_time_values_mismatch"

@@ -50,6 +50,16 @@ class E2Phase(StrEnum):
     COMPLETED = "completed"
 
 
+class E1EventKind(StrEnum):
+    ACTION = "action"
+    TRANSIT = "transit"
+
+
+class E2EventKind(StrEnum):
+    PERIODIC = "periodic"
+    EPISODE = "episode"
+
+
 @dataclass(frozen=True, slots=True)
 class O1SlotState:
     slot_id: int
@@ -130,6 +140,7 @@ class O1Payload:
 
 @dataclass(frozen=True, slots=True)
 class E1Payload:
+    event_kind: E1EventKind
     event_count: int
     recent_event_times: tuple[float, ...]
     cooldown_until: float
@@ -145,6 +156,8 @@ class E1Payload:
     history_eviction_count: int = 0
 
     def __post_init__(self) -> None:
+        if not isinstance(self.event_kind, E1EventKind):
+            raise TypeError("E1 event_kind must be an E1EventKind")
         counters = (
             self.event_count,
             self.duplicate_suppression_count,
@@ -179,6 +192,7 @@ class E1Payload:
 
 @dataclass(frozen=True, slots=True)
 class E2Payload:
+    event_kind: E2EventKind
     completed_count: int
     phase: E2Phase
     completed_intervals: tuple[tuple[float, float], ...]
@@ -192,6 +206,8 @@ class E2Payload:
     history_eviction_count: int = 0
 
     def __post_init__(self) -> None:
+        if not isinstance(self.event_kind, E2EventKind):
+            raise TypeError("E2 event_kind must be an E2EventKind")
         counters = (
             self.completed_count,
             self.duplicate_suppression_count,
@@ -678,6 +694,18 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             or type(record.payload) is not type(previous.payload)
         ):
             raise ValueError("State Bank replacement cannot change owner/head/payload type")
+        if (
+            isinstance(previous.payload, E1Payload)
+            and isinstance(record.payload, E1Payload)
+            and (record.payload.event_kind is not previous.payload.event_kind)
+        ):
+            raise ValueError("State Bank replacement cannot change E1 event kind")
+        if (
+            isinstance(previous.payload, E2Payload)
+            and isinstance(record.payload, E2Payload)
+            and (record.payload.event_kind is not previous.payload.event_kind)
+        ):
+            raise ValueError("State Bank replacement cannot change E2 event kind")
         if not previous.valid:
             raise ValueError("invalidated State Bank records are terminal")
         if record.valid != previous.valid:
@@ -1304,14 +1332,21 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
         observation: E1SoftOutput,
         semantic_embeddings: Tensor,
         *,
+        event_kind: E1EventKind,
         row: int = 0,
     ) -> StateBankRuntimeState:
         _require_live_state(state)
+        if not isinstance(event_kind, E1EventKind):
+            raise TypeError("event_kind must be an E1EventKind")
         _validate_row(row, observation.logits.shape[0], "E1")
         semantics = _select_semantics(semantic_embeddings, observation.logits.shape[:2], row)
         prior_record = _find_aggregate_record(state, HeadType.E1)
-        prior = prior_record.payload if prior_record is not None else E1Payload(0, (), 0.0)
+        prior = (
+            prior_record.payload if prior_record is not None else E1Payload(event_kind, 0, (), 0.0)
+        )
         assert isinstance(prior, E1Payload)
+        if prior.event_kind is not event_kind:
+            raise ValueError("E1 event kind cannot change within a trajectory")
         event_count = prior.event_count
         recent = list(prior.recent_event_times)
         cooldown_until = prior.cooldown_until
@@ -1407,11 +1442,15 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
                     state,
                     replacement,
                     action="e1_overlap_ignored",
-                    details=(("duplicate_positions", delta_duplicates),),
+                    details=(
+                        ("event_kind", event_kind.value),
+                        ("duplicate_positions", delta_duplicates),
+                    ),
                     audit_timestamp=max(last_timestamp, 0.0),
                 ),
             )
         payload = E1Payload(
+            event_kind=event_kind,
             event_count=event_count,
             recent_event_times=tuple(recent),
             cooldown_until=cooldown_until,
@@ -1436,6 +1475,7 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             payload=payload,
             action="e1_fsm_update",
             details=(
+                ("event_kind", event_kind.value),
                 ("position_id", last_position),
                 ("events_added", delta_events),
                 ("duplicate_positions", delta_duplicates),
@@ -1453,18 +1493,23 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
         observation: E2SoftOutput,
         semantic_embeddings: Tensor,
         *,
+        event_kind: E2EventKind,
         row: int = 0,
     ) -> StateBankRuntimeState:
         _require_live_state(state)
+        if not isinstance(event_kind, E2EventKind):
+            raise TypeError("event_kind must be an E2EventKind")
         _validate_row(row, observation.event_logits.shape[0], "E2")
         semantics = _select_semantics(semantic_embeddings, observation.event_logits.shape[:2], row)
         prior_record = _find_aggregate_record(state, HeadType.E2)
         prior = (
             prior_record.payload
             if prior_record is not None
-            else E2Payload(0, E2Phase.INACTIVE, (), ())
+            else E2Payload(event_kind, 0, E2Phase.INACTIVE, (), ())
         )
         assert isinstance(prior, E2Payload)
+        if prior.event_kind is not event_kind:
+            raise ValueError("E2 event kind cannot change within a trajectory")
         completed_count = prior.completed_count
         intervals = list(prior.completed_intervals)
         recent = list(prior.recent_event_times)
@@ -1575,11 +1620,15 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
                     state,
                     replacement,
                     action="e2_overlap_ignored",
-                    details=(("duplicate_positions", delta_duplicates),),
+                    details=(
+                        ("event_kind", event_kind.value),
+                        ("duplicate_positions", delta_duplicates),
+                    ),
                     audit_timestamp=max(last_timestamp, 0.0),
                 ),
             )
         payload = E2Payload(
+            event_kind=event_kind,
             completed_count=completed_count,
             phase=phase,
             completed_intervals=tuple(intervals),
@@ -1604,6 +1653,7 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             payload=payload,
             action="e2_fsm_update",
             details=(
+                ("event_kind", event_kind.value),
                 ("position_id", last_position),
                 ("completed_added", delta_completed),
                 ("duplicate_positions", delta_duplicates),

@@ -17,7 +17,9 @@ from ttt_svcbench_qwen.observation_heads import (
     StreamReplayAudit,
 )
 from ttt_svcbench_qwen.state_bank import (
+    E1EventKind,
     E1Payload,
+    E2EventKind,
     E2Payload,
     E2Phase,
     HeadType,
@@ -332,8 +334,11 @@ def test_all_five_payloads_record_xor_head_and_detach_contracts() -> None:
         (HeadType.O1, O1Payload(0, 0, (), baseline_initialized=False)),
         (HeadType.O2, _candidate(first_seen=1.0)),
         (HeadType.O2, _confirmed(first_seen=2.0, last_seen=2.0)),
-        (HeadType.E1, E1Payload(0, (), 0.0)),
-        (HeadType.E2, E2Payload(0, E2Phase.INACTIVE, (), ())),
+        (HeadType.E1, E1Payload(E1EventKind.ACTION, 0, (), 0.0)),
+        (
+            HeadType.E2,
+            E2Payload(E2EventKind.PERIODIC, 0, E2Phase.INACTIVE, (), ()),
+        ),
     )
     records = []
     for index, (head_type, payload) in enumerate(payloads):
@@ -397,6 +402,7 @@ def test_state_record_time_contract_blocks_future_payload_evidence() -> None:
         update_count=1,
     )
     e1_payload = E1Payload(
+        event_kind=E1EventKind.ACTION,
         event_count=1,
         recent_event_times=(3.0,),
         cooldown_until=8.0,
@@ -407,6 +413,7 @@ def test_state_record_time_contract_blocks_future_payload_evidence() -> None:
         last_position_id=2,
     )
     e2_payload = E2Payload(
+        event_kind=E2EventKind.PERIODIC,
         completed_count=1,
         phase=E2Phase.COMPLETED,
         completed_intervals=((1.0, 4.0),),
@@ -458,6 +465,7 @@ def test_state_record_time_contract_blocks_future_payload_evidence() -> None:
         replace(e2_record, payload=replace(e2_payload, recent_event_times=(6.0,)))
     with pytest.raises(ValueError, match="E2 candidate time"):
         active_payload = E2Payload(
+            event_kind=E2EventKind.PERIODIC,
             completed_count=0,
             phase=E2Phase.ACTIVE,
             completed_intervals=(),
@@ -907,7 +915,7 @@ def test_batched_view_supports_row_wise_head_partitions_and_none_rows(
         time_range=None,
         valid=True,
         confidence=0.7,
-        payload=E1Payload(0, (), 0.0),
+        payload=E1Payload(E1EventKind.ACTION, 0, (), 0.0),
     )
     third = bank.append_record(
         bank.reset("video-row-c", "trajectory-row-c"),
@@ -1059,8 +1067,11 @@ def test_aggregate_partitions_reject_duplicate_generic_append(
 ) -> None:
     aggregate_payloads = (
         (HeadType.O1, O1Payload(0, 0, (), baseline_initialized=False)),
-        (HeadType.E1, E1Payload(0, (), 0.0)),
-        (HeadType.E2, E2Payload(0, E2Phase.INACTIVE, (), ())),
+        (HeadType.E1, E1Payload(E1EventKind.ACTION, 0, (), 0.0)),
+        (
+            HeadType.E2,
+            E2Payload(E2EventKind.PERIODIC, 0, E2Phase.INACTIVE, (), ()),
+        ),
     )
     for index, (head_type, payload) in enumerate(aggregate_payloads):
         state = bank.append_record(
@@ -1084,6 +1095,82 @@ def test_aggregate_partitions_reject_duplicate_generic_append(
                 confidence=0.7,
                 payload=payload,
             )
+
+
+def test_event_kind_provenance_is_required_and_frozen(
+    bank: StructuredStateBank,
+) -> None:
+    e1_observation = _e1_output(
+        torch.zeros(1, 3),
+        torch.tensor([0.0]),
+        torch.tensor([0]),
+    )
+    e2_observation = _e2_output(
+        torch.zeros(1, 4),
+        torch.tensor([0]),
+        torch.tensor([0.0]),
+        torch.tensor([0]),
+    )
+    semantics = _unit_semantic().reshape(1, 1, -1)
+
+    e1_states = tuple(
+        bank.update_e1(
+            bank.reset(f"video-e1-{kind.value}", f"trajectory-e1-{kind.value}"),
+            e1_observation,
+            semantics,
+            event_kind=kind,
+        )
+        for kind in E1EventKind
+    )
+    e2_states = tuple(
+        bank.update_e2(
+            bank.reset(f"video-e2-{kind.value}", f"trajectory-e2-{kind.value}"),
+            e2_observation,
+            semantics,
+            event_kind=kind,
+        )
+        for kind in E2EventKind
+    )
+    assert tuple(state.records[0].payload.event_kind for state in e1_states) == tuple(E1EventKind)
+    assert tuple(state.records[0].payload.event_kind for state in e2_states) == tuple(E2EventKind)
+    assert dict(e1_states[0].audit_log[-1].details)["event_kind"] == "action"
+    assert dict(e2_states[0].audit_log[-1].details)["event_kind"] == "periodic"
+
+    with pytest.raises(ValueError, match="E1 event kind cannot change"):
+        bank.update_e1(
+            e1_states[0],
+            e1_observation,
+            semantics,
+            event_kind=E1EventKind.TRANSIT,
+        )
+    with pytest.raises(ValueError, match="E2 event kind cannot change"):
+        bank.update_e2(
+            e2_states[0],
+            e2_observation,
+            semantics,
+            event_kind=E2EventKind.EPISODE,
+        )
+
+    e1_record = e1_states[0].records[0]
+    assert isinstance(e1_record.payload, E1Payload)
+    with pytest.raises(ValueError, match="replacement cannot change E1 event kind"):
+        bank.update_record(
+            e1_states[0],
+            replace(
+                e1_record,
+                payload=replace(e1_record.payload, event_kind=E1EventKind.TRANSIT),
+            ),
+        )
+    e2_record = e2_states[0].records[0]
+    assert isinstance(e2_record.payload, E2Payload)
+    with pytest.raises(ValueError, match="replacement cannot change E2 event kind"):
+        bank.update_record(
+            e2_states[0],
+            replace(
+                e2_record,
+                payload=replace(e2_record.payload, event_kind=E2EventKind.EPISODE),
+            ),
+        )
 
 
 def test_first_aggregate_with_older_cross_head_time_keeps_audit_monotonic(
@@ -1114,6 +1201,7 @@ def test_first_aggregate_with_older_cross_head_time_keeps_audit_monotonic(
         state,
         _e1_output(torch.zeros(1, 3), torch.tensor([2.0]), torch.tensor([0])),
         _unit_semantic(2).reshape(1, 1, -1),
+        event_kind=E1EventKind.ACTION,
     )
     state = bank.update_e2(
         state,
@@ -1124,6 +1212,7 @@ def test_first_aggregate_with_older_cross_head_time_keeps_audit_monotonic(
             torch.tensor([0]),
         ),
         _unit_semantic(3).reshape(1, 1, -1),
+        event_kind=E2EventKind.PERIODIC,
     )
 
     audit_timestamps = tuple(entry.timestamp for entry in state.audit_log)
@@ -1298,6 +1387,7 @@ def test_fresh_all_invalid_e1_and_e2_outputs_do_not_enter_bank(
             valid_mask=valid_mask,
         ),
         semantics,
+        event_kind=E1EventKind.ACTION,
     )
     assert unchanged_e1 is fresh_e1
     assert not unchanged_e1.records and not unchanged_e1.audit_log
@@ -1314,6 +1404,7 @@ def test_fresh_all_invalid_e1_and_e2_outputs_do_not_enter_bank(
             valid_mask=valid_mask,
         ),
         semantics,
+        event_kind=E2EventKind.PERIODIC,
     )
     assert unchanged_e2 is fresh_e2
     assert not unchanged_e2.records and not unchanged_e2.audit_log
@@ -1344,6 +1435,7 @@ def test_exact_fp32_fsm_thresholds_with_non_prefix_valid_masks(
             valid_mask=e1_valid,
         ),
         e1_semantics,
+        event_kind=E1EventKind.ACTION,
     )
     e1_payload = e1_state.records[0].payload
     assert isinstance(e1_payload, E1Payload)
@@ -1376,6 +1468,7 @@ def test_exact_fp32_fsm_thresholds_with_non_prefix_valid_masks(
             valid_mask=e2_valid,
         ),
         e2_semantics,
+        event_kind=E2EventKind.PERIODIC,
     )
     e2_payload = e2_state.records[0].payload
     assert isinstance(e2_payload, E2Payload)
@@ -1410,6 +1503,7 @@ def test_e1_hysteresis_cooldown_nms_overlap_and_gap_fail_closed(
         bank.reset("video-e1", "trajectory-e1"),
         _e1_output(probabilities, timestamps, positions),
         semantics,
+        event_kind=E1EventKind.ACTION,
     )
     payload = state.records[0].payload
     assert isinstance(payload, E1Payload)
@@ -1424,6 +1518,7 @@ def test_e1_hysteresis_cooldown_nms_overlap_and_gap_fail_closed(
         state,
         _e1_output(probabilities[-2:], timestamps[-2:], positions[-2:]),
         semantics[:, -2:],
+        event_kind=E1EventKind.ACTION,
     )
     overlap_payload = overlap.records[0].payload
     assert isinstance(overlap_payload, E1Payload)
@@ -1442,6 +1537,7 @@ def test_e1_hysteresis_cooldown_nms_overlap_and_gap_fail_closed(
             state,
             _e1_output(torch.tensor([[0.2, 0.0, 0.0]]), torch.tensor([1.0]), torch.tensor([8])),
             _unit_semantic().reshape(1, 1, -1),
+            event_kind=E1EventKind.ACTION,
         )
 
     nms_state = bank.append_record(
@@ -1453,6 +1549,7 @@ def test_e1_hysteresis_cooldown_nms_overlap_and_gap_fail_closed(
         valid=True,
         confidence=0.9,
         payload=E1Payload(
+            E1EventKind.ACTION,
             1,
             (1.0,),
             0.0,
@@ -1467,6 +1564,7 @@ def test_e1_hysteresis_cooldown_nms_overlap_and_gap_fail_closed(
         nms_state,
         _e1_output(torch.tensor([[0.9, 0.8, 0.8]]), torch.tensor([1.2]), torch.tensor([2])),
         _unit_semantic().reshape(1, 1, -1),
+        event_kind=E1EventKind.ACTION,
     )
     nms_payload = nms_state.records[0].payload
     assert isinstance(nms_payload, E1Payload)
@@ -1496,6 +1594,7 @@ def test_e2_phase_gated_transitions_rearm_overlap_and_conflicts(
         bank.reset("video-e2", "trajectory-e2"),
         _e2_output(events, phases, timestamps, positions),
         semantics,
+        event_kind=E2EventKind.PERIODIC,
     )
     payload = state.records[0].payload
     assert isinstance(payload, E2Payload)
@@ -1511,6 +1610,7 @@ def test_e2_phase_gated_transitions_rearm_overlap_and_conflicts(
         state,
         _e2_output(events[-2:], phases[-2:], timestamps[-2:], positions[-2:]),
         semantics[:, -2:],
+        event_kind=E2EventKind.PERIODIC,
     )
     overlap_payload = overlap.records[0].payload
     assert isinstance(overlap_payload, E2Payload)
@@ -1533,6 +1633,7 @@ def test_e2_phase_gated_transitions_rearm_overlap_and_conflicts(
                 torch.tensor([10]),
             ),
             _unit_semantic().reshape(1, 1, -1),
+            event_kind=E2EventKind.PERIODIC,
         )
 
     conflict = bank.update_e2(
@@ -1544,6 +1645,7 @@ def test_e2_phase_gated_transitions_rearm_overlap_and_conflicts(
             torch.tensor([0]),
         ),
         _unit_semantic().reshape(1, 1, -1),
+        event_kind=E2EventKind.PERIODIC,
     )
     conflict_payload = conflict.records[0].payload
     assert isinstance(conflict_payload, E2Payload)
@@ -1568,6 +1670,7 @@ def test_e1_and_e2_history_513_eviction_preserves_exact_totals(
         bank.reset("video-e1-history", "trajectory-e1-history"),
         _e1_output(e1_tensor, torch.tensor(e1_times), e1_positions),
         e1_semantics,
+        event_kind=E1EventKind.ACTION,
     )
     e1_payload = e1_state.records[0].payload
     assert isinstance(e1_payload, E1Payload)
@@ -1598,6 +1701,7 @@ def test_e1_and_e2_history_513_eviction_preserves_exact_totals(
             e2_positions,
         ),
         e2_semantics,
+        event_kind=E2EventKind.PERIODIC,
     )
     e2_payload = e2_state.records[0].payload
     assert isinstance(e2_payload, E2Payload)

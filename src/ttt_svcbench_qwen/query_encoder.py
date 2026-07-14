@@ -27,7 +27,7 @@ from ttt_svcbench_qwen.config import (
 )
 from ttt_svcbench_qwen.data import assert_runtime_payload_safe, extract_explicit_time_values
 from ttt_svcbench_qwen.query_tokens import QuestionTokenBatch
-from ttt_svcbench_qwen.state_bank import HeadType
+from ttt_svcbench_qwen.state_bank import E1EventKind, E2EventKind, HeadType
 
 
 class Operator(StrEnum):
@@ -68,6 +68,18 @@ OPERATOR_TO_HEAD_TYPE: Mapping[Operator, HeadType | None] = {
     Operator.E1_TRANSIT: HeadType.E1,
     Operator.E2_PERIODIC: HeadType.E2,
     Operator.E2_EPISODE: HeadType.E2,
+    Operator.UNSUPPORTED: None,
+}
+
+OPERATOR_TO_EVENT_KIND: Mapping[Operator, E1EventKind | E2EventKind | None] = {
+    Operator.O1_SNAP: None,
+    Operator.O1_DELTA: None,
+    Operator.O2_UNIQUE: None,
+    Operator.O2_GAIN: None,
+    Operator.E1_ACTION: E1EventKind.ACTION,
+    Operator.E1_TRANSIT: E1EventKind.TRANSIT,
+    Operator.E2_PERIODIC: E2EventKind.PERIODIC,
+    Operator.E2_EPISODE: E2EventKind.EPISODE,
     Operator.UNSUPPORTED: None,
 }
 
@@ -140,9 +152,7 @@ class QueryEncoderInput:
         batch_size, width, _ = embeddings.shape
         if self.question_tokens.input_ids.shape != (batch_size, width):
             raise ValueError("question token shape must match question_embeddings [B, L_q]")
-        if self.query_time.shape != (batch_size,) or not torch.is_floating_point(
-            self.query_time
-        ):
+        if self.query_time.shape != (batch_size,) or not torch.is_floating_point(self.query_time):
             raise ValueError("query_time must be floating [B]")
         if not bool(torch.isfinite(embeddings).all()):
             raise ValueError("question_embeddings must be finite")
@@ -249,9 +259,7 @@ class OperatorRouterOutput:
         batch_size = self.logits.shape[0] if self.logits.ndim == 2 else -1
         if self.logits.shape != (batch_size, len(Operator)):
             raise ValueError("operator logits must be [B, 9]")
-        if self.confidence.shape != (batch_size,) or not torch.is_floating_point(
-            self.confidence
-        ):
+        if self.confidence.shape != (batch_size,) or not torch.is_floating_point(self.confidence):
             raise ValueError("operator confidence must be floating [B]")
         if self.raw_indices.shape != (batch_size,) or self.raw_indices.dtype != torch.int64:
             raise ValueError("raw operator indices must be int64 [B]")
@@ -413,8 +421,7 @@ class QueryEncoderSupervision:
             raise ValueError("operator targets must be within [0, 9)")
         if bool(
             torch.any(
-                (self.time_mode_targets < 0)
-                | (self.time_mode_targets >= len(TimeWindowMode))
+                (self.time_mode_targets < 0) | (self.time_mode_targets >= len(TimeWindowMode))
             )
         ):
             raise ValueError("time mode targets must be within [0, 4)")
@@ -426,9 +433,7 @@ class QueryEncoderSupervision:
         if not torch.equal(start_ignored, end_ignored):
             raise ValueError("numeric span start/end targets must be ignored together")
         valid = ~start_ignored
-        if bool(
-            torch.any(self.span_start_targets[valid] > self.span_end_targets[valid])
-        ):
+        if bool(torch.any(self.span_start_targets[valid] > self.span_end_targets[valid])):
             raise ValueError("numeric span targets use inclusive indices with start <= end")
 
 
@@ -470,9 +475,7 @@ class QueryEmbeddingEncoder(nn.Module):  # type: ignore[misc]
 
     def forward(self, question_embeddings: Tensor, padding_mask: Tensor) -> QueryEmbeddingOutput:
         if question_embeddings.ndim != 3 or question_embeddings.shape[-1] != self.input_dim:
-            raise ValueError(
-                f"question_embeddings must be [B, L_q, {self.input_dim}]"
-            )
+            raise ValueError(f"question_embeddings must be [B, L_q, {self.input_dim}]")
         if padding_mask.shape != question_embeddings.shape[:2] or padding_mask.dtype != torch.bool:
             raise ValueError("padding_mask must be bool [B, L_q]")
         if padding_mask.device != question_embeddings.device:
@@ -546,8 +549,7 @@ class OperatorRouter(nn.Module):  # type: ignore[misc]
         if not torch.is_floating_point(q_operator) or not bool(torch.isfinite(q_operator).all()):
             raise ValueError("q_operator must be finite and floating")
         logits = (
-            F.normalize(q_operator, dim=-1)
-            @ F.normalize(self.prototypes, dim=-1).transpose(0, 1)
+            F.normalize(q_operator, dim=-1) @ F.normalize(self.prototypes, dim=-1).transpose(0, 1)
         ) / self.temperature
         probabilities = torch.softmax(logits, dim=-1)
         confidence, raw_indices = probabilities.max(dim=-1)
@@ -603,9 +605,7 @@ class TimeWindowResolver(nn.Module):  # type: ignore[misc]
         if q_time.ndim != 2 or q_time.shape[1] != self.input_dim:
             raise ValueError(f"q_time must be [B, {self.input_dim}]")
         if token_states.ndim != 3 or token_states.shape[-1] != self.token_hidden_dim:
-            raise ValueError(
-                f"token_states must be [B, L_q, {self.token_hidden_dim}]"
-            )
+            raise ValueError(f"token_states must be [B, L_q, {self.token_hidden_dim}]")
         if token_states.shape[0] != q_time.shape[0]:
             raise ValueError("q_time and token_states batch sizes must match")
         if padding_mask.shape != token_states.shape[:2] or padding_mask.dtype != torch.bool:
@@ -620,13 +620,21 @@ class TimeWindowResolver(nn.Module):  # type: ignore[misc]
         mode_probabilities = torch.softmax(mode_logits, dim=-1)
         mode_confidence, mode_indices = mode_probabilities.max(dim=-1)
         minimum = torch.finfo(token_states.dtype).min
-        span_start_logits = self.span_start(token_states).squeeze(-1).masked_fill(
-            padding_mask,
-            minimum,
+        span_start_logits = (
+            self.span_start(token_states)
+            .squeeze(-1)
+            .masked_fill(
+                padding_mask,
+                minimum,
+            )
         )
-        span_end_logits = self.span_end(token_states).squeeze(-1).masked_fill(
-            padding_mask,
-            minimum,
+        span_end_logits = (
+            self.span_end(token_states)
+            .squeeze(-1)
+            .masked_fill(
+                padding_mask,
+                minimum,
+            )
         )
         return TimeResolverLogits(
             mode_logits=mode_logits,
@@ -821,9 +829,7 @@ class QueryEncoder(nn.Module):  # type: ignore[misc]
             apply_confidence_gate=apply_confidence_gate,
         )
         effective_operators = tuple(
-            operator
-            if resolution.status is TimeResolutionStatus.OK
-            else Operator.UNSUPPORTED
+            operator if resolution.status is TimeResolutionStatus.OK else Operator.UNSUPPORTED
             for operator, resolution in zip(
                 route.hard_operators,
                 time_output.resolutions,
@@ -835,9 +841,7 @@ class QueryEncoder(nn.Module):  # type: ignore[misc]
             route=route,
             time=time_output,
             hard_operators=effective_operators,
-            head_types=tuple(
-                OPERATOR_TO_HEAD_TYPE[operator] for operator in effective_operators
-            ),
+            head_types=tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in effective_operators),
         )
 
 
@@ -964,9 +968,7 @@ def _normalize_explicit_time_values(
     for row in raw:
         if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
             raise TypeError("each explicit_time_values row must be a numeric sequence")
-        if not all(
-            isinstance(item, (int, float)) and not isinstance(item, bool) for item in row
-        ):
+        if not all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in row):
             raise TypeError("explicit_time_values rows must contain only numbers")
         normalized.append(tuple(float(cast(float, item)) for item in row))
     return tuple(normalized)

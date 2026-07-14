@@ -330,6 +330,7 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "o2_confirmed_retrieval_eligible": True,
         "dynamic_view_padding": "batch_max",
         "n_state_definition": "owner_head_present_records_before_filters",
+        "event_kind_provenance": "hard_operator_frozen_per_aggregate",
     }
     assert bank.confirmed_store.model_dump() == {
         "initial_capacity": 256,
@@ -426,6 +427,52 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
     assert config.retriever.ann_enabled is False
     assert config.state_resampler.num_queries == 16
     assert config.state_resampler.output_dim == 4096
+    assert config.state_resampler.model_dump() == {
+        "num_queries": 16,
+        "num_layers": 3,
+        "num_heads": 8,
+        "head_dim": 64,
+        "ffn_dim": 2048,
+        "hidden_dim": 512,
+        "output_dim": 4096,
+        "layer_norm_eps": 1.0e-5,
+        "activation": "gelu",
+        "dropout": 0.0,
+        "attention_bias": True,
+        "output_projection_bias": True,
+        "attention_softmax_dtype": "float32",
+        "empty_record_embedding": True,
+        "empty_record_policy": "internal_trainable_kv_external_zero_width",
+        "attention_audit": "final_layer_mean_heads_selected_mass",
+        "parameter_count": 14_722_048,
+    }
+    assert config.state_reader.model_dump() == {
+        "signed_exact_count": True,
+        "empty_exact_count": 0,
+        "status_propagation": "retriever_exact",
+        "o1_delta_policy": "fixed_baseline_v1",
+        "o2_identity_key": "identity_id",
+        "point_window_boundary": "closed",
+        "e1_history_policy": "cumulative_or_retained_completion_times",
+        "e1_truncated_window_status": "invalid",
+        "e2_window_anchor": "completion_end",
+        "event_kind_mismatch_status": "invalid",
+        "number_text_format": "canonical_ascii_signed_decimal",
+        "tokenizer_add_special_tokens": False,
+        "tokenizer_roundtrip_required": True,
+        "tokenizer_class": "Qwen2TokenizerFast",
+        "tokenizer_vocab_size": 151_643,
+        "tokenizer_required_files": (
+            "merges.txt",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+        ),
+        "tokenizer_manifest_sha256": (
+            "ccd18347b6d6714d91d4c55b37ff05e473a0f8e84fbcba2bda1401a9572f44c3"
+        ),
+        "ground_truth_input_forbidden": True,
+    }
     assert config.predictor.model_dump() == {
         "input_dim": 768,
         "hidden_dim": 1536,
@@ -745,6 +792,10 @@ def set_nested(*path_and_value: object) -> Mutation:
             "state_bank.o2_candidate_retrieval_eligible",
         ),
         (
+            set_nested("state_bank", "event_kind_provenance", "ground_truth_label"),
+            "state_bank.event_kind_provenance",
+        ),
+        (
             set_nested("parameter_budget", "temporal_encoder_millions", 48.49),
             "parameter budget components|temporal encoder budget",
         ),
@@ -761,6 +812,82 @@ def set_nested(*path_and_value: object) -> Mutation:
             "parameter budget components",
         ),
         (set_nested("state_resampler", "num_queries", 8), "num_queries must be 16"),
+        (
+            set_nested("state_resampler", "layer_norm_eps", 1.0e-6),
+            "state_resampler.layer_norm_eps",
+        ),
+        (
+            set_nested("state_resampler", "activation", "silu"),
+            "state_resampler.activation",
+        ),
+        (
+            set_nested("state_resampler", "dropout", 0.1),
+            "state_resampler.dropout",
+        ),
+        (
+            set_nested("state_resampler", "attention_bias", False),
+            "state_resampler.attention_bias",
+        ),
+        (
+            set_nested("state_resampler", "output_projection_bias", False),
+            "state_resampler.output_projection_bias",
+        ),
+        (
+            set_nested("state_resampler", "attention_softmax_dtype", "float16"),
+            "state_resampler.attention_softmax_dtype",
+        ),
+        (
+            set_nested("state_resampler", "empty_record_embedding", False),
+            "state_resampler.empty_record_embedding",
+        ),
+        (
+            set_nested("state_resampler", "empty_record_policy", "masked_softmax"),
+            "state_resampler.empty_record_policy",
+        ),
+        (
+            set_nested("state_resampler", "attention_audit", "none"),
+            "state_resampler.attention_audit",
+        ),
+        (
+            set_nested("state_resampler", "parameter_count", 14_720_000),
+            "state_resampler.parameter_count",
+        ),
+        (
+            set_nested("state_reader", "signed_exact_count", False),
+            "state_reader.signed_exact_count",
+        ),
+        (
+            set_nested("state_reader", "empty_exact_count", 1),
+            "state_reader.empty_exact_count",
+        ),
+        (
+            set_nested("state_reader", "status_propagation", "infer_from_length"),
+            "state_reader.status_propagation",
+        ),
+        (
+            set_nested("state_reader", "o1_delta_policy", "window_delta"),
+            "state_reader.o1_delta_policy",
+        ),
+        (
+            set_nested("state_reader", "e1_truncated_window_status", "empty"),
+            "state_reader.e1_truncated_window_status",
+        ),
+        (
+            set_nested("state_reader", "e2_window_anchor", "interval_start"),
+            "state_reader.e2_window_anchor",
+        ),
+        (
+            set_nested("state_reader", "number_text_format", "localized"),
+            "state_reader.number_text_format",
+        ),
+        (
+            set_nested("state_reader", "tokenizer_add_special_tokens", True),
+            "state_reader.tokenizer_add_special_tokens",
+        ),
+        (
+            set_nested("state_reader", "ground_truth_input_forbidden", False),
+            "state_reader.ground_truth_input_forbidden",
+        ),
         (set_nested("fast_ttt", "optimizer", "momentum", 0.9), "momentum must be 0.0"),
         (
             set_nested("retriever", "similarity_dtype", "float16"),

@@ -395,6 +395,7 @@ class StateBankConfig(FrozenModel):
     o2_confirmed_retrieval_eligible: bool
     dynamic_view_padding: str
     n_state_definition: str
+    event_kind_provenance: str
 
 
 class QueryEncoderConfig(FrozenModel):
@@ -459,7 +460,37 @@ class StateResamplerConfig(FrozenModel):
     ffn_dim: PositiveInt
     hidden_dim: PositiveInt
     output_dim: PositiveInt
+    layer_norm_eps: PositiveFloat
+    activation: str
+    dropout: Probability
+    attention_bias: bool
+    output_projection_bias: bool
+    attention_softmax_dtype: str
     empty_record_embedding: bool
+    empty_record_policy: str
+    attention_audit: str
+    parameter_count: PositiveInt
+
+
+class StateReaderConfig(FrozenModel):
+    signed_exact_count: bool
+    empty_exact_count: NonNegativeInt
+    status_propagation: str
+    o1_delta_policy: str
+    o2_identity_key: str
+    point_window_boundary: str
+    e1_history_policy: str
+    e1_truncated_window_status: str
+    e2_window_anchor: str
+    event_kind_mismatch_status: str
+    number_text_format: str
+    tokenizer_add_special_tokens: bool
+    tokenizer_roundtrip_required: bool
+    tokenizer_class: str
+    tokenizer_vocab_size: PositiveInt
+    tokenizer_required_files: tuple[str, ...]
+    tokenizer_manifest_sha256: str
+    ground_truth_input_forbidden: bool
 
 
 class PredictorConfig(FrozenModel):
@@ -517,6 +548,7 @@ class ProjectConfig(FrozenModel):
     time_resolver: TimeResolverConfig
     retriever: RetrieverConfig
     state_resampler: StateResamplerConfig
+    state_reader: StateReaderConfig
     predictor: PredictorConfig
     loss: LossConfig
     evaluation: EvaluationConfig
@@ -1068,6 +1100,11 @@ class ProjectConfig(FrozenModel):
                 self.state_bank.n_state_definition,
                 "owner_head_present_records_before_filters",
             ),
+            (
+                "state_bank.event_kind_provenance",
+                self.state_bank.event_kind_provenance,
+                "hard_operator_frozen_per_aggregate",
+            ),
             ("query_encoder.input_dim", self.query_encoder.input_dim, 4096),
             ("query_encoder.hidden_dim", self.query_encoder.hidden_dim, 768),
             ("query_encoder.num_layers", self.query_encoder.num_layers, 4),
@@ -1183,6 +1220,114 @@ class ProjectConfig(FrozenModel):
             ("state_resampler.ffn_dim", self.state_resampler.ffn_dim, 2048),
             ("state_resampler.hidden_dim", self.state_resampler.hidden_dim, 512),
             ("state_resampler.output_dim", self.state_resampler.output_dim, 4096),
+            ("state_resampler.layer_norm_eps", self.state_resampler.layer_norm_eps, 1.0e-5),
+            ("state_resampler.activation", self.state_resampler.activation, "gelu"),
+            ("state_resampler.dropout", self.state_resampler.dropout, 0.0),
+            ("state_resampler.attention_bias", self.state_resampler.attention_bias, True),
+            (
+                "state_resampler.output_projection_bias",
+                self.state_resampler.output_projection_bias,
+                True,
+            ),
+            (
+                "state_resampler.attention_softmax_dtype",
+                self.state_resampler.attention_softmax_dtype,
+                "float32",
+            ),
+            (
+                "state_resampler.empty_record_embedding",
+                self.state_resampler.empty_record_embedding,
+                True,
+            ),
+            (
+                "state_resampler.empty_record_policy",
+                self.state_resampler.empty_record_policy,
+                "internal_trainable_kv_external_zero_width",
+            ),
+            (
+                "state_resampler.attention_audit",
+                self.state_resampler.attention_audit,
+                "final_layer_mean_heads_selected_mass",
+            ),
+            ("state_resampler.parameter_count", self.state_resampler.parameter_count, 14_722_048),
+            ("state_reader.signed_exact_count", self.state_reader.signed_exact_count, True),
+            ("state_reader.empty_exact_count", self.state_reader.empty_exact_count, 0),
+            (
+                "state_reader.status_propagation",
+                self.state_reader.status_propagation,
+                "retriever_exact",
+            ),
+            (
+                "state_reader.o1_delta_policy",
+                self.state_reader.o1_delta_policy,
+                "fixed_baseline_v1",
+            ),
+            ("state_reader.o2_identity_key", self.state_reader.o2_identity_key, "identity_id"),
+            (
+                "state_reader.point_window_boundary",
+                self.state_reader.point_window_boundary,
+                "closed",
+            ),
+            (
+                "state_reader.e1_history_policy",
+                self.state_reader.e1_history_policy,
+                "cumulative_or_retained_completion_times",
+            ),
+            (
+                "state_reader.e1_truncated_window_status",
+                self.state_reader.e1_truncated_window_status,
+                "invalid",
+            ),
+            (
+                "state_reader.e2_window_anchor",
+                self.state_reader.e2_window_anchor,
+                "completion_end",
+            ),
+            (
+                "state_reader.event_kind_mismatch_status",
+                self.state_reader.event_kind_mismatch_status,
+                "invalid",
+            ),
+            (
+                "state_reader.number_text_format",
+                self.state_reader.number_text_format,
+                "canonical_ascii_signed_decimal",
+            ),
+            (
+                "state_reader.tokenizer_add_special_tokens",
+                self.state_reader.tokenizer_add_special_tokens,
+                False,
+            ),
+            (
+                "state_reader.tokenizer_roundtrip_required",
+                self.state_reader.tokenizer_roundtrip_required,
+                True,
+            ),
+            (
+                "state_reader.tokenizer_class",
+                self.state_reader.tokenizer_class,
+                "Qwen2TokenizerFast",
+            ),
+            (
+                "state_reader.tokenizer_vocab_size",
+                self.state_reader.tokenizer_vocab_size,
+                151_643,
+            ),
+            (
+                "state_reader.tokenizer_required_files",
+                self.state_reader.tokenizer_required_files,
+                ("merges.txt", "tokenizer.json", "tokenizer_config.json", "vocab.json"),
+            ),
+            (
+                "state_reader.tokenizer_manifest_sha256",
+                self.state_reader.tokenizer_manifest_sha256,
+                "ccd18347b6d6714d91d4c55b37ff05e473a0f8e84fbcba2bda1401a9572f44c3",
+            ),
+            (
+                "state_reader.ground_truth_input_forbidden",
+                self.state_reader.ground_truth_input_forbidden,
+                True,
+            ),
             ("predictor.input_dim", self.predictor.input_dim, 768),
             ("predictor.hidden_dim", self.predictor.hidden_dim, 1536),
             ("predictor.output_dim", self.predictor.output_dim, 768),
@@ -1509,6 +1654,27 @@ class ProjectConfig(FrozenModel):
         )
         if self.retriever.operator_head_types != expected_retriever_heads:
             raise ValueError("retriever.operator_head_types must align with the frozen 9 operators")
+        state_resampler = self.state_resampler
+        attention_parameters = (
+            4 * state_resampler.hidden_dim * state_resampler.hidden_dim
+            + 4 * state_resampler.hidden_dim
+        )
+        ffn_parameters = (
+            2 * state_resampler.hidden_dim * state_resampler.ffn_dim
+            + state_resampler.ffn_dim
+            + state_resampler.hidden_dim
+        )
+        norm_parameters = 3 * 2 * state_resampler.hidden_dim
+        expected_resampler_parameters = (
+            state_resampler.num_layers
+            * (2 * attention_parameters + ffn_parameters + norm_parameters)
+            + state_resampler.num_queries * state_resampler.hidden_dim
+            + state_resampler.hidden_dim
+            + state_resampler.hidden_dim * state_resampler.output_dim
+            + state_resampler.output_dim
+        )
+        if state_resampler.parameter_count != expected_resampler_parameters:
+            raise ValueError("state_resampler.parameter_count must match the frozen P12 topology")
         if self.time_resolver.modes != ("now", "history", "recent", "explicit_range"):
             raise ValueError("time_resolver.modes must contain the frozen 4 modes")
         if self.state_bank.isolation_keys != ("video_id", "trajectory_id", "head_type"):

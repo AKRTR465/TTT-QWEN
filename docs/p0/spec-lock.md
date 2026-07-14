@@ -7,8 +7,8 @@
 | 规范文件 | `ARCHITECTURE.md` |
 | SPEC_VERSION | `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval` |
 | 修订日期 | `2026-07-14` |
-| 文档状态 | `PARTIALLY IMPLEMENTED / P0-P11 ENGINEERING-VERIFIED` |
-| ARCHITECTURE_SHA256 | `0db99432134fbb576069298172c7747b265d1cb5d0ec0d215e1e2abd773b0993` |
+| 文档状态 | `PARTIALLY IMPLEMENTED / P0-P12 ENGINEERING-VERIFIED` |
+| ARCHITECTURE_SHA256 | `ae8f738cff76c1ca49b19a515521b89f0d392eb2d5832dff02dcf1478f302c18` |
 | 基线 Git commit | `7f0185f8136faf88cc59e5ba2ec7309c36f8d013` |
 | UV_LOCK_SHA256 | `c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2` |
 | 基座模型 | `Qwen/Qwen3-VL-8B-Instruct` |

@@ -19,7 +19,9 @@ from ttt_svcbench_qwen.query_encoder import (
     TimeWindowMode,
 )
 from ttt_svcbench_qwen.state_bank import (
+    E1EventKind,
     E1Payload,
+    E2EventKind,
     E2Payload,
     E2Phase,
     HeadType,
@@ -101,9 +103,9 @@ def _aggregate_payload(head_type: HeadType) -> StatePayload:
     if head_type is HeadType.O1:
         return O1Payload(0, 0, ())
     if head_type is HeadType.E1:
-        return E1Payload(0, (), 0.0)
+        return E1Payload(E1EventKind.ACTION, 0, (), 0.0)
     if head_type is HeadType.E2:
-        return E2Payload(0, E2Phase.INACTIVE, (), ())
+        return E2Payload(E2EventKind.PERIODIC, 0, E2Phase.INACTIVE, (), ())
     raise ValueError("O2 records require an explicit identity payload")
 
 

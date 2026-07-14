@@ -2,8 +2,8 @@
 
 > 规范版本：state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval  
 > 修订日期：2026-07-14
-> 状态：PARTIALLY IMPLEMENTED / P0-P11 ENGINEERING-VERIFIED
-> 说明：本文描述完整目标实现；当前 P0–P11 已通过工程门禁，P12–P22 尚未完整实现或运行。
+> 状态：PARTIALLY IMPLEMENTED / P0-P12 ENGINEERING-VERIFIED
+> 说明：本文描述完整目标实现；当前 P0–P12 已通过工程门禁，P13–P22 尚未完整实现或运行。
 
 ## 0. 计划目标
 
@@ -989,12 +989,17 @@ E_{\mathrm{state}}
 | O1 | current count、baseline count、活动槽状态 |
 | O2 Candidate | 256 维身份原型、观测次数、TTL、置信度 |
 | O2 Confirmed | identity_id、256 维原型、first_seen、last_seen、observation_count |
-| E1 | event_count、recent_event_times、cooldown |
-| E2 | completed_count、phase、已完成区间、recent_event_times |
+| E1 | event_kind(Action/Transit)、event_count、recent_event_times、cooldown |
+| E2 | event_kind(Periodic/Episode)、completed_count、phase、已完成区间、recent_event_times |
 
 O1、E1、E2 每个 owner/head 分区各维护一条稳定 `record_id` 的聚合记录，更新使用 functional
 replace；因此持续更新不会追加重复 summary。O2 在 P9 只使用 generic CRUD 接口，identity matching、
 Candidate→Confirmed、prototype EMA、容量增长和 `unique_count` 全部属于 P10。
+
+E1/E2 aggregate 额外冻结由 effective hard operator 派生的 event kind provenance：
+`E1-Action/Transit→Action/Transit`，`E2-Periodic/Episode→Periodic/Episode`。kind 不是监督标签，
+首次写入后同一 aggregate 不得换型；Reader 收到 kind 与 operator 不一致的记录必须返回 invalid，
+不能把错型记录跳过后伪装成计数 0。
 
 每条对象或事件记录额外保存归一化 512 维 semantic_embedding，表示“这条记录是什么”。
 
@@ -1482,8 +1487,19 @@ R_t
 \in\mathbb R^{B\times16\times4096}.
 \]
 
-因此，无论命中 3、30 还是 300 条记录，输出始终是 16 个 State Token。没有匹配记录时使用
-显式 empty_record_embedding，禁止产生 NaN。完整 State Token Resampler 约 14.72M 参数。
+因此，无论命中 3、30 还是 300 条记录，输出始终是 16 个 State Token。可靠 `EMPTY` 使用显式
+trainable `empty_record_embedding` 作为内部唯一 K/V，禁止对全 mask 直接 softmax 或产生 NaN；外部
+审计仍保持真实 zero-width record 轴、record mask 全空且 selected mass=0。`UNSUPPORTED/INVALID`
+同样避免全 mask 计算，但最终 hidden/state token 必须严格归零，`state_token_valid_mask=false`，不得
+把“不知道”注入 LLM 或向 q_target/empty K/V 传播梯度。非空 `OK` 行只将全部
+`selected_record_ids` 按 P11 canonical 顺序打包，不做 Top-K；即使 `N_s>N_ret` 且 selected 列不连续，
+未选候选也不得进入 K/V。最终层 8-head 平均后的 cross-attention 权重为
+`[B,16,max_N_ret]`，padding 权重严格为 0，selected mass=1。
+
+每层固定三个 affine LayerNorm(`eps=1e-5`)、带 bias 的 self/cross Q/K/V/O、GELU
+`512→2048→512` FFN；attention logits 与 masked softmax 使用 FP32，dropout=0。加上
+`Q_state[16,512]`、empty embedding 和带 bias `512→4096` 投影后，State Resampler 精确为
+14,722,048 参数（约 14.72M）。
 
 ### 10.2 State Token 的职责
 
@@ -1505,16 +1521,22 @@ resolved TimeWindow
 retrieved typed records
 ~~~
 
+上述三项由同一个 `RetrieverOutput` 绑定保存；若调用方仍显式传入 operator/window，必须逐行与
+Retriever provenance 完全一致，否则在算术前 fail closed。禁止用 O1-Snap 的检索结果改算
+O1-Delta，或在检索后放宽时间窗口。Retriever 还必须保存 candidate typed-record snapshot；selected
+record 的完整 payload、semantic tensor、ID 与 owner 必须逐字段匹配该 snapshot，Reader 每次读取前
+重新验证，不能只凭相同 record ID 接受被替换的计数 payload。
+
 Reader 使用固定算术：
 
 | Operator | 精确读出 |
 | :--- | :--- |
 | O1-Snap | current_visible_count |
-| O1-Delta | current_visible_count - baseline_count |
+| O1-Delta | signed `current_visible_count - baseline_count`；第一版固定 baseline，不伪造任意历史 delta |
 | O2-Unique | query_time 前 Confirmed 身份数 |
-| O2-Gain | 时间窗口内 first_seen 身份数 |
-| E1-Action / Transit | query_time 前符合类型的完成事件数 |
-| E2-Periodic / Episode | query_time 前符合类型的完整区间数 |
+| O2-Gain | 闭区间内 first_seen 的唯一 Confirmed identity 数 |
+| E1-Action / Transit | kind 匹配的完成事件数；history 用 cumulative count，其他窗口按 completion time 闭区间 |
+| E2-Periodic / Episode | kind 匹配且 completion end 落在闭区间的完整区间数 |
 | unsupported | 不生成伪造整数 |
 
 输出结构至少包含：
@@ -1530,6 +1552,23 @@ audit_fields
 ~~~
 
 整数序列化必须使用 Reader 计算结果，不能在训练时偷换为 ground-truth count。
+
+Reader 精确传播 Retriever status：`OK→OK`，可靠 `EMPTY→EMPTY + exact_count=0`，
+`UNSUPPORTED/INVALID` 不产生整数或 number tokens。OK 算术可以得到 0；O1-Delta 可以得到负数，
+不得 clamp。E1 retained history 最多 512 个 completion time；history 查询可使用 cumulative
+`event_count`，但 bounded window 若可能覆盖已驱逐时间则返回 invalid，禁止猜测。
+
+每个成功结果除 selected record IDs 外，还必须记录可复算的标量 operands：O1 current/baseline 与
+`baseline_policy=fixed_baseline_v1`，O2 Confirmed/distinct/first-seen 匹配数，E1 cumulative/retained/
+eviction/matched 数，以及 E2 completed/matched interval 数。Composer 接入前必须把同一个
+`RetrieverOutput` 与 `ReaderResult` 交回 Reader 做确定性重算并要求整项相等；只让 number IDs 与被
+篡改的 count 自洽不构成来源审计。
+
+number text 固定为 Python/ASCII canonical signed decimal `str(exact_count)`，使用 pinned Qwen
+tokenizer 且 `add_special_tokens=false`；IDs 必须 decode 回同一 canonical text 和整数，并重新编码为
+同一 IDs。运行时同时固定 tokenizer class、vocab size 和四个 tokenizer-only 文件的 SHA256 manifest，
+不得下载或加载 8B 权重来完成该审计。Reader API 不接收 answer、count、occurrence_times 或
+counting subtype 标签，结果不可变，State Token 的任何修改也不能改变 exact_count。
 
 ## 11. LLM 输入拼接与 DeepStack
 
@@ -1881,7 +1920,7 @@ reset Reader audit state
 
 ## 17. 推荐实现模块
 
-模块按以下职责拆分；P3–P11 对应模块已通过工程门禁，P12 及后续模块仍按本计划施工：
+模块按以下职责拆分；P3–P12 对应模块已通过工程门禁，P13 及后续模块仍按本计划施工：
 
 ~~~text
 src/ttt_svcbench_qwen/
