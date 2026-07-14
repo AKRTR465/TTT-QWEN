@@ -1,0 +1,31 @@
+timestamp_utc=2026-07-14T03:12:39.6354609Z
+command=uv run pytest -q
+exit_code=0
+result=381 passed in 63.27s
+
+command=uv run ruff check .
+exit_code=0
+result=All checks passed!
+
+command=uv run ruff format --check on 9 modified Python files
+exit_code=0
+result=9 files already formatted
+note=repo-wide format check still reports 11 untouched pre-existing files; no unrelated formatting diff was introduced
+
+command=uv run mypy
+exit_code=0
+result=Success: no issues found in 21 source files
+
+command=uv run python -m ttt_svcbench_qwen.config --config configs/model_state_ttt_8b.yaml
+exit_code=0
+result=validated config JSON emitted
+
+command=git diff --check
+exit_code=0
+result=no output
+
+architecture_sha256=0db99432134fbb576069298172c7747b265d1cb5d0ec0d215e1e2abd773b0993
+uv_lock_sha256=c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2
+post_evidence_timestamp_utc=2026-07-14T03:15:28.0157232Z
+post_evidence_pytest=381 passed in 63.40s
+post_evidence_quality=ruff,mypy,config,strict-utf8,hash,diff all passed

@@ -394,6 +394,34 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
     assert config.time_resolver.confidence_threshold is None
     assert config.time_resolver.threshold_status is CalibrationStatus.CALIBRATION_REQUIRED
     assert config.retriever.record_similarity_threshold == 0.35
+    assert config.retriever.similarity_dtype == "float32"
+    assert config.retriever.normalization_eps == 1.0e-8
+    assert config.retriever.zero_query_policy == "unsupported"
+    assert config.retriever.threshold_comparison == "greater_than_or_equal"
+    assert config.retriever.record_confidence_threshold is None
+    assert config.retriever.operator_head_types == (
+        "o1",
+        "o1",
+        "o2",
+        "o2",
+        "e1",
+        "e1",
+        "e2",
+        "e2",
+        None,
+    )
+    assert config.retriever.filter_order == (
+        "invalid",
+        "retrieval_ineligible",
+        "future",
+        "outside_window",
+        "below_similarity",
+    )
+    assert config.retriever.selection_order == ("score_desc", "record_id_asc")
+    assert config.retriever.owner_mismatch_status == "invalid"
+    assert config.retriever.aggregate_time_policy == "causal_availability_only_window_in_reader"
+    assert config.retriever.atomic_window_boundary == "closed"
+    assert config.retriever.metrics_policy == "offline_ground_truth_runtime_label_free"
     assert config.retriever.top_k is None
     assert config.retriever.ann_enabled is False
     assert config.state_resampler.num_queries == 16
@@ -734,7 +762,70 @@ def set_nested(*path_and_value: object) -> Mutation:
         ),
         (set_nested("state_resampler", "num_queries", 8), "num_queries must be 16"),
         (set_nested("fast_ttt", "optimizer", "momentum", 0.9), "momentum must be 0.0"),
+        (
+            set_nested("retriever", "similarity_dtype", "float16"),
+            "retriever.similarity_dtype",
+        ),
+        (
+            set_nested("retriever", "normalization_eps", 1.0e-6),
+            "retriever.normalization_eps",
+        ),
+        (
+            set_nested("retriever", "zero_query_policy", "first_unit_basis"),
+            "retriever.zero_query_policy",
+        ),
+        (
+            set_nested("retriever", "threshold_comparison", "greater_than"),
+            "retriever.threshold_comparison",
+        ),
+        (
+            set_nested("retriever", "record_confidence_threshold", 0.5),
+            "retriever.record_confidence_threshold",
+        ),
+        (
+            set_nested(
+                "retriever",
+                "operator_head_types",
+                ["o1", "o1", "o2", "o2", "e1", "e1", "e2", "e2", "o1"],
+            ),
+            "retriever.operator_head_types",
+        ),
+        (
+            set_nested(
+                "retriever",
+                "filter_order",
+                [
+                    "retrieval_ineligible",
+                    "invalid",
+                    "future",
+                    "outside_window",
+                    "below_similarity",
+                ],
+            ),
+            "retriever.filter_order",
+        ),
+        (
+            set_nested("retriever", "selection_order", ["record_id_asc"]),
+            "retriever.selection_order",
+        ),
+        (
+            set_nested("retriever", "owner_mismatch_status", "empty"),
+            "retriever.owner_mismatch_status",
+        ),
+        (
+            set_nested("retriever", "aggregate_time_policy", "record_window"),
+            "retriever.aggregate_time_policy",
+        ),
+        (
+            set_nested("retriever", "atomic_window_boundary", "half_open"),
+            "retriever.atomic_window_boundary",
+        ),
+        (
+            set_nested("retriever", "metrics_policy", "runtime_ground_truth"),
+            "retriever.metrics_policy",
+        ),
         (set_nested("retriever", "top_k", 16), "retriever.top_k must be None"),
+        (set_nested("retriever", "ann_enabled", True), "retriever.ann_enabled must be False"),
         (set_nested("model", "vision", "deepstack_visual_indexes", [7, 15, 23]), "deepstack"),
         (set_nested("query_encoder", "num_heads", 10), "num_heads must be 12"),
         (

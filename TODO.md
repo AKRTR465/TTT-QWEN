@@ -3,7 +3,7 @@
 > 对齐源：[ARCHITECTURE.md](./ARCHITECTURE.md)  
 > 规范版本：`state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`  
 > 生成日期：2026-07-13  
-> 文档状态：施工分解 / P0–P6 已通过，P7 允许开始
+> 文档状态：施工分解 / P0–P11 已通过，P12 允许开始
 > 总原则：本文件只描述施工顺序和验收门禁；任何勾选都必须有代码、测试、日志或实验记录作为证据。
 
 ## 0. 使用方法
@@ -940,7 +940,7 @@
 
 - 查询目标是当前 video + 当前 trajectory 的 Structured State Bank。
 - 不查询原始像素、LLM KV cache、O2 256 维 identity prototype 或外部向量库。
-- 第一版不做 Top-K；所有超过阈值的合法记录都必须可见。
+- 第一版不做 Top-K；所有达到或超过阈值的合法记录都必须可见。
 - 固定 Top-K 会截断合法对象/事件并造成静默少计，因此不能用“更方便 batching”作为启用理由。
 - “可靠查询但没有记录”可返回 0；“查询或时间解析不可靠”必须 unsupported。
 
@@ -948,50 +948,50 @@
 
 #### P11.1 候选分区
 
-- [ ] hard operator 映射到合法 head_type。
-- [ ] 按 video_id、trajectory_id、head_type 取得候选 records。
-- [ ] 统计过滤前 `N_s`。
-- [ ] 生成 ragged/padded `E_state[B,N_s,512]` 和 record mask。
-- [ ] q_target 和 E_state 都执行 L2 normalize。
+- [x] hard operator 映射到合法 head_type。
+- [x] 按 video_id、trajectory_id、head_type 取得候选 records。
+- [x] 统计过滤前 `N_s`。
+- [x] 生成 ragged/padded `E_state[B,N_s,512]` 和 record mask。
+- [x] q_target 和 E_state 都执行 L2 normalize。
 
 #### P11.2 相似度与硬过滤
 
-- [ ] 计算余弦分数 `S[B,N_s]`。
-- [ ] 强制 same video_id。
-- [ ] 强制 same question_trajectory_id。
-- [ ] 强制 head_type 匹配 hard operator。
-- [ ] 强制 `record.valid=true`。
-- [ ] 强制 record time ≤ query_time。
-- [ ] 需要窗口时强制 record 与 requested TimeWindow 相交。
-- [ ] 强制 semantic similarity ≥ calibrated threshold。
-- [ ] `record_similarity_threshold` bootstrap 值使用 0.35，但标记为待校准。
-- [ ] `top_k=null`，不得按数量截断。
-- [ ] `ann_enabled=false`。
-- [ ] 返回全部命中记录、score、record_id、`N_s` 和 `N_ret`。
+- [x] 计算余弦分数 `S[B,N_s]`。
+- [x] 强制 same video_id。
+- [x] 强制 same question_trajectory_id。
+- [x] 强制 head_type 匹配 hard operator。
+- [x] 强制 `record.valid=true`。
+- [x] 强制 record time ≤ query_time。
+- [x] 按 record kind 处理窗口：O1/E1/E2 aggregate 只做因果可用性检查并由 P12 在 payload 内应用窗口；O2 Confirmed/atomic record 使用闭区间相交。
+- [x] 强制 semantic similarity ≥ 当前 bootstrap/calibrated threshold。
+- [x] `record_similarity_threshold` bootstrap 值使用 0.35，但标记为待校准。
+- [x] `top_k=null`，不得按数量截断。
+- [x] `ann_enabled=false`。
+- [x] 返回全部命中记录、score、record_id、`N_s` 和 `N_ret`。
 
 #### P11.3 状态判定与审计
 
-- [ ] 路由/时间/检索置信度不可靠时返回 unsupported。
-- [ ] Bank 覆盖有效且可靠查询无匹配时返回 empty，允许 Reader 解释为 0。
-- [ ] 区分 empty Bank、无语义匹配、全部超时、全部 invalid 和 unsupported。
-- [ ] 记录每个过滤原因的计数。
-- [ ] 保留 selected_record_ids 和分数供 Reader/评估审计。
-- [ ] 统计 Retriever precision、recall、空检索率。
+- [x] 路由/时间/检索置信度不可靠时返回 unsupported。
+- [x] Bank 覆盖有效且可靠查询无匹配时返回 empty，允许 Reader 解释为 0。
+- [x] 区分 empty Bank、无语义匹配、全部超时、全部 invalid 和 unsupported。
+- [x] 记录每个过滤原因的计数。
+- [x] 保留 selected_record_ids 和分数供 Reader/评估审计。
+- [x] 由不进入 runtime 的离线 evaluator 统计 Retriever precision、recall 和空检索率。
 
 ### 实施后验收项
 
-- [ ] `0≤N_ret≤N_s` 对所有 batch 成立。
-- [ ] 3、30、300 条命中均不被 Top-K 截断。
-- [ ] 跨视频、跨 trajectory、错误 head、未来时间和 invalid 记录全部被过滤。
-- [ ] threshold 边界值有确定行为。
-- [ ] empty 与 unsupported 可由结构化 status 区分。
-- [ ] O2 identity prototype 不会被误当 semantic embedding 查询。
-- [ ] 无外部 ANN/向量数据库依赖。
+- [x] `0≤N_ret≤N_s` 对所有 batch 成立。
+- [x] 3、30、300 条命中均不被 Top-K 截断。
+- [x] 跨视频、跨 trajectory、错误 head、未来时间和 invalid 记录全部被过滤。
+- [x] threshold 边界值有确定行为。
+- [x] empty 与 unsupported 可由结构化 status 区分。
+- [x] O2 identity prototype 不会被误当 semantic embedding 查询。
+- [x] 无外部 ANN/向量数据库依赖。
 
 ### 交付物与退出条件
 
-- [ ] 交付 `state_retriever.py`、过滤审计、ragged batch 支持和检索测试。
-- [ ] 出现 silent truncation 或未来记录命中时禁止接入 Reader。
+- [x] 交付 `state_retriever.py`、过滤审计、ragged batch 支持和检索测试。
+- [x] 出现 silent truncation 或未来记录命中时禁止接入 Reader。
 
 ---
 

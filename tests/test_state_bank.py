@@ -22,11 +22,13 @@ from ttt_svcbench_qwen.state_bank import (
     E2Phase,
     HeadType,
     O1Payload,
+    O1SlotState,
     SemanticProjector,
     StateRecord,
     StateRecordKind,
     StructuredStateBank,
     build_state_bank,
+    clone_state_record,
     semantic_projector_parameter_count,
 )
 
@@ -193,16 +195,35 @@ def _e2_output(
     )
 
 
-def _candidate(name: str = "candidate-0") -> CandidateIdentity:
+def _candidate(
+    name: str = "candidate-0",
+    *,
+    first_seen: float = 0.0,
+    last_seen: float | None = None,
+) -> CandidateIdentity:
     prototype = torch.zeros(256)
     prototype[0] = 1.0
-    return CandidateIdentity(name, prototype, 1, 8, 0.8)
+    resolved_last_seen = first_seen if last_seen is None else last_seen
+    return CandidateIdentity(
+        name,
+        prototype,
+        1,
+        8,
+        0.8,
+        first_seen=first_seen,
+        last_seen=resolved_last_seen,
+    )
 
 
-def _confirmed(name: str = "identity-0") -> ConfirmedIdentity:
+def _confirmed(
+    name: str = "identity-0",
+    *,
+    first_seen: float = 0.0,
+    last_seen: float = 1.0,
+) -> ConfirmedIdentity:
     prototype = torch.zeros(256)
     prototype[1] = 1.0
-    return ConfirmedIdentity(name, prototype, 0.0, 1.0, 2)
+    return ConfirmedIdentity(name, prototype, first_seen, last_seen, 2)
 
 
 def test_meta_topology_exact_parameter_count_builder_and_state_dict_boundary() -> None:
@@ -309,8 +330,8 @@ def test_bfloat16_projector_and_hard_append_normalize_in_float32() -> None:
 def test_all_five_payloads_record_xor_head_and_detach_contracts() -> None:
     payloads = (
         (HeadType.O1, O1Payload(0, 0, (), baseline_initialized=False)),
-        (HeadType.O2, _candidate()),
-        (HeadType.O2, _confirmed()),
+        (HeadType.O2, _candidate(first_seen=1.0)),
+        (HeadType.O2, _confirmed(first_seen=2.0, last_seen=2.0)),
         (HeadType.E1, E1Payload(0, (), 0.0)),
         (HeadType.E2, E2Payload(0, E2Phase.INACTIVE, (), ())),
     )
@@ -353,6 +374,145 @@ def test_all_five_payloads_record_xor_head_and_detach_contracts() -> None:
         replace(records[1], payload=grad_candidate)
 
 
+def test_state_record_time_contract_blocks_future_payload_evidence() -> None:
+    o1_payload = O1Payload(
+        current_visible_count=1,
+        baseline_count=0,
+        active_slot_ids=(0,),
+        slot_states=(
+            O1SlotState(
+                slot_id=0,
+                is_object=True,
+                is_target=True,
+                visible=True,
+                enter=False,
+                exit=False,
+                last_timestamp=5.0,
+                last_position_id=2,
+                confidence=0.9,
+            ),
+        ),
+        last_timestamp=5.0,
+        last_position_id=2,
+        update_count=1,
+    )
+    e1_payload = E1Payload(
+        event_count=1,
+        recent_event_times=(3.0,),
+        cooldown_until=8.0,
+        active=True,
+        armed=False,
+        candidate_start=4.0,
+        last_timestamp=5.0,
+        last_position_id=2,
+    )
+    e2_payload = E2Payload(
+        completed_count=1,
+        phase=E2Phase.COMPLETED,
+        completed_intervals=((1.0, 4.0),),
+        recent_event_times=(4.0,),
+        last_timestamp=5.0,
+        last_position_id=2,
+    )
+
+    def aggregate_record(
+        head_type: HeadType, payload: O1Payload | E1Payload | E2Payload
+    ) -> StateRecord:
+        return StateRecord(
+            record_id=f"record-{head_type.value}",
+            video_id="video-time-contract",
+            trajectory_id="trajectory-time-contract",
+            head_type=head_type,
+            semantic_embedding=_unit_semantic(),
+            timestamp=5.0,
+            time_range=None,
+            valid=True,
+            confidence=0.9,
+            payload=payload,
+        )
+
+    o1_record = aggregate_record(HeadType.O1, o1_payload)
+    e1_record = aggregate_record(HeadType.E1, e1_payload)
+    e2_record = aggregate_record(HeadType.E2, e2_payload)
+
+    with pytest.raises(ValueError, match="last_timestamp must match"):
+        replace(o1_record, payload=replace(o1_payload, last_timestamp=4.0))
+    with pytest.raises(ValueError, match="O1 slot time"):
+        future_slot = replace(o1_payload.slot_states[0], last_timestamp=6.0)
+        replace(o1_record, payload=replace(o1_payload, slot_states=(future_slot,)))
+    with pytest.raises(ValueError, match="require a point timestamp"):
+        replace(o1_record, timestamp=None, time_range=(0.0, 5.0))
+
+    with pytest.raises(ValueError, match="last_timestamp must match"):
+        replace(e1_record, payload=replace(e1_payload, last_timestamp=4.0))
+    with pytest.raises(ValueError, match="E1 event time"):
+        replace(e1_record, payload=replace(e1_payload, recent_event_times=(6.0,)))
+    with pytest.raises(ValueError, match="E1 candidate time"):
+        replace(e1_record, payload=replace(e1_payload, candidate_start=6.0))
+
+    with pytest.raises(ValueError, match="last_timestamp must match"):
+        replace(e2_record, payload=replace(e2_payload, last_timestamp=4.0))
+    with pytest.raises(ValueError, match="E2 interval time"):
+        replace(e2_record, payload=replace(e2_payload, completed_intervals=((1.0, 6.0),)))
+    with pytest.raises(ValueError, match="E2 event time"):
+        replace(e2_record, payload=replace(e2_payload, recent_event_times=(6.0,)))
+    with pytest.raises(ValueError, match="E2 candidate time"):
+        active_payload = E2Payload(
+            completed_count=0,
+            phase=E2Phase.ACTIVE,
+            completed_intervals=(),
+            recent_event_times=(),
+            current_start=6.0,
+            last_timestamp=5.0,
+            last_position_id=2,
+        )
+        replace(e2_record, payload=active_payload)
+
+
+def test_o2_record_time_contract_preserves_first_seen_and_allows_later_last_seen() -> None:
+    point_candidate = _candidate("candidate-time", first_seen=2.0, last_seen=5.0)
+    point_confirmed = _confirmed("identity-time", first_seen=2.0, last_seen=5.0)
+    point_record = StateRecord(
+        record_id="record-point",
+        video_id="video-o2-time",
+        trajectory_id="trajectory-o2-time",
+        head_type=HeadType.O2,
+        semantic_embedding=_unit_semantic(),
+        timestamp=2.0,
+        time_range=None,
+        valid=True,
+        confidence=0.9,
+        payload=point_confirmed,
+    )
+    StateRecord(
+        record_id="record-candidate-point",
+        video_id="video-o2-time",
+        trajectory_id="trajectory-o2-time",
+        head_type=HeadType.O2,
+        semantic_embedding=_unit_semantic(1),
+        timestamp=2.0,
+        time_range=None,
+        valid=True,
+        confidence=0.8,
+        payload=point_candidate,
+    )
+    range_record = replace(
+        point_record,
+        record_id="record-range",
+        timestamp=None,
+        time_range=(2.0, 5.0),
+    )
+
+    assert isinstance(range_record.payload, ConfirmedIdentity)
+    assert range_record.payload.last_seen == 5.0
+    with pytest.raises(ValueError, match="point record timestamp"):
+        replace(point_record, timestamp=3.0)
+    with pytest.raises(ValueError, match="range record boundaries"):
+        replace(range_record, time_range=(1.0, 5.0))
+    with pytest.raises(ValueError, match="range record boundaries"):
+        replace(range_record, time_range=(2.0, 6.0))
+
+
 def test_functional_crud_tombstones_snapshot_clear_and_release(
     bank: StructuredStateBank,
 ) -> None:
@@ -366,7 +526,7 @@ def test_functional_crud_tombstones_snapshot_clear_and_release(
         time_range=None,
         valid=True,
         confidence=0.8,
-        payload=_candidate(),
+        payload=_candidate(first_seen=1.0),
     )
     assert not fresh.records
     assert first.records[0].record_id == "record-00000000"
@@ -375,7 +535,14 @@ def test_functional_crud_tombstones_snapshot_clear_and_release(
         semantic.untyped_storage().data_ptr()
     )
 
-    replacement = replace(first.records[0], timestamp=2.0, confidence=0.9)
+    first_payload = first.records[0].payload
+    assert isinstance(first_payload, CandidateIdentity)
+    replacement = replace(
+        first.records[0],
+        timestamp=2.0,
+        confidence=0.9,
+        payload=replace(first_payload, first_seen=2.0, last_seen=2.0),
+    )
     updated = bank.update_record(first, replacement)
     assert first.records[0].timestamp == 1.0
     assert updated.records[0].timestamp == 2.0
@@ -468,7 +635,7 @@ def test_functional_crud_tombstones_snapshot_clear_and_release(
         time_range=None,
         valid=True,
         confidence=0.7,
-        payload=_confirmed(),
+        payload=_confirmed(first_seen=4.0, last_seen=4.0),
     )
     assert second.records[0].record_id == "record-00000001"
 
@@ -613,7 +780,7 @@ def test_dynamic_batched_view_keeps_present_and_record_valid_masks_separate(
         time_range=None,
         valid=True,
         confidence=0.8,
-        payload=_candidate("candidate-a"),
+        payload=_candidate("candidate-a", first_seen=1.0),
     )
     first = bank.append_record(
         first,
@@ -623,7 +790,7 @@ def test_dynamic_batched_view_keeps_present_and_record_valid_masks_separate(
         time_range=(1.0, 2.0),
         valid=True,
         confidence=0.9,
-        payload=_confirmed("identity-a"),
+        payload=_confirmed("identity-a", first_seen=1.0, last_seen=2.0),
     )
     first = bank.invalidate_record(
         first,
@@ -640,7 +807,7 @@ def test_dynamic_batched_view_keeps_present_and_record_valid_masks_separate(
         time_range=None,
         valid=True,
         confidence=0.7,
-        payload=_candidate("candidate-b"),
+        payload=_candidate("candidate-b", first_seen=3.0),
     )
     third = bank.reset("video-view-c", "trajectory-view-c")
     parameter_shapes = tuple(parameter.shape for parameter in bank.parameters())
@@ -660,13 +827,29 @@ def test_dynamic_batched_view_keeps_present_and_record_valid_masks_separate(
         [False, False],
     ]
     assert view.n_state.tolist() == [2, 1, 0]
+    assert view.owner_record_counts.tolist() == [2, 1, 0]
+    assert view.video_ids == ("video-view-a", "video-view-b", "video-view-c")
+    assert view.trajectory_ids == (
+        "trajectory-view-a",
+        "trajectory-view-b",
+        "trajectory-view-c",
+    )
+    assert view.bank_versions == (first.version, second.version, third.version)
     assert view.record_ids[0] == tuple(record.record_id for record in first.records)
+    assert (
+        tuple(record.record_id if record is not None else None for record in view.cloned_records[0])
+        == view.record_ids[0]
+    )
     assert torch.count_nonzero(view.embeddings[~view.present_mask]) == 0
     assert torch.all(view.timestamps[~view.present_mask] == -1.0)
     assert torch.all(view.time_ranges[~view.present_mask] == -1.0)
     assert tuple(parameter.shape for parameter in bank.parameters()) == parameter_shapes
     original = first.records[0].semantic_embedding.clone()
     view.embeddings[0, 0].zero_()
+    torch.testing.assert_close(first.records[0].semantic_embedding, original)
+    cloned = view.cloned_records[0][0]
+    assert cloned is not None
+    cloned.semantic_embedding.zero_()
     torch.testing.assert_close(first.records[0].semantic_embedding, original)
 
     empty_view = bank.view(
@@ -677,8 +860,169 @@ def test_dynamic_batched_view_keeps_present_and_record_valid_masks_separate(
     )
     assert empty_view.embeddings.shape == (2, 0, SEMANTIC_DIM)
     assert empty_view.retrieval_eligible_mask.shape == (2, 0)
+    assert empty_view.owner_record_counts.tolist() == [0, 0]
+    assert empty_view.cloned_records == ((), ())
     with pytest.raises(ValueError, match="owners must be unique"):
         bank.view((first, first))
+
+
+def test_batched_view_supports_row_wise_head_partitions_and_none_rows(
+    bank: StructuredStateBank,
+) -> None:
+    first = bank.append_record(
+        bank.reset("video-row-a", "trajectory-row-a"),
+        head_type=HeadType.O1,
+        semantic_embedding=_unit_semantic(0),
+        timestamp=1.0,
+        time_range=None,
+        valid=True,
+        confidence=0.9,
+        payload=O1Payload(0, 0, ()),
+    )
+    first = bank.append_record(
+        first,
+        head_type=HeadType.O2,
+        semantic_embedding=_unit_semantic(1),
+        timestamp=1.5,
+        time_range=None,
+        valid=True,
+        confidence=0.8,
+        payload=_candidate("candidate-row-a", first_seen=1.5),
+    )
+    first = bank.append_record(
+        first,
+        head_type=HeadType.O2,
+        semantic_embedding=_unit_semantic(2),
+        timestamp=2.0,
+        time_range=None,
+        valid=True,
+        confidence=0.95,
+        payload=_confirmed("identity-row-a", first_seen=2.0, last_seen=2.0),
+    )
+    second = bank.append_record(
+        bank.reset("video-row-b", "trajectory-row-b"),
+        head_type=HeadType.E1,
+        semantic_embedding=_unit_semantic(3),
+        timestamp=3.0,
+        time_range=None,
+        valid=True,
+        confidence=0.7,
+        payload=E1Payload(0, (), 0.0),
+    )
+    third = bank.append_record(
+        bank.reset("video-row-c", "trajectory-row-c"),
+        head_type=HeadType.O1,
+        semantic_embedding=_unit_semantic(4),
+        timestamp=4.0,
+        time_range=None,
+        valid=True,
+        confidence=0.6,
+        payload=O1Payload(0, 0, ()),
+    )
+
+    view = bank.view(
+        (first, second, third),
+        (HeadType.O2, HeadType.E1, None),
+    )
+
+    assert view.embeddings.shape == (3, 2, SEMANTIC_DIM)
+    assert view.n_state.tolist() == [2, 1, 0]
+    assert view.owner_record_counts.tolist() == [3, 1, 1]
+    assert view.present_mask.tolist() == [[True, True], [True, False], [False, False]]
+    assert view.head_types == (
+        (HeadType.O2, HeadType.O2),
+        (HeadType.E1, None),
+        (None, None),
+    )
+    assert view.record_kinds == (
+        (StateRecordKind.O2_CANDIDATE, StateRecordKind.O2_CONFIRMED),
+        (StateRecordKind.E1_AGGREGATE, None),
+        (None, None),
+    )
+    assert view.retrieval_eligible_mask.tolist() == [
+        [False, True],
+        [True, False],
+        [False, False],
+    ]
+    assert all(record is None for record in view.cloned_records[2])
+
+    scalar_view = bank.view((first, second, third), HeadType.O2)
+    assert scalar_view.n_state.tolist() == [2, 0, 0]
+    unfiltered_view = bank.view((first, second, third), None)
+    assert unfiltered_view.n_state.tolist() == [3, 1, 1]
+    assert torch.equal(unfiltered_view.n_state, unfiltered_view.owner_record_counts)
+
+    with pytest.raises(ValueError, match="head filters must match the batch size"):
+        bank.view((first, second), (HeadType.O1,))
+    with pytest.raises(TypeError, match="must contain HeadType or None"):
+        bank.view((first,), ("o1",))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="released State Bank runtime"):
+        bank.view((bank.release(third),), (None,))
+
+
+def test_state_bank_view_strictly_validates_aligned_snapshot_metadata_and_storage(
+    bank: StructuredStateBank,
+) -> None:
+    state = bank.append_record(
+        bank.reset("video-view-contract", "trajectory-view-contract"),
+        head_type=HeadType.O2,
+        semantic_embedding=_unit_semantic(0),
+        timestamp=1.0,
+        time_range=None,
+        valid=True,
+        confidence=0.8,
+        payload=_candidate("candidate-view-contract", first_seen=1.0),
+    )
+    state = bank.append_record(
+        state,
+        head_type=HeadType.O2,
+        semantic_embedding=_unit_semantic(0),
+        timestamp=2.0,
+        time_range=None,
+        valid=True,
+        confidence=0.9,
+        payload=_confirmed("identity-view-contract", first_seen=2.0, last_seen=2.0),
+    )
+    view = bank.view((state,), HeadType.O2)
+    first = view.cloned_records[0][0]
+    second = view.cloned_records[0][1]
+    assert first is not None and second is not None
+
+    isolated = clone_state_record(first)
+    assert isolated.semantic_embedding.untyped_storage().data_ptr() != (
+        first.semantic_embedding.untyped_storage().data_ptr()
+    )
+    isolated.semantic_embedding.zero_()
+    assert torch.count_nonzero(first.semantic_embedding) == 1
+    with pytest.raises(TypeError, match="requires a StateRecord"):
+        clone_state_record("not-a-record")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="owner metadata is inconsistent"):
+        replace(view, video_ids=("video-wrong",))
+    with pytest.raises(ValueError, match="record ID metadata is inconsistent"):
+        replace(view, record_ids=(("record-wrong", view.record_ids[0][1]),))
+    with pytest.raises(ValueError, match="record head metadata is inconsistent"):
+        replace(view, head_types=((HeadType.O1, HeadType.O2),))
+    with pytest.raises(ValueError, match="record kind metadata is inconsistent"):
+        replace(
+            view,
+            record_kinds=((StateRecordKind.O2_CONFIRMED, StateRecordKind.O2_CONFIRMED),),
+        )
+
+    invalid_mask = view.record_valid_mask.clone()
+    invalid_mask[0, 0] = False
+    with pytest.raises(ValueError, match="record validity metadata is inconsistent"):
+        replace(view, record_valid_mask=invalid_mask)
+
+    shared_second = replace(second, semantic_embedding=first.semantic_embedding)
+    shared_embeddings = view.embeddings.clone()
+    shared_embeddings[0, 1] = first.semantic_embedding
+    with pytest.raises(ValueError, match="must not share mutable tensor storage"):
+        replace(
+            view,
+            embeddings=shared_embeddings,
+            cloned_records=((first, shared_second),),
+        )
 
 
 def test_batched_view_rejects_cross_owner_shared_tensor_storage(
@@ -692,7 +1036,7 @@ def test_batched_view_rejects_cross_owner_shared_tensor_storage(
         time_range=None,
         valid=True,
         confidence=0.8,
-        payload=_candidate("candidate-shared"),
+        payload=_candidate("candidate-shared", first_seen=1.0),
     )
     shared_record = replace(
         first.records[0],
@@ -753,7 +1097,7 @@ def test_first_aggregate_with_older_cross_head_time_keeps_audit_monotonic(
         time_range=None,
         valid=True,
         confidence=0.8,
-        payload=_candidate("candidate-audit"),
+        payload=_candidate("candidate-audit", first_seen=100.0),
     )
     state = bank.update_o1(
         state,

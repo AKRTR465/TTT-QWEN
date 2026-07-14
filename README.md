@@ -5,13 +5,14 @@
 完整架构、训练协议和消融方案见 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前对齐版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
-> 当前施工状态：P0–P10 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
+> 当前施工状态：P0–P11 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
 > P3 用官方 HF meta 模块和 tiny 随机权重模型完成 Qwen 接口与 DeepStack 工程验收。真实 8B
 > A0/集成仍保留在 P19/P21/P22；P4 已完成 Query Encoder、Operator Router 与 Time Window
 > Resolver 的工程门禁，但尚未训练或校准。P5 Fast Adapter 已通过纯合成张量工程门禁，
 > P6–P9 的空间、时间、四类 soft Observation、Semantic Projector、hard Bank 与事件 FSM 也已通过
 > 纯合成张量工程门禁；P10 的 Candidate/Confirmed、CPU exact matching 和非权威 Hot Cache 已用
-> 小型合成 identity 向量通过工程门禁，P11 允许开始；其余空壳
+> 小型合成 identity 向量通过工程门禁；P11 的 FP32 exact threshold Retriever、hard filters、
+> typed records/status/audit 已用小型合成 Bank 通过工程门禁，P12 允许开始；其余空壳
 > 被调用时会明确抛出 `NotImplementedError`。
 
 ## 当前固定条件
@@ -60,7 +61,8 @@
   eval/inference显式落到unsupported；
 - time embedding必须结合合法query_time、全局pointer和唯一候选受限grammar解析为确定性时间
   窗口；失败时不猜测、不clamp；
-- State Bank记录通过归一化embedding检索，默认不设top-k；最终整数仍由确定性Reader计算；
+- State Bank记录按 hard operator 分区后通过 FP32 归一化 cosine 全量阈值检索，默认阈值 0.35、
+  不设 top-k、ANN 关闭；最终整数仍由确定性 Reader 计算；
 - 16个learned State Query经3层Perceiver Resampler汇总全部命中记录，生成16个4096维
   State Token；它们不是Top-16记录；
 - O2 Confirmed身份库从256开始按块动态增长；Candidate从64开始并设512安全上限；
@@ -87,7 +89,7 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | :--- | :--- |
 | v5 YAML、完整解析、固定维度/容量/优化器校验 | P1 已实现并有契约测试 |
 | Video/Query/Encoder/Observation/Record/Retriever/Reader/runtime 类型 | P1 已实现并有 shape/dtype/边界测试 |
-| 推荐模块导入与职责边界 | P1 已实现；P3–P9 对应模块已通过各自工程门禁，其余后续入口显式 `NotImplementedError` |
+| 推荐模块导入与职责边界 | P1 已实现；P3–P11 对应模块已通过各自工程门禁，其余后续入口显式 `NotImplementedError` |
 | 数据 schema、防泄漏、因果切分、processor/query token、A0 runner | P2 工程门禁已通过；fold/A0 为明确标注的合成替代 |
 | Qwen video boundary、Main Merger 插入点、DeepStack 保护 | P3 已实现；tiny/meta 工程契约已验证，真实 8B 留至 P19 |
 | Query Encoder、9-prototype Router、Time Window Resolver | P4 已实现；本地结构/参数/offset/fail-closed 契约已验证，模型尚未训练、阈值尚未校准 |
@@ -96,7 +98,9 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | P7 时间事件编码器 | 已通过本地合成张量工程门禁；逐层 KV、overlap replay margin、因果滑窗和 runtime 隔离均已验证 |
 | P8 四类 Observation Decoder | 已通过本地合成张量工程门禁；输出/metadata、因果流式 replay、runtime 隔离、精确参数和 online freeze 均已验证 |
 | P9 Semantic Projector、State Bank 与事件 FSM | 已通过小型合成张量工程门禁；统一 records、动态 padded view、O1/E1/E2 hard state、隔离、审计、snapshot 和梯度/持久化边界均已验证 |
-| P10–P19 Identity Bank、Reader、loss、训练、推理 | 尚未实现；P10 允许开始，O2 Candidate→Confirmed 生命周期、P18 跨 runtime reset 与 P19 真实 8B 仍保留 |
+| P10 Identity Bank | 已通过小型合成 identity 工程门禁；Candidate→Confirmed、CPU exact store、动态容量、非权威 Hot Cache 与离线指标边界均已验证 |
+| P11 Embedding State Retriever | 已通过小型合成 Bank 工程门禁；row-wise owner/head 分区、FP32 cosine、因果/窗口/valid filters、无 Top-K 全量返回及结构化审计均已验证；0.35 阈值留 P21 校准 |
+| P12–P19 Reader、loss、训练、推理 | 尚未实现；P12 允许开始，P18 跨 runtime reset 与 P19 真实 8B 仍保留 |
 | 真实 8B、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行 |
 
 ## 环境变量

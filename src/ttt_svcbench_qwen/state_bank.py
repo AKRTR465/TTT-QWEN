@@ -292,6 +292,7 @@ class StateRecord:
         if expected_head is None or self.head_type is not expected_head:
             raise ValueError("StateRecord head_type does not match its typed payload")
         _validate_payload_tensors_detached(self.payload)
+        _validate_record_payload_time(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,10 +382,15 @@ class StateBankView:
     timestamps: Tensor
     time_ranges: Tensor
     n_state: Tensor
+    owner_record_counts: Tensor
+    video_ids: tuple[str, ...]
+    trajectory_ids: tuple[str, ...]
+    bank_versions: tuple[int, ...]
     record_ids: tuple[tuple[str | None, ...], ...]
     head_types: tuple[tuple[HeadType | None, ...], ...]
     record_kinds: tuple[tuple[StateRecordKind | None, ...], ...]
     retrieval_eligible_mask: Tensor
+    cloned_records: tuple[tuple[StateRecord | None, ...], ...]
 
     def __post_init__(self) -> None:
         if (
@@ -419,13 +425,30 @@ class StateBankView:
         ):
             raise ValueError("StateBankView n_state must be int64 [B]")
         if (
-            len(self.record_ids) != shape[0]
+            self.owner_record_counts.shape != (shape[0],)
+            or self.owner_record_counts.dtype != torch.int64
+            or self.owner_record_counts.device != self.embeddings.device
+        ):
+            raise ValueError("StateBankView owner_record_counts must be int64 [B]")
+        if (
+            len(self.video_ids) != shape[0]
+            or len(self.trajectory_ids) != shape[0]
+            or len(self.bank_versions) != shape[0]
+            or len(self.record_ids) != shape[0]
             or len(self.head_types) != shape[0]
             or len(self.record_kinds) != shape[0]
+            or len(self.cloned_records) != shape[0]
         ):
             raise ValueError("StateBankView owner metadata must match batch size")
+        if any(not value for value in self.video_ids + self.trajectory_ids):
+            raise ValueError("StateBankView owner identifiers must be non-empty")
+        if len(set(zip(self.video_ids, self.trajectory_ids, strict=True))) != shape[0]:
+            raise ValueError("StateBankView owners must be unique")
+        if any(type(version) is not int or version < 0 for version in self.bank_versions):
+            raise ValueError("StateBankView bank versions must be non-negative integers")
         if any(
-            len(row) != shape[1] for row in self.record_ids + self.head_types + self.record_kinds
+            len(row) != shape[1]
+            for row in (self.record_ids + self.head_types + self.record_kinds + self.cloned_records)
         ):
             raise ValueError("StateBankView owner metadata must match padded record width")
         if (
@@ -434,6 +457,7 @@ class StateBankView:
             or self.retrieval_eligible_mask.device != self.embeddings.device
         ):
             raise ValueError("StateBankView retrieval eligibility must be bool [B, N]")
+        _validate_state_bank_view_records(self)
         if self.embeddings.device.type != "meta":
             if bool(torch.any(self.record_valid_mask & ~self.present_mask)):
                 raise ValueError("StateBankView valid records must also be present")
@@ -452,6 +476,8 @@ class StateBankView:
                 )
             if not torch.equal(self.n_state, self.present_mask.sum(dim=1)):
                 raise ValueError("StateBankView n_state must count stored records")
+            if bool(torch.any(self.owner_record_counts < self.n_state)):
+                raise ValueError("owner_record_counts cannot be smaller than the head partition")
             if bool(torch.any(self.timestamps[~self.present_mask] != -1.0)) or bool(
                 torch.any(self.time_ranges[~self.present_mask] != -1.0)
             ):
@@ -938,7 +964,7 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
     def view(
         self,
         states: Sequence[StateBankRuntimeState],
-        head_type: HeadType | None = None,
+        head_type: HeadType | Sequence[HeadType | None] | None = None,
     ) -> StateBankView:
         normalized = tuple(states)
         if not normalized or any(
@@ -947,18 +973,24 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             raise ValueError("State Bank view requires at least one runtime state")
         for state in normalized:
             _require_live_state(state)
-        if head_type is not None and not isinstance(head_type, HeadType):
-            raise TypeError("State Bank view head_type must be a HeadType or None")
+        row_head_types = _normalize_view_head_filter(head_type, len(normalized))
         owners = tuple((state.video_id, state.trajectory_id) for state in normalized)
         if len(set(owners)) != len(owners):
             raise ValueError("State Bank batch owners must be unique")
+        source_records = tuple(record for state in normalized for record in state.records)
+        _assert_tensor_groups_isolated(
+            tuple(_record_tensors(record) for record in source_records),
+            "batched State Bank records",
+        )
         rows = tuple(
             tuple(
-                record
+                _clone_record(record)
                 for record in state.records
-                if head_type is None or record.head_type is head_type
+                if row_head_types is None or record.head_type is row_head_types[row]
             )
-            for state in normalized
+            if row_head_types is None or row_head_types[row] is not None
+            else ()
+            for row, state in enumerate(normalized)
         )
         all_records = tuple(record for records in rows for record in records)
         if all_records:
@@ -991,15 +1023,22 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             (batch_size, max_records, 2), -1.0, dtype=torch.float64, device=reference.device
         )
         n_state = torch.zeros(batch_size, dtype=torch.int64, device=reference.device)
+        owner_record_counts = torch.tensor(
+            tuple(len(state.records) for state in normalized),
+            dtype=torch.int64,
+            device=reference.device,
+        )
         record_ids: list[tuple[str | None, ...]] = []
         head_types: list[tuple[HeadType | None, ...]] = []
         record_kinds: list[tuple[StateRecordKind | None, ...]] = []
+        cloned_records: list[tuple[StateRecord | None, ...]] = []
         for row, records in enumerate(rows):
             count = len(records)
             n_state[row] = count
             ids: list[str | None] = [None] * max_records
             heads: list[HeadType | None] = [None] * max_records
             kinds: list[StateRecordKind | None] = [None] * max_records
+            record_copies: list[StateRecord | None] = [None] * max_records
             for column, record in enumerate(records):
                 kind = _record_kind(record)
                 embeddings[row, column] = record.semantic_embedding
@@ -1011,6 +1050,7 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
                 ids[column] = record.record_id
                 heads[column] = record.head_type
                 kinds[column] = kind
+                record_copies[column] = record
                 if record.timestamp is not None:
                     timestamps[row, column] = record.timestamp
                 else:
@@ -1021,6 +1061,7 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             record_ids.append(tuple(ids))
             head_types.append(tuple(heads))
             record_kinds.append(tuple(kinds))
+            cloned_records.append(tuple(record_copies))
         return StateBankView(
             embeddings=embeddings,
             present_mask=present_mask,
@@ -1028,10 +1069,15 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             timestamps=timestamps,
             time_ranges=time_ranges,
             n_state=n_state,
+            owner_record_counts=owner_record_counts,
+            video_ids=tuple(state.video_id for state in normalized),
+            trajectory_ids=tuple(state.trajectory_id for state in normalized),
+            bank_versions=tuple(state.version for state in normalized),
             record_ids=tuple(record_ids),
             head_types=tuple(head_types),
             record_kinds=tuple(record_kinds),
             retrieval_eligible_mask=retrieval_eligible_mask,
+            cloned_records=tuple(cloned_records),
         )
 
     @torch.no_grad()  # type: ignore[untyped-decorator]
@@ -1632,6 +1678,14 @@ def build_state_bank(config: ProjectConfig | None = None) -> StructuredStateBank
     return StructuredStateBank(config)
 
 
+def clone_state_record(record: StateRecord) -> StateRecord:
+    """Return a storage-isolated typed record for downstream snapshot consumers."""
+
+    if not isinstance(record, StateRecord):
+        raise TypeError("clone_state_record requires a StateRecord")
+    return _clone_record(record)
+
+
 def semantic_projector_parameter_count(module: SemanticProjector | StructuredStateBank) -> int:
     projector = module.semantic_projector if isinstance(module, StructuredStateBank) else module
     return sum(parameter.numel() for parameter in projector.parameters())
@@ -1649,6 +1703,51 @@ def _validate_strict_times(times: tuple[float, ...], name: str) -> None:
         raise ValueError(f"{name} times must be finite and non-negative")
     if any(right <= left for left, right in zip(times, times[1:], strict=False)):
         raise ValueError(f"{name} times must increase strictly")
+
+
+def _validate_record_payload_time(record: StateRecord) -> None:
+    payload = record.payload
+    if isinstance(payload, (O1Payload, E1Payload, E2Payload)):
+        if record.timestamp is None:
+            raise ValueError("aggregate StateRecord payloads require a point timestamp")
+        timestamp = record.timestamp
+        if payload.last_timestamp != -1.0 and not _float_close(payload.last_timestamp, timestamp):
+            raise ValueError("aggregate payload last_timestamp must match the record timestamp")
+        if isinstance(payload, O1Payload):
+            _require_times_not_after(
+                tuple(slot.last_timestamp for slot in payload.slot_states),
+                timestamp,
+                "O1 slot",
+            )
+        elif isinstance(payload, E1Payload):
+            _require_times_not_after(payload.recent_event_times, timestamp, "E1 event")
+            if payload.candidate_start is not None:
+                _require_times_not_after((payload.candidate_start,), timestamp, "E1 candidate")
+        else:
+            interval_times = tuple(
+                value for interval in payload.completed_intervals for value in interval
+            )
+            _require_times_not_after(interval_times, timestamp, "E2 interval")
+            _require_times_not_after(payload.recent_event_times, timestamp, "E2 event")
+            if payload.current_start is not None:
+                _require_times_not_after((payload.current_start,), timestamp, "E2 candidate")
+        return
+    if isinstance(payload, (CandidateIdentity, ConfirmedIdentity)):
+        if record.timestamp is not None:
+            if not _float_close(record.timestamp, payload.first_seen):
+                raise ValueError("O2 point record timestamp must match payload first_seen")
+            return
+        assert record.time_range is not None
+        start, end = record.time_range
+        if not _float_close(start, payload.first_seen) or not _float_close(end, payload.last_seen):
+            raise ValueError("O2 range record boundaries must match payload first_seen/last_seen")
+        return
+    raise TypeError("StateRecord carries an unsupported payload type")
+
+
+def _require_times_not_after(times: tuple[float, ...], endpoint: float, name: str) -> None:
+    if any(value > endpoint and not _float_close(value, endpoint) for value in times):
+        raise ValueError(f"{name} time cannot be later than the record timestamp")
 
 
 def _validate_payload_tensors_detached(payload: StatePayload) -> None:
@@ -1685,6 +1784,97 @@ def _record_tensors(record: StateRecord) -> tuple[Tensor, ...]:
     return (record.semantic_embedding, *_payload_tensors(record.payload))
 
 
+def _validate_state_bank_view_records(view: StateBankView) -> None:
+    groups: list[tuple[Tensor, ...]] = []
+    meta = view.embeddings.device.type == "meta"
+    for row, records in enumerate(view.cloned_records):
+        present_ids: list[str] = []
+        for column, record in enumerate(records):
+            record_id = view.record_ids[row][column]
+            head_type = view.head_types[row][column]
+            record_kind = view.record_kinds[row][column]
+            if record is None:
+                if record_id is not None or head_type is not None or record_kind is not None:
+                    raise ValueError("StateBankView padding record metadata must be None")
+                if not meta and bool(view.present_mask[row, column]):
+                    raise ValueError("StateBankView present entries require cloned records")
+                continue
+            if record_id is None or head_type is None or record_kind is None:
+                raise ValueError("StateBankView cloned records require complete metadata")
+            if (
+                record.video_id != view.video_ids[row]
+                or record.trajectory_id != view.trajectory_ids[row]
+            ):
+                raise ValueError("StateBankView cloned record owner metadata is inconsistent")
+            if record.record_id != record_id:
+                raise ValueError("StateBankView cloned record ID metadata is inconsistent")
+            if record.head_type is not head_type:
+                raise ValueError("StateBankView cloned record head metadata is inconsistent")
+            if _record_kind(record) is not record_kind:
+                raise ValueError("StateBankView cloned record kind metadata is inconsistent")
+            if (
+                record.semantic_embedding.dtype != view.embeddings.dtype
+                or record.semantic_embedding.device != view.embeddings.device
+            ):
+                raise ValueError(
+                    "StateBankView cloned record semantics must match view dtype/device"
+                )
+            present_ids.append(record.record_id)
+            groups.append(_record_tensors(record))
+            if meta:
+                continue
+            if not bool(view.present_mask[row, column]):
+                raise ValueError("StateBankView cloned records must be marked present")
+            if bool(view.record_valid_mask[row, column]) is not record.valid:
+                raise ValueError("StateBankView cloned record validity metadata is inconsistent")
+            expected_eligible = record.valid and record_kind is not StateRecordKind.O2_CANDIDATE
+            if bool(view.retrieval_eligible_mask[row, column]) is not expected_eligible:
+                raise ValueError("StateBankView cloned record retrieval metadata is inconsistent")
+            if not torch.equal(view.embeddings[row, column], record.semantic_embedding):
+                raise ValueError("StateBankView cloned record semantic metadata is inconsistent")
+            stored_timestamp = float(view.timestamps[row, column].item())
+            stored_range = view.time_ranges[row, column]
+            if record.timestamp is not None:
+                if not _float_close(stored_timestamp, record.timestamp) or bool(
+                    torch.any(stored_range != -1.0)
+                ):
+                    raise ValueError(
+                        "StateBankView cloned record timestamp metadata is inconsistent"
+                    )
+            else:
+                assert record.time_range is not None
+                expected_range = torch.tensor(
+                    record.time_range,
+                    dtype=torch.float64,
+                    device=view.embeddings.device,
+                )
+                if stored_timestamp != -1.0 or not torch.equal(stored_range, expected_range):
+                    raise ValueError(
+                        "StateBankView cloned record time-range metadata is inconsistent"
+                    )
+        if len(set(present_ids)) != len(present_ids):
+            raise ValueError("StateBankView cloned record IDs must be unique within each owner")
+    _assert_tensor_groups_isolated(tuple(groups), "StateBankView cloned records")
+    if view.embeddings.numel() > 0:
+        embedding_storage = _tensor_storage_key(view.embeddings)
+        if any(
+            tensor.numel() > 0 and _tensor_storage_key(tensor) == embedding_storage
+            for group in groups
+            for tensor in group
+        ):
+            raise ValueError("StateBankView tensors and cloned records must not share storage")
+
+
+def _tensor_storage_key(tensor: Tensor) -> tuple[str, int | None, int]:
+    if tensor.device.type == "meta":
+        return ("meta", None, id(tensor))
+    return (
+        tensor.device.type,
+        tensor.device.index,
+        int(tensor.untyped_storage().data_ptr()),
+    )
+
+
 def _assert_tensor_groups_isolated(groups: Sequence[tuple[Tensor, ...]], name: str) -> None:
     seen: set[tuple[str, int | None, int]] = set()
     for group in groups:
@@ -1692,16 +1882,7 @@ def _assert_tensor_groups_isolated(groups: Sequence[tuple[Tensor, ...]], name: s
         for tensor in group:
             if tensor.numel() == 0:
                 continue
-            key = (
-                ("meta", None, id(tensor))
-                if tensor.device.type == "meta"
-                else (
-                    tensor.device.type,
-                    tensor.device.index,
-                    int(tensor.untyped_storage().data_ptr()),
-                )
-            )
-            group_keys.add(key)
+            group_keys.add(_tensor_storage_key(tensor))
         if seen.intersection(group_keys):
             raise ValueError(f"{name} must not share mutable tensor storage")
         seen.update(group_keys)
@@ -1716,6 +1897,24 @@ def _normalize_head_types(
     if len(normalized) != count or any(not isinstance(value, HeadType) for value in normalized):
         raise ValueError("head_types must provide one valid HeadType per source state")
     return normalized
+
+
+def _normalize_view_head_filter(
+    head_type: HeadType | Sequence[HeadType | None] | None,
+    count: int,
+) -> tuple[HeadType | None, ...] | None:
+    if head_type is None:
+        return None
+    if isinstance(head_type, HeadType):
+        return (head_type,) * count
+    if isinstance(head_type, (str, bytes)) or not isinstance(head_type, Sequence):
+        raise TypeError("State Bank view head_type must be a HeadType, sequence, or None")
+    normalized = tuple(head_type)
+    if len(normalized) != count:
+        raise ValueError("row-wise State Bank head filters must match the batch size")
+    if any(value is not None and not isinstance(value, HeadType) for value in normalized):
+        raise TypeError("row-wise State Bank head filters must contain HeadType or None")
+    return cast(tuple[HeadType | None, ...], normalized)
 
 
 def _normalize_semantic(raw: Tensor, eps: float) -> Tensor:

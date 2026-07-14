@@ -1,4 +1,4 @@
-# 实施决策（v5 高容量版，P0–P10 已通过）
+# 实施决策（v5 高容量版，P0–P11 已通过）
 
 本文件记录已经冻结的 v5 边界。P0 已冻结规格和仓库基线；P1 已把运行 YAML、强类型配置、
 运行时类型和推荐模块骨架迁移到 v5；P2 已通过数据、因果预处理和合成 A0 工程门禁；P3 已实现
@@ -6,8 +6,9 @@ Qwen video boundary、Main Merger 插入点和 DeepStack 保护；P4 已实现 Q
 Router 和 Time Window Resolver；P5 已通过 Fast Adapter 的本地合成张量工程门禁；P6/P7/P8/P9
 已通过空间对象编码器、时间事件编码器、四类 Observation Decoder、Semantic Projector、类型化
 State Bank 与事件 FSM 的本地合成张量工程门禁；P10 已通过 Identity Bank 动态容量、exact
-matching、Candidate→Confirmed 生命周期和非权威 Hot Cache 的本地合成张量工程门禁。Retriever、
-Reader、训练和推理入口仍按后续 Part 实现。详细论证见
+matching、Candidate→Confirmed 生命周期和非权威 Hot Cache 的本地合成张量工程门禁；P11 已通过
+FP32 全记录阈值 Retriever、hard filters、typed records/status/audit 和无 Top-K 的本地合成 Bank
+工程门禁。Reader、训练和推理入口仍按 P12 及后续 Part 实现。详细论证见
 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前规范版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
@@ -23,9 +24,9 @@ Reader、训练和推理入口仍按后续 Part 实现。详细论证见
    均保留未校准状态。任一状态未校准时，配置拒绝正式评估。
 4. P1 类型覆盖 VideoBatch、Query/TimeWindow、空间/时间输出与 cache、四类 soft output、
    typed records、Retriever、ReaderResult 以及完整 per-video runtime ownership。
-5. P3 `qwen_adapter.py`、P4 `query_encoder.py` 和 P5 `fast_ttt.py` 已通过各自工程门禁。其余推荐
-   模块当前只提供职责边界、类型和显式
-   未实现入口；模块可导入不等于算法已实现。
+5. P3 `qwen_adapter.py`、P4 `query_encoder.py`、P5 `fast_ttt.py` 及 P6–P11 对应模块已通过各自
+   工程门禁。P12 及后续推荐模块仍只提供职责边界、类型和显式未实现入口；模块可导入不等于
+   算法已实现。
 
 ## P2 合成退出决策
 
@@ -223,7 +224,7 @@ Reader、训练和推理入口仍按后续 Part 实现。详细论证见
 9. P9 唯一新增模型参数是 Semantic Projector 1,316,864；按当前其余分项口径，新增模块分项和为
    156,715,683。Bank、FSM、dynamic view、audit 和 snapshot 都是零参数。
 
-## P10 实施前冻结边界
+## P10 已验收冻结边界
 
 1. O2 identity 匹配只使用归一化 256 维向量的 CPU FP32 全量 cosine；Candidate/Confirmed
    `match_threshold=0.80`，novelty、match confidence、reliability、Candidate low-confidence
@@ -247,7 +248,7 @@ Reader、训练和推理入口仍按后续 Part 实现。详细论证见
    `semantic_record_id`；Candidate 另存 TTL/confidence/reliable streak，Confirmed 另存 prototype
    version。Confirmed first_seen 继承 Candidate 首次可靠观测，O2 StateRecord timestamp 固定为
    first_seen。promotion invalidate Candidate record 后 append 新 Confirmed record，旧 ID 只作 tombstone；
-   Candidate 不可语义检索，只有 valid Confirmed record 可检索，检索实现仍留 P11。
+   Candidate 不可语义检索，只有 valid Confirmed record 可检索；该查询边界已由 P11 实现并验收。
 7. Confirmed CPU FP32 store 从 256 起按 256 分块、无语义硬上限；它始终执行完整 exact search，
    `ann_enabled=false`。CUDA BF16 Hot Cache 默认开启、容量 256，仅为派生副本；命中不能提前接受，
    miss 在 CPU exact 后换入，prototype version 不一致视为 miss。换出按
@@ -259,6 +260,41 @@ Reader、训练和推理入口仍按后续 Part 实现。详细论证见
 9. Bank/runtime 不接收真值标签。离线 evaluator 定义 duplicate rate 为同一 GT 的额外 Confirmed IDs
    除以有 GT 映射的 Confirmed IDs，missed-new rate 为未被任何 Confirmed 覆盖的 GT identities 除以
    GT identities；分母为零返回 `not_applicable`。
+
+## P11 已验收冻结边界
+
+1. Retriever 只使用 P4 的 effective hard operator，固定映射为
+   `O1-Snap/O1-Delta→O1`、`O2-Unique/O2-Gain→O2`、
+   `E1-Action/E1-Transit→E1`、`E2-Periodic/E2-Episode→E2`、
+   `unsupported→None`。owner 必须与 Bank 的 `(video_id,trajectory_id)` 完全一致；不一致是
+   `invalid`，不得降成 empty 或查询其他分区。
+2. q_target 和 512 维 record semantic embedding 在 FP32 中用 `eps=1e-8` L2 normalize，cosine
+   bootstrap 阈值为 0.35，边界使用 `>=`。有限零范数 q_target 返回 `unsupported`，禁止 unit-basis
+   fallback；shape、dtype、非 finite 等直接输入契约错误必须抛出。`record.confidence` 不作为额外
+   P11 threshold，正式阈值仍留 P21 校准。
+3. 每行 `N_s` 在 owner/head 分区后、所有 hard filter 前统计，包含 invalid record 和 O2 Candidate，
+   不包含 padding/wrong-head。过滤原因按
+   `invalid→retrieval_ineligible→future→outside_window→below_similarity` 互斥归因；O2 Candidate
+   retrieval-ineligible，只有 valid Confirmed 可做 O2 语义检索。
+4. O1/E1/E2 是 aggregate record，其 record timestamp 是最新提交状态的因果可用时间，不是 payload
+   内事件时间。P11 对 aggregate 只检查不晚于 query_time，不能按 recent/explicit window 丢弃整条
+   aggregate；P12 必须在 payload 的 baseline、event times、completed intervals 上应用 TimeWindow。
+   O2 Confirmed 的 timestamp=first_seen，及未来 atomic point/range record，由 P11 使用闭区间窗口，
+   端点相等算命中。O1-Delta 当前仍只能按既有 `current_visible_count-baseline_count` 契约读出；若
+   后续要求任意历史窗口 delta，必须先增加可审计历史状态，不能让 P11 从 aggregate timestamp 猜测。
+5. `top_k=null`、`ann_enabled=false`。所有达到阈值的记录都保留；selected mask 保持候选列对齐，
+   selected IDs/typed records 仅按 `(score desc,record_id asc)` 做确定性排序。相同分数不是冲突，
+   不得 top-k、截断或只取 top-1。
+6. `TimeResolutionStatus.INVALID` 传播为 Retriever `invalid`；time/operator 低置信或 unsupported、有限
+   零范数 q_target 传播为 `unsupported`。可靠且 owner/head/time 合法但没有命中时才是 `empty`；
+   empty Bank、无 semantic match、全 future、全 invalid、全 retrieval-ineligible 必须有独立 reason
+   和互斥计数。`ok` 必须至少有一个 selected record。
+7. P11 交付未压缩 typed selected records、IDs、score、candidate/selected mask、`N_s/N_ret`、status
+   和过滤审计；不做 Reader 算术、State Resampler、number token、Bank mutation 或 label lookup。
+   P12 只从该 typed record 集合和 resolved TimeWindow 计算 exact integer。
+8. runtime 不计算 precision/recall，也不接收 GT。离线 evaluator 用 selected IDs 与 relevant record
+   集合计算 micro precision/recall，分母为零返回 `not_applicable`；空检索率固定为
+   `EMPTY/(OK+EMPTY)`，unsupported/invalid rate 单独报告。
 
 ## 已固定
 

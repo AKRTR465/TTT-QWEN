@@ -435,6 +435,18 @@ class RetrieverConfig(FrozenModel):
     semantic_dim: PositiveInt
     record_similarity_threshold: Probability
     threshold_status: CalibrationStatus
+    similarity_dtype: str
+    normalization_eps: PositiveFloat
+    zero_query_policy: str
+    threshold_comparison: str
+    record_confidence_threshold: Probability | None
+    operator_head_types: tuple[str | None, ...]
+    filter_order: tuple[str, ...]
+    selection_order: tuple[str, ...]
+    owner_mismatch_status: str
+    aggregate_time_policy: str
+    atomic_window_boundary: str
+    metrics_policy: str
     top_k: PositiveInt | None
     ann_enabled: bool
 
@@ -1113,6 +1125,55 @@ class ProjectConfig(FrozenModel):
                 self.retriever.record_similarity_threshold,
                 0.35,
             ),
+            ("retriever.similarity_dtype", self.retriever.similarity_dtype, "float32"),
+            ("retriever.normalization_eps", self.retriever.normalization_eps, 1.0e-8),
+            ("retriever.zero_query_policy", self.retriever.zero_query_policy, "unsupported"),
+            (
+                "retriever.threshold_comparison",
+                self.retriever.threshold_comparison,
+                "greater_than_or_equal",
+            ),
+            (
+                "retriever.record_confidence_threshold",
+                self.retriever.record_confidence_threshold,
+                None,
+            ),
+            (
+                "retriever.filter_order",
+                self.retriever.filter_order,
+                (
+                    "invalid",
+                    "retrieval_ineligible",
+                    "future",
+                    "outside_window",
+                    "below_similarity",
+                ),
+            ),
+            (
+                "retriever.selection_order",
+                self.retriever.selection_order,
+                ("score_desc", "record_id_asc"),
+            ),
+            (
+                "retriever.owner_mismatch_status",
+                self.retriever.owner_mismatch_status,
+                "invalid",
+            ),
+            (
+                "retriever.aggregate_time_policy",
+                self.retriever.aggregate_time_policy,
+                "causal_availability_only_window_in_reader",
+            ),
+            (
+                "retriever.atomic_window_boundary",
+                self.retriever.atomic_window_boundary,
+                "closed",
+            ),
+            (
+                "retriever.metrics_policy",
+                self.retriever.metrics_policy,
+                "offline_ground_truth_runtime_label_free",
+            ),
             ("retriever.top_k", self.retriever.top_k, None),
             ("retriever.ann_enabled", self.retriever.ann_enabled, False),
             ("state_resampler.num_queries", self.state_resampler.num_queries, 16),
@@ -1435,6 +1496,19 @@ class ProjectConfig(FrozenModel):
         )
         if self.operator_router.prototypes != prototypes:
             raise ValueError("operator_router.prototypes must contain the frozen 9 operators")
+        expected_retriever_heads = (
+            "o1",
+            "o1",
+            "o2",
+            "o2",
+            "e1",
+            "e1",
+            "e2",
+            "e2",
+            None,
+        )
+        if self.retriever.operator_head_types != expected_retriever_heads:
+            raise ValueError("retriever.operator_head_types must align with the frozen 9 operators")
         if self.time_resolver.modes != ("now", "history", "recent", "explicit_range"):
             raise ValueError("time_resolver.modes must contain the frozen 4 modes")
         if self.state_bank.isolation_keys != ("video_id", "trajectory_id", "head_type"):

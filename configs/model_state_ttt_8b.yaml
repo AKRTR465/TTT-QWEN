@@ -353,6 +353,18 @@ retriever:
   semantic_dim: 512
   record_similarity_threshold: 0.35
   threshold_status: bootstrap_calibration_required
+  similarity_dtype: float32
+  normalization_eps: 1.0e-8
+  zero_query_policy: unsupported
+  threshold_comparison: greater_than_or_equal
+  record_confidence_threshold: null
+  operator_head_types: [o1, o1, o2, o2, e1, e1, e2, e2, null]
+  filter_order: [invalid, retrieval_ineligible, future, outside_window, below_similarity]
+  selection_order: [score_desc, record_id_asc]
+  owner_mismatch_status: invalid
+  aggregate_time_policy: causal_availability_only_window_in_reader
+  atomic_window_boundary: closed
+  metrics_policy: offline_ground_truth_runtime_label_free
   top_k: null
   ann_enabled: false
 

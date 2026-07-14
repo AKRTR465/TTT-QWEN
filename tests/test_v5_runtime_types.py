@@ -51,7 +51,12 @@ from ttt_svcbench_qwen.state_encoder import (
     TemporalEncoderOutput,
 )
 from ttt_svcbench_qwen.state_reader import ReaderResult, ReaderStatus
-from ttt_svcbench_qwen.state_retriever import RetrievalStatus, RetrieverOutput
+from ttt_svcbench_qwen.state_retriever import (
+    RetrievalFilterAudit,
+    RetrievalReason,
+    RetrievalStatus,
+    RetrieverOutput,
+)
 
 
 def make_video_batch() -> VideoBatch:
@@ -299,11 +304,34 @@ def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
     bank = StateBankRuntimeState("video-a", "trajectory-a", (record,), ())
     retrieval = RetrieverOutput(
         selected_record_ids=(("record-1",),),
-        scores=torch.tensor([[0.9]]),
+        selected_scores=((0.5,),),
+        selected_records=((record,),),
+        candidate_record_ids=(("record-1",),),
+        state_embeddings=semantic.reshape(1, 1, 512),
+        scores=torch.tensor([[0.5]]),
+        present_mask=torch.tensor([[True]]),
         selected_mask=torch.tensor([[True]]),
         status=(RetrievalStatus.OK,),
+        reason=(RetrievalReason.MATCHED,),
         n_state=torch.tensor([1]),
         n_retrieved=torch.tensor([1]),
+        audit=(
+            RetrievalFilterAudit(
+                n_state=1,
+                head_partition_excluded_count=0,
+                query_rejected_count=0,
+                owner_mismatch_count=0,
+                invalid_count=0,
+                retrieval_ineligible_count=0,
+                future_count=0,
+                outside_window_count=0,
+                below_similarity_count=0,
+                selected_count=1,
+            ),
+        ),
+        video_ids=("video-a",),
+        trajectory_ids=("trajectory-a",),
+        bank_versions=(bank.version,),
     )
     window = TimeWindow(TimeWindowMode.HISTORY, 2.0, 0.0, 2.0, True)
     reader = ReaderResult(

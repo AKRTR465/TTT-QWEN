@@ -70,8 +70,8 @@ ${OUTPUT_ROOT}/
 | P7 | 时间事件编码器已定义 | 已通过：P3–P7 联合定向 236 tests；全量 271 tests、Ruff、mypy、严格 UTF-8、配置 CLI 和 `git diff --check` 均绿色；仅合成张量，真实视频/8B 留至 P19 |
 | P8 | 四类 Observation Decoder 已定义 | 已通过：P5–P8 相邻定向 123 tests；全量 285 tests、Ruff、mypy、严格 UTF-8、配置 CLI 和 `git diff --check` 均绿色；仅 Meta/小型合成张量，hard Bank/FSM 留至 P9–P10 |
 | P9 | Semantic Projector、State Bank、FSM 已定义 | 已通过：P9 定向 17 tests、相邻定向 107 tests、全量 309 tests；Ruff、mypy、严格 UTF-8、配置 CLI、spec-lock hash 和 `git diff --check` 均绿色；仅 Meta/小型合成张量，O2 生命周期/P18 reset 编排/P19 真实资产仍保留 |
-| P10 | Identity Bank 与 Hot Cache 已定义 | 未实现 |
-| P11 | Embedding State Retriever 已定义 | 未实现 |
+| P10 | Identity Bank 与 Hot Cache 已定义 | 已通过：Candidate→Confirmed、CPU FP32 exact matching、>256 动态容量、非权威 Hot Cache 与隔离/持久化边界均以小型合成 identity 验证 |
+| P11 | Embedding State Retriever 已定义 | 已通过：row-wise owner/head 分区、FP32 cosine、全量 threshold filters、typed records/status/audit、ragged 3/30/300 与无 Top-K 均以小型合成 Bank 验证 |
 | P12 | Resampler 与 Deterministic Reader 已定义 | 未实现 |
 | P13 | Input Composer 与模型编排已定义 | 未实现 |
 | P14 | Loss 与 functional SGD 已定义 | 未实现 |

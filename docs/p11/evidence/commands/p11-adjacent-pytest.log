@@ -1,0 +1,4 @@
+timestamp_utc=2026-07-14T03:12:39.6354609Z
+command=uv run pytest -q tests/test_query_encoder.py tests/test_state_bank.py tests/test_identity_bank.py tests/test_state_retriever.py tests/test_v5_config_contract.py tests/test_v5_runtime_types.py tests/test_v5_module_skeletons.py tests/test_p0_baseline_contract.py
+exit_code=0
+result=229 passed in 52.39s
