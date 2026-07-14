@@ -5,7 +5,7 @@
 完整架构、训练协议和消融方案见 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前对齐版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
-> 当前施工状态：P0–P14 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
+> 当前施工状态：P0–P15 已通过工程门禁；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
 > P3 用官方 HF meta 模块和 tiny 随机权重模型完成 Qwen 接口与 DeepStack 工程验收。真实 8B
 > A0/集成仍保留在 P19/P21/P22；P4 已完成 Query Encoder、Operator Router 与 Time Window
 > Resolver 的工程门禁，但尚未训练或校准。P5 Fast Adapter 已通过纯合成张量工程门禁，
@@ -16,7 +16,10 @@
 > Deterministic Reader、record operands、状态隔离与 tokenizer-only SHA256 审计也已通过；P13
 > Composer、原生 Qwen prefill/DeepStack/mRoPE 桥与一次性模型编排已用 synthetic/tiny 资产通过；
 > P14 typed loss、逐视频 functional SGD、full-second-order meta 路与梯度/delta 审计也已用合成
-> case 通过，P15 允许开始。P15 及之后的空壳被调用时会明确抛出 `NotImplementedError`。
+> case 通过；P15 已以 synthetic/tiny A2 接通 typed target、hard Bank/FSM、Retriever/Reader、
+> Composer/Qwen prefill、`L_state+L_answer`、Outer AdamW、独立指标与 trainable-only checkpoint。
+> 该证据不包含真实视频、数据集或 8B 权重；P16 尚未开始，必须先通过 P15 artifact/hash/
+> Reader-stability exit gate。
 
 ## 当前固定条件
 
@@ -80,6 +83,9 @@
 - O2 Confirmed身份库从256开始按块动态增长；Candidate从64开始并设512安全上限；
 - 每个新视频重置fast weights、SGD状态、时序缓存和State Bank；
 - 测试时禁止使用答案、count、occurrence_times、counting_type和counting_subtype。
+- P15 工程配置固定 A2、`static_w0_no_inner_sgd` 和冻结 Qwen；只有 static `W0`
+  与显式状态模块进入 Outer AdamW，Predictor、functional SGD、transient `W_t`、
+  hard runtime 与 Qwen 参数均排除。
 
 ## 本机安装
 
@@ -101,7 +107,7 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | :--- | :--- |
 | v5 YAML、完整解析、固定维度/容量/优化器校验 | P1 已实现并有契约测试 |
 | Video/Query/Encoder/Observation/Record/Retriever/Reader/runtime 类型 | P1 已实现并有 shape/dtype/边界测试 |
-| 推荐模块导入与职责边界 | P1 已实现；P3–P14 对应模块已通过各自工程门禁，其余后续入口显式 `NotImplementedError` |
+| 推荐模块导入与职责边界 | P1 已实现；P3–P15 对应模块已通过各自工程门禁，P16 及后续入口仍按阶段 fail closed |
 | 数据 schema、防泄漏、因果切分、processor/query token、A0 runner | P2 工程门禁已通过；fold/A0 为明确标注的合成替代 |
 | Qwen video boundary、Main Merger 插入点、DeepStack 保护 | P3 已实现；tiny/meta 工程契约已验证，真实 8B 留至 P19 |
 | Query Encoder、9-prototype Router、Time Window Resolver | P4 已实现；本地结构/参数/offset/fail-closed 契约已验证，模型尚未训练、阈值尚未校准 |
@@ -115,7 +121,8 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | P12 State Resampler 与 Deterministic Reader | 已通过小型合成 typed-record 工程门禁；16×4096 固定输出、FP32 masked attention、状态隔离、candidate/selected snapshot 完整性、8 operator 精确算术、record operands、signed number token 和本地 tokenizer manifest 均已验证 |
 | P13 Input Composer 与模型编排 | 已通过 synthetic/tiny 工程门禁；固定 token 注册/初始化、变长 payload/左 padding、三类 mask、原生 mRoPE/rope delta/cache、预计算 adapted Main+原 DeepStack、Reader 重验、observe/answer/decode 生命周期均已验证 |
 | P14 Loss 与 functional SGD | 已通过合成门禁；逐 row loss/valid/skip、full-second-order meta、finite/clip/reset、模块 gradient/delta 表均已验证 |
-| P15–P19 训练、推理 | 尚未实现；P15 允许开始，P18 跨 runtime reset 与 P19 真实 8B 仍保留 |
+| P15 Stage A 显式状态 Warm-up | 已通过 synthetic/tiny A2 工程门禁；Qwen/Inner SGD 冻结，typed provenance target、四类 hard rollout、Reader/Qwen prefill、State+Answer Outer step、指标、checkpoint 与 fail-closed exit gate 已验证 |
+| P16–P19 Meta-TTT、推理与分布式 | 尚未开始；P16 需 P15 exit gate，P18 跨 runtime reset 与 P19 真实 8B 仍保留 |
 | 真实 8B、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行 |
 
 ## 环境变量

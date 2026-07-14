@@ -102,11 +102,14 @@ class SpySuite:
     def write_bank(
         self,
         observations: object,
+        spatial: object,
+        temporal: object,
         query: object,
         request: ObservationChunkRequest,
     ) -> BankWriteOutput:
         self.events.append("bank")
         assert observations == "observation-soft"
+        assert (spatial, temporal) == ("spatial-soft", "temporal-soft")
         return BankWriteOutput("runtime-1", ("bank-1",), "bank-audit")
 
     def retrieve_query(
@@ -367,6 +370,8 @@ def test_answer_query_audits_same_retrieval_before_resampler_and_native_prefill(
     assert composer_request["reader_results"] == suite.reader_results
     assert composer_request["state_tokens"] == "state-tokens"
     assert composer_request["state_token_valid_mask"] == "state-valid"
+    assert composer_request["include_state"] is True
+    assert composer_request["include_number"] is True
 
     prefill = suite.prefill_request
     assert prefill is not None
@@ -554,6 +559,8 @@ def test_disabled_features_are_not_called_and_are_reported_as_absent(
     assert suite.composer_request is not None
     assert suite.composer_request["reader_results"] == ()
     assert suite.composer_request["state_tokens"] is None
+    assert suite.composer_request["include_state"] is False
+    assert suite.composer_request["include_number"] is False
 
 
 def test_qwen_kwargs_cannot_override_composer_or_native_visual_fields() -> None:

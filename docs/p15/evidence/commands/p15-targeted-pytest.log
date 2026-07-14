@@ -1,0 +1,5 @@
+command: .\.venv\Scripts\python.exe -m pytest -q tests\test_stage_a_composer.py tests\test_stage_a_targets.py tests\test_stage_a_runtime.py tests\test_stage_a_trainer.py tests\test_stage_a_metrics.py tests\test_p15_artifacts.py tests\test_p15_tiny_integration.py tests\test_model.py tests\test_v5_config_contract.py tests\test_v5_module_skeletons.py
+exit_code: 0
+result: 194 passed in 44.73s
+scope: P15 Composer, typed targets, hard/soft runtime, Stage A trainer, metrics, artifacts, tiny A2 integration, model/config boundaries
+asset_policy: synthetic/tiny in-process cases only; no video, dataset, or 8B-weight download

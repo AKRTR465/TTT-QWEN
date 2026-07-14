@@ -2,8 +2,8 @@
 
 > 规范版本：state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval  
 > 修订日期：2026-07-14
-> 状态：PARTIALLY IMPLEMENTED / P0-P14 ENGINEERING-VERIFIED
-> 说明：本文描述完整目标实现；当前 P0–P14 已通过工程门禁，P15–P22 尚未完整实现或运行。
+> 状态：PARTIALLY IMPLEMENTED / P0-P15 ENGINEERING-VERIFIED
+> 说明：本文描述完整目标实现；当前 P0–P15 已通过工程门禁，P16–P22 尚未完整实现或运行。
 
 ## 0. 计划目标
 
@@ -1796,7 +1796,7 @@ L_{\mathrm{state}}
 - \(L_{\mathrm{retrieval}}\)：记录级正负样本检索；
 - \(L_{\mathrm{time}}\)：时间语义分类和合法数值窗口监督。
 
-P14 只消费显式 dense target：O1 六字段使用 P15 target builder 提供的 pre-matched slot/mask，
+P14 只消费显式 dense target：O1 六字段使用 P15 已实现 target builder 提供的 pre-matched slot/mask，
 不得从最终 count 反推或伪造 assignment；E2 使用四个 event BCE 与 phase CE，phase CE 是 hard
 FSM 不入图时的 soft proxy。缺失标签的分量保持 invalid，不参与 reduction。
 
@@ -1854,13 +1854,34 @@ L_{\mathrm{total}}
 
 - Query Embedding Encoder；
 - operator prototypes 和 Time Window Resolver；
-- State Retriever 与 State Token Projector；
+- State Retriever、Semantic Projector 与 State Resampler/Projector；
 - 空间对象路和时间事件路；
 - O1、O2、E1、E2；
-- State Reader；
+- Deterministic Reader 端到端路径（固定算术不入 optimizer）；
 - 必要的 Qwen 参数或 LoRA。
 
 目标：在没有 TTT 的情况下，状态模块与 Reader 已能正确工作。
+
+P15 已按用户批准的低空间口径完成该阶段的 synthetic/tiny 工程门禁：
+
+- 运行变体固定 A2，Qwen 全冻结，Inner SGD、TTT loss、Predictor 和 transient
+  fast runtime 不可达；
+- static `W0`、Query/时空 Encoder、四 Head、Semantic Projector 与 Resampler 按显式
+  allowlist 进入 Outer AdamW；
+- `official_explicit`/`synthetic_explicit`/`missing` provenance 决定 typed target 有效性，
+  missing 不得变成零标签，O1 不得从最终 count 反推 dense slot；
+- episode 依次运行因果 observe、四类 hard Bank/Identity/FSM write、Retriever/Reader、
+  Resampler/Composer 和一次 teacher-forced Qwen prefill；soft Projector 保留梯度，hard records
+  detach/clone；
+- A1 只计算 Answer Loss，A2 只计算 State+Answer Loss；四任务平衡采样、独立指标、
+  finite/clip/skip 和 trainable-only checkpoint 均以小型 case 验证。
+
+P15 产物只允许小型 UTF-8 配置/指标/审计/失败样例/冻结策略/manifest 进入 Git；
+checkpoint 位于忽略输出目录，只保存 allowlisted safetensors 与 optimizer/RNG。只有
+artifact hash、Reader 稳定性、零 Reader/LLM 数字分歧、零 TTT activity、四类 hard rollout、
+reset/cache/FSM/checkpoint 审计和已处理失败样例同时通过 fail-closed exit gate，才能
+开始 P16。P16 尚未开始。该门禁没有下载视频、数据集或 8B 权重，不是训练收敛、
+真实精度、显式状态收益或 TTT 科学增益证据。
 
 ### Stage B：单步 Meta-TTT
 
@@ -1966,7 +1987,7 @@ reset Reader audit state
 
 ## 17. 推荐实现模块
 
-模块按以下职责拆分；P3–P14 对应模块已通过工程门禁，P15 及后续模块仍按本计划施工：
+模块按以下职责拆分；P3–P15 对应模块已通过工程门禁，P16 及后续模块仍按本计划施工：
 
 ~~~text
 src/ttt_svcbench_qwen/
@@ -1983,6 +2004,10 @@ src/ttt_svcbench_qwen/
 ├── input_composer.py
 ├── losses.py
 ├── functional_sgd.py
+├── stage_a_targets.py
+├── stage_a_runtime.py
+├── stage_a_metrics.py
+├── p15_artifacts.py
 ├── trainer.py
 ├── inference.py
 └── config.py
@@ -2000,6 +2025,12 @@ src/ttt_svcbench_qwen/
 - state_reader.py：确定性算术和数字序列化；
 - qwen_adapter.py：预计算 adapted Main/原 DeepStack 的一次性 provider 与 prefill-only State scatter；
 - input_composer.py：新增 placeholder、mask、mRoPE/cache 审计和 token 拼接；
+- stage_a_targets.py：provenance-aware 纯标签 target 与最后边界 prediction/label 对齐；
+- stage_a_runtime.py：Stage A hard Bank/Identity/FSM writer、soft Projector 与 runtime audit；
+- stage_a_metrics.py：O1/O2/E1/E2、operator/time/retrieval 与 Reader/LLM 独立指标；
+- p15_artifacts.py：小型 UTF-8/hash 产物包与 P16 fail-closed exit gate；
+- trainer.py：Stage A episode/typed forward、Outer AdamW allowlist、finite/clip/skip、平衡采样和
+  trainable-only checkpoint；
 - model.py：只负责 DI、observe/answer/decode 生命周期和统一输出，不重复实现子模块逻辑。
 
 ## 18. 必须通过的验收测试

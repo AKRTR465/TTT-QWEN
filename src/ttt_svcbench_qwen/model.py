@@ -191,6 +191,7 @@ class BankWriteOutput:
     runtime_state: object
     bank_states: tuple[object, ...]
     audit: object
+    soft_write: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +201,7 @@ class SoftIntermediates:
     spatial: object | None
     temporal: object | None
     observations: object | None
+    state_write: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,6 +392,8 @@ class BankWriter(Protocol):
     def __call__(
         self,
         observations: object,
+        spatial: object,
+        temporal: object,
         query: object,
         request: ObservationChunkRequest,
     ) -> BankWriteOutput: ...
@@ -440,6 +444,8 @@ class ComposerStage(Protocol):
         embedding_owner: object,
         rope_indexer: object,
         video_grid_thw: object,
+        include_state: bool,
+        include_number: bool,
     ) -> object: ...
 
 
@@ -561,6 +567,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             runtime_state = request.runtime_state
             bank_states = request.bank_states
             bank_audit: object | None = None
+            soft_write: object | None = None
             if self.feature_flags.bank_enabled:
                 spatial_encoder = cast(SpatialStage, self.components.spatial_encoder)
                 temporal_encoder = cast(TemporalStage, self.components.temporal_encoder)
@@ -569,7 +576,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
                 spatial = spatial_encoder(adapted, query, request)
                 temporal = temporal_encoder(adapted, query, request)
                 observations = heads(spatial, temporal, query, request)
-                write = writer(observations, query, request)
+                write = writer(observations, spatial, temporal, query, request)
                 if not isinstance(write, BankWriteOutput):
                     raise TypeError("bank_writer must return BankWriteOutput")
                 if len(write.bank_states) != len(request.owner.video_ids):
@@ -577,6 +584,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
                 runtime_state = write.runtime_state
                 bank_states = write.bank_states
                 bank_audit = write.audit
+                soft_write = write.soft_write
 
             lifecycle._succeed("observe", runtime_state)
             return ObservationChunkOutput(
@@ -595,6 +603,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
                     spatial=spatial,
                     temporal=temporal,
                     observations=observations,
+                    state_write=soft_write,
                 ),
                 lifecycle=lifecycle.audit(),
             )
@@ -656,6 +665,8 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
                 embedding_owner=request.embedding_owner,
                 rope_indexer=request.rope_indexer,
                 video_grid_thw=request.video_grid_thw,
+                include_state=self.feature_flags.state_tokens_enabled,
+                include_number=self.feature_flags.reader_enabled,
             )
             prefill_request = QwenPrefillRequest(
                 input_ids=_required_attribute(composed, "input_ids", "Composer output"),

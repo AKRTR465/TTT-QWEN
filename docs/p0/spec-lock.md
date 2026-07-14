@@ -7,8 +7,8 @@
 | 规范文件 | `ARCHITECTURE.md` |
 | SPEC_VERSION | `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval` |
 | 修订日期 | `2026-07-14` |
-| 文档状态 | `PARTIALLY IMPLEMENTED / P0-P14 ENGINEERING-VERIFIED` |
-| ARCHITECTURE_SHA256 | `d397cab2943fac9a032b718800d37c69c60e1b82152d395a8aa869cc3f454597` |
+| 文档状态 | `PARTIALLY IMPLEMENTED / P0-P15 ENGINEERING-VERIFIED` |
+| ARCHITECTURE_SHA256 | `31f3d98eea2d9d6b4dbeca687d025c717de22009319df883e37a511eb7d40352` |
 | 基线 Git commit | `7f0185f8136faf88cc59e5ba2ec7309c36f8d013` |
 | UV_LOCK_SHA256 | `c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2` |
 | 基座模型 | `Qwen/Qwen3-VL-8B-Instruct` |
@@ -59,6 +59,11 @@
     联合 FP32 clip=1，attempted=update+skip，只有下一代 fast matrices 允许 inner delta。
 14. O1 State target 是 P15 builder 提供的 pre-matched dense slots；E2 phase CE 是 hard FSM
     不入图时的 soft proxy。P14 不从最终 count 伪造 dense labels。
+15. P15 低空间 Stage A 固定 A2、`static_w0_no_inner_sgd`、冻结 Qwen 和空 Qwen
+    allowlist；A2 只计算 State+Answer Loss，Inner TTT/Predictor/functional SGD 不可达。
+    target 只认 `official_explicit`/`synthetic_explicit`/`missing` provenance，hard write 与 soft
+    gradient 分离；只保存 trainable-only checkpoint。P16 必须在 P15 artifact/hash/
+    Reader-stability exit gate 通过后才允许开始，当前尚未开始。
 
 ## 第一版禁止项
 
@@ -78,7 +83,8 @@
 
 以下内容不是 v5 已验证事实，只有训练折或独立校准集证据才能冻结：
 
-- Outer Training 使用全量微调、分阶段解冻或 LLM LoRA；
+- 正式 Outer Training 使用全量微调、分阶段解冻或 LLM LoRA；P15 synthetic
+  工程门禁的 Qwen 全冻结选择不替代该科学决策；
 - 768 与旧 512 主干的净收益，活动槽 16/32/48/64，State Token 8/16/32；
 - 是否用训练折证据替换或增强 P4 的“双 pointer + 唯一候选受限 grammar” baseline；
 - operator unsupported、record similarity、O1/O2/E1/E2 FSM/match/cooldown/NMS 阈值；

@@ -535,6 +535,42 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "answer_causal_shift": True,
         "answer_ignore_index": -100,
     }
+    assert config.stage_a.model_dump() == {
+        "variant": "a2",
+        "inner_sgd_enabled": False,
+        "fast_adapter_mode": "static_w0_no_inner_sgd",
+        "qwen_strategy": "frozen_synthetic_engineering_gate",
+        "qwen_parameter_allowlist": (),
+        "trainable_components": (
+            "fast_adapter",
+            "query_encoder",
+            "spatial_encoder",
+            "temporal_encoder",
+            "observation_heads",
+            "state_bank",
+            "resampler",
+        ),
+        "balanced_task_sampling": True,
+        "synthetic_engineering_gate_only": True,
+        "seed": 42,
+        "optimizer": {
+            "name": "adamw",
+            "learning_rate": 3.0e-4,
+            "weight_decay": 0.01,
+            "betas": (0.9, 0.999),
+            "epsilon": 1.0e-8,
+            "grad_clip_norm": 1.0,
+        },
+        "checkpoint": {
+            "format": "trainable_safetensors_plus_pt_state_v1",
+            "trainable_only": True,
+            "include_optimizer": True,
+            "include_rng": True,
+            "save_full_model": False,
+            "save_runtime_state": False,
+            "best_metric": "validation_total_loss",
+        },
+    }
 
 
 def test_v5_parameter_budget_matches_architecture_rounding() -> None:
@@ -988,6 +1024,18 @@ def set_nested(*path_and_value: object) -> Mutation:
         (
             set_nested("loss", "answer_ignore_index", 0),
             "loss.answer_ignore_index",
+        ),
+        (
+            set_nested("stage_a", "inner_sgd_enabled", True),
+            "stage_a.inner_sgd_enabled",
+        ),
+        (
+            set_nested("stage_a", "fast_adapter_mode", "disabled"),
+            "stage_a.fast_adapter_mode",
+        ),
+        (
+            set_nested("stage_a", "checkpoint", "save_runtime_state", True),
+            "stage_a.checkpoint.save_runtime_state",
         ),
         (set_nested("fast_ttt", "optimizer", "momentum", 0.9), "momentum must be 0.0"),
         (

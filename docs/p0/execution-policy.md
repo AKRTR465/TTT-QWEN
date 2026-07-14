@@ -75,8 +75,8 @@ ${OUTPUT_ROOT}/
 | P12 | Resampler 与 Deterministic Reader 已定义 | 已通过：16×4096 固定输出、无 Top-K selected K/V、FP32 masked attention、OK/EMPTY/unknown 状态隔离、8 operator typed-record 算术、record operands、signed number-token 与 pinned tokenizer manifest 均以小型合成 case 验证 |
 | P13 | Input Composer 与模型编排已定义 | 已通过：fixed token/embedding、payload/mask/mRoPE、prepared DeepStack、Reader 审计、DI 与单次 prefill 均以 synthetic/tiny HF 验证；无视频/数据集/8B 下载 |
 | P14 | Loss 与 functional SGD 已定义 | 已通过：typed per-row TTT/State/Answer/Outer、current→snapshot detach、row-isolated SGD、joint FP32 clip、full-second-order meta、skip/reset/counter 与真实冻结链 gradient/delta 均以合成 case 验证；无资产下载 |
-| P15 | Stage A warm-up 已定义 | 未实现/未运行 |
-| P16 | Stage B 单步 Meta-TTT 已定义 | 未实现/未运行 |
+| P15 | Stage A warm-up 已定义 | 已通过 synthetic/tiny A2 工程门禁：provenance-aware typed target、四类 hard Bank/Identity/FSM rollout、可微 soft Projector、Retriever/Reader/Composer/Qwen prefill、State+Answer Outer AdamW、独立指标、trainable-only checkpoint 与 fail-closed artifact/hash exit gate 已验证；无视频/数据集/8B 下载 |
+| P16 | Stage B 单步 Meta-TTT 已定义 | 尚未开始；仅在 P15 exit gate 通过后允许施工 |
 | P17 | Stage C 一致性与多 support 已定义 | 未实现/未运行 |
 | P18 | 测试时协议与推理入口已定义 | 未实现 |
 | P19 | 真实 8B/分布式阶段已定义 | 未实现/未运行 |

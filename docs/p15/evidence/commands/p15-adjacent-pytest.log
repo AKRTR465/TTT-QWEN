@@ -1,0 +1,4 @@
+command: P3-P15 adjacent pytest suite (Qwen boundary, Query, Fast Adapter, encoders, heads, banks, Retriever, Reader, Composer, model, losses, SGD, Stage A, config)
+exit_code: 0
+result: 542 passed in 99.20s
+asset_policy: existing local tiny/tokenizer assets plus synthetic tensors; no download

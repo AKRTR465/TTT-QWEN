@@ -42,10 +42,15 @@ VISION_START_TOKEN = "<|vision_start|>"
 VISION_END_TOKEN = "<|vision_end|>"
 TOKEN_INITIALIZATION_STRATEGY = "fp32_mean_of_vision_start_video_pad_vision_end_then_cast"
 EXACT_NUMBER_INSTRUCTION = "\nUse the exact number provided below; do not recount or override it.\n"
+IGNORE_INDEX = -100
 
 _REGISTRATION_LOCK = RLock()
 _COUNT_BEARING_STATUSES = frozenset((ReaderStatus.OK.value, ReaderStatus.EMPTY.value))
 _NO_COUNT_STATUSES = frozenset((ReaderStatus.UNSUPPORTED.value, ReaderStatus.INVALID.value))
+_DISABLED_READER_STATUS = "disabled"
+_AUDIT_READER_STATUSES = (
+    _COUNT_BEARING_STATUSES | _NO_COUNT_STATUSES | frozenset((_DISABLED_READER_STATUS,))
+)
 
 
 class ComposerTokenizer(Protocol):
@@ -222,7 +227,7 @@ class CompositionRowAudit:
     number_included: bool
 
     def __post_init__(self) -> None:
-        if self.reader_status not in _COUNT_BEARING_STATUSES | _NO_COUNT_STATUSES:
+        if self.reader_status not in _AUDIT_READER_STATUSES:
             raise ValueError("row audit contains an unknown Reader status")
         counts = (
             self.source_token_count,
@@ -234,6 +239,8 @@ class CompositionRowAudit:
             raise ValueError("row audit token counts must be non-negative integers")
         if self.composed_token_count != self.source_token_count + self.inserted_token_count:
             raise ValueError("row audit source/inserted/composed lengths do not add up")
+        if self.insertion_index is not None and self.insertion_index >= self.source_token_count:
+            raise ValueError("row audit insertion index must point inside the source sequence")
         position_groups = (
             self.video_positions,
             self.state_positions,
@@ -295,7 +302,7 @@ class CompositionRowAudit:
                 or self.state_included
                 or self.number_included
             ):
-                raise ValueError("UNSUPPORTED/INVALID rows cannot audit injected payload")
+                raise ValueError("non-count-bearing rows cannot audit injected payload")
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +423,151 @@ class ComposedInput:
                     raise ValueError("row audit left padding does not match attention_mask")
                 if valid_count != audit.composed_token_count:
                     raise ValueError("row audit composed length does not match attention_mask")
+
+
+@dataclass(frozen=True, slots=True)
+class TeacherForcedRowAudit:
+    """Absolute source-to-composed positions for one teacher-forced row."""
+
+    source_valid_positions: tuple[int, ...]
+    composed_source_positions: tuple[int, ...]
+    source_supervised_positions: tuple[int, ...]
+    composed_supervised_positions: tuple[int, ...]
+    source_number_positions: tuple[int, ...]
+    composed_number_positions: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        groups = (
+            self.source_valid_positions,
+            self.composed_source_positions,
+            self.source_supervised_positions,
+            self.composed_supervised_positions,
+            self.source_number_positions,
+            self.composed_number_positions,
+        )
+        if any(
+            any(type(position) is not int or position < 0 for position in group) for group in groups
+        ):
+            raise ValueError("teacher-forced audit positions must be non-negative integers")
+        if any(tuple(sorted(set(group))) != group for group in groups):
+            raise ValueError("teacher-forced audit positions must be unique and increasing")
+        if len(self.source_valid_positions) != len(self.composed_source_positions):
+            raise ValueError("source and composed provenance positions must be one-to-one")
+        if len(self.source_supervised_positions) != len(self.composed_supervised_positions):
+            raise ValueError("source and composed supervised positions must be one-to-one")
+        if len(self.source_number_positions) != len(self.composed_number_positions):
+            raise ValueError("source and composed number positions must be one-to-one")
+        if not set(self.source_supervised_positions).issubset(self.source_valid_positions):
+            raise ValueError("source supervised positions must be valid source positions")
+        if not set(self.composed_supervised_positions).issubset(self.composed_source_positions):
+            raise ValueError("composed supervised positions must retain source provenance")
+        if not set(self.source_number_positions).issubset(self.source_supervised_positions):
+            raise ValueError("source number positions must be supervised")
+        if not set(self.composed_number_positions).issubset(self.composed_supervised_positions):
+            raise ValueError("composed number positions must be supervised")
+        provenance = dict(
+            zip(self.source_valid_positions, self.composed_source_positions, strict=True)
+        )
+        if tuple(provenance[position] for position in self.source_supervised_positions) != (
+            self.composed_supervised_positions
+        ):
+            raise ValueError("supervised positions must preserve source-to-composed provenance")
+        if tuple(provenance[position] for position in self.source_number_positions) != (
+            self.composed_number_positions
+        ):
+            raise ValueError("number positions must preserve source-to-composed provenance")
+
+
+@dataclass(frozen=True, slots=True)
+class TeacherForcedComposedInput:
+    """A composed Qwen input plus answer-only labels and their number-token subset."""
+
+    composed_input: ComposedInput
+    labels: Tensor
+    number_token_mask: Tensor
+    row_audits: tuple[TeacherForcedRowAudit, ...]
+
+    def __post_init__(self) -> None:
+        composed = self.composed_input
+        shape = composed.input_ids.shape
+        device = composed.input_ids.device
+        if self.labels.shape != shape or self.labels.dtype != torch.int64:
+            raise ValueError("teacher-forced labels must be int64 [B, L_composed]")
+        if self.labels.device != device:
+            raise ValueError("teacher-forced labels must share the composed-input device")
+        if self.number_token_mask.shape != shape or self.number_token_mask.dtype is not torch.bool:
+            raise ValueError("teacher-forced number_token_mask must be bool [B, L_composed]")
+        if self.number_token_mask.device != device:
+            raise ValueError(
+                "teacher-forced number_token_mask must share the composed-input device"
+            )
+        if len(self.row_audits) != shape[0]:
+            raise ValueError("teacher-forced row_audits need one entry per batch row")
+        if device.type == "meta":
+            return
+
+        supervised = self.labels != IGNORE_INDEX
+        attention = composed.attention_mask.bool()
+        if bool(torch.any(supervised & ~attention)):
+            raise ValueError("padding labels must use ignore index -100")
+        if bool(torch.any(self.number_token_mask & ~supervised)):
+            raise ValueError("number_token_mask must be a subset of supervised assistant labels")
+        if bool(torch.any(self.number_token_mask & composed.number_position_mask)):
+            raise ValueError("Reader number context cannot become an answer number label")
+        if bool(torch.any(supervised & composed.video_position_mask)):
+            raise ValueError("video context labels must use ignore index -100")
+        if bool(torch.any(self.number_token_mask[:, 0])):
+            raise ValueError("the first label cannot be predicted by the causal shift")
+        if bool(torch.any(supervised & (self.labels != composed.input_ids))):
+            raise ValueError("supervised labels must preserve composed token-ID provenance")
+
+        source_origin_mask = torch.zeros_like(supervised)
+        for row, audit in enumerate(self.row_audits):
+            composition_audit = composed.row_audits[row]
+            if len(audit.source_valid_positions) != composition_audit.source_token_count:
+                raise ValueError("teacher-forced source audit disagrees with Composer source count")
+            if any(position >= shape[1] for position in audit.composed_source_positions):
+                raise ValueError("teacher-forced composed provenance position is out of range")
+            valid_positions = torch.nonzero(attention[row]).flatten()
+            insertion_index = composition_audit.insertion_index
+            inserted_count = composition_audit.inserted_token_count
+            if insertion_index is None:
+                relative_source_positions = torch.arange(
+                    composition_audit.source_token_count,
+                    dtype=torch.int64,
+                    device=device,
+                )
+            else:
+                before = torch.arange(insertion_index, dtype=torch.int64, device=device)
+                after = torch.arange(
+                    insertion_index + inserted_count,
+                    composition_audit.composed_token_count,
+                    dtype=torch.int64,
+                    device=device,
+                )
+                relative_source_positions = torch.cat((before, after))
+            expected_composed_sources = tuple(
+                valid_positions.index_select(0, relative_source_positions).tolist()
+            )
+            if expected_composed_sources != audit.composed_source_positions:
+                raise ValueError("teacher-forced row audit does not match payload insertion")
+            source_origin_mask[row, list(audit.composed_source_positions)] = True
+            actual_supervised = tuple(torch.nonzero(supervised[row]).flatten().tolist())
+            if actual_supervised != audit.composed_supervised_positions:
+                raise ValueError("teacher-forced supervised mask and row audit disagree")
+            actual_numbers = tuple(torch.nonzero(self.number_token_mask[row]).flatten().tolist())
+            if actual_numbers != audit.composed_number_positions:
+                raise ValueError("teacher-forced number mask and row audit disagree")
+        if bool(torch.any(supervised & ~source_origin_mask)):
+            raise ValueError(
+                "inserted payload, boundary, instruction, and context labels must be -100"
+            )
+
+    @property
+    def composed(self) -> ComposedInput:
+        """Compatibility alias for callers that name the wrapped input ``composed``."""
+
+        return self.composed_input
 
 
 def register_input_composer_tokens(
@@ -544,6 +696,7 @@ def compose_inputs(
     video_grid_thw: Tensor | None,
     include_state: bool = True,
     include_number: bool = True,
+    payload_insertion_indices: Sequence[int | None] | None = None,
 ) -> ComposedInput:
     """Insert audited state/number segments and build one native-Qwen prefill.
 
@@ -565,6 +718,8 @@ def compose_inputs(
         state_token_valid_mask,
         reader_results,
         include_state=include_state,
+        include_number=include_number,
+        payload_insertion_indices=payload_insertion_indices,
     )
     device = _embedding_device(_embedding_layer(embedding_owner), base_input_ids.device)
     source_ids = base_input_ids.to(device=device, dtype=torch.int64)
@@ -604,24 +759,26 @@ def compose_inputs(
             raise ValueError("each base prefill row must contain at least one valid token")
         if any(value in special_ids.composer_ids for value in valid_ids):
             raise ValueError("base prefill already contains Composer payload tokens")
-        im_end_positions = [
-            index for index, token_id in enumerate(valid_ids) if token_id == special_ids.im_end
-        ]
-        if not im_end_positions:
-            raise ValueError("base prefill must contain a final user <|im_end|>")
-        status = _reader_status(reader_results[row])
-        exact_count = reader_results[row].exact_count
-        number_ids = tuple(reader_results[row].number_token_ids)
-        row_state_valid = False if state_valid is None else bool(state_valid[row].item())
-        _validate_reader_row(
-            status,
-            exact_count,
-            number_ids,
-            row_state_valid,
-            forbidden_number_ids,
-            include_state=include_state,
-            include_number=include_number,
-        )
+        if len(reader_results) != 0:
+            status = _reader_status(reader_results[row])
+            exact_count = reader_results[row].exact_count
+            number_ids = tuple(reader_results[row].number_token_ids)
+            row_state_valid = (
+                False if not include_state or state_valid is None else bool(state_valid[row].item())
+            )
+            _validate_reader_row(
+                status,
+                exact_count,
+                number_ids,
+                row_state_valid,
+                forbidden_number_ids,
+                include_state=include_state,
+                include_number=include_number,
+            )
+        else:
+            status = _DISABLED_READER_STATUS
+            exact_count = None
+            number_ids = ()
         base_origins = [
             "video" if token_id == special_ids.video_pad else "base" for token_id in valid_ids
         ]
@@ -630,7 +787,27 @@ def compose_inputs(
         inserted_number_ids = number_ids if number_included else ()
         inserted_instruction_ids = instruction_ids if number_included else ()
         if state_included or number_included:
-            insertion_index = im_end_positions[-1]
+            requested_insertion = (
+                None if payload_insertion_indices is None else payload_insertion_indices[row]
+            )
+            if requested_insertion is None:
+                im_end_positions = [
+                    index
+                    for index, token_id in enumerate(valid_ids)
+                    if token_id == special_ids.im_end
+                ]
+                if not im_end_positions:
+                    raise ValueError("payload composition requires a final user <|im_end|>")
+                insertion_index = im_end_positions[-1]
+            else:
+                insertion_index = requested_insertion
+                if (
+                    insertion_index >= len(valid_ids)
+                    or valid_ids[insertion_index] != special_ids.im_end
+                ):
+                    raise ValueError(
+                        "payload insertion index must point to a valid user <|im_end|>"
+                    )
             state_payload = (
                 [
                     special_ids.state_start,
@@ -803,6 +980,178 @@ def compose_inputs(
     )
 
 
+def compose_teacher_forced_inputs(
+    *,
+    base_input_ids: Tensor,
+    base_attention_mask: Tensor,
+    base_labels: Tensor,
+    base_number_token_mask: Tensor,
+    state_tokens: Tensor | None,
+    state_token_valid_mask: Tensor | None,
+    reader_results: Sequence[ReaderResultLike],
+    tokenizer: ComposerTokenizer,
+    embedding_owner: EmbeddingOwner,
+    rope_indexer: RopeIndexer | RopeIndexCallable,
+    video_grid_thw: Tensor | None,
+    include_state: bool = True,
+    include_number: bool = True,
+) -> TeacherForcedComposedInput:
+    """Compose a teacher-forced chat and retain only source assistant supervision.
+
+    The source labels use ``-100`` for every prompt/context position.  Payload placement is
+    resolved from the last context ``<|im_end|>`` before the final supervised assistant target,
+    so an assistant turn's own end token cannot move State/Reader context into the answer.  The
+    returned number mask is mapped only from ``base_number_token_mask``; the Reader-number mask
+    on :class:`ComposedInput` is deliberately never reused as answer supervision.
+    """
+
+    _validate_teacher_forced_source_tensors(
+        source_input_ids=base_input_ids,
+        source_attention_mask=base_attention_mask,
+        source_labels=base_labels,
+        source_number_token_mask=base_number_token_mask,
+    )
+    insertion_indices: tuple[int | None, ...] | None = None
+    if include_state or include_number:
+        raw_im_end_id = tokenizer.convert_tokens_to_ids(IM_END_TOKEN)
+        if type(raw_im_end_id) is not int or raw_im_end_id < 0:
+            raise ValueError("tokenizer is missing the native Qwen <|im_end|> token")
+        insertion_indices = _teacher_forced_insertion_indices(
+            source_input_ids=base_input_ids,
+            source_attention_mask=base_attention_mask,
+            source_labels=base_labels,
+            im_end_id=raw_im_end_id,
+        )
+        if len(reader_results) == base_input_ids.shape[0]:
+            for row, result in enumerate(reader_results):
+                if (
+                    _reader_status(result) in _COUNT_BEARING_STATUSES
+                    and insertion_indices[row] is None
+                ):
+                    raise ValueError(
+                        "teacher-forced payload requires a context user <|im_end|> "
+                        "before the assistant target"
+                    )
+    composed = compose_inputs(
+        base_input_ids=base_input_ids,
+        base_attention_mask=base_attention_mask,
+        state_tokens=state_tokens,
+        state_token_valid_mask=state_token_valid_mask,
+        reader_results=reader_results,
+        tokenizer=tokenizer,
+        embedding_owner=embedding_owner,
+        rope_indexer=rope_indexer,
+        video_grid_thw=video_grid_thw,
+        include_state=include_state,
+        include_number=include_number,
+        payload_insertion_indices=insertion_indices,
+    )
+    return map_teacher_forced_targets(
+        composed_input=composed,
+        source_input_ids=base_input_ids,
+        source_attention_mask=base_attention_mask,
+        source_labels=base_labels,
+        source_number_token_mask=base_number_token_mask,
+    )
+
+
+def map_teacher_forced_targets(
+    *,
+    composed_input: ComposedInput,
+    source_input_ids: Tensor,
+    source_attention_mask: Tensor,
+    source_labels: Tensor,
+    source_number_token_mask: Tensor,
+) -> TeacherForcedComposedInput:
+    """Map source-aligned answer labels through row-specific payload insertion/padding."""
+
+    batch_size = _validate_teacher_forced_source_tensors(
+        source_input_ids=source_input_ids,
+        source_attention_mask=source_attention_mask,
+        source_labels=source_labels,
+        source_number_token_mask=source_number_token_mask,
+        expected_batch_size=composed_input.input_ids.shape[0],
+    )
+    device = composed_input.input_ids.device
+    source_ids = source_input_ids.to(device=device, dtype=torch.int64)
+    source_attention = source_attention_mask.to(device=device).bool()
+    source_targets = source_labels.to(device=device, dtype=torch.int64)
+    source_numbers = source_number_token_mask.to(device=device)
+    labels = torch.full_like(composed_input.input_ids, IGNORE_INDEX)
+    number_token_mask = torch.zeros_like(composed_input.input_ids, dtype=torch.bool)
+    row_audits: list[TeacherForcedRowAudit] = []
+
+    for row in range(batch_size):
+        composition_audit = composed_input.row_audits[row]
+        source_valid_positions_tensor = torch.nonzero(source_attention[row]).flatten()
+        source_valid_positions = tuple(source_valid_positions_tensor.tolist())
+        source_count = len(source_valid_positions)
+        if source_count != composition_audit.source_token_count:
+            raise ValueError("source attention provenance disagrees with Composer source count")
+        composed_valid_positions = torch.nonzero(
+            composed_input.attention_mask[row].bool()
+        ).flatten()
+        if composed_valid_positions.numel() != composition_audit.composed_token_count:
+            raise ValueError("composed attention provenance disagrees with row audit")
+
+        insertion_index = composition_audit.insertion_index
+        inserted_count = composition_audit.inserted_token_count
+        if insertion_index is None:
+            if inserted_count != 0:
+                raise ValueError("Composer audit cannot insert tokens without an insertion index")
+            relative_source_positions = torch.arange(source_count, dtype=torch.int64, device=device)
+        else:
+            if insertion_index > source_count:
+                raise ValueError("Composer insertion index exceeds the source token count")
+            before = torch.arange(insertion_index, dtype=torch.int64, device=device)
+            after = torch.arange(
+                insertion_index + inserted_count,
+                source_count + inserted_count,
+                dtype=torch.int64,
+                device=device,
+            )
+            relative_source_positions = torch.cat((before, after))
+        if relative_source_positions.numel() != source_count:
+            raise RuntimeError("teacher-forced source mapping lost one or more tokens")
+        composed_source_positions_tensor = composed_valid_positions.index_select(
+            0, relative_source_positions
+        )
+        source_valid_ids = source_ids[row].index_select(0, source_valid_positions_tensor)
+        composed_source_ids = composed_input.input_ids[row].index_select(
+            0, composed_source_positions_tensor
+        )
+        if not torch.equal(source_valid_ids, composed_source_ids):
+            raise ValueError("composed token IDs do not preserve source provenance")
+
+        valid_targets = source_targets[row].index_select(0, source_valid_positions_tensor)
+        valid_number_mask = source_numbers[row].index_select(0, source_valid_positions_tensor)
+        labels[row].index_copy_(0, composed_source_positions_tensor, valid_targets)
+        number_token_mask[row].index_copy_(0, composed_source_positions_tensor, valid_number_mask)
+        supervised_relative = torch.nonzero(valid_targets != IGNORE_INDEX).flatten()
+        number_relative = torch.nonzero(valid_number_mask).flatten()
+        source_supervised = source_valid_positions_tensor.index_select(0, supervised_relative)
+        composed_supervised = composed_source_positions_tensor.index_select(0, supervised_relative)
+        source_number = source_valid_positions_tensor.index_select(0, number_relative)
+        composed_number = composed_source_positions_tensor.index_select(0, number_relative)
+        row_audits.append(
+            TeacherForcedRowAudit(
+                source_valid_positions=source_valid_positions,
+                composed_source_positions=tuple(composed_source_positions_tensor.tolist()),
+                source_supervised_positions=tuple(source_supervised.tolist()),
+                composed_supervised_positions=tuple(composed_supervised.tolist()),
+                source_number_positions=tuple(source_number.tolist()),
+                composed_number_positions=tuple(composed_number.tolist()),
+            )
+        )
+
+    return TeacherForcedComposedInput(
+        composed_input=composed_input,
+        labels=labels,
+        number_token_mask=number_token_mask,
+        row_audits=tuple(row_audits),
+    )
+
+
 def _resolve_special_token_ids(tokenizer: ComposerTokenizer) -> ComposerSpecialTokenIds:
     values = {
         token: tokenizer.convert_tokens_to_ids(token)
@@ -921,6 +1270,8 @@ def _validate_compose_inputs(
     reader_results: Sequence[ReaderResultLike],
     *,
     include_state: bool,
+    include_number: bool,
+    payload_insertion_indices: Sequence[int | None] | None,
 ) -> int:
     if (
         base_input_ids.ndim != 2
@@ -955,9 +1306,107 @@ def _validate_compose_inputs(
             raise ValueError("state_token_valid_mask must be bool [B] when State is enabled")
         if state_tokens.device.type != "meta" and not bool(torch.isfinite(state_tokens).all()):
             raise ValueError("state_tokens must be finite")
-    if len(reader_results) != batch_size:
+    reader_count = len(reader_results)
+    if reader_count == 0:
+        if include_state or include_number:
+            raise ValueError("enabled State/number composition requires one Reader row per item")
+    elif reader_count != batch_size:
         raise ValueError("reader_results must contain one row per batch item")
+    if payload_insertion_indices is not None:
+        if len(payload_insertion_indices) != batch_size:
+            raise ValueError("payload_insertion_indices need one entry per batch row")
+        if any(
+            value is not None and (type(value) is not int or value < 0)
+            for value in payload_insertion_indices
+        ):
+            raise ValueError("payload insertion indices must be non-negative integers or None")
     return int(batch_size)
+
+
+def _validate_teacher_forced_source_tensors(
+    *,
+    source_input_ids: Tensor,
+    source_attention_mask: Tensor,
+    source_labels: Tensor,
+    source_number_token_mask: Tensor,
+    expected_batch_size: int | None = None,
+) -> int:
+    if (
+        source_input_ids.ndim != 2
+        or source_input_ids.shape[0] <= 0
+        or source_input_ids.shape[1] <= 0
+        or source_input_ids.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError("source_input_ids must be non-empty integer [B, L_source]")
+    shape = source_input_ids.shape
+    if source_attention_mask.shape != shape or source_attention_mask.dtype not in (
+        torch.bool,
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("source_attention_mask must be bool/integer [B, L_source]")
+    if source_labels.shape != shape or source_labels.dtype != torch.int64:
+        raise ValueError("source_labels must be int64 [B, L_source]")
+    if source_number_token_mask.shape != shape or source_number_token_mask.dtype is not torch.bool:
+        raise ValueError("source_number_token_mask must be bool [B, L_source]")
+    devices = {
+        source_input_ids.device,
+        source_attention_mask.device,
+        source_labels.device,
+        source_number_token_mask.device,
+    }
+    if len(devices) != 1:
+        raise ValueError("teacher-forced source tensors must share one device")
+    batch_size = int(shape[0])
+    if expected_batch_size is not None and batch_size != expected_batch_size:
+        raise ValueError("teacher-forced source batch size must match ComposedInput")
+    if source_input_ids.device.type == "meta":
+        return batch_size
+
+    unique_attention = set(int(value) for value in torch.unique(source_attention_mask).tolist())
+    if not unique_attention.issubset({0, 1}):
+        raise ValueError("source_attention_mask must be binary")
+    attention = source_attention_mask.bool()
+    supervised = source_labels != IGNORE_INDEX
+    if bool(torch.any(supervised & ~attention)):
+        raise ValueError("masked source labels must be -100 outside source attention")
+    if bool(torch.any(supervised & (source_labels < 0))):
+        raise ValueError("supervised source labels must be non-negative token IDs")
+    if bool(torch.any(supervised & (source_labels != source_input_ids))):
+        raise ValueError("supervised source labels must equal their source token IDs")
+    if bool(torch.any(source_number_token_mask & ~supervised)):
+        raise ValueError("source number mask must be a subset of supervised source labels")
+    return batch_size
+
+
+def _teacher_forced_insertion_indices(
+    *,
+    source_input_ids: Tensor,
+    source_attention_mask: Tensor,
+    source_labels: Tensor,
+    im_end_id: int,
+) -> tuple[int | None, ...]:
+    """Locate the last context user-end before the final supervised assistant token."""
+
+    indices: list[int | None] = []
+    attention = source_attention_mask.bool()
+    for row in range(source_input_ids.shape[0]):
+        valid_positions = torch.nonzero(attention[row]).flatten()
+        valid_ids = source_input_ids[row].index_select(0, valid_positions)
+        valid_labels = source_labels[row].index_select(0, valid_positions)
+        supervised_positions = torch.nonzero(valid_labels != IGNORE_INDEX).flatten()
+        upper_bound = (
+            int(supervised_positions[-1].item())
+            if supervised_positions.numel() > 0
+            else int(valid_ids.numel())
+        )
+        candidates = torch.nonzero(
+            (valid_ids == im_end_id)
+            & (valid_labels == IGNORE_INDEX)
+            & (torch.arange(valid_ids.numel(), device=valid_ids.device) < upper_bound)
+        ).flatten()
+        indices.append(int(candidates[-1].item()) if candidates.numel() > 0 else None)
+    return tuple(indices)
 
 
 def _reader_status(result: ReaderResultLike) -> str:

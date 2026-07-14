@@ -1,0 +1,127 @@
+{
+  "architecture_sha256": "31f3d98eea2d9d6b4dbeca687d025c717de22009319df883e37a511eb7d40352",
+  "bank_reset_ok": true,
+  "cache_isolation_ok": true,
+  "checkpoint_roundtrip_ok": true,
+  "finite_gradients": true,
+  "finite_loss": true,
+  "fsm_rollout_ok": true,
+  "functional_sgd_reachable": false,
+  "git_commit": "319fd80bbca28c4c771a815ef033f12368879b6a-p15-worktree",
+  "hard_head_rows": {
+    "e1": 1,
+    "e2": 1,
+    "o1": 1,
+    "o2": 1
+  },
+  "inner_sgd_attempted": 0,
+  "inner_sgd_skipped": 0,
+  "inner_sgd_updated": 0,
+  "metric_operator_confusion": [
+    [
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  ],
+  "predictor_reachable": false,
+  "reader_llm_mismatch_rows": [],
+  "retrieval_true_positive_count": 4,
+  "schema": "p15_stage_a_audit_v1",
+  "tiny_outer_step": 1,
+  "transient_w_t_present": false
+}

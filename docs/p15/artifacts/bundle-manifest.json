@@ -1,0 +1,11 @@
+{
+  "files": {
+    "audit.json": "de90679c1e6cea0872b34967041a3c64ae7192fba2acc194c09bee687683f695",
+    "checkpoint-manifest.json": "5d0db2efd7d5c9c0fd277a4261c91f15913e8a15a6af85388079b3ae1855cfdf",
+    "config-snapshot.yaml": "9a6167101a3c7c65da0f65e4fdb7b66f8beb7fdc8e6692816c01445d0d60447c",
+    "failure-examples.json": "04d54fc2d95f0347bcf9853efc20bebef0d4f69a5e682bd56a7a40c3db8bdbe1",
+    "freeze-strategy.md": "6a17b3186eee24818549ca1e96a8828948b69a0157d033e3e28c965ac98dc33b",
+    "metrics.json": "742e2c470c2ba23e363ec0d93d4c28c0d588e573979b2a1a5d374b484558683c"
+  },
+  "schema": "p15_artifact_bundle_v1"
+}

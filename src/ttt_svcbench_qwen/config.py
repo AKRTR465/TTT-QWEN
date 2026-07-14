@@ -536,6 +536,48 @@ class LossConfig(FrozenModel):
     answer_ignore_index: int
 
 
+class StageAVariant(StrEnum):
+    """P15 ablations that are legal before any Meta-TTT episode."""
+
+    A1 = "a1"
+    A2 = "a2"
+
+
+class StageAOptimizerConfig(FrozenModel):
+    name: str
+    learning_rate: PositiveFloat
+    weight_decay: NonNegativeFloat
+    betas: tuple[Probability, Probability]
+    epsilon: PositiveFloat
+    grad_clip_norm: PositiveFloat
+
+
+class StageACheckpointConfig(FrozenModel):
+    format: str
+    trainable_only: bool
+    include_optimizer: bool
+    include_rng: bool
+    save_full_model: bool
+    save_runtime_state: bool
+    best_metric: str
+
+
+class StageATrainingConfig(FrozenModel):
+    """Low-space P15 engineering gate; scientific choices remain a P21 concern."""
+
+    variant: StageAVariant
+    inner_sgd_enabled: bool
+    fast_adapter_mode: str
+    qwen_strategy: str
+    qwen_parameter_allowlist: tuple[str, ...]
+    trainable_components: tuple[str, ...]
+    balanced_task_sampling: bool
+    synthetic_engineering_gate_only: bool
+    seed: NonNegativeInt
+    optimizer: StageAOptimizerConfig
+    checkpoint: StageACheckpointConfig
+
+
 class EvaluationConfig(FrozenModel):
     formal_evaluation_enabled: bool
     official_clean_tuning_forbidden: bool
@@ -581,6 +623,7 @@ class ProjectConfig(FrozenModel):
     input_composer: InputComposerConfig
     predictor: PredictorConfig
     loss: LossConfig
+    stage_a: StageATrainingConfig
     evaluation: EvaluationConfig
     parameter_budget: ParameterBudgetConfig
 
@@ -1460,6 +1503,68 @@ class ProjectConfig(FrozenModel):
             ("loss.auxiliary_outer_weight", self.loss.auxiliary_outer_weight, 0.1),
             ("loss.answer_causal_shift", self.loss.answer_causal_shift, True),
             ("loss.answer_ignore_index", self.loss.answer_ignore_index, -100),
+            ("stage_a.variant", self.stage_a.variant, StageAVariant.A2),
+            ("stage_a.inner_sgd_enabled", self.stage_a.inner_sgd_enabled, False),
+            (
+                "stage_a.fast_adapter_mode",
+                self.stage_a.fast_adapter_mode,
+                "static_w0_no_inner_sgd",
+            ),
+            (
+                "stage_a.qwen_strategy",
+                self.stage_a.qwen_strategy,
+                "frozen_synthetic_engineering_gate",
+            ),
+            ("stage_a.qwen_parameter_allowlist", self.stage_a.qwen_parameter_allowlist, ()),
+            (
+                "stage_a.trainable_components",
+                self.stage_a.trainable_components,
+                (
+                    "fast_adapter",
+                    "query_encoder",
+                    "spatial_encoder",
+                    "temporal_encoder",
+                    "observation_heads",
+                    "state_bank",
+                    "resampler",
+                ),
+            ),
+            ("stage_a.balanced_task_sampling", self.stage_a.balanced_task_sampling, True),
+            (
+                "stage_a.synthetic_engineering_gate_only",
+                self.stage_a.synthetic_engineering_gate_only,
+                True,
+            ),
+            ("stage_a.seed", self.stage_a.seed, 42),
+            ("stage_a.optimizer.name", self.stage_a.optimizer.name, "adamw"),
+            ("stage_a.optimizer.learning_rate", self.stage_a.optimizer.learning_rate, 3.0e-4),
+            ("stage_a.optimizer.weight_decay", self.stage_a.optimizer.weight_decay, 0.01),
+            ("stage_a.optimizer.betas", self.stage_a.optimizer.betas, (0.9, 0.999)),
+            ("stage_a.optimizer.epsilon", self.stage_a.optimizer.epsilon, 1.0e-8),
+            ("stage_a.optimizer.grad_clip_norm", self.stage_a.optimizer.grad_clip_norm, 1.0),
+            (
+                "stage_a.checkpoint.format",
+                self.stage_a.checkpoint.format,
+                "trainable_safetensors_plus_pt_state_v1",
+            ),
+            ("stage_a.checkpoint.trainable_only", self.stage_a.checkpoint.trainable_only, True),
+            (
+                "stage_a.checkpoint.include_optimizer",
+                self.stage_a.checkpoint.include_optimizer,
+                True,
+            ),
+            ("stage_a.checkpoint.include_rng", self.stage_a.checkpoint.include_rng, True),
+            ("stage_a.checkpoint.save_full_model", self.stage_a.checkpoint.save_full_model, False),
+            (
+                "stage_a.checkpoint.save_runtime_state",
+                self.stage_a.checkpoint.save_runtime_state,
+                False,
+            ),
+            (
+                "stage_a.checkpoint.best_metric",
+                self.stage_a.checkpoint.best_metric,
+                "validation_total_loss",
+            ),
             (
                 "evaluation.official_clean_tuning_forbidden",
                 self.evaluation.official_clean_tuning_forbidden,

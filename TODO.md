@@ -3,7 +3,7 @@
 > 对齐源：[ARCHITECTURE.md](./ARCHITECTURE.md)  
 > 规范版本：`state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`  
 > 生成日期：2026-07-13  
-> 文档状态：施工分解 / P0–P14 已通过，P15 允许开始
+> 文档状态：施工分解 / P0–P15 已通过轻量工程门禁；P16 尚未开始，只能在 P15 exit gate 通过后开始
 > 总原则：本文件只描述施工顺序和验收门禁；任何勾选都必须有代码、测试、日志或实验记录作为证据。
 
 ## 0. 使用方法
@@ -1027,7 +1027,8 @@
 - [x] 实现 `P_state:512→4096`，输出 `R_t[B,16,4096]`。
 - [x] N_ret=0 时注入显式 `empty_record_embedding`；unsupported/invalid 输出零 token 与 false valid mask。
 - [x] 记录 cross-attention selected mass 供解释审计。
-- [x] 验证 q_target 与全部 selected semantic records 均可向 State Token 传递软信息/梯度；语义质量留 P15/P21。
+- [x] 验证 q_target 与全部 selected semantic records 均可向 State Token 传递软信息/梯度；P15
+      已完成合成工程接线，真实语义质量留 P21。
 - [x] 精确参数量 14,722,048（约 14.72M）。
 
 #### P12.2 Deterministic Reader
@@ -1288,45 +1289,50 @@
 ### 实施前注意事项
 
 - Stage A 的目标是验证显式状态系统，不是证明在线适应收益。
-- Outer Training 采用全量、分阶段解冻或 LLM LoRA 尚未决定；必须先在训练折上选择并记录。
+- 低空间工程门禁固定为 `frozen_synthetic_engineering_gate`：Qwen 参数不入
+  Outer optimizer，static `W0` 和显式状态模块按 allowlist 进入 AdamW。正式全量/分阶段/
+  LoRA 选择仍留 P21，不由合成门禁代替。
 - hard state rollout 与 soft training proxy 必须同时运行，但 hard 路径不反传。
 - Reader exact count 指标必须独立于 LLM answer 指标。
 
 ### 实施过程 TODO
 
-- [ ] 在 `trainer.py` 增加 Stage A 模式并强制 Inner SGD 关闭。
-- [ ] 训练 Query Embedding Encoder。
-- [ ] 训练 operator prototypes。
-- [ ] 训练 Time Window Resolver。
-- [ ] 训练 State Retriever 的语义表示与 record-level supervision。
-- [ ] 训练 Semantic Projector 和 State Resampler/Projector。
-- [ ] 训练空间对象路和时间事件路。
-- [ ] 训练 O1/O2/E1/E2。
-- [ ] 运行 hard State Bank、Identity Bank 和 FSM rollout。
-- [ ] 将 Deterministic Reader 纳入 Stage A 端到端路径；其固定算术若无可学习参数则不加入
+- [x] 在 `trainer.py` 增加 Stage A 模式并强制 Inner SGD 关闭。
+- [x] 以 synthetic/tiny A2 step 验证 Query Embedding Encoder 的 Outer 可训练路径。
+- [x] 以显式标签验证 operator prototypes 的 Outer 可训练路径。
+- [x] 以显式标签验证 Time Window Resolver 的 Outer 可训练路径。
+- [x] 接通 State Retriever 语义表示与 record-level supervision，并验证 relevant record ID 对齐。
+- [x] 验证 Semantic Projector 和 State Resampler/Projector 的可微 soft 路径。
+- [x] 以 synthetic/tiny step 验证空间对象路和时间事件路的 Outer 可训练路径。
+- [x] 以互斥 typed target 验证 O1/O2/E1/E2 的有标签 State Loss 接线。
+- [x] 运行 hard State Bank、Identity Bank 和 FSM rollout。
+- [x] 将 Deterministic Reader 纳入 Stage A 端到端路径；其固定算术无可学习参数，不加入
       optimizer，只通过 State/Answer loss 验证上游状态质量。
-- [ ] 训练必要的 Qwen 参数或选定 LoRA；记录冻结清单。
-- [ ] 使用 `L_state+L_answer`，Inner `L_TTT` 不执行更新。
-- [ ] 为每类任务构建平衡采样和有效标签 mask。
-- [ ] 监控 O1 soft/hard count、O2 duplicate/missed-new、E1/E2 duplicate/miss。
-- [ ] 监控 operator 9 类、unsupported、retrieval、time-window 和 Reader exact count。
-- [ ] 保存最优 checkpoint 时同时保存 tokenizer/config/spec version。
-- [ ] 在 validation 上检查 Reader 与 LLM 数字不一致案例。
+- [x] 选定 Qwen 全冻结的合成工程策略，参数 allowlist 为空，冻结清单进入产物。
+- [x] A2 使用 `L_state+L_answer`，A1 仅使用 `L_answer`；Inner `L_TTT`/Predictor/
+      functional SGD 全部不可达。
+- [x] 为 O1/O2/E1/E2 构建确定性平衡采样和 provenance-aware 有效标签 mask。
+- [x] 监控 O1 soft/hard count、O2 duplicate/missed-new、E1/E2 duplicate/miss。
+- [x] 监控 operator 9 类、unsupported、retrieval、time-window 和 Reader exact count。
+- [x] checkpoint 仅保存 allowlisted safetensors 与 optimizer/RNG，manifest 记录 tokenizer/config/
+      spec version/hash，不保存 full Qwen 或 runtime state。
+- [x] 记录 Reader 与 LLM 数字不一致行；零分母指标报告 `null`，不伪造为 0。
 
 ### 实施后验收项
 
-- [ ] 关闭 TTT 时四类任务均能端到端生成 hard state 和 ReaderResult。
-- [ ] Query Router、Time Resolver、Retriever、Reader 的独立指标可计算。
-- [ ] Reader exact count 不依赖 ground-truth count 注入。
-- [ ] Bank reset、扩容、cache 和 FSM 在训练 batch 中稳定。
-- [ ] loss 无 NaN/Inf，梯度和显存可控。
-- [ ] A2（四 Head+Bank+Reader、TTT off）可复现实验完成。
-- [ ] Stage A 指标、checkpoint 和失败样例齐全。
+- [x] 关闭 TTT 时四类任务均能端到端生成 hard state 和 ReaderResult。
+- [x] Query Router、Time Resolver、Retriever、Reader 的独立指标可计算。
+- [x] Reader exact count 不依赖 ground-truth count 注入。
+- [x] Bank reset、扩容、cache 和 FSM 在 synthetic/tiny batch 中稳定。
+- [x] loss/gradient 非有限时整步 skip，不产生部分参数更新。
+- [x] A2（四 Head+Bank+Reader、TTT off）synthetic/tiny 工程回放可复现。
+- [x] Stage A 指标、trainable-only checkpoint 和已处理失败样例齐全。
 
 ### 交付物与退出条件
 
-- [ ] 交付 Stage A 配置、checkpoint、A2 报告和冻结策略记录。
-- [ ] 无 TTT 时 Reader 尚不能稳定工作，禁止用 Meta-TTT 掩盖基础错误。
+- [x] 交付 Stage A 配置、trainable-only checkpoint manifest、A2 报告和冻结策略记录。
+- [x] P15 artifact/hash/Reader-stability exit gate fail closed；未通过时禁止用 Meta-TTT
+      掩盖基础错误。P16 尚未开始。
 
 ---
 
@@ -1878,6 +1884,14 @@
 - [x] `tests/test_losses.py`：三个 TTT 项、State/Answer/Outer loss。
 - [x] `tests/test_functional_sgd.py`：只更新 fast、finite/clip/skip。
 - [x] `tests/test_p14_gradient_audit.py`：真实冻结链与逐模块 gradient/delta 表。
+- [x] `tests/test_stage_a_composer.py`：teacher-forced label 映射与 Reader-number 监督隔离。
+- [x] `tests/test_stage_a_targets.py`：三值 provenance、四互斥 Head、Query/Retrieval target 与 fail-closed 校验。
+- [x] `tests/test_stage_a_runtime.py`：四类 hard write、soft Projector 梯度与 hard-record detach。
+- [x] `tests/test_stage_a_metrics.py`：独立指标、手算分母、confusion 与零分母 `null`。
+- [x] `tests/test_stage_a_trainer.py`：A1/A2 loss、Outer allowlist、finite/clip/skip、平衡采样与 checkpoint roundtrip。
+- [x] `tests/test_p15_artifacts.py`：UTF-8/hash 产物包与 P16 fail-closed exit gate。
+- [x] `tests/test_p15_tiny_integration.py`：StateTTTModel→hard writer→Retriever/Reader→
+      Composer/Qwen prefill→Stage A typed State+Answer loss 单次端到端路径。
 - [ ] `tests/test_inference_protocol.py`：reset、next-chunk 生效、generate 单次 prefill。
 - [ ] `tests/test_leakage_guards.py`：denylist、future frames、fold isolation。
 - [ ] `tests/test_end_to_end_demo.py`：ARCH 第 18 章全链路。

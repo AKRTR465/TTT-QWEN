@@ -12,12 +12,13 @@ PACKAGE = ROOT / "src" / "ttt_svcbench_qwen"
 IMPLEMENTED = (
     ("losses", "compute_losses"),
     ("functional_sgd", "functional_sgd_step"),
+    ("trainer", "build_trainer"),
+    ("stage_a_targets", "build_stage_a_targets"),
+    ("stage_a_metrics", "compute_stage_a_metrics"),
+    ("stage_a_runtime", "StageABankWriter"),
 )
 
-SKELETONS = (
-    ("trainer", "build_trainer", "P15-P19"),
-    ("inference", "run_inference", "P18"),
-)
+SKELETONS = (("inference", "run_inference", "P18"),)
 
 
 def import_module(name: str) -> ModuleType:
@@ -39,7 +40,7 @@ def test_recommended_modules_import_and_unimplemented_paths_fail_explicitly(
 
 
 @pytest.mark.parametrize(("module_name", "entrypoint"), IMPLEMENTED)
-def test_p14_modules_import_with_documented_callable_entrypoints(
+def test_implemented_modules_import_with_documented_callable_entrypoints(
     module_name: str, entrypoint: str
 ) -> None:
     module = import_module(module_name)
