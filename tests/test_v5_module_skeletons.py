@@ -10,8 +10,6 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "src" / "ttt_svcbench_qwen"
 
 SKELETONS = (
-    ("model", "build_model", "P13"),
-    ("input_composer", "compose_inputs", "P13"),
     ("losses", "compute_losses", "P14"),
     ("functional_sgd", "functional_sgd_step", "P14"),
     ("trainer", "build_trainer", "P15-P19"),
@@ -44,6 +42,8 @@ def test_all_required_p1_module_files_exist() -> None:
         "config",
         "fast_ttt",
         "identity_bank",
+        "input_composer",
+        "model",
         "query_encoder",
         "qwen_adapter",
         "state_encoder",
@@ -54,11 +54,13 @@ def test_all_required_p1_module_files_exist() -> None:
     assert expected <= actual
 
 
-def test_model_skeleton_contains_composition_only() -> None:
+def test_p13_model_remains_composition_only() -> None:
     source = (PACKAGE / "model.py").read_text(encoding="utf-8")
 
-    assert "import torch" not in source
-    assert "nn.Module" not in source
     assert "Linear(" not in source
     assert "Optimizer" not in source
+    assert ".backward(" not in source
+    assert "functional_sgd" not in source
+    assert "def observe_chunk" in source
+    assert "def answer_query" in source
     assert "def build_model" in source

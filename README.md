@@ -5,7 +5,7 @@
 完整架构、训练协议和消融方案见 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前对齐版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
-> 当前施工状态：P0–P12 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
+> 当前施工状态：P0–P13 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
 > P3 用官方 HF meta 模块和 tiny 随机权重模型完成 Qwen 接口与 DeepStack 工程验收。真实 8B
 > A0/集成仍保留在 P19/P21/P22；P4 已完成 Query Encoder、Operator Router 与 Time Window
 > Resolver 的工程门禁，但尚未训练或校准。P5 Fast Adapter 已通过纯合成张量工程门禁，
@@ -13,8 +13,9 @@
 > 纯合成张量工程门禁；P10 的 Candidate/Confirmed、CPU exact matching 和非权威 Hot Cache 已用
 > 小型合成 identity 向量通过工程门禁；P11 的 FP32 exact threshold Retriever、hard filters、
 > typed records/status/audit 已用小型合成 Bank 通过工程门禁；P12 的 16-token Resampler、
-> Deterministic Reader、record operands、状态隔离与 tokenizer-only SHA256 审计也已通过，P13 允许开始；其余空壳
-> 被调用时会明确抛出 `NotImplementedError`。
+> Deterministic Reader、record operands、状态隔离与 tokenizer-only SHA256 审计也已通过；P13
+> Composer、原生 Qwen prefill/DeepStack/mRoPE 桥与一次性模型编排已用 synthetic/tiny 资产通过，
+> P14 允许开始。P14 及之后的空壳被调用时会明确抛出 `NotImplementedError`。
 
 ## 当前固定条件
 
@@ -34,7 +35,7 @@
   24,815,360参数；时间事件路使用6层、768维Pre-LN GELU因果Transformer，absolute sinusoidal
   使用显式global position id，Q/K/V/O带bias，LayerNorm eps为`1e-5`；
 - P6的`required_slot_counts`只做preserve-existing/reject-excess容量审计，不表示已从视频识别
-  真实对象；语义判断和hard state留给P8/P9，模型编排和受管推理生命周期留给P13/P18；
+  真实对象；P13 已提供组合入口，跨视频 reset 与完整受管推理生命周期仍留 P18；
 - O1/O2/E1/E2分别使用FiLM MLP、256维identity MLP、5层gated causal TCN和2层GRU；仅O1
   直接读取q_target，E1/E2读取P7已query-conditioned的H_t；O1固定`1+scale` FiLM，O2在FP32
   做L2归一化并对有效零范数回退到unit basis；
@@ -66,6 +67,12 @@
   不设 top-k、ANN 关闭；最终整数仍由确定性 Reader 计算；
 - 16个learned State Query经3层Perceiver Resampler汇总全部命中记录，生成16个4096维
   State Token；它们不是Top-16记录；
+- Composer 固定注册 `<|state_start|>/<|state_pad|>/<|state_end|>/<|number_start|>/`
+  `<|number_end|>`，本地 tokenizer ID 为 151669–151673；模型已有 151936 行，注册绝不缩表，
+  新 input/lm_head 行由既有视觉边界三行 FP32 均值确定性初始化；
+- batch 使用左 padding；video/state/number mask 两两互斥。Composer 用完整模板 IDs 预审
+  Qwen mRoPE/`rope_deltas`，运行时保留 `input_ids`，State 仅在 prefill 独立 scatter 一次，video 与
+  DeepStack 仍走 HF 原生路径；
 - O2 Confirmed身份库从256开始按块动态增长；Candidate从64开始并设512安全上限；
 - 每个新视频重置fast weights、SGD状态、时序缓存和State Bank；
 - 测试时禁止使用答案、count、occurrence_times、counting_type和counting_subtype。
@@ -90,7 +97,7 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | :--- | :--- |
 | v5 YAML、完整解析、固定维度/容量/优化器校验 | P1 已实现并有契约测试 |
 | Video/Query/Encoder/Observation/Record/Retriever/Reader/runtime 类型 | P1 已实现并有 shape/dtype/边界测试 |
-| 推荐模块导入与职责边界 | P1 已实现；P3–P12 对应模块已通过各自工程门禁，其余后续入口显式 `NotImplementedError` |
+| 推荐模块导入与职责边界 | P1 已实现；P3–P13 对应模块已通过各自工程门禁，其余后续入口显式 `NotImplementedError` |
 | 数据 schema、防泄漏、因果切分、processor/query token、A0 runner | P2 工程门禁已通过；fold/A0 为明确标注的合成替代 |
 | Qwen video boundary、Main Merger 插入点、DeepStack 保护 | P3 已实现；tiny/meta 工程契约已验证，真实 8B 留至 P19 |
 | Query Encoder、9-prototype Router、Time Window Resolver | P4 已实现；本地结构/参数/offset/fail-closed 契约已验证，模型尚未训练、阈值尚未校准 |
@@ -102,7 +109,8 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | P10 Identity Bank | 已通过小型合成 identity 工程门禁；Candidate→Confirmed、CPU exact store、动态容量、非权威 Hot Cache 与离线指标边界均已验证 |
 | P11 Embedding State Retriever | 已通过小型合成 Bank 工程门禁；row-wise owner/head 分区、FP32 cosine、因果/窗口/valid filters、无 Top-K 全量返回及结构化审计均已验证；0.35 阈值留 P21 校准 |
 | P12 State Resampler 与 Deterministic Reader | 已通过小型合成 typed-record 工程门禁；16×4096 固定输出、FP32 masked attention、状态隔离、candidate/selected snapshot 完整性、8 operator 精确算术、record operands、signed number token 和本地 tokenizer manifest 均已验证 |
-| P13–P19 Composer、loss、训练、推理 | 尚未实现；P13 允许开始，P18 跨 runtime reset 与 P19 真实 8B 仍保留 |
+| P13 Input Composer 与模型编排 | 已通过 synthetic/tiny 工程门禁；固定 token 注册/初始化、变长 payload/左 padding、三类 mask、原生 mRoPE/rope delta/cache、预计算 adapted Main+原 DeepStack、Reader 重验、observe/answer/decode 生命周期均已验证 |
+| P14–P19 loss、训练、推理 | 尚未实现；P14 允许开始，P18 跨 runtime reset 与 P19 真实 8B 仍保留 |
 | 真实 8B、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行 |
 
 ## 环境变量

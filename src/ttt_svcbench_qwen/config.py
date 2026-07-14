@@ -493,6 +493,25 @@ class StateReaderConfig(FrozenModel):
     ground_truth_input_forbidden: bool
 
 
+class InputComposerConfig(FrozenModel):
+    state_token_count: PositiveInt
+    special_tokens: tuple[str, ...]
+    special_token_ids: tuple[NonNegativeInt, ...]
+    tokenizer_base_length: PositiveInt
+    tokenizer_extended_length: PositiveInt
+    tokenizer_revision: str
+    model_embedding_rows: PositiveInt
+    embedding_initialization: str
+    embedding_source_token_ids: tuple[NonNegativeInt, ...]
+    initialize_input_and_output_embeddings: bool
+    padding_side: str
+    state_payload_statuses: tuple[str, ...]
+    invalid_payload_policy: str
+    payload_order: tuple[str, ...]
+    prefill_once: bool
+    generation_num_beams: PositiveInt
+
+
 class PredictorConfig(FrozenModel):
     input_dim: PositiveInt
     hidden_dim: PositiveInt
@@ -549,6 +568,7 @@ class ProjectConfig(FrozenModel):
     retriever: RetrieverConfig
     state_resampler: StateResamplerConfig
     state_reader: StateReaderConfig
+    input_composer: InputComposerConfig
     predictor: PredictorConfig
     loss: LossConfig
     evaluation: EvaluationConfig
@@ -1327,6 +1347,86 @@ class ProjectConfig(FrozenModel):
                 "state_reader.ground_truth_input_forbidden",
                 self.state_reader.ground_truth_input_forbidden,
                 True,
+            ),
+            ("input_composer.state_token_count", self.input_composer.state_token_count, 16),
+            (
+                "input_composer.special_tokens",
+                self.input_composer.special_tokens,
+                (
+                    "<|state_start|>",
+                    "<|state_pad|>",
+                    "<|state_end|>",
+                    "<|number_start|>",
+                    "<|number_end|>",
+                ),
+            ),
+            (
+                "input_composer.special_token_ids",
+                self.input_composer.special_token_ids,
+                (151_669, 151_670, 151_671, 151_672, 151_673),
+            ),
+            (
+                "input_composer.tokenizer_base_length",
+                self.input_composer.tokenizer_base_length,
+                151_669,
+            ),
+            (
+                "input_composer.tokenizer_extended_length",
+                self.input_composer.tokenizer_extended_length,
+                151_674,
+            ),
+            (
+                "input_composer.tokenizer_revision",
+                self.input_composer.tokenizer_revision,
+                BASE_MODEL_REVISION,
+            ),
+            (
+                "input_composer.model_embedding_rows",
+                self.input_composer.model_embedding_rows,
+                151_936,
+            ),
+            (
+                "input_composer.embedding_initialization",
+                self.input_composer.embedding_initialization,
+                "fp32_mean_of_vision_start_video_pad_vision_end_then_cast",
+            ),
+            (
+                "input_composer.embedding_source_token_ids",
+                self.input_composer.embedding_source_token_ids,
+                (151_652, 151_656, 151_653),
+            ),
+            (
+                "input_composer.initialize_input_and_output_embeddings",
+                self.input_composer.initialize_input_and_output_embeddings,
+                True,
+            ),
+            ("input_composer.padding_side", self.input_composer.padding_side, "left"),
+            (
+                "input_composer.state_payload_statuses",
+                self.input_composer.state_payload_statuses,
+                ("ok", "empty"),
+            ),
+            (
+                "input_composer.invalid_payload_policy",
+                self.input_composer.invalid_payload_policy,
+                "omit_state_and_number",
+            ),
+            (
+                "input_composer.payload_order",
+                self.input_composer.payload_order,
+                (
+                    "system_user_question_video",
+                    "state",
+                    "number",
+                    "user_end",
+                    "assistant_generation_prefix",
+                ),
+            ),
+            ("input_composer.prefill_once", self.input_composer.prefill_once, True),
+            (
+                "input_composer.generation_num_beams",
+                self.input_composer.generation_num_beams,
+                1,
             ),
             ("predictor.input_dim", self.predictor.input_dim, 768),
             ("predictor.hidden_dim", self.predictor.hidden_dim, 1536),

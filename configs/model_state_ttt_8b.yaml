@@ -408,6 +408,29 @@ state_reader:
   tokenizer_manifest_sha256: ccd18347b6d6714d91d4c55b37ff05e473a0f8e84fbcba2bda1401a9572f44c3
   ground_truth_input_forbidden: true
 
+input_composer:
+  state_token_count: 16
+  special_tokens:
+    - <|state_start|>
+    - <|state_pad|>
+    - <|state_end|>
+    - <|number_start|>
+    - <|number_end|>
+  special_token_ids: [151669, 151670, 151671, 151672, 151673]
+  tokenizer_base_length: 151669
+  tokenizer_extended_length: 151674
+  tokenizer_revision: 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
+  model_embedding_rows: 151936
+  embedding_initialization: fp32_mean_of_vision_start_video_pad_vision_end_then_cast
+  embedding_source_token_ids: [151652, 151656, 151653]
+  initialize_input_and_output_embeddings: true
+  padding_side: left
+  state_payload_statuses: [ok, empty]
+  invalid_payload_policy: omit_state_and_number
+  payload_order: [system_user_question_video, state, number, user_end, assistant_generation_prefix]
+  prefill_once: true
+  generation_num_beams: 1
+
 predictor:
   input_dim: 768
   hidden_dim: 1536

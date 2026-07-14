@@ -73,7 +73,7 @@ ${OUTPUT_ROOT}/
 | P10 | Identity Bank 与 Hot Cache 已定义 | 已通过：Candidate→Confirmed、CPU FP32 exact matching、>256 动态容量、非权威 Hot Cache 与隔离/持久化边界均以小型合成 identity 验证 |
 | P11 | Embedding State Retriever 已定义 | 已通过：row-wise owner/head 分区、FP32 cosine、全量 threshold filters、typed records/status/audit、ragged 3/30/300 与无 Top-K 均以小型合成 Bank 验证 |
 | P12 | Resampler 与 Deterministic Reader 已定义 | 已通过：16×4096 固定输出、无 Top-K selected K/V、FP32 masked attention、OK/EMPTY/unknown 状态隔离、8 operator typed-record 算术、record operands、signed number-token 与 pinned tokenizer manifest 均以小型合成 case 验证 |
-| P13 | Input Composer 与模型编排已定义 | 未实现 |
+| P13 | Input Composer 与模型编排已定义 | 已通过：fixed token/embedding、payload/mask/mRoPE、prepared DeepStack、Reader 审计、DI 与单次 prefill 均以 synthetic/tiny HF 验证；无视频/数据集/8B 下载 |
 | P14 | Loss 与 functional SGD 已定义 | 未实现 |
 | P15 | Stage A warm-up 已定义 | 未实现/未运行 |
 | P16 | Stage B 单步 Meta-TTT 已定义 | 未实现/未运行 |

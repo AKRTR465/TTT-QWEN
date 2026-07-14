@@ -2,8 +2,8 @@
 
 > 规范版本：state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval  
 > 修订日期：2026-07-14
-> 状态：PARTIALLY IMPLEMENTED / P0-P12 ENGINEERING-VERIFIED
-> 说明：本文描述完整目标实现；当前 P0–P12 已通过工程门禁，P13–P22 尚未完整实现或运行。
+> 状态：PARTIALLY IMPLEMENTED / P0-P13 ENGINEERING-VERIFIED
+> 说明：本文描述完整目标实现；当前 P0–P13 已通过工程门禁，P14–P22 尚未完整实现或运行。
 
 ## 0. 计划目标
 
@@ -1605,6 +1605,13 @@ L_{\mathrm{payload}}
 
 真实 \(L_{\mathrm{total}}\) 还必须包含 chat template、system prompt、视觉边界和状态边界 special token。
 
+P13 固定注册且按顺序保存 5 个 token：`<|state_start|>`、`<|state_pad|>`、
+`<|state_end|>`、`<|number_start|>`、`<|number_end|>`。pinned tokenizer 对应 ID 为
+151669–151673；Qwen text embedding 已有 151936 行，因此绝不能把模型 resize 缩小到 151674。
+首次新增时，input embedding 与非 tied lm_head 分别使用 vision-start/video-pad/vision-end 三行
+FP32 均值再 cast；checkpoint reload 不得重新初始化。OK/EMPTY 注入启用的 State/number 段，
+UNSUPPORTED/INVALID 两段均省略；batch 使用左 padding，每行保留完整 token 位置审计。
+
 ### 11.2 实现约束
 
 - video embeddings 继续使用 Qwen 原生 video placeholder mask 和 masked_scatter；
@@ -1615,6 +1622,12 @@ L_{\mathrm{payload}}
 - State Token 不得被误标为 visual position；
 - DeepStack 只在原 visual positions 注入，不作用到 State Token 或 number token；
 - generate 的 prefill 只构建一次状态输入，自回归阶段不得重复更新 Bank 或 fast weights。
+
+生产 prefill 必须保留完整 `input_ids` 给原生 Qwen：Composer 用同一 IDs、attention mask 和 video grid
+预先审计 `[3,B,L] position_ids` 与 `[B,1] rope_deltas`，但不以 `inputs_embeds` 替代原生输入。
+State embedding 仅在首个 token embedding forward 独立 scatter 一次；video 继续由 HF 原生 scatter。
+Fast 后 Main splits 与未改动的三组 DeepStack tensor 由一次性 prepared provider 交回同一原生 forward，
+不得重跑 ViT/Fast。当前 provider 只允许 greedy 单序列；beam expansion 未实现时必须 fail closed。
 
 ### 11.3 LLM 职责
 
@@ -1920,7 +1933,7 @@ reset Reader audit state
 
 ## 17. 推荐实现模块
 
-模块按以下职责拆分；P3–P12 对应模块已通过工程门禁，P13 及后续模块仍按本计划施工：
+模块按以下职责拆分；P3–P13 对应模块已通过工程门禁，P14 及后续模块仍按本计划施工：
 
 ~~~text
 src/ttt_svcbench_qwen/
@@ -1951,8 +1964,9 @@ src/ttt_svcbench_qwen/
 - query_encoder.py：target/operator/time；
 - state_retriever.py：全记录阈值检索；
 - state_reader.py：确定性算术和数字序列化；
-- input_composer.py：新增 placeholder、mask、position 和 token 拼接；
-- model.py：只负责组合模块，不重复实现子模块逻辑。
+- qwen_adapter.py：预计算 adapted Main/原 DeepStack 的一次性 provider 与 prefill-only State scatter；
+- input_composer.py：新增 placeholder、mask、mRoPE/cache 审计和 token 拼接；
+- model.py：只负责 DI、observe/answer/decode 生命周期和统一输出，不重复实现子模块逻辑。
 
 ## 18. 必须通过的验收测试
 
@@ -2003,8 +2017,10 @@ src/ttt_svcbench_qwen/
 3. number token 来自 Reader，不来自 ground truth；
 4. DeepStack shape、mask 和注入顺序与原模型一致；
 5. State Token 不进入 visual mask；
-6. 新增 token 的 attention mask、position id 和 cache position 正确；
-7. query_time 之后的帧不会进入 Bank、TTT 或答案。
+6. number token 不进入 visual mask；
+7. 新增 token 的 attention mask、mRoPE position、rope delta 和 cache position 正确；
+8. prefill 后至少两个 decode step 不重复 State scatter、Bank 写入或 fast 更新；
+9. query_time 之后的帧不会进入 Bank、TTT 或答案。
 
 ## 19. 最小消融
 

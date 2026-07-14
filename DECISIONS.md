@@ -1,4 +1,4 @@
-# 实施决策（v5 高容量版，P0–P12 已通过）
+# 实施决策（v5 高容量版，P0–P13 已通过）
 
 本文件记录已经冻结的 v5 边界。P0 已冻结规格和仓库基线；P1 已把运行 YAML、强类型配置、
 运行时类型和推荐模块骨架迁移到 v5；P2 已通过数据、因果预处理和合成 A0 工程门禁；P3 已实现
@@ -9,7 +9,9 @@ State Bank 与事件 FSM 的本地合成张量工程门禁；P10 已通过 Ident
 matching、Candidate→Confirmed 生命周期和非权威 Hot Cache 的本地合成张量工程门禁；P11 已通过
 FP32 全记录阈值 Retriever、hard filters、typed records/status/audit 和无 Top-K 的本地合成 Bank
 工程门禁；P12 已通过 16-token Resampler、Deterministic Reader、record operands 与 pinned
-tokenizer-only manifest 的本地合成工程门禁。Composer、训练和推理入口仍按 P13 及后续 Part 实现。详细论证见
+tokenizer-only manifest 的本地合成工程门禁；P13 已通过 Composer、原生 Qwen prefill 桥、完整
+模型编排与一次性生命周期的 synthetic/tiny 工程门禁。Loss、SGD、训练和完整推理仍按 P14 及后续
+Part 实现。详细论证见
 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前规范版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
@@ -25,8 +27,8 @@ tokenizer-only manifest 的本地合成工程门禁。Composer、训练和推理
    均保留未校准状态。任一状态未校准时，配置拒绝正式评估。
 4. P1 类型覆盖 VideoBatch、Query/TimeWindow、空间/时间输出与 cache、四类 soft output、
    typed records、Retriever、ReaderResult 以及完整 per-video runtime ownership。
-5. P3 `qwen_adapter.py`、P4 `query_encoder.py`、P5 `fast_ttt.py` 及 P6–P12 对应模块已通过各自
-   工程门禁。P13 及后续推荐模块仍只提供职责边界、类型和显式未实现入口；模块可导入不等于
+5. P3 `qwen_adapter.py`、P4 `query_encoder.py`、P5 `fast_ttt.py` 及 P6–P13 对应模块已通过各自
+   工程门禁。P14 及后续推荐模块仍只提供职责边界、类型和显式未实现入口；模块可导入不等于
    算法已实现。
 
 ## P2 合成退出决策
@@ -333,6 +335,45 @@ tokenizer-only manifest 的本地合成工程门禁。Composer、训练和推理
 9. 成功 Reader audit 必须保存 records→operands→exact_count 的标量链路；Composer 必须携带同一
    RetrieverOutput 调用 `audit_results` 做确定性重算。即使调用方同步替换 exact_count 与匹配的
    number IDs，只要不等于原 typed-record 算术也必须失败。
+
+## P13 已验证边界
+
+1. Composer special token 固定按以下顺序注册：`<|state_start|>`、`<|state_pad|>`、
+   `<|state_end|>`、`<|number_start|>`、`<|number_end|>`。pinned tokenizer 的 ID 固定为
+   151669–151673，长度由 151669 变为 151674；Qwen text embedding 已有 151936 行，注册只增不减，
+   禁止调用 resize 把模型缩到 tokenizer 长度。
+2. 只有首次新增 token 时才初始化对应行；input embedding 与非 tied lm_head 分别取既有
+   vision-start/video-pad/vision-end 三行的 FP32 均值再 cast。tied 权重只写一次；已扩展 tokenizer
+   与 checkpoint 重载时不重置已训练行。token mapping、revision、表大小和初始化行均进入审计。
+3. payload 固定在最后一个 user `<|im_end|>` 前插入，顺序为 State 段、exact-number instruction 与
+   number 段，并按启用策略组成；同时保留原 system/user/question/video 与 assistant generation
+   prefix。OK/EMPTY 才可注入；UNSUPPORTED/INVALID 不注入零向量或伪造数字。batch 固定左 padding。
+4. `ComposedInput` 保存 `input_ids/inputs_embeds/attention_mask`、`[3,B,L] position_ids`、
+   `[B,1] rope_deltas`、`[L] cache_position`、video/state/number 三个互斥 mask、原 Reader number IDs、
+   special-token registration 与逐行 token 位置审计。placeholder/payload 数量、dtype/device 或来源
+   任一不一致均 fail fast。
+5. 运行时保留完整 `input_ids` 给 HF；Composer 先以同一 IDs/grid/mask 调原生 `get_rope_index()`
+   形成审计，Qwen prefill 再原生计算并缓存同值 `rope_deltas`。State hook 只在首个 embedding
+   prefill 独立 scatter 一次；decode 的单 token embedding 透传，禁止 `inputs_embeds` 并用。
+6. `PreparedVideoFeatures` 保存实际 Fast/Adapter 后 Main splits 与原 DeepStack tensors；回答 prefill
+   的一次性 provider 复用它们而不重跑 ViT/Fast。video 仍由 HF 原生 placeholder/scatter，DeepStack
+   的对象、顺序和 visual-only mask 不变；state/number 永不进入 visual mask。greedy 单序列已验证，
+   beam 展开留后续实现并在当前入口 fail closed。
+7. `StateTTTModel` 只做 DI 编排：`observe_chunk` 依次委托 visual→Query→Fast→双 Encoder→四 Head→
+   Bank writer；`answer_query` 使用同一 Bank snapshot 委托 Retriever→Reader read/recompute/number
+   audit→Resampler→Composer→Qwen prefill；`decode_step` 只能到 Qwen。数值、FSM、Reader 算术、
+   SGD 或 loss 均不在 `model.py` 复制。
+8. 同一 `nn.Module` 即使由多个 bound-method 入口注入，也只按对象 identity 注册一次；runtime、
+   lifecycle、Bank records 与 per-video fast state 不进入 model state_dict。每个 owner 最多一个
+   prefill；之后 observe/重复 prefill 被拒绝，decode 不可到达 Bank/Fast/Reader/Composer。
+9. feature flag 依赖固定为：Bank off 时 Reader/State 均 off；Reader off 允许 A6 的 state-only
+   payload；State off 允许 Q2 的 number-only payload；Fast 独立开关。Q0/Q1 的替代 Query/Retriever
+   只允许通过 DI 注入，规则 parser 的实验定义仍留 P21，P13 不暗自实现。
+10. Bank writer 必须按每行 effective operator/head 复用 P9/P10 的 O1/O2/E1/E2 API、baseline、
+    identity 与 event-kind policy，不能无条件写四个 head 或在 `model.py` 自创 FSM。Reader 结果不可被
+    LLM 覆盖；answer number agreement 与训练 target/Reader agreement 提供独立统计和阻断函数。
+11. P13 证据只来自 synthetic payload、tiny 随机 HF Qwen 和既有 11.5 MB tokenizer snapshot；未
+    下载视频、数据集或 8B 权重，不把该门禁描述为真实模型精度或科学增益。真实 8B 仍留 P19。
 
 ## 已固定
 

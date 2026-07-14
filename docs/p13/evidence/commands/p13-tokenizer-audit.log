@@ -1,0 +1,10 @@
+mode: HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1, local_files_only=True
+tokenizer_class: Qwen2TokenizerFast
+vocab_size: 151643
+base_length: 151669
+added_count: 5
+extended_length: 151674
+composer_ids: [151669, 151670, 151671, 151672, 151673]
+initialization_source_ids: [151652, 151656, 151653]
+model_embedding_rows_contract: 151936
+download_performed: false

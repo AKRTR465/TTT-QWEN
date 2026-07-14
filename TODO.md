@@ -3,7 +3,7 @@
 > 对齐源：[ARCHITECTURE.md](./ARCHITECTURE.md)  
 > 规范版本：`state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`  
 > 生成日期：2026-07-13  
-> 文档状态：施工分解 / P0–P12 已通过，P13 允许开始
+> 文档状态：施工分解 / P0–P13 已通过，P14 允许开始
 > 总原则：本文件只描述施工顺序和验收门禁；任何勾选都必须有代码、测试、日志或实验记录作为证据。
 
 ## 0. 使用方法
@@ -1078,72 +1078,74 @@
 - State Token 不得标成 visual position；DeepStack 只能作用于原 visual positions。
 - state 和 number payload 必须位于 assistant answer 之前。
 - generate prefill 只构建一次；decode 循环不能重复 Bank/TTT 更新。
+> P13 依照用户批准的轻量口径，只使用合成输入、tiny 随机 Qwen 与既有 tokenizer-only
+> snapshot 验证工程合同；未下载视频、数据集或 8B 权重，真实 8B 集成仍保留在 P19。
 
 ### 实施过程 TODO
 
 #### P13.1 Special token 与模板
 
-- [ ] 定义 state begin/end、state placeholder、number begin/end 等必要 special token。
-- [ ] 将 16 个固定 state placeholder 加入 tokenizer/chat template。
-- [ ] 定义可变长度 number token 放置规则。
-- [ ] 保存 tokenizer revision 和新增 token id 映射。
-- [ ] 确保新增 token embedding 初始化和 checkpoint 保存可复现。
+- [x] 定义 state begin/end、state placeholder、number begin/end 等必要 special token。
+- [x] 将 16 个固定 state placeholder 加入 tokenizer/chat template。
+- [x] 定义可变长度 number token 放置规则。
+- [x] 保存 tokenizer revision 和新增 token id 映射。
+- [x] 确保新增 token embedding 初始化和 checkpoint 保存可复现。
 
 #### P13.2 Payload 拼接
 
-- [ ] 保留原始 system/user/question token。
-- [ ] video embeddings 继续走 Qwen 原生 video placeholder mask + `masked_scatter`。
-- [ ] 对 16 个 state placeholder 执行独立 `masked_scatter`。
-- [ ] number 位置使用 Reader 返回的真实 tokenizer token id。
-- [ ] 组装顺序保证 question/video/state/number 在 assistant answer 之前。
-- [ ] 计算简化长度 `L_payload=L_q+N_v+K_s+L_num`。
-- [ ] Demo 验证 `7+392+16+L_num=415+L_num`。
-- [ ] 真实长度额外计入 chat template、system、视觉边界和状态边界 token。
+- [x] 保留原始 system/user/question token。
+- [x] video embeddings 继续走 Qwen 原生 video placeholder mask + `masked_scatter`。
+- [x] 对 16 个 state placeholder 执行独立 `masked_scatter`。
+- [x] number 位置使用 Reader 返回的真实 tokenizer token id。
+- [x] 组装顺序保证 question/video/state/number 在 assistant answer 之前。
+- [x] 计算简化长度 `L_payload=L_q+N_v+K_s+L_num`。
+- [x] Demo 验证 `7+392+16+L_num=415+L_num`。
+- [x] 真实长度额外计入 chat template、system、视觉边界和状态边界 token。
 
 #### P13.3 Mask、position 与 cache
 
-- [ ] attention mask 覆盖所有新增位置。
-- [ ] position_ids 覆盖所有新增位置且与 Qwen RoPE/多模态位置约定兼容。
-- [ ] cache_position 覆盖 prefill 后的正确偏移。
-- [ ] State Token 不进入 visual mask。
-- [ ] number token 不进入 visual mask。
-- [ ] DeepStack 只注入原 visual positions，不作用于 state/number。
-- [ ] padding batch 中每种 payload 的 mask 正确。
+- [x] attention mask 覆盖所有新增位置。
+- [x] position_ids 覆盖所有新增位置且与 Qwen RoPE/多模态位置约定兼容。
+- [x] cache_position 覆盖 prefill 后的正确偏移。
+- [x] State Token 不进入 visual mask。
+- [x] number token 不进入 visual mask。
+- [x] DeepStack 只注入原 visual positions，不作用于 state/number。
+- [x] padding batch 中每种 payload 的 mask 正确。
 
 #### P13.4 模型编排
 
-- [ ] `model.py` 只按顺序调用 qwen adapter、Query、Fast、双 Encoder、四 Decoder、Bank、Retriever、Reader、Resampler、Composer。
-- [ ] 明确“视频观测/状态更新”和“回答 query”两个入口。
-- [ ] 允许关闭 Fast、Bank、Reader、State Token，支持 A0–A6/Q0–Q3。
-- [ ] 统一返回 answer logits、ReaderResult、state audit、TTT soft intermediates。
-- [ ] 保留 Qwen 原 generate API 所需字段。
-- [ ] prefill 构建完成后设置一次性标记，decode step 拒绝再次写 Bank 或更新 fast weights。
+- [x] `model.py` 只按顺序调用 qwen adapter、Query、Fast、双 Encoder、四 Decoder、Bank、Retriever、Reader、Resampler、Composer。
+- [x] 明确“视频观测/状态更新”和“回答 query”两个入口。
+- [x] 允许关闭 Fast、Bank、Reader、State Token，支持 A0–A6/Q0–Q3。
+- [x] 统一返回 answer logits、ReaderResult、state audit、TTT soft intermediates。
+- [x] 保留 Qwen 原 generate API 所需字段。
+- [x] prefill 构建完成后设置一次性标记，decode step 拒绝再次写 Bank 或更新 fast weights。
 
 #### P13.5 LLM 职责约束
 
-- [ ] prompt 明确要求读取提供的 exact number。
-- [ ] LLM 负责根据问题组织答案、使用 State Token 解释对象/身份/事件背景、读取 number token
+- [x] prompt 明确要求读取提供的 exact number。
+- [x] LLM 负责根据问题组织答案、使用 State Token 解释对象/身份/事件背景、读取 number token
       并输出自然语言。
-- [ ] 训练标签与 Reader number 一致时才训练最终表达。
-- [ ] 记录 LLM 是否输出了与 Reader 不一致的数字。
-- [ ] 不让 LLM 从 392 个 video tokens 重新累计长视频计数。
-- [ ] 不让 LLM 从 16 个 State Token 猜测精确整数。
-- [ ] 不允许 LLM 覆盖 Reader 已确定的数字。
+- [x] 训练标签与 Reader number 一致时才训练最终表达。
+- [x] 记录 LLM 是否输出了与 Reader 不一致的数字。
+- [x] 不让 LLM 从 392 个 video tokens 重新累计长视频计数。
+- [x] 不让 LLM 从 16 个 State Token 猜测精确整数。
+- [x] 不允许 LLM 覆盖 Reader 已确定的数字。
 
 ### 实施后验收项
 
-- [ ] Demo payload 长度公式正确，真实模板长度可逐 token 审计。
-- [ ] video/state/number placeholder 数与 payload 数严格一致；不一致时 fail fast。
-- [ ] 新增 attention mask、position id、cache position 全部通过单元测试。
-- [ ] State Token/number token 不属于 visual positions。
-- [ ] DeepStack shape、mask、注入顺序与原模型一致。
-- [ ] generate prefill 后多个 decode step 不改变 Bank、fast weights 或 runtime state。
-- [ ] LLM 输出数字与 Reader exact_count 的一致率可单独统计。
+- [x] Demo payload 长度公式正确，真实模板长度可逐 token 审计。
+- [x] video/state/number placeholder 数与 payload 数严格一致；不一致时 fail fast。
+- [x] 新增 attention mask、position id、cache position 全部通过单元测试。
+- [x] State Token/number token 不属于 visual positions。
+- [x] DeepStack shape、mask、注入顺序与原模型一致。
+- [x] generate prefill 后多个 decode step 不改变 Bank、fast weights 或 runtime state。
+- [x] LLM 输出数字与 Reader exact_count 的一致率可单独统计。
 
 ### 交付物与退出条件
 
-- [ ] 交付 `input_composer.py`、`model.py`、tokenizer 变更、prefill/decode 集成测试。
-- [ ] 任意 placeholder 错位、DeepStack 污染或 decode 重复更新时阻断训练。
+- [x] 交付 `input_composer.py`、`model.py`、tokenizer 变更、prefill/decode 集成测试。
+- [x] 任意 placeholder 错位、DeepStack 污染或 decode 重复更新时阻断训练。
 
 ## P14. TTT/State/Answer Loss 与 functional SGD
 
@@ -1849,7 +1851,7 @@
 
 - [ ] `tests/test_v5_config_contract.py`：所有固定维度、容量、loss 和 optimizer 契约。
 - [ ] `tests/test_video_preprocessing.py`：Demo grid/pixels、变长、query-time cut。
-- [ ] `tests/test_qwen_adapter.py`：真实插入点和 DeepStack 等价。
+- [x] `tests/test_qwen_adapter.py`：真实插入点和 DeepStack 等价。
 - [ ] `tests/test_fast_ttt.py`：shape、参数数、reset、freeze。
 - [ ] `tests/test_state_encoder.py`：slot recurrence、causality、cache。
 - [ ] `tests/test_observation_heads.py`：四 Decoder 输出和参数预算。
@@ -1858,7 +1860,9 @@
 - [ ] `tests/test_query_encoder.py`：padding、9 prototypes、TimeWindow。
 - [ ] `tests/test_state_retriever.py`：filters、no Top-K、empty/unsupported。
 - [ ] `tests/test_state_reader.py`：八个合法 operator、number audit。
-- [ ] `tests/test_input_composer.py`：placeholder、mask、position、DeepStack。
+- [x] `tests/test_input_composer.py`：placeholder、mask、position、DeepStack。
+- [x] `tests/test_model.py`：编排顺序、DI、feature flags 与一次性 prefill 生命周期。
+- [x] `tests/test_p13_tiny_integration.py`：tiny Qwen 原生 mRoPE/DeepStack 与多步 decode。
 - [ ] `tests/test_losses.py`：三个 TTT 项、State/Answer/Outer loss。
 - [ ] `tests/test_functional_sgd.py`：只更新 fast、finite/clip/skip。
 - [ ] `tests/test_inference_protocol.py`：reset、next-chunk 生效、generate 单次 prefill。
@@ -1951,10 +1955,10 @@
 → 自然语言答案
 ~~~
 
-- [ ] hard operator 先限定 head_type，再做 q_target 语义检索。
-- [ ] Reader 使用完整 records，Resampler 使用同一检索结果的软摘要。
-- [ ] number 与 State Token 在 assistant answer 前注入。
-- [ ] decode 期间不重复以上状态路径。
+- [x] hard operator 先限定 head_type，再做 q_target 语义检索。
+- [x] Reader 使用完整 records，Resampler 使用同一检索结果的软摘要。
+- [x] number 与 State Token 在 assistant answer 前注入。
+- [x] decode 期间不重复以上状态路径。
 
 ---
 

@@ -7,8 +7,8 @@
 | 规范文件 | `ARCHITECTURE.md` |
 | SPEC_VERSION | `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval` |
 | 修订日期 | `2026-07-14` |
-| 文档状态 | `PARTIALLY IMPLEMENTED / P0-P12 ENGINEERING-VERIFIED` |
-| ARCHITECTURE_SHA256 | `ae8f738cff76c1ca49b19a515521b89f0d392eb2d5832dff02dcf1478f302c18` |
+| 文档状态 | `PARTIALLY IMPLEMENTED / P0-P13 ENGINEERING-VERIFIED` |
+| ARCHITECTURE_SHA256 | `b1ef88726da124835b43e1e64f2ee3d430a28d4670db785a223ff51224e07329` |
 | 基线 Git commit | `7f0185f8136faf88cc59e5ba2ec7309c36f8d013` |
 | UV_LOCK_SHA256 | `c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2` |
 | 基座模型 | `Qwen/Qwen3-VL-8B-Instruct` |
@@ -50,7 +50,9 @@
 8. Query Encoder 产生 target/operator/time 三个 512 维 embedding；operator 为 8 个合法类型加
    unsupported；State Retriever 使用归一化余弦阈值且不做固定 Top-K。
 9. 16 个 State Token 只提供语义摘要；精确 number payload 由 Reader 给出，LLM 只负责表达。
-10. query_time 之后的帧和答案/计数标签字段不进入 Bank、TTT、Retriever、Reader 或生成输入。
+10. Composer 固定 5 个 special token、左 padding、互斥 video/state/number mask；State 只在
+    prefill 独立 scatter 一次，video/mRoPE/DeepStack 保持 Qwen 原生路径。
+11. query_time 之后的帧和答案/计数标签字段不进入 Bank、TTT、Retriever、Reader 或生成输入。
 
 ## 第一版禁止项
 

@@ -1,0 +1,3 @@
+mode: System.Text.UTF8Encoding(false, true), strict decoder
+result: strict_utf8_files=167
+invalid_files: 0

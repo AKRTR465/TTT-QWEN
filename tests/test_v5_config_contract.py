@@ -473,6 +473,36 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         ),
         "ground_truth_input_forbidden": True,
     }
+    assert config.input_composer.model_dump() == {
+        "state_token_count": 16,
+        "special_tokens": (
+            "<|state_start|>",
+            "<|state_pad|>",
+            "<|state_end|>",
+            "<|number_start|>",
+            "<|number_end|>",
+        ),
+        "special_token_ids": (151_669, 151_670, 151_671, 151_672, 151_673),
+        "tokenizer_base_length": 151_669,
+        "tokenizer_extended_length": 151_674,
+        "tokenizer_revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+        "model_embedding_rows": 151_936,
+        "embedding_initialization": "fp32_mean_of_vision_start_video_pad_vision_end_then_cast",
+        "embedding_source_token_ids": (151_652, 151_656, 151_653),
+        "initialize_input_and_output_embeddings": True,
+        "padding_side": "left",
+        "state_payload_statuses": ("ok", "empty"),
+        "invalid_payload_policy": "omit_state_and_number",
+        "payload_order": (
+            "system_user_question_video",
+            "state",
+            "number",
+            "user_end",
+            "assistant_generation_prefix",
+        ),
+        "prefill_once": True,
+        "generation_num_beams": 1,
+    }
     assert config.predictor.model_dump() == {
         "input_dim": 768,
         "hidden_dim": 1536,
@@ -887,6 +917,22 @@ def set_nested(*path_and_value: object) -> Mutation:
         (
             set_nested("state_reader", "ground_truth_input_forbidden", False),
             "state_reader.ground_truth_input_forbidden",
+        ),
+        (
+            set_nested("input_composer", "state_token_count", 8),
+            "input_composer.state_token_count",
+        ),
+        (
+            set_nested("input_composer", "special_token_ids", [1, 2, 3, 4, 5]),
+            "input_composer.special_token_ids",
+        ),
+        (
+            set_nested("input_composer", "padding_side", "right"),
+            "input_composer.padding_side",
+        ),
+        (
+            set_nested("input_composer", "prefill_once", False),
+            "input_composer.prefill_once",
         ),
         (set_nested("fast_ttt", "optimizer", "momentum", 0.9), "momentum must be 0.0"),
         (

@@ -69,10 +69,7 @@ class VideoBatch:
             raise TypeError("timestamps must use a floating dtype")
         if self.query_time.shape != (batch_size,) or not torch.is_floating_point(self.query_time):
             raise ValueError("query_time must be floating [B]")
-        if (
-            self.valid_mask.shape != self.timestamps.shape
-            or self.valid_mask.dtype != torch.bool
-        ):
+        if self.valid_mask.shape != self.timestamps.shape or self.valid_mask.dtype != torch.bool:
             raise ValueError("valid_mask must be bool [B, T]")
         if len(self.video_ids) != batch_size or len(self.trajectory_ids) != batch_size:
             raise ValueError("video_ids and trajectory_ids must contain one value per batch item")
@@ -115,9 +112,7 @@ class MergedVideoMetadata:
             raise TypeError("raw and merged grids must use the same dtype")
         if self.spatial_merge_size <= 0:
             raise ValueError("spatial_merge_size must be positive")
-        if bool(torch.any(self.video_grid_thw <= 0)) or bool(
-            torch.any(self.merged_grid_thw <= 0)
-        ):
+        if bool(torch.any(self.video_grid_thw <= 0)) or bool(torch.any(self.merged_grid_thw <= 0)):
             raise ValueError("raw and merged grids must be positive")
         if not torch.equal(self.video_grid_thw[:, 0], self.merged_grid_thw[:, 0]):
             raise ValueError("Main Merger must preserve the temporal grid")
@@ -216,6 +211,107 @@ class QwenVisualOutput:
         return tuple(torch.split(self.packed_main_visual_embeddings(), self.metadata.token_counts))
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class PreparedVideoFeatures:
+    """Actual adapted Main features plus untouched DeepStack tensors consumed by Qwen.
+
+    The tensors intentionally keep their autograd graph and object identity. A prepared value is a
+    one-prefill capability, not a persistent cache or detached runtime snapshot.
+    """
+
+    main_features: tuple[Tensor, ...]
+    deepstack_features: tuple[Tensor, Tensor, Tensor]
+    metadata: MergedVideoMetadata
+
+    def __post_init__(self) -> None:
+        hidden_size = self.main_features[0].shape[-1] if self.main_features else 0
+        if hidden_size <= 0:
+            raise ValueError("prepared Main features must contain at least one hidden dimension")
+        _validate_feature_splits(
+            self.main_features,
+            self.metadata.token_counts,
+            hidden_size,
+            "prepared Main",
+        )
+        if len(self.deepstack_features) != 3:
+            raise ValueError("prepared DeepStack features must contain exactly three tensors")
+        first = self.main_features[0]
+        for index, feature in enumerate(self.deepstack_features):
+            if feature.shape != (self.metadata.token_offsets[-1], hidden_size):
+                raise ValueError(f"prepared DeepStack feature {index} has an invalid packed shape")
+            if feature.dtype != first.dtype or feature.device != first.device:
+                raise ValueError(
+                    "prepared DeepStack dtype/device must match prepared Main features"
+                )
+
+    def validate_request(self, pixel_values_videos: Tensor, video_grid_thw: Tensor) -> None:
+        """Reject a provider request that is not the exact video geometry used for preparation."""
+
+        if video_grid_thw.ndim != 2 or video_grid_thw.shape[1] != 3:
+            raise ValueError("precomputed provider video_grid_thw must be [B, 3]")
+        if video_grid_thw.dtype not in (torch.int32, torch.int64):
+            raise TypeError("precomputed provider video_grid_thw must use an integer dtype")
+        expected_grid = self.metadata.video_grid_thw.detach().to(device="cpu")
+        requested_grid = video_grid_thw.detach().to(device="cpu")
+        if not torch.equal(requested_grid, expected_grid):
+            raise ValueError("precomputed provider video_grid_thw does not match prepared features")
+        if pixel_values_videos.ndim != 2 or not torch.is_floating_point(pixel_values_videos):
+            raise ValueError(
+                "precomputed provider pixels must be packed floating [sum(N_patch), D]"
+            )
+        expected_patches = sum(
+            int(value) for value in torch.prod(video_grid_thw.detach().to("cpu"), dim=1).tolist()
+        )
+        if pixel_values_videos.shape[0] != expected_patches:
+            raise ValueError(
+                "precomputed provider packed patch count does not match video_grid_thw"
+            )
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class StateEmbeddingPayload:
+    """Packed State embeddings to scatter once into one exact Qwen prefill sequence.
+
+    ``state_embeddings`` is ``[N_state, H]`` in the row-major order selected by
+    ``state_position_mask``. Expected IDs and the mask are immutable audit snapshots; State
+    embeddings retain their graph so answer losses can reach the State Resampler.
+    """
+
+    expected_input_ids: Tensor
+    state_position_mask: Tensor
+    state_embeddings: Tensor
+
+    def __post_init__(self) -> None:
+        input_ids = self.expected_input_ids
+        mask = self.state_position_mask
+        embeddings = self.state_embeddings
+        if (
+            input_ids.ndim != 2
+            or input_ids.shape[0] <= 0
+            or input_ids.shape[1] <= 1
+            or input_ids.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("expected_input_ids must be non-empty integer [B, L>1]")
+        if mask.shape != input_ids.shape or mask.dtype != torch.bool:
+            raise ValueError("state_position_mask must be bool with the expected input_ids shape")
+        if mask.device != input_ids.device:
+            raise ValueError("state_position_mask must share the expected input_ids device")
+        if (
+            embeddings.ndim != 2
+            or embeddings.shape[1] <= 0
+            or not torch.is_floating_point(embeddings)
+        ):
+            raise ValueError("state_embeddings must be floating [N_state, H]")
+        if embeddings.shape[0] != int(mask.sum().item()):
+            raise ValueError("state_embeddings rows must equal the State mask population")
+        if embeddings.device != input_ids.device:
+            raise ValueError("state_embeddings must share the expected input_ids device")
+        if not bool(torch.isfinite(embeddings).all()):
+            raise ValueError("state_embeddings must be finite")
+        object.__setattr__(self, "expected_input_ids", input_ids.detach().clone())
+        object.__setattr__(self, "state_position_mask", mask.detach().clone())
+
+
 class QwenVideoFeatureBoundary(nn.Module):  # type: ignore[misc]
     """Adapt only packed Main Merger features and preserve upstream DeepStack objects."""
 
@@ -235,6 +331,7 @@ class QwenVideoFeatureBoundary(nn.Module):  # type: ignore[misc]
         self.adapter = adapter
         self.adapter_enabled = adapter_enabled
         self.last_output: QwenVisualOutput | None = None
+        self.last_prepared: PreparedVideoFeatures | None = None
 
     def set_adapter_enabled(self, enabled: bool) -> None:
         if enabled and self.adapter is None:
@@ -250,6 +347,11 @@ class QwenVideoFeatureBoundary(nn.Module):  # type: ignore[misc]
         output = self._capture(main_features, deepstack_features, video_grid_thw)
         self.last_output = output
         if not self.adapter_enabled:
+            self.last_prepared = PreparedVideoFeatures(
+                main_features=tuple(main_features),
+                deepstack_features=output.deepstack_features,
+                metadata=output.metadata,
+            )
             return main_features, deepstack_features
         if self.adapter is None:
             raise RuntimeError("adapter disappeared while adapter_enabled is true")
@@ -269,7 +371,13 @@ class QwenVideoFeatureBoundary(nn.Module):  # type: ignore[misc]
         ):
             raise ValueError("video adapter must preserve Main Merger dtype/device")
         packed = adapted[output.visual_valid_mask]
-        return tuple(torch.split(packed, output.metadata.token_counts)), deepstack_features
+        adapted_splits = tuple(torch.split(packed, output.metadata.token_counts))
+        self.last_prepared = PreparedVideoFeatures(
+            main_features=adapted_splits,
+            deepstack_features=output.deepstack_features,
+            metadata=output.metadata,
+        )
+        return adapted_splits, deepstack_features
 
     def _capture(
         self,
@@ -337,11 +445,18 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
             adapter_enabled=adapter_enabled,
         )
         self._hook_active = False
+        self._state_hook_active = False
         self._hook_lock = RLock()
 
     @property
     def last_visual_output(self) -> QwenVisualOutput | None:
         return self.video_boundary.last_output
+
+    @property
+    def last_prepared_video_features(self) -> PreparedVideoFeatures | None:
+        """Return the actual post-Adapter Main features most recently handed to Qwen."""
+
+        return self.video_boundary.last_prepared
 
     @property
     def feature_owner(self) -> QwenFeatureOwner:
@@ -355,27 +470,51 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
             self.qwen_model.eval()
         return self
 
-    def forward(self, *args: object, **kwargs: object) -> object:
+    def forward(
+        self,
+        *args: object,
+        prepared_video_features: PreparedVideoFeatures | None = None,
+        state_embedding_payload: StateEmbeddingPayload | None = None,
+        **kwargs: object,
+    ) -> object:
         with self._hook_lock:
-            self.video_boundary.last_output = None
+            self._clear_captures()
+            if state_embedding_payload is not None:
+                self._validate_state_call(args, kwargs, state_embedding_payload)
             try:
-                with self._patched_video_features():
+                with (
+                    self._patched_state_embeddings(state_embedding_payload),
+                    self._patched_video_features(prepared_video_features),
+                ):
                     return cast(object, self.qwen_model(*args, **kwargs))
             except Exception:
-                self.video_boundary.last_output = None
+                self._clear_captures()
                 raise
 
-    def generate(self, *args: object, **kwargs: object) -> object:
+    def generate(
+        self,
+        *args: object,
+        prepared_video_features: PreparedVideoFeatures | None = None,
+        state_embedding_payload: StateEmbeddingPayload | None = None,
+        **kwargs: object,
+    ) -> object:
         generate_method = getattr(self.qwen_model, "generate", None)
         if not callable(generate_method):
             raise TypeError("wrapped Qwen model does not provide generate()")
         with self._hook_lock:
-            self.video_boundary.last_output = None
+            self._clear_captures()
+            if state_embedding_payload is not None:
+                self._validate_state_call(args, kwargs, state_embedding_payload)
+            if prepared_video_features is not None or state_embedding_payload is not None:
+                self._assert_unexpanded_generation(kwargs)
             try:
-                with self._patched_video_features():
+                with (
+                    self._patched_state_embeddings(state_embedding_payload),
+                    self._patched_video_features(prepared_video_features),
+                ):
                     return cast(object, generate_method(*args, **kwargs))
             except Exception:
-                self.video_boundary.last_output = None
+                self._clear_captures()
                 raise
 
     def get_video_features(
@@ -388,7 +527,7 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
                 raise RuntimeError(
                     "direct get_video_features cannot run while the forward hook is active"
                 )
-            self.video_boundary.last_output = None
+            self._clear_captures()
             try:
                 main, deepstack = self.feature_owner.get_video_features(
                     pixel_values_videos,
@@ -400,11 +539,14 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
                     video_grid_thw,
                 )
             except Exception:
-                self.video_boundary.last_output = None
+                self._clear_captures()
                 raise
 
     @contextmanager
-    def _patched_video_features(self) -> Iterator[None]:
+    def _patched_video_features(
+        self,
+        prepared: PreparedVideoFeatures | None = None,
+    ) -> Iterator[None]:
         with self._hook_lock:
             if self._hook_active:
                 raise RuntimeError("Qwen video feature hook is not re-entrant")
@@ -412,13 +554,24 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
             had_instance_method = "get_video_features" in vars(owner)
             original_instance_method = vars(owner).get("get_video_features")
             original = owner.get_video_features
+            prepared_consumed = False
 
             def intercepted(
                 pixel_values_videos: Tensor,
                 video_grid_thw: Tensor | None = None,
             ) -> tuple[Sequence[Tensor], Sequence[Tensor]]:
+                nonlocal prepared_consumed
                 if video_grid_thw is None:
                     raise ValueError("video_grid_thw is required for the State-TTT boundary")
+                if prepared is not None:
+                    if prepared_consumed:
+                        raise RuntimeError(
+                            "precomputed video features may be consumed only once per prefill"
+                        )
+                    prepared.validate_request(pixel_values_videos, video_grid_thw)
+                    prepared_consumed = True
+                    self.video_boundary.last_prepared = prepared
+                    return prepared.main_features, prepared.deepstack_features
                 main, deepstack = original(pixel_values_videos, video_grid_thw)
                 return self.video_boundary.intercept_features(
                     main,
@@ -430,12 +583,128 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
             owner.get_video_features = intercepted  # type: ignore[method-assign]
             try:
                 yield
+                if prepared is not None and not prepared_consumed:
+                    raise RuntimeError(
+                        "precomputed video features were not consumed exactly once during prefill"
+                    )
             finally:
                 if had_instance_method:
                     owner.get_video_features = original_instance_method  # type: ignore[method-assign,assignment]
                 else:
                     delattr(owner, "get_video_features")
                 self._hook_active = False
+
+    @contextmanager
+    def _patched_state_embeddings(
+        self,
+        payload: StateEmbeddingPayload | None = None,
+    ) -> Iterator[None]:
+        if payload is None:
+            yield
+            return
+        with self._hook_lock:
+            if self._state_hook_active:
+                raise RuntimeError("Qwen State embedding hook is not re-entrant")
+            get_embeddings = getattr(self.qwen_model, "get_input_embeddings", None)
+            if not callable(get_embeddings):
+                raise TypeError("wrapped Qwen model does not expose get_input_embeddings()")
+            embedding_layer = get_embeddings()
+            if not isinstance(embedding_layer, nn.Module):
+                raise TypeError("Qwen input embedding owner must be an nn.Module")
+            payload_consumed = False
+
+            def scatter_state(
+                _module: nn.Module,
+                module_args: tuple[object, ...],
+                output: object,
+            ) -> object:
+                nonlocal payload_consumed
+                if not module_args or not isinstance(module_args[0], Tensor):
+                    raise TypeError("Qwen input embedding hook requires Tensor input_ids")
+                actual_ids = module_args[0]
+                if not isinstance(output, Tensor):
+                    raise TypeError("Qwen input embedding hook requires a Tensor output")
+                if actual_ids.ndim == 2 and actual_ids.shape[1] == 1:
+                    return output
+                if payload_consumed:
+                    raise RuntimeError(
+                        "State embeddings were already consumed; decode must use one-token inputs"
+                    )
+                expected_ids = payload.expected_input_ids
+                if (
+                    actual_ids.shape != expected_ids.shape
+                    or actual_ids.dtype != expected_ids.dtype
+                    or actual_ids.device != expected_ids.device
+                    or not torch.equal(actual_ids, expected_ids)
+                ):
+                    raise ValueError("Qwen prefill input_ids do not match StateEmbeddingPayload")
+                if output.ndim != 3 or output.shape[:2] != actual_ids.shape:
+                    raise ValueError("Qwen input embeddings must be [B, L, H]")
+                if output.shape[-1] != payload.state_embeddings.shape[-1]:
+                    raise ValueError("State embedding hidden size does not match Qwen embeddings")
+                state_mask = payload.state_position_mask.to(device=output.device)
+                expanded_mask = state_mask.unsqueeze(-1).expand_as(output)
+                state_values = payload.state_embeddings.to(
+                    device=output.device,
+                    dtype=output.dtype,
+                )
+                scattered = output.masked_scatter(expanded_mask, state_values)
+                payload_consumed = True
+                return scattered
+
+            self._state_hook_active = True
+            handle = embedding_layer.register_forward_hook(scatter_state)
+            try:
+                yield
+                if not payload_consumed:
+                    raise RuntimeError(
+                        "StateEmbeddingPayload was not consumed exactly once during prefill"
+                    )
+            finally:
+                handle.remove()
+                self._state_hook_active = False
+
+    def _clear_captures(self) -> None:
+        self.video_boundary.last_output = None
+        self.video_boundary.last_prepared = None
+
+    def _validate_state_call(
+        self,
+        args: Sequence[object],
+        kwargs: Mapping[str, object],
+        payload: StateEmbeddingPayload,
+    ) -> None:
+        if args:
+            raise ValueError("StateEmbeddingPayload requires keyword input_ids")
+        if kwargs.get("inputs_embeds") is not None:
+            raise ValueError("StateEmbeddingPayload cannot be combined with inputs_embeds")
+        input_ids = kwargs.get("input_ids")
+        if not isinstance(input_ids, Tensor):
+            raise ValueError("StateEmbeddingPayload requires Tensor input_ids")
+        expected_ids = payload.expected_input_ids
+        if (
+            input_ids.shape != expected_ids.shape
+            or input_ids.dtype != expected_ids.dtype
+            or input_ids.device != expected_ids.device
+            or not torch.equal(input_ids, expected_ids)
+        ):
+            raise ValueError("input_ids do not match StateEmbeddingPayload expected_input_ids")
+
+    def _assert_unexpanded_generation(self, kwargs: Mapping[str, object]) -> None:
+        generation_config = kwargs.get("generation_config")
+        if generation_config is None:
+            generation_config = getattr(self.qwen_model, "generation_config", None)
+        for name in ("num_beams", "num_return_sequences"):
+            value = kwargs.get(name)
+            if value is None and generation_config is not None:
+                value = getattr(generation_config, name, 1)
+            if value is None:
+                value = 1
+            if value != 1:
+                raise ValueError(
+                    "precomputed video generation requires "
+                    f"{name}=1; expanded generation is deferred"
+                )
 
 
 def assert_qwen_checkpoint_config(checkpoint_config: object, project: ProjectConfig) -> None:

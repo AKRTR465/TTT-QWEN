@@ -1,0 +1,4 @@
+command: .\.venv\Scripts\python.exe -m pytest -q tests\test_input_composer.py tests\test_model.py tests\test_qwen_adapter.py tests\test_p13_tiny_integration.py
+exit_code: 0
+result: 69 passed in 24.60s
+asset_policy: synthetic tensors and tiny random HF Qwen only; no download
