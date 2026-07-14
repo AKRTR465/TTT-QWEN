@@ -1,0 +1,3 @@
+command: strict UTF-8 decode of tracked and untracked repository text artifacts
+exit_code: 0
+result: strict_utf8_files=172

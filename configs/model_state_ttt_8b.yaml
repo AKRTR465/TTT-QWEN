@@ -72,6 +72,7 @@ fast_ttt:
     steps_per_chunk: 1
     grad_clip_norm: 1.0
     reset_per_video: true
+    meta_gradient_mode: full_second_order
 
 spatial_encoder:
   input_dim: 4096
@@ -435,13 +436,22 @@ predictor:
   input_dim: 768
   hidden_dim: 1536
   output_dim: 768
+  layer_norm_eps: 1.0e-5
+  activation: silu
+  linear_bias: true
+  parameter_count: 2363136
 
 loss:
   pred_weight: 1.0
   identity_weight: 0.5
   event_weight: 0.5
   o1_unlabeled_weight: 0.0
+  operator_weight: 1.0
+  retrieval_weight: 1.0
+  time_weight: 1.0
   auxiliary_outer_weight: 0.1
+  answer_causal_shift: true
+  answer_ignore_index: -100
 
 evaluation:
   formal_evaluation_enabled: false

@@ -1,4 +1,4 @@
-# 实施决策（v5 高容量版，P0–P13 已通过）
+# 实施决策（v5 高容量版，P0–P14 已通过）
 
 本文件记录已经冻结的 v5 边界。P0 已冻结规格和仓库基线；P1 已把运行 YAML、强类型配置、
 运行时类型和推荐模块骨架迁移到 v5；P2 已通过数据、因果预处理和合成 A0 工程门禁；P3 已实现
@@ -10,8 +10,9 @@ matching、Candidate→Confirmed 生命周期和非权威 Hot Cache 的本地合
 FP32 全记录阈值 Retriever、hard filters、typed records/status/audit 和无 Top-K 的本地合成 Bank
 工程门禁；P12 已通过 16-token Resampler、Deterministic Reader、record operands 与 pinned
 tokenizer-only manifest 的本地合成工程门禁；P13 已通过 Composer、原生 Qwen prefill 桥、完整
-模型编排与一次性生命周期的 synthetic/tiny 工程门禁。Loss、SGD、训练和完整推理仍按 P14 及后续
-Part 实现。详细论证见
+模型编排与一次性生命周期的 synthetic/tiny 工程门禁；P14 已通过 typed loss、逐视频 functional
+SGD、full-second-order meta 路与模块 gradient/delta 审计的合成工程门禁。训练和完整推理仍按
+P15 及后续 Part 实现。详细论证见
 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前规范版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
@@ -27,8 +28,8 @@ Part 实现。详细论证见
    均保留未校准状态。任一状态未校准时，配置拒绝正式评估。
 4. P1 类型覆盖 VideoBatch、Query/TimeWindow、空间/时间输出与 cache、四类 soft output、
    typed records、Retriever、ReaderResult 以及完整 per-video runtime ownership。
-5. P3 `qwen_adapter.py`、P4 `query_encoder.py`、P5 `fast_ttt.py` 及 P6–P13 对应模块已通过各自
-   工程门禁。P14 及后续推荐模块仍只提供职责边界、类型和显式未实现入口；模块可导入不等于
+5. P3 `qwen_adapter.py`、P4 `query_encoder.py`、P5 `fast_ttt.py` 及 P6–P14 对应模块已通过各自
+   工程门禁。P15 及后续推荐模块仍只提供职责边界、类型和显式未实现入口；模块可导入不等于
    算法已实现。
 
 ## P2 合成退出决策
@@ -375,6 +376,37 @@ Part 实现。详细论证见
 11. P13 证据只来自 synthetic payload、tiny 随机 HF Qwen 和既有 11.5 MB tokenizer snapshot；未
     下载视频、数据集或 8B 权重，不把该门禁描述为真实模型精度或科学增益。真实 8B 仍留 P19。
 
+## P14 已验证边界
+
+1. Temporal Predictor 固定为 `LayerNorm(768, eps=1e-5)→Linear(1536)→SiLU→Linear(768)`，
+   标准 bias，精确 2,363,136 参数；只预测同一 row 内连续且有效的下一 tubelet，target detach，
+   少于一个 pair 时返回 invalid 而不是伪造有效零。
+2. O2/E1/E2 overlap 全部以 current prediction 为 source、detached previous snapshot 为 target；
+   identity 256 维 unit norm，position/timestamp/一对一索引与 matched/mismatch/duplicate/
+   low-confidence/invalid-source/padding 均强类型审计。跨 chunk snapshot/match 生命周期留 P17。
+3. `L_TTT[row]=L_pred[row]+0.5L_id[row]+0.5L_event[row]`；O1 unlabeled 严格为零，无效项不重归一，
+   scalar 只对 union-valid rows 求均值。E1/E2 先在 row 内相加；混合有效 batch 已手算验证。
+4. State Loss 只消费显式 typed dense target：O1 pre-matched 六字段、O2 identity/two scores、E1、
+   E2 four-event/phase soft-FSM proxy，以及 9 类 operator、record relevance 与 time mode/span。
+   缺失标签保持 invalid，P14 不由最终 count 伪造 assignment。
+5. Answer CE 固定 causal shift 与 `ignore_index=-100`；number-token、完整 answer exact match 和
+   Reader exact count 三类指标独立。Outer 固定为 after-update Answer+State，本次与额外 support
+   TTT 均进入 `+0.1 mean(valid TTT rows)`。
+6. functional SGD 通过 typed `TTTLossOutput` 按 video row 自动取得 loss/count/reason；batch helper
+   保证 fast storage 隔离并正确保留共享 batch graph，禁止单视频状态消费跨视频 scalar。
+7. online 更新只产生独立 leaf 的下一代 `W_t`；meta 固定 `meta_full_second_order`，
+   `create_graph=True` 且不 detach，after-update query gradient 可回到 `W0`。该选择同时锁入配置、
+   result audit 与测试；一阶近似留 P16/P21 显式比较。
+8. 两矩阵以联合 FP32 global norm clip=1；无有效项、时间不足、非有限 loss/gradient、零梯度、
+   clip 后非法及 BF16 不可表示更新均显式 skip。attempted 始终等于 update+skip；reset 同时恢复
+   当前 checkpoint `W0` 并清空 fast/optimizer counters。
+9. gradient/delta audit 表固定输出 group、parameter count、gradient presence/norm、delta norm 与
+   expected/allowed。真实 Fast Adapter→冻结 4096→768 bridge→真实 O1→P14 State loss 合成链已
+   验证：只有 1,179,648 个 online fast 参数产生 inner delta；Adapter checkpoint、冻结 bridge/O1、
+   Semantic Projector、hard Bank/FSM 及 Query/Reader/Qwen excluded 组均无 inner delta。
+10. P14 所有证据均来自进程内合成张量和小型模块链；未下载视频、数据集或 8B 权重，不支持
+    训练收敛、真实精度或 TTT 科学增益结论。O1 target builder 留 P15，真实模型/资产留 P19。
+
 ## 已固定
 
 1. 基座使用Qwen3-VL-8B-Instruct，不使用4B版本。
@@ -451,8 +483,17 @@ Part 实现。详细论证见
 7. `L_pred`固定为当前chunk内的next-tubelet prediction：
    `MSE(P(H_t[:,:-1]), stop_gradient(H_t[:,1:]))`；有效时间位置不足2时该项无效，不跨chunk
    保留autograd graph。
-8. O1不进入无标签TTT loss，但必须保留对应的有标签State Loss。
-9. 顶层Outer loss固定为：
+8. O2/E1/E2 overlap consistency 固定为“当前 chunk prediction → detached previous
+   `SoftOverlapSnapshot` target”。只有 current source 保留梯度；snapshot 不入 Bank/checkpoint，
+   不保留上一 chunk fast graph。position/timestamp/唯一索引与 matched/mismatch/duplicate/
+   low-confidence/invalid-source 状态属于强类型有效性合同；跨 chunk snapshot/match 编排留 P17。
+9. TTT reduction 固定先逐视频组成 pred + 0.5 id + 0.5 event；无效项为零且不重归一，唯一
+   batch scalar 是 update-valid rows 的均值。单视频 SGD 只能从 typed output 取对应 row，禁止消费
+   跨视频 scalar。E1/E2 也先逐 row 相加再按 event-valid rows 求均值。
+10. O1不进入无标签TTT loss，但必须保留对应的有标签State Loss。P14 只消费 P15 target builder
+    产生的 pre-matched dense slot/mask，不从最终 count 伪造 slot assignment；E2 phase CE 是 hard
+    FSM 不入图时的 soft proxy。
+11. 顶层Outer loss固定为：
 
    \[
    L_{\mathrm{total}}
@@ -461,8 +502,12 @@ Part 实现。详细论证见
    +0.1\operatorname{mean}(L_{\mathrm{TTT}}).
    \]
 
-10. 真正训练TTT更新方向的是更新后query的Answer Loss和State Loss；TTT Auxiliary Loss只维持无标签目标可学习。
-11. 第一版不加入Gate Loss、harmful-update loss、improvement margin、fast-weight drift、update-norm或KL retention等额外正则项。
+12. 当前 support TTT 必须自动进入 auxiliary mean，调用方 tuple 只表示额外/更早 support；空 tuple
+    不得静默漏掉本次 TTT。
+13. 真正训练TTT更新方向的是更新后query的Answer Loss和State Loss；TTT Auxiliary Loss只维持无标签目标可学习。
+14. P14 的 differentiable update 固定为 `meta_full_second_order`（`create_graph=True`、不 detach），
+    online 为 `online_leaf`；一阶近似只能在 P16/P21 通过显式配置和实验比较。
+15. 第一版不加入Gate Loss、harmful-update loss、improvement margin、fast-weight drift、update-norm或KL retention等额外正则项。
 
 ## 在线优化器
 

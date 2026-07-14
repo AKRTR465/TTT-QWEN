@@ -3,7 +3,7 @@
 > 对齐源：[ARCHITECTURE.md](./ARCHITECTURE.md)  
 > 规范版本：`state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`  
 > 生成日期：2026-07-13  
-> 文档状态：施工分解 / P0–P13 已通过，P14 允许开始
+> 文档状态：施工分解 / P0–P14 已通过，P15 允许开始
 > 总原则：本文件只描述施工顺序和验收门禁；任何勾选都必须有代码、测试、日志或实验记录作为证据。
 
 ## 0. 使用方法
@@ -1166,104 +1166,116 @@
 
 #### P14.1 时序预测 `L_pred`
 
-- [ ] 实现 Predictor：LayerNorm 768 → Linear 768→1536 → SiLU → Linear 1536→768。
-- [ ] 对当前 chunk 使用 `P(H_t[:,:-1])` 预测 `stop_gradient(H_t[:,1:])`。
-- [ ] 使用 MSE，只对连续且有效的 tubelet pair 求均值。
-- [ ] Predictor 不预测像素、不预测最终计数。
-- [ ] 有效时间位置少于 2 时返回 invalid term，而不是伪造 0 参与平均。
-- [ ] 参数量约 2.36M。
+- [x] 实现 Predictor：LayerNorm 768 → Linear 768→1536 → SiLU → Linear 1536→768。
+- [x] 对当前 chunk 使用 `P(H_t[:,:-1])` 预测 `stop_gradient(H_t[:,1:])`。
+- [x] 使用 MSE，只对连续且有效的 tubelet pair 求均值。
+- [x] Predictor 不预测像素、不预测最终计数。
+- [x] 有效时间位置少于 2 时返回 invalid term，而不是伪造 0 参与平均。
+- [x] 参数量约 2.36M。
 
 #### P14.2 身份一致性 `L_id`
 
-- [ ] 只选择相邻重叠 chunk 中可靠匹配的同一对象。
-- [ ] 严格实现 `1-cos(e_(t-1,i), stop_gradient(e_(t,j)))`，stop-gradient 固定作用在当前
-      chunk 的匹配 identity target 上。
-- [ ] identity 向量必须是 O2 的 normalized 256 维向量。
-- [ ] 没有有效匹配时该项值为 0，同时 valid=false，避免错误影响全局平均。
-- [ ] 对 mismatch、重复匹配和低置信度匹配写审计计数。
-- [ ] mask 仅决定有效样本，不控制是否学习更新。
+- [x] 只选择相邻重叠 chunk 中可靠匹配的同一对象。
+- [x] 严格实现 `1-cos(e_current_prediction, stop_gradient(e_previous_snapshot_target))`；当前
+      chunk prediction 是带梯度 source，上一 chunk 只保存 detached `SoftOverlapSnapshot`，
+      禁止长期保留旧 fast graph。
+- [x] identity 向量必须是 O2 的 normalized 256 维向量。
+- [x] 没有有效匹配时该项值为 0，同时 valid=false，避免错误影响全局平均。
+- [x] 对 mismatch、重复匹配、低置信度和 invalid source/padding 写强类型状态与审计计数。
+- [x] position 必须相等、timestamp 在冻结容差内一致，source/target index 均不得重复。
+- [x] mask 仅决定有效样本，不控制是否学习更新。
 
 #### P14.3 事件一致性 `L_event`
 
-- [ ] 定义 `L_event=L_E1-overlap+L_E2-overlap`。
-- [ ] E1 对重叠位置比较 eventness、completion、transition。
-- [ ] E2 比较 start、active、end、complete 和 phase distribution。
-- [ ] 第一实现对二值 soft outputs 使用 masked MSE。
-- [ ] 第一实现对 phase distribution 使用 stop-gradient target KL。
-- [ ] 所有项只在有效、时间对齐的重叠位置求均值。
-- [ ] hard FSM、event_count、completed_count 和记录列表不进入 loss 图。
-- [ ] 将 MSE/BCE/其他距离保留为 P21 消融，不提前宣称最终最优。
+- [x] 定义 `L_event=L_E1-overlap+L_E2-overlap`。
+- [x] E1 对重叠位置比较 current prediction 与 detached previous snapshot 的 eventness、
+      completion、transition。
+- [x] E2 沿相同 source/target 方向比较 start、active、end、complete 和 phase distribution。
+- [x] 第一实现对二值 soft outputs 使用 masked MSE。
+- [x] 第一实现对 phase distribution 使用 stop-gradient target KL。
+- [x] 所有项只在有效、时间对齐的重叠位置求均值。
+- [x] hard FSM、event_count、completed_count 和记录列表不进入 loss 图。
+- [x] P14 只实现显式 typed source/target loss；snapshot/match 的跨 chunk 编排留 P17。
+- [x] 将 MSE/BCE/其他距离保留为 P21 消融，不提前宣称最终最优。
 
 #### P14.4 顶层无标签 loss
 
-- [ ] 实现 `L_TTT=L_pred+0.5*L_id+0.5*L_event`。
-- [ ] O1 unlabeled 权重固定为 0，并断言没有 O1 项偷偷加入。
-- [ ] 按项返回 value、valid count、mask count 和 skip reason。
-- [ ] 无任何有效项时整次 inner update 跳过。
-- [ ] 检查每项和总 loss 有限。
+- [x] 实现 `L_TTT=L_pred+0.5*L_id+0.5*L_event`。
+- [x] O1 unlabeled 权重固定为 0，并断言没有 O1 项偷偷加入。
+- [x] 按项返回 value、valid count、mask count 和 skip reason。
+- [x] 先逐视频形成 `L_TTT[row]`，唯一 batch scalar 是对 update-valid rows 的均值；禁止
+      各分项按不同有效行独立平均后再相加。
+- [x] Functional SGD 必须从强类型 `TTTLossOutput` 逐 row 取 loss/valid/reason，不接收跨视频
+      batch scalar 作为单视频更新。
+- [x] 无任何有效项时整次 inner update 跳过。
+- [x] 检查每项和总 loss 有限。
 
 #### P14.5 有标签 State Loss
 
-- [ ] 每个样本只计算对应任务的 `L_O1`、`L_O2`、`L_E1` 或 `L_E2`。
-- [ ] 定义 O1 六字段监督和 slot matching/mask。
-- [ ] 定义 O2 identity/match/novelty 监督。
-- [ ] 定义 E1 eventness/completion/transition 监督。
-- [ ] 定义 E2 event/phase/FSM 辅助监督。
-- [ ] 加入 9 类 `L_operator`。
-- [ ] 加入 record-level 正负样本 `L_retrieval`。
-- [ ] 加入时间语义和合法数值窗口 `L_time`。
-- [ ] 实现 `L_state=L_task+lambda_op*L_operator+lambda_ret*L_retrieval+lambda_time*L_time`。
-- [ ] 不为不相关 Head 构造伪标签或 loss。
+- [x] 每个样本只计算对应任务的 `L_O1`、`L_O2`、`L_E1` 或 `L_E2`。
+- [x] 定义 O1 六字段监督并消费 P15 target builder 提供的 pre-matched dense slot/mask；P14
+      不从最终 count 伪造 slot assignment。
+- [x] 定义 O2 identity/match/novelty 监督。
+- [x] 定义 E1 eventness/completion/transition 监督。
+- [x] 定义 E2 四个 event BCE 与 phase CE；phase CE 是 hard FSM 不入图时的 soft FSM proxy。
+- [x] 加入 9 类 `L_operator`。
+- [x] 加入 record-level 正负样本 `L_retrieval`。
+- [x] 加入时间语义和合法数值窗口 `L_time`。
+- [x] 实现 `L_state=L_task+lambda_op*L_operator+lambda_ret*L_retrieval+lambda_time*L_time`。
+- [x] 不为不相关 Head 构造伪标签或 loss。
 
 #### P14.6 Answer 与 Outer Loss
 
-- [ ] 实现 teacher-forced answer CE。
-- [ ] 单独记录 number token accuracy。
-- [ ] 单独记录完整自然语言 answer accuracy。
-- [ ] 单独记录 Reader exact count accuracy。
-- [ ] Support inner update 后在后续 Query 计算 `L_outer=L_answer_after+L_state_after`。
-- [ ] 最终实现 `L_total=L_outer+0.1*mean(L_TTT)`。
-- [ ] 明确 after-update Query Loss 才训练“更新后是否更好”；auxiliary 只保持无标签目标可学习。
+- [x] 实现 teacher-forced answer CE。
+- [x] 单独记录 number token accuracy。
+- [x] 单独记录完整自然语言 answer accuracy。
+- [x] 单独记录 Reader exact count accuracy。
+- [x] Support inner update 后在后续 Query 计算 `L_outer=L_answer_after+L_state_after`。
+- [x] 最终实现 `L_total=L_outer+0.1*mean(L_TTT)`。
+- [x] `compute_losses` 本次计算出的 support `L_TTT` 必须自动进入 auxiliary mean，禁止因空的
+      additional-support tuple 静默漏项。
+- [x] 明确 after-update Query Loss 才训练“更新后是否更好”；auxiliary 只保持无标签目标可学习。
 
 #### P14.7 Functional SGD
 
-- [ ] 在 `functional_sgd.py` 实现只接收两个 fast matrix 的一步 SGD。
-- [ ] 默认 lr=`1e-4`、momentum=0、weight_decay=0、steps=1。
-- [ ] 更新前检查 loss finite。
-- [ ] 用 `autograd.grad` 或等价方式只求 fast gradients。
-- [ ] 检查每个 gradient finite。
-- [ ] 计算并记录 pre-clip norm。
-- [ ] 执行 global norm clip=1.0。
-- [ ] 裁剪后再次检查 finite/usable。
-- [ ] 无效时保持 `W_t` 不变并记录 skip reason。
-- [ ] 有效时生成 `W_(t+1)`，不在当前 chunk 重跑观测。
-- [ ] 为 Meta-TTT 保留所需可微更新路径；一阶/二阶近似若需选择，单独记录且不得静默 detach。
-- [ ] reset 时清空任何 SGD runtime state。
+- [x] 在 `functional_sgd.py` 实现只接收两个 fast matrix 的一步 SGD。
+- [x] 默认 lr=`1e-4`、momentum=0、weight_decay=0、steps=1。
+- [x] 更新前检查 loss finite。
+- [x] 用 `autograd.grad` 或等价方式只求 fast gradients。
+- [x] 检查每个 gradient finite。
+- [x] 计算并记录 pre-clip norm。
+- [x] 执行 global norm clip=1.0。
+- [x] 裁剪后再次检查 finite/usable。
+- [x] 无效时保持 `W_t` 不变并记录 skip reason。
+- [x] 有效时生成 `W_(t+1)`，不在当前 chunk 重跑观测。
+- [x] P14 Meta 路固定并显式记录 `meta_full_second_order`：`create_graph=True`、不 detach；
+      online 路记录 `online_leaf`。一阶近似若在 P16/P21 比较，必须另立配置与实验记录。
+- [x] reset 时清空任何 SGD runtime state。
 
 #### P14.8 梯度审计
 
-- [ ] 验证 Shared Encoder/Decoder 参数在线不变但其运算允许梯度传到 Fast Adapter。
-- [ ] 验证 hard Bank/FSM 没有梯度。
-- [ ] 验证 Query/Reader/LLM 不在 inner optimizer。
-- [ ] 输出每模块 gradient presence、norm 和 parameter delta 审计表。
-- [ ] 对非 finite loss/gradient 构造故障注入测试。
+- [x] 验证 Shared Encoder/Decoder 参数在线不变但其运算允许梯度传到 Fast Adapter。
+- [x] 验证 hard Bank/FSM 没有梯度。
+- [x] 验证 Query/Reader/LLM 不在 inner optimizer。
+- [x] 输出每模块 gradient presence、norm 和 parameter delta 审计表。
+- [x] 对非 finite loss/gradient 构造故障注入测试。
 
 ### 实施后验收项
 
-- [ ] Predictor shape、参数量和 T<2 invalid 行为正确。
-- [ ] 三个无标签项的 stop-gradient 方向和 valid mask 测试通过。
-- [ ] `L_TTT` 权重严格为 1/0.5/0.5，O1=0。
-- [ ] State Loss 只监督对应任务 Head。
-- [ ] Inner SGD 后只有两个 fast matrix 发生变化。
-- [ ] 当前 chunk 输出不因本 chunk 末更新而改变，下一 chunk 使用新参数。
-- [ ] 非有限和无有效项均安全跳过。
-- [ ] reset 后恢复 `W0`。
-- [ ] 梯度能穿过冻结状态网络到达 fast weights。
+- [x] Predictor shape、参数量和 T<2 invalid 行为正确。
+- [x] 三个无标签项的 stop-gradient 方向和 valid mask 测试通过。
+- [x] `L_TTT` 权重严格为 1/0.5/0.5，O1=0。
+- [x] State Loss 只监督对应任务 Head。
+- [x] Inner SGD 后只有两个 fast matrix 发生变化。
+- [x] 当前 chunk 输出不因本 chunk 末更新而改变，下一 chunk 使用新参数。
+- [x] 非有限和无有效项均安全跳过。
+- [x] reset 后恢复 `W0`。
+- [x] 梯度能穿过冻结状态网络到达 fast weights。
 
 ### 交付物与退出条件
 
-- [ ] 交付 `losses.py`、`functional_sgd.py`、loss dataclass、梯度/skip 审计和故障测试。
-- [ ] 任何非 fast 参数在 inner step 变化时禁止开始 Meta-TTT。
+- [x] 交付 `losses.py`、`functional_sgd.py`、loss dataclass、梯度/skip 审计和故障测试。
+- [x] 任何非 fast 参数在 inner step 变化时禁止开始 Meta-TTT。
 
 ---
 
@@ -1863,8 +1875,9 @@
 - [x] `tests/test_input_composer.py`：placeholder、mask、position、DeepStack。
 - [x] `tests/test_model.py`：编排顺序、DI、feature flags 与一次性 prefill 生命周期。
 - [x] `tests/test_p13_tiny_integration.py`：tiny Qwen 原生 mRoPE/DeepStack 与多步 decode。
-- [ ] `tests/test_losses.py`：三个 TTT 项、State/Answer/Outer loss。
-- [ ] `tests/test_functional_sgd.py`：只更新 fast、finite/clip/skip。
+- [x] `tests/test_losses.py`：三个 TTT 项、State/Answer/Outer loss。
+- [x] `tests/test_functional_sgd.py`：只更新 fast、finite/clip/skip。
+- [x] `tests/test_p14_gradient_audit.py`：真实冻结链与逐模块 gradient/delta 表。
 - [ ] `tests/test_inference_protocol.py`：reset、next-chunk 生效、generate 单次 prefill。
 - [ ] `tests/test_leakage_guards.py`：denylist、future frames、fold isolation。
 - [ ] `tests/test_end_to_end_demo.py`：ARCH 第 18 章全链路。

@@ -103,6 +103,7 @@ def test_v5_fast_and_inner_sgd_contract() -> None:
         "steps_per_chunk": 1,
         "grad_clip_norm": 1.0,
         "reset_per_video": True,
+        "meta_gradient_mode": "full_second_order",
     }
 
 
@@ -507,13 +508,32 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "input_dim": 768,
         "hidden_dim": 1536,
         "output_dim": 768,
+        "layer_norm_eps": 1.0e-5,
+        "activation": "silu",
+        "linear_bias": True,
+        "parameter_count": 2_363_136,
     }
+    predictor = config.predictor
+    expected_predictor_parameters = (
+        2 * predictor.input_dim
+        + predictor.input_dim * predictor.hidden_dim
+        + predictor.hidden_dim
+        + predictor.hidden_dim * predictor.output_dim
+        + predictor.output_dim
+    )
+    assert predictor.linear_bias is True
+    assert predictor.parameter_count == expected_predictor_parameters == 2_363_136
     assert config.loss.model_dump() == {
         "pred_weight": 1.0,
         "identity_weight": 0.5,
         "event_weight": 0.5,
         "o1_unlabeled_weight": 0.0,
+        "operator_weight": 1.0,
+        "retrieval_weight": 1.0,
+        "time_weight": 1.0,
         "auxiliary_outer_weight": 0.1,
+        "answer_causal_shift": True,
+        "answer_ignore_index": -100,
     }
 
 
@@ -934,7 +954,51 @@ def set_nested(*path_and_value: object) -> Mutation:
             set_nested("input_composer", "prefill_once", False),
             "input_composer.prefill_once",
         ),
+        (
+            set_nested("predictor", "layer_norm_eps", 1.0e-6),
+            "predictor.layer_norm_eps",
+        ),
+        (
+            set_nested("predictor", "activation", "gelu"),
+            "predictor.activation",
+        ),
+        (
+            set_nested("predictor", "linear_bias", False),
+            "predictor.linear_bias",
+        ),
+        (
+            set_nested("predictor", "parameter_count", 2_361_600),
+            "predictor.parameter_count",
+        ),
+        (set_nested("loss", "pred_weight", 0.5), "loss.pred_weight"),
+        (set_nested("loss", "identity_weight", 1.0), "loss.identity_weight"),
+        (set_nested("loss", "event_weight", 1.0), "loss.event_weight"),
+        (set_nested("loss", "o1_unlabeled_weight", 0.1), "loss.o1_unlabeled_weight"),
+        (set_nested("loss", "operator_weight", 0.5), "loss.operator_weight"),
+        (set_nested("loss", "retrieval_weight", 0.5), "loss.retrieval_weight"),
+        (set_nested("loss", "time_weight", 0.5), "loss.time_weight"),
+        (
+            set_nested("loss", "auxiliary_outer_weight", 0.2),
+            "loss.auxiliary_outer_weight",
+        ),
+        (
+            set_nested("loss", "answer_causal_shift", False),
+            "loss.answer_causal_shift",
+        ),
+        (
+            set_nested("loss", "answer_ignore_index", 0),
+            "loss.answer_ignore_index",
+        ),
         (set_nested("fast_ttt", "optimizer", "momentum", 0.9), "momentum must be 0.0"),
+        (
+            set_nested(
+                "fast_ttt",
+                "optimizer",
+                "meta_gradient_mode",
+                "first_order",
+            ),
+            "fast_ttt.optimizer.meta_gradient_mode",
+        ),
         (
             set_nested("retriever", "similarity_dtype", "float16"),
             "retriever.similarity_dtype",

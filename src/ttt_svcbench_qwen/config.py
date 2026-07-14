@@ -119,6 +119,7 @@ class InnerSGDConfig(FrozenModel):
     steps_per_chunk: PositiveInt
     grad_clip_norm: PositiveFloat
     reset_per_video: bool
+    meta_gradient_mode: str
 
 
 class FastTTTConfig(FrozenModel):
@@ -516,6 +517,10 @@ class PredictorConfig(FrozenModel):
     input_dim: PositiveInt
     hidden_dim: PositiveInt
     output_dim: PositiveInt
+    layer_norm_eps: PositiveFloat
+    activation: str
+    linear_bias: bool
+    parameter_count: PositiveInt
 
 
 class LossConfig(FrozenModel):
@@ -523,7 +528,12 @@ class LossConfig(FrozenModel):
     identity_weight: NonNegativeFloat
     event_weight: NonNegativeFloat
     o1_unlabeled_weight: NonNegativeFloat
+    operator_weight: NonNegativeFloat
+    retrieval_weight: NonNegativeFloat
+    time_weight: NonNegativeFloat
     auxiliary_outer_weight: NonNegativeFloat
+    answer_causal_shift: bool
+    answer_ignore_index: int
 
 
 class EvaluationConfig(FrozenModel):
@@ -689,6 +699,11 @@ class ProjectConfig(FrozenModel):
             ("fast_ttt.optimizer.steps_per_chunk", self.fast_ttt.optimizer.steps_per_chunk, 1),
             ("fast_ttt.optimizer.grad_clip_norm", self.fast_ttt.optimizer.grad_clip_norm, 1.0),
             ("fast_ttt.optimizer.reset_per_video", self.fast_ttt.optimizer.reset_per_video, True),
+            (
+                "fast_ttt.optimizer.meta_gradient_mode",
+                self.fast_ttt.optimizer.meta_gradient_mode,
+                "full_second_order",
+            ),
             ("spatial_encoder.input_dim", self.spatial_encoder.input_dim, 4096),
             ("spatial_encoder.hidden_dim", self.spatial_encoder.hidden_dim, 768),
             ("spatial_encoder.stages", self.spatial_encoder.stages, 2),
@@ -1431,11 +1446,20 @@ class ProjectConfig(FrozenModel):
             ("predictor.input_dim", self.predictor.input_dim, 768),
             ("predictor.hidden_dim", self.predictor.hidden_dim, 1536),
             ("predictor.output_dim", self.predictor.output_dim, 768),
+            ("predictor.layer_norm_eps", self.predictor.layer_norm_eps, 1.0e-5),
+            ("predictor.activation", self.predictor.activation, "silu"),
+            ("predictor.linear_bias", self.predictor.linear_bias, True),
+            ("predictor.parameter_count", self.predictor.parameter_count, 2_363_136),
             ("loss.pred_weight", self.loss.pred_weight, 1.0),
             ("loss.identity_weight", self.loss.identity_weight, 0.5),
             ("loss.event_weight", self.loss.event_weight, 0.5),
             ("loss.o1_unlabeled_weight", self.loss.o1_unlabeled_weight, 0.0),
+            ("loss.operator_weight", self.loss.operator_weight, 1.0),
+            ("loss.retrieval_weight", self.loss.retrieval_weight, 1.0),
+            ("loss.time_weight", self.loss.time_weight, 1.0),
             ("loss.auxiliary_outer_weight", self.loss.auxiliary_outer_weight, 0.1),
+            ("loss.answer_causal_shift", self.loss.answer_causal_shift, True),
+            ("loss.answer_ignore_index", self.loss.answer_ignore_index, -100),
             (
                 "evaluation.official_clean_tuning_forbidden",
                 self.evaluation.official_clean_tuning_forbidden,

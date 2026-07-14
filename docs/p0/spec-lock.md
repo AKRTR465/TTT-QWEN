@@ -7,8 +7,8 @@
 | 规范文件 | `ARCHITECTURE.md` |
 | SPEC_VERSION | `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval` |
 | 修订日期 | `2026-07-14` |
-| 文档状态 | `PARTIALLY IMPLEMENTED / P0-P13 ENGINEERING-VERIFIED` |
-| ARCHITECTURE_SHA256 | `b1ef88726da124835b43e1e64f2ee3d430a28d4670db785a223ff51224e07329` |
+| 文档状态 | `PARTIALLY IMPLEMENTED / P0-P14 ENGINEERING-VERIFIED` |
+| ARCHITECTURE_SHA256 | `d397cab2943fac9a032b718800d37c69c60e1b82152d395a8aa869cc3f454597` |
 | 基线 Git commit | `7f0185f8136faf88cc59e5ba2ec7309c36f8d013` |
 | UV_LOCK_SHA256 | `c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2` |
 | 基座模型 | `Qwen/Qwen3-VL-8B-Instruct` |
@@ -53,6 +53,12 @@
 10. Composer 固定 5 个 special token、左 padding、互斥 video/state/number mask；State 只在
     prefill 独立 scatter 一次，video/mRoPE/DeepStack 保持 Qwen 原生路径。
 11. query_time 之后的帧和答案/计数标签字段不进入 Bank、TTT、Retriever、Reader 或生成输入。
+12. Predictor 固定 LN 768→Linear 1536→SiLU→Linear 768、精确 2,363,136 参数；TTT 先逐视频
+    组合并只对 union-valid rows 求均值，O1 unlabeled 权重为零。
+13. 单视频 SGD 只能消费 typed TTT row；online=`online_leaf`，meta=`meta_full_second_order`，两矩阵
+    联合 FP32 clip=1，attempted=update+skip，只有下一代 fast matrices 允许 inner delta。
+14. O1 State target 是 P15 builder 提供的 pre-matched dense slots；E2 phase CE 是 hard FSM
+    不入图时的 soft proxy。P14 不从最终 count 伪造 dense labels。
 
 ## 第一版禁止项
 
