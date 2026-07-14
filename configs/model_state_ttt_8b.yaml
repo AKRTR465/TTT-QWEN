@@ -486,6 +486,48 @@ stage_a:
     save_runtime_state: false
     best_metric: validation_total_loss
 
+stage_b:
+  variant: a3
+  support_chunks: 1
+  minimum_query_points: 1
+  enabled_ttt_terms: [pred]
+  inner_sgd_enabled: true
+  update_effect: next_chunk_only
+  auxiliary_outer_weight: 0.1
+  reset_per_episode: true
+  compare_before_after: true
+  meta_gradient_mode: meta_full_second_order
+  reuse_strategy: causal_replay_isolated_prefill
+  synthetic_engineering_gate_only: true
+  seed: 42
+
+stage_c:
+  active_variant: a5
+  variants: [a4, a5]
+  a4_enabled_ttt_terms: [pred, identity]
+  a5_enabled_ttt_terms: [pred, identity, event]
+  support_chunk_schedule: [1, 4, 8]
+  maximum_support_chunks: 8
+  minimum_query_points: 2
+  multi_query_enabled: true
+  detach_overlap_snapshots: true
+  detach_runtime_between_chunks: true
+  update_effect: next_chunk_only
+  reuse_strategy: causal_replay_isolated_prefill
+  synthetic_engineering_gate_only: true
+  seed: 42
+
+inference:
+  reset_per_video: true
+  update_effect: next_chunk_only
+  prefill_once: true
+  decode_state_immutable: true
+  release_on_exception: true
+  checksum_runtime_state: true
+  repeat_query_policy: explicit_new_or_retry
+  record_skip_reasons: true
+  synthetic_engineering_gate_only: true
+
 evaluation:
   formal_evaluation_enabled: false
   official_clean_tuning_forbidden: true

@@ -1,5 +1,8 @@
 .venv/
+venv/
 .env
+.env.*
+!.env.example
 *.local.yaml
 
 __pycache__/
@@ -16,6 +19,7 @@ htmlcov/
 data/
 datasets/
 models/
+weights/
 checkpoints/
 outputs/
 runs/
@@ -28,4 +32,3 @@ wandb/
 *.pth
 *.ckpt
 *.safetensors
-

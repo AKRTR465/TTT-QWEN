@@ -13,7 +13,11 @@ from typing import cast
 import torch
 from torch import Tensor
 
-from ttt_svcbench_qwen.identity_bank import IdentityBank, IdentityBankRuntimeState
+from ttt_svcbench_qwen.identity_bank import (
+    IdentityBank,
+    IdentityBankRuntimeState,
+    IdentityObservationDecision,
+)
 from ttt_svcbench_qwen.model import (
     BankWriteOutput,
     ObservationChunkRequest,
@@ -195,6 +199,7 @@ class StageAWriteAudit:
     bank_versions_after: tuple[int, ...]
     record_counts_after: tuple[int, ...]
     identity_counts_after: tuple[int, ...]
+    identity_decisions: tuple[tuple[IdentityObservationDecision, ...], ...]
     skipped_rows: tuple[int, ...]
     inner_sgd_attempted: int = 0
     inner_sgd_updated: int = 0
@@ -207,6 +212,7 @@ class StageAWriteAudit:
             self.bank_versions_after,
             self.record_counts_after,
             self.identity_counts_after,
+            self.identity_decisions,
         )
         if batch_size <= 0 or any(len(values) != batch_size for values in fields):
             raise ValueError("Stage A write audit must align to one non-empty batch")
@@ -297,6 +303,9 @@ class StageABankWriter:
         soft = self._project_soft(spatial, temporal, observations)
         next_banks = list(runtime.state_bank_states)
         next_identities = list(runtime.identity_bank_states)
+        identity_decisions: list[tuple[IdentityObservationDecision, ...]] = [
+            () for _ in runtime.identity_bank_states
+        ]
         skipped: list[int] = []
         for row, operator in enumerate(query.hard_operators):
             head = OPERATOR_TO_HEAD_TYPE[operator]
@@ -331,6 +340,7 @@ class StageABankWriter:
                 )
                 next_identities[row] = result.identity_state
                 next_banks[row] = result.state_bank_state
+                identity_decisions[row] = result.decisions
             elif head is HeadType.E1:
                 event_kind = OPERATOR_TO_EVENT_KIND[operator]
                 if not isinstance(event_kind, E1EventKind):
@@ -373,6 +383,7 @@ class StageABankWriter:
             bank_versions_after=tuple(state.version for state in next_banks),
             record_counts_after=tuple(len(state.records) for state in next_banks),
             identity_counts_after=tuple(state.unique_count for state in next_identities),
+            identity_decisions=tuple(identity_decisions),
             skipped_rows=tuple(skipped),
         )
         return BankWriteOutput(

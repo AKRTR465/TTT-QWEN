@@ -1338,6 +1338,13 @@
 
 ## P16. Stage B：单步 Meta-TTT
 
+> **2026-07-14 审计结论**：`meta_trainer.py`、A3 配置、
+> `tests/test_meta_trainer.py`、`tests/test_stage_gate_artifacts.py` 与 `docs/p16/README.md`
+> 已覆盖本阶段代码、正/负路径和 fail-closed 产物门禁。定向验证为 P16/P17/P18 新增套件
+> `32 passed`，P14 loss/functional-SGD 相邻套件 `44 passed`，Ruff 与 Mypy 通过。
+> **边界**：这里的 `[x]` 仅表示 synthetic/tiny CPU 工程闭环通过；没有使用真实视频、
+> SVCBench、Qwen3-VL-8B 权重或 GPU，也不构成收敛、精度或科学收益证据。
+
 ### 目标与依赖
 
 使用 1 个 Support chunk、仅 `L_pred` 和一步 functional SGD，验证元训练、reset 和 after-update Query 监督。依赖 P15。
@@ -1351,39 +1358,45 @@
 
 ### 实施过程 TODO
 
-- [ ] 构造 episode：1 Support chunk + 至少 1 个后续 Query point。
-- [ ] Support 使用当前 `W_t` 前向并写 hard state。
-- [ ] 计算当前 chunk 内 `L_pred`。
-- [ ] 只对两个 fast matrix 做一步 SGD。
-- [ ] 得到 `W_(t+1)` 并仅用于后续 Query/chunk。
-- [ ] 在 Query 上计算 after-update `L_answer+L_state`。
-- [ ] 加入 `0.1*L_pred` auxiliary。
-- [ ] 通过 outer gradient 学习 `W0` 和允许的 Outer 参数。
-- [ ] 每个 episode 开始 reset fast/SGD/cache/slot/Bank/FSM/audit。
-- [ ] 记录 before-update 与 after-update Query 指标。
-- [ ] 记录 update norm、gradient norm、skip reason、每视频 update 次数。
-- [ ] 对 first-order/second-order 实现做梯度正确性小张量检查。
-- [ ] 用固定 seed 做重复性测试。
-- [ ] 构造无有效时间位置 Support，确认跳过而不破坏 episode。
+- [x] 构造 episode：1 Support chunk + 至少 1 个后续 Query point。
+- [x] Support 使用当前 `W_t` 前向并写 hard state。
+- [x] 计算当前 chunk 内 `L_pred`。
+- [x] 只对两个 fast matrix 做一步 SGD。
+- [x] 得到 `W_(t+1)` 并仅用于后续 Query/chunk。
+- [x] 在 Query 上计算 after-update `L_answer+L_state`。
+- [x] 加入 `0.1*L_pred` auxiliary。
+- [x] 通过 outer gradient 学习 `W0` 和允许的 Outer 参数。
+- [x] 每个 episode 开始 reset fast/SGD/cache/slot/Bank/FSM/audit。
+- [x] 记录 before-update 与 after-update Query 指标。
+- [x] 记录 update norm、gradient norm、skip reason、每视频 update 次数。
+- [x] 对 first-order/second-order 实现做梯度正确性小张量检查。
+- [x] 用固定 seed 做重复性测试。
+- [x] 构造无有效时间位置 Support，确认跳过而不破坏 episode。
 
 ### 实施后验收项
 
-- [ ] 单 Support 流程严格按 observe→state→loss→SGD→next 生效。
-- [ ] Support 标签没有进入 inner loss。
-- [ ] after-update Query loss 能反传到 meta-learned `W0`。
-- [ ] 只有两个 fast matrix 在 episode 内变化。
-- [ ] 不同 episode/video 之间无 fast 或 state 污染。
-- [ ] before/after 指标、update norm 和 skip 率均可审计。
-- [ ] A3（A2+`L_pred`+SGD）可独立运行。
+- [x] 单 Support 流程严格按 observe→state→loss→SGD→next 生效。
+- [x] Support 标签没有进入 inner loss。
+- [x] after-update Query loss 能反传到 meta-learned `W0`。
+- [x] 只有两个 fast matrix 在 episode 内变化。
+- [x] 不同 episode/video 之间无 fast 或 state 污染。
+- [x] before/after 指标、update norm 和 skip 率均可审计。
+- [x] A3（A2+`L_pred`+SGD）可独立运行。
 
 ### 交付物与退出条件
 
-- [ ] 交付 Stage B episode runner、meta-gradient 测试、A3 配置和报告。
-- [ ] reset、更新方向或 outer gradient 任一不正确时禁止加入一致性 loss。
+- [x] 交付 Stage B episode runner、meta-gradient 测试、A3 配置和报告。
+- [x] reset、更新方向或 outer gradient 任一不正确时禁止加入一致性 loss。
 
 ---
 
 ## P17. Stage C：身份/事件一致性与多 Support
+
+> **2026-07-14 审计结论**：A4/A5 隔离、相邻 chunk detach/overlap、1/4/8 Support、
+> multi-Query、invalid skip、图释放与 synthetic paired-CI 工具已有代码和定向测试证据；
+> fail-closed 阶段产物契约见 `stage_gate_artifacts.py`，阶段记录见 `docs/p17/README.md`。
+> **边界**：当前仍是 synthetic/tiny CPU 工程证据。独立 `missed-new` 指标尚未接入 runner
+> 审计，且 CPU graph 回收不能替代 GPU 显存验证；真实消融收益与置信结论仍属于 P19/P21/P22。
 
 ### 目标与依赖
 
@@ -1400,53 +1413,66 @@
 
 #### P17.1 加入身份一致性
 
-- [ ] 在 A3 上只开启 `L_id`，形成 A4。
-- [ ] 验证可靠匹配 mask、无匹配 invalid 和 stop-gradient。
-- [ ] 监控 identity duplicate/missed-new、梯度 norm 和 update skip。
-- [ ] 比较 A4 vs A3，记录收益、退化和置信区间。
+- [x] 在 A3 上只开启 `L_id`，形成 A4。
+- [x] 验证可靠匹配 mask、无匹配 invalid 和 stop-gradient。
+- [ ] 监控 identity duplicate/missed-new、梯度 norm 和 update skip；当前已有
+      duplicate/low-confidence、gradient norm 与 skip 审计，缺少独立 `missed-new` 指标。
+- [x] 比较 A4 vs A3，记录收益、退化和置信区间；当前仅为 synthetic paired CI，
+      明确禁止据此宣称真实收益。
 
 #### P17.2 加入事件一致性
 
-- [ ] 在 A4 上开启 `L_event`，形成 A5。
-- [ ] 分开记录 E1 overlap 和 E2 overlap。
-- [ ] 验证 event/phase mask、MSE/KL 和 FSM detach。
-- [ ] 比较 A5 vs A4，记录分任务收益。
+- [x] 在 A4 上开启 `L_event`，形成 A5。
+- [x] 分开记录 E1 overlap 和 E2 overlap。
+- [x] 验证 event/phase mask、MSE/KL 和 FSM detach。
+- [x] 比较 A5 vs A4，记录分任务收益；当前仅验证 synthetic 分任务报告工具，
+      不代表真实 SVCBench 收益。
 
 #### P17.3 多 Support
 
-- [ ] 逐步从 1 增加到 4 个连续 Support chunks。
-- [ ] 稳定后扩展到最多 8 个连续 Support chunks。
-- [ ] 每个有效 chunk 最多一步 SGD。
-- [ ] 每步更新只影响后续 chunk。
-- [ ] 维护 fast version、temporal cache、slot state、Bank/FSM 的一致时间轴。
-- [ ] 限制 autograd 生命周期，确认显存不会随整段视频无界增长。
-- [ ] 对 invalid chunk 跳过更新但继续正确推进时间和 hard state。
+- [x] 逐步从 1 增加到 4 个连续 Support chunks。
+- [x] 稳定后扩展到最多 8 个连续 Support chunks。
+- [x] 每个有效 chunk 最多一步 SGD。
+- [x] 每步更新只影响后续 chunk。
+- [x] 维护 fast version、temporal cache、slot state、Bank/FSM 的一致时间轴。
+- [ ] 限制 autograd 生命周期，确认显存不会随整段视频无界增长；当前已证明 CPU
+      8-Support backward 后 graph 可回收且跨 episode 节点不增长，GPU 显存仍待 P19 实测。
+- [x] 对 invalid chunk 跳过更新但继续正确推进时间和 hard state。
 
 #### P17.4 多 Query point
 
-- [ ] 一个 episode 支持多个后续 query point。
-- [ ] 每个 query 只读取其 query_time 之前的 state。
-- [ ] 同视频 query point 共享因果历史时，明确 trajectory 隔离/复用策略并保持规范键。
-- [ ] 分别计算每个 query 的 after-update Answer/State loss。
-- [ ] 防止较晚 query 的标签或状态回流到较早 query。
+- [x] 一个 episode 支持多个后续 query point。
+- [x] 每个 query 只读取其 query_time 之前的 state。
+- [x] 同视频 query point 共享因果历史时，明确 trajectory 隔离/复用策略并保持规范键。
+- [x] 分别计算每个 query 的 after-update Answer/State loss。
+- [x] 防止较晚 query 的标签或状态回流到较早 query。
 
 ### 实施后验收项
 
-- [ ] A4、A5 能分别复现，配置差异只包含目标增量。
-- [ ] 1/4/8 Support 的更新时间线可逐步审计。
-- [ ] 多 Query 不发生未来信息或标签泄漏。
-- [ ] 显存不会因跨 chunk graph 无界增长。
-- [ ] `L_TTT=L_pred+0.5L_id+0.5L_event` 精确生效。
-- [ ] 每个增量都有 before/after、分任务和失败案例。
+- [x] A4、A5 能分别复现，配置差异只包含目标增量。
+- [x] 1/4/8 Support 的更新时间线可逐步审计。
+- [x] 多 Query 不发生未来信息或标签泄漏。
+- [ ] 显存不会因跨 chunk graph 无界增长；当前只有 bounded CPU graph 生命周期证据，
+      尚无 CUDA 显存曲线。
+- [x] `L_TTT=L_pred+0.5L_id+0.5L_event` 精确生效。
+- [x] 每个增量都有 before/after、分任务和失败案例；结果仅为 synthetic 工程记录。
 
 ### 交付物与退出条件
 
-- [ ] 交付 Stage C runner、A4/A5 配置、multi-support/query 测试和消融报告。
-- [ ] 只有 A5 完成因果与状态审计后才允许构建正式推理路径。
+- [x] 交付 Stage C runner、A4/A5 配置、multi-support/query 测试和 synthetic 消融报告。
+- [x] A5 的 synthetic/tiny CPU 因果与状态审计已通过，允许构建 P18 runtime 骨架；
+      这不等于允许正式 8B 服务器评估。
 
 ---
 
 ## P18. 测试时协议与推理入口
+
+> **2026-07-14 审计结论**：`inference.py` 已交付 per-video runtime manager、因果裁剪、
+> Fast Adapter 受管绑定、hard-state bridge、query/prefill/decode/release 生命周期、协议 CLI
+> 与失败路径测试；`tests/test_inference_protocol.py` 和阶段产物门禁均已通过。
+> **边界**：这是 synthetic/tiny CPU runtime 骨架。生产 `TTTUpdateStage` 尚未把真实
+> `L_TTT` 与 functional SGD 接入推理 manager，`GenerationDriver` 也尚未在真实
+> Qwen3-VL-8B 上生成；BF16、FlashAttention、多 GPU、显存、吞吐和真实效果均未完成。
 
 ### 目标与依赖
 
@@ -1463,61 +1489,66 @@
 
 #### P18.1 每视频 reset
 
-- [ ] reset fast weights 到 `W0`。
-- [ ] reset SGD state。
-- [ ] reset temporal cache。
-- [ ] reset recurrent slot state。
-- [ ] reset Identity Candidate/Confirmed/Hot Cache。
-- [ ] reset O1/E1/E2 FSM 和 event histories。
-- [ ] reset Reader audit state。
-- [ ] reset GRU hidden、fast version 和 update counters。
-- [ ] 为 reset 前后生成 state checksum，证明无跨视频残留。
+- [x] reset fast weights 到 `W0`。
+- [x] reset SGD state。
+- [x] reset temporal cache。
+- [x] reset recurrent slot state。
+- [x] reset Identity Candidate/Confirmed/Hot Cache。
+- [x] reset O1/E1/E2 FSM 和 event histories。
+- [x] reset Reader audit state。
+- [x] reset GRU hidden、fast version 和 update counters。
+- [x] 为 reset 前后生成 state checksum，证明无跨视频残留。
 
 #### P18.2 每 chunk 因果流程
 
-- [ ] 第 1 步：严格裁剪到 query_time 以前。
-- [ ] 第 2 步：Qwen ViT + Main Merger。
-- [ ] 第 3 步：Fast Adapter 使用当前 `W_t`。
-- [ ] 第 4 步：空间对象路和时间事件路。
-- [ ] 第 5 步：四 Decoder 产生 soft observation。
-- [ ] 第 6 步：`no_grad` 更新 State Bank/FSM。
-- [ ] 第 7 步：若有有效无标签目标，计算 `L_TTT`。
-- [ ] 第 8 步：一步 SGD 得到 `W_(t+1)`。
-- [ ] 记录 chunk id、时间范围、fast version、更新是否执行和 skip reason。
+- [x] 第 1 步：严格裁剪到 query_time 以前。
+- [x] 第 2 步：Qwen ViT + Main Merger。
+- [x] 第 3 步：Fast Adapter 使用当前 `W_t`。
+- [x] 第 4 步：空间对象路和时间事件路。
+- [x] 第 5 步：四 Decoder 产生 soft observation。
+- [x] 第 6 步：`no_grad` 更新 State Bank/FSM。
+- [ ] 第 7 步：若有有效无标签目标，计算 `L_TTT`；当前 manager 只有 fail-closed
+      `TTTUpdateStage` 注入契约，尚无生产推理 updater。
+- [ ] 第 8 步：一步 SGD 得到 `W_(t+1)`；版本/边界校验已实现并由 tiny updater 测试，
+      但真实 `functional_sgd_steps_from_ttt` 尚未接入 P18。
+- [x] 记录 chunk id、时间范围、fast version、更新是否执行和 skip reason。
 
 #### P18.3 回答 query
 
-- [ ] Query Encoder 生成三个 embedding。
-- [ ] operator prototypes 生成 hard operator/unsupported。
-- [ ] Time Resolver 生成显式 TimeWindow。
-- [ ] q_target 检索当前合法 Bank。
-- [ ] Reader 计算 exact integer 和 number tokens。
-- [ ] Resampler 生成 16 个 State Token。
-- [ ] Composer 组装 question/video/state/number。
-- [ ] Qwen LLM 生成自然语言答案。
-- [ ] 保存 ReaderResult、selected records、State attention 和最终文本。
+- [x] Query Encoder 生成三个 embedding。
+- [x] operator prototypes 生成 hard operator/unsupported。
+- [x] Time Resolver 生成显式 TimeWindow。
+- [x] q_target 检索当前合法 Bank。
+- [x] Reader 计算 exact integer 和 number tokens。
+- [x] Resampler 生成 16 个 State Token。
+- [x] Composer 组装 question/video/state/number。
+- [ ] Qwen LLM 生成自然语言答案；decode/generation 生命周期和接口已覆盖，当前仅由
+      synthetic driver 生成文本，尚无真实 8B generation 证据。
+- [x] 保存 ReaderResult、selected records、State attention 和最终文本。
 
 #### P18.4 Generate 生命周期
 
-- [ ] prefill 前只执行一次 query read/composition。
-- [ ] decode step 只更新 LLM KV cache。
-- [ ] decode step 禁止修改 Bank、FSM、fast weights、slot state 或 temporal cache。
-- [ ] 重复调用 generate 时明确是新 query 还是同 query 重试，并保持 state 语义一致。
-- [ ] abort/exception 后安全释放当前 runtime，不污染下一视频。
+- [x] prefill 前只执行一次 query read/composition。
+- [x] decode step 只更新 LLM KV cache。
+- [x] decode step 禁止修改 Bank、FSM、fast weights、slot state 或 temporal cache。
+- [x] 重复调用 generate 时明确是新 query 还是同 query 重试，并保持 state 语义一致。
+- [x] abort/exception 后安全释放当前 runtime，不污染下一视频。
 
 ### 实施后验收项
 
-- [ ] 两个连续视频的首 chunk 均从相同 `W0` 和空 Bank 开始。
-- [ ] 当前 chunk 更新只影响下一 chunk。
-- [ ] query_time 后帧的扰动不改变 ReaderResult 或答案输入。
-- [ ] generate 多 token 期间 fast/Banks checksum 不变。
-- [ ] invalid/unsupported/empty/ok 四种 Reader 状态均能生成合规响应。
-- [ ] 推理日志能完整重放每次计数来源。
+- [x] 两个连续视频的首 chunk 均从相同 `W0` 和空 Bank 开始。
+- [x] 当前 chunk 更新只影响下一 chunk；当前证据验证 runtime/update 契约，真实 updater
+      仍为上一节未完成项。
+- [x] query_time 后帧的扰动不改变 ReaderResult 或答案输入。
+- [x] generate 多 token 期间 fast/Banks checksum 不变。
+- [x] invalid/unsupported/empty/ok 四种 Reader 状态均能生成合规响应。
+- [x] 推理结果保留 ReaderResult、selected record IDs 与 arithmetic audit，可回放计数来源。
 
 ### 交付物与退出条件
 
-- [ ] 交付 `inference.py`、per-video runtime manager、CLI/入口和端到端因果测试。
-- [ ] reset 或 future-leakage 测试失败时禁止服务器正式评估。
+- [x] 交付 `inference.py`、per-video runtime manager、协议 CLI/入口和 synthetic/tiny
+      端到端因果测试。
+- [x] reset 或 future-leakage 证据失败时，P18 fail-closed gate 禁止进入服务器正式评估。
 
 ---
 

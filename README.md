@@ -4,8 +4,11 @@
 
 完整架构、训练协议和消融方案见 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前对齐版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
+当前实施边界、验证结果与服务器迁移顺序见
+[IMPLEMENTATION_PROGRESS.md](./IMPLEMENTATION_PROGRESS.md)。
 
-> 当前施工状态：P0–P15 已通过工程门禁；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
+> 当前施工状态：P0–P17 已通过本机 synthetic/tiny/小张量 CPU 工程门禁，P18 已通过 runtime
+> 骨架门禁；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
 > P3 用官方 HF meta 模块和 tiny 随机权重模型完成 Qwen 接口与 DeepStack 工程验收。真实 8B
 > A0/集成仍保留在 P19/P21/P22；P4 已完成 Query Encoder、Operator Router 与 Time Window
 > Resolver 的工程门禁，但尚未训练或校准。P5 Fast Adapter 已通过纯合成张量工程门禁，
@@ -18,8 +21,13 @@
 > P14 typed loss、逐视频 functional SGD、full-second-order meta 路与梯度/delta 审计也已用合成
 > case 通过；P15 已以 synthetic/tiny A2 接通 typed target、hard Bank/FSM、Retriever/Reader、
 > Composer/Qwen prefill、`L_state+L_answer`、Outer AdamW、独立指标与 trainable-only checkpoint。
-> 该证据不包含真实视频、数据集或 8B 权重；P16 尚未开始，必须先通过 P15 artifact/hash/
-> Reader-stability exit gate。
+> P16 已以 A3 接通单 Support→functional SGD→后续 Query→outer gradient 的 Stage B 闭环；P17
+> 已以 A4/A5 接通 identity/event consistency、1/4/8 Support 与多 Query 的 Stage C CPU 工程闭环，
+> 但独立 missed-new runner 指标与 GPU 显存证据仍待补；P18 runtime 骨架已接通逐视频
+> reset/release、因果 chunk、Fast Adapter state 绑定、update stage 注入契约、单次 prefill 与
+> immutable decode。生产 `TTTUpdateStage` 尚未把真实 `L_TTT`→functional SGD 接入 manager，真实
+> Qwen3-VL-8B `GenerationDriver` 也尚未运行；真实加载、训练、生成、收敛与效果验证仍从 P19 开始，
+> 并在 P21/P22 完成校准、消融和 clean 评估。
 
 ## 当前固定条件
 
@@ -40,7 +48,7 @@
   24,815,360参数；时间事件路使用6层、768维Pre-LN GELU因果Transformer，absolute sinusoidal
   使用显式global position id，Q/K/V/O带bias，LayerNorm eps为`1e-5`；
 - P6的`required_slot_counts`只做preserve-existing/reject-excess容量审计，不表示已从视频识别
-  真实对象；P13 已提供组合入口，跨视频 reset 与完整受管推理生命周期仍留 P18；
+  真实对象；P13 已提供组合入口，P18 runtime 骨架已补齐跨视频 reset/release 与受管生命周期边界；
 - O1/O2/E1/E2分别使用FiLM MLP、256维identity MLP、5层gated causal TCN和2层GRU；仅O1
   直接读取q_target，E1/E2读取P7已query-conditioned的H_t；O1固定`1+scale` FiLM，O2在FP32
   做L2归一化并对有效零范数回退到unit basis；
@@ -86,6 +94,13 @@
 - P15 工程配置固定 A2、`static_w0_no_inner_sgd` 和冻结 Qwen；只有 static `W0`
   与显式状态模块进入 Outer AdamW，Predictor、functional SGD、transient `W_t`、
   hard runtime 与 Qwen 参数均排除。
+- P16 Stage B 固定 A3、单 Support 与仅 `L_pred` 的 inner step；P17 Stage C 固定 A4/A5 隔离
+  identity/event 增量，并覆盖 1/4/8 Support 与多后续 Query；两阶段只验证 synthetic/tiny CPU
+  调度、梯度、因果和图生命周期；P17 独立 missed-new runner 指标与 CUDA 显存曲线尚未完成。
+- P18 runtime 骨架固定逐视频原子 reset/release、因果裁剪、Fast Adapter state 绑定、注入式 update
+  stage 的 next-only 边界、单次 read/compose/prefill 与不修改 runtime 的 decode；生产
+  `L_TTT`→functional SGD updater 与真实 8B `GenerationDriver` 未接通，BF16、FlashAttention、
+  DeepSpeed 和多 GPU 仍属于 P19+。
 
 ## 本机安装
 
@@ -107,11 +122,11 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | :--- | :--- |
 | v5 YAML、完整解析、固定维度/容量/优化器校验 | P1 已实现并有契约测试 |
 | Video/Query/Encoder/Observation/Record/Retriever/Reader/runtime 类型 | P1 已实现并有 shape/dtype/边界测试 |
-| 推荐模块导入与职责边界 | P1 已实现；P3–P15 对应模块已通过各自工程门禁，P16 及后续入口仍按阶段 fail closed |
+| 推荐模块导入与职责边界 | P1 已实现；P3–P17 对应模块已通过各自工程门禁，P18 仅通过 runtime 骨架门禁，P19 及后续入口仍按阶段 fail closed |
 | 数据 schema、防泄漏、因果切分、processor/query token、A0 runner | P2 工程门禁已通过；fold/A0 为明确标注的合成替代 |
 | Qwen video boundary、Main Merger 插入点、DeepStack 保护 | P3 已实现；tiny/meta 工程契约已验证，真实 8B 留至 P19 |
 | Query Encoder、9-prototype Router、Time Window Resolver | P4 已实现；本地结构/参数/offset/fail-closed 契约已验证，模型尚未训练、阈值尚未校准 |
-| Fast Adapter、per-video fast state、参数边界 | P5 状态边界与 P14 typed row→functional SGD/gradient audit 已通过合成门禁；受管在线生命周期留至 P18，真实 8B 留至 P19 |
+| Fast Adapter、per-video fast state、参数边界 | P5 状态边界与 P14 typed row→functional SGD/gradient audit 已通过合成门禁；P18 只验证受管绑定和注入式更新边界，生产 updater 与真实 8B 留至 P19+ |
 | P6 空间对象编码器 | 已通过本地合成张量工程门禁；真实视频/8B、语义对象 overflow 与端到端 runtime 仍留后续阶段 |
 | P7 时间事件编码器 | 已通过本地合成张量工程门禁；逐层 KV、overlap replay margin、因果滑窗和 runtime 隔离均已验证 |
 | P8 四类 Observation Decoder | 已通过本地合成张量工程门禁；输出/metadata、因果流式 replay、runtime 隔离、精确参数和 online freeze 均已验证 |
@@ -122,8 +137,10 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | P13 Input Composer 与模型编排 | 已通过 synthetic/tiny 工程门禁；固定 token 注册/初始化、变长 payload/左 padding、三类 mask、原生 mRoPE/rope delta/cache、预计算 adapted Main+原 DeepStack、Reader 重验、observe/answer/decode 生命周期均已验证 |
 | P14 Loss 与 functional SGD | 已通过合成门禁；逐 row loss/valid/skip、full-second-order meta、finite/clip/reset、模块 gradient/delta 表均已验证 |
 | P15 Stage A 显式状态 Warm-up | 已通过 synthetic/tiny A2 工程门禁；Qwen/Inner SGD 冻结，typed provenance target、四类 hard rollout、Reader/Qwen prefill、State+Answer Outer step、指标、checkpoint 与 fail-closed exit gate 已验证 |
-| P16–P19 Meta-TTT、推理与分布式 | 尚未开始；P16 需 P15 exit gate，P18 跨 runtime reset 与 P19 真实 8B 仍保留 |
-| 真实 8B、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行 |
+| P16 Stage B 单步 Meta-TTT | 已通过 synthetic/tiny CPU A3 工程门禁；单 Support、`L_pred` inner step、next-only functional SGD、后续 Query outer loss、full-second-order `W0` gradient、reset/skip/leakage 审计均已验证 |
+| P17 Stage C 多 Support Meta-TTT | 已通过 synthetic/tiny CPU A4/A5 工程闭环；identity/event objective 隔离、O2/E1/E2 overlap matcher、1/4/8 Support、多 Query 与 bounded CPU graph 回收已验证；独立 missed-new runner 指标和 GPU 显存证据待补 |
+| P18 测试时协议与推理入口 | 已通过 synthetic/tiny CPU runtime 骨架门禁；reset/checksum/release、因果裁剪、真实 Fast Adapter state 绑定、Stage A runtime bridge、update stage 注入/next-only 边界、单次 prefill、immutable decode 与失败释放已验证；生产 `L_TTT`→functional SGD updater 和真实 8B `GenerationDriver` 未运行 |
+| 真实 Qwen3-VL-8B、分布式、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行；P16–P17 的 CPU 工程证据与 P18 runtime 骨架证据不得用于真实训练、性能或科学增益结论 |
 
 ## 环境变量
 

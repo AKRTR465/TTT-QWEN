@@ -7,8 +7,8 @@
 | 规范文件 | `ARCHITECTURE.md` |
 | SPEC_VERSION | `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval` |
 | 修订日期 | `2026-07-14` |
-| 文档状态 | `PARTIALLY IMPLEMENTED / P0-P15 ENGINEERING-VERIFIED` |
-| ARCHITECTURE_SHA256 | `31f3d98eea2d9d6b4dbeca687d025c717de22009319df883e37a511eb7d40352` |
+| 文档状态 | `PARTIALLY IMPLEMENTED / P0-P17 SYNTHETIC-TINY ENGINEERING-VERIFIED + P18 RUNTIME-SKELETON-VERIFIED` |
+| ARCHITECTURE_SHA256 | `edbd18f83ed32ad3b2b0d0a475c677d052440cdbf3c7ec1b2340cfc71d7d9f0a` |
 | 基线 Git commit | `7f0185f8136faf88cc59e5ba2ec7309c36f8d013` |
 | UV_LOCK_SHA256 | `c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2` |
 | 基座模型 | `Qwen/Qwen3-VL-8B-Instruct` |
@@ -62,8 +62,8 @@
 15. P15 低空间 Stage A 固定 A2、`static_w0_no_inner_sgd`、冻结 Qwen 和空 Qwen
     allowlist；A2 只计算 State+Answer Loss，Inner TTT/Predictor/functional SGD 不可达。
     target 只认 `official_explicit`/`synthetic_explicit`/`missing` provenance，hard write 与 soft
-    gradient 分离；只保存 trainable-only checkpoint。P16 必须在 P15 artifact/hash/
-    Reader-stability exit gate 通过后才允许开始，当前尚未开始。
+    gradient 分离；只保存 trainable-only checkpoint。P16–P17 已在 P15 artifact/hash/
+    Reader-stability exit gate 通过后完成 synthetic/tiny CPU 工程门禁；P18 仅完成 runtime 骨架协议门禁。
 
 ## 第一版禁止项
 

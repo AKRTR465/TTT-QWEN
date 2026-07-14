@@ -324,6 +324,10 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
     assert result.runtime_state.next_chunk_index == 1
     assert isinstance(result.audit, StageAWriteAudit)
     assert result.audit.head_types == (HeadType.O1, HeadType.O2, HeadType.E1, HeadType.E2)
+    assert len(result.audit.identity_decisions) == 4
+    assert result.audit.identity_decisions[0] == ()
+    assert result.audit.identity_decisions[1]
+    assert result.audit.identity_decisions[2:] == ((), ())
     assert isinstance(result.soft_write, StageASoftWriteOutput)
     assert all(state.records for state in result.bank_states)
     assert all(

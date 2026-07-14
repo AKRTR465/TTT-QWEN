@@ -16,27 +16,19 @@ IMPLEMENTED = (
     ("stage_a_targets", "build_stage_a_targets"),
     ("stage_a_metrics", "compute_stage_a_metrics"),
     ("stage_a_runtime", "StageABankWriter"),
+    ("meta_trainer", "MetaTTTEpisodeRunner"),
+    ("inference", "run_inference"),
 )
 
-SKELETONS = (("inference", "run_inference", "P18"),)
+SKELETONS: tuple[tuple[str, str, str], ...] = ()
 
 
 def import_module(name: str) -> ModuleType:
     return importlib.import_module(f"ttt_svcbench_qwen.{name}")
 
 
-@pytest.mark.parametrize(("module_name", "entrypoint", "owner"), SKELETONS)
-def test_recommended_modules_import_and_unimplemented_paths_fail_explicitly(
-    module_name: str, entrypoint: str, owner: str
-) -> None:
-    module = import_module(module_name)
-    doc = module.__doc__ or ""
-
-    assert "Inputs:" in doc
-    assert "Outputs:" in doc
-    assert "Forbidden:" in doc
-    with pytest.raises(NotImplementedError, match=owner):
-        getattr(module, entrypoint)()
+def test_no_recommended_module_remains_an_unimplemented_skeleton() -> None:
+    assert SKELETONS == ()
 
 
 @pytest.mark.parametrize(("module_name", "entrypoint"), IMPLEMENTED)

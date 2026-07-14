@@ -571,6 +571,64 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
             "best_metric": "validation_total_loss",
         },
     }
+    assert config.stage_b.model_dump() == {
+        "variant": "a3",
+        "support_chunks": 1,
+        "minimum_query_points": 1,
+        "enabled_ttt_terms": ("pred",),
+        "inner_sgd_enabled": True,
+        "update_effect": "next_chunk_only",
+        "auxiliary_outer_weight": 0.1,
+        "reset_per_episode": True,
+        "compare_before_after": True,
+        "meta_gradient_mode": "meta_full_second_order",
+        "reuse_strategy": "causal_replay_isolated_prefill",
+        "synthetic_engineering_gate_only": True,
+        "seed": 42,
+    }
+    assert config.stage_c.model_dump() == {
+        "active_variant": "a5",
+        "variants": ("a4", "a5"),
+        "a4_enabled_ttt_terms": ("pred", "identity"),
+        "a5_enabled_ttt_terms": ("pred", "identity", "event"),
+        "support_chunk_schedule": (1, 4, 8),
+        "maximum_support_chunks": 8,
+        "minimum_query_points": 2,
+        "multi_query_enabled": True,
+        "detach_overlap_snapshots": True,
+        "detach_runtime_between_chunks": True,
+        "update_effect": "next_chunk_only",
+        "reuse_strategy": "causal_replay_isolated_prefill",
+        "synthetic_engineering_gate_only": True,
+        "seed": 42,
+    }
+    assert config.inference.model_dump() == {
+        "reset_per_video": True,
+        "update_effect": "next_chunk_only",
+        "prefill_once": True,
+        "decode_state_immutable": True,
+        "release_on_exception": True,
+        "checksum_runtime_state": True,
+        "repeat_query_policy": "explicit_new_or_retry",
+        "record_skip_reasons": True,
+        "synthetic_engineering_gate_only": True,
+    }
+
+
+def test_stage_c_a4_and_a5_are_independently_selectable_with_one_term_delta() -> None:
+    raw_a5 = load_raw_config()
+    config_a5 = ProjectConfig.model_validate(raw_a5)
+    assert config_a5.stage_c.active_variant.value == "a5"
+    assert config_a5.stage_c.enabled_ttt_terms == ("pred", "identity", "event")
+
+    raw_a4 = copy.deepcopy(raw_a5)
+    raw_a4["stage_c"]["active_variant"] = "a4"
+    config_a4 = ProjectConfig.model_validate(raw_a4)
+    assert config_a4.stage_c.active_variant.value == "a4"
+    assert config_a4.stage_c.enabled_ttt_terms == ("pred", "identity")
+    assert set(config_a5.stage_c.enabled_ttt_terms) - set(config_a4.stage_c.enabled_ttt_terms) == {
+        "event"
+    }
 
 
 def test_v5_parameter_budget_matches_architecture_rounding() -> None:
@@ -1036,6 +1094,35 @@ def set_nested(*path_and_value: object) -> Mutation:
         (
             set_nested("stage_a", "checkpoint", "save_runtime_state", True),
             "stage_a.checkpoint.save_runtime_state",
+        ),
+        (set_nested("stage_b", "support_chunks", 2), "stage_b.support_chunks"),
+        (
+            set_nested("stage_b", "enabled_ttt_terms", ["pred", "identity"]),
+            "stage_b.enabled_ttt_terms",
+        ),
+        (
+            set_nested("stage_b", "meta_gradient_mode", "first_order"),
+            "stage_b.meta_gradient_mode",
+        ),
+        (
+            set_nested("stage_c", "support_chunk_schedule", [1, 2, 4]),
+            "stage_c.support_chunk_schedule",
+        ),
+        (
+            set_nested("stage_c", "active_variant", "a3"),
+            "stage_c.active_variant",
+        ),
+        (
+            set_nested("stage_c", "a5_enabled_ttt_terms", ["pred", "event"]),
+            "stage_c.a5_enabled_ttt_terms",
+        ),
+        (
+            set_nested("inference", "decode_state_immutable", False),
+            "inference.decode_state_immutable",
+        ),
+        (
+            set_nested("inference", "repeat_query_policy", "implicit_retry"),
+            "inference.repeat_query_policy",
         ),
         (set_nested("fast_ttt", "optimizer", "momentum", 0.9), "momentum must be 0.0"),
         (

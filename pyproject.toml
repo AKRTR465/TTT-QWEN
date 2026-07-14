@@ -35,6 +35,9 @@ tracking = [
     "wandb>=0.21,<1",
 ]
 
+[project.scripts]
+ttt-svcbench-infer = "ttt_svcbench_qwen.inference:main"
+
 [dependency-groups]
 dev = [
     "mypy>=1.15,<2",

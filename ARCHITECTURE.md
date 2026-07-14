@@ -2,8 +2,10 @@
 
 > 规范版本：state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval  
 > 修订日期：2026-07-14
-> 状态：PARTIALLY IMPLEMENTED / P0-P15 ENGINEERING-VERIFIED
-> 说明：本文描述完整目标实现；当前 P0–P15 已通过工程门禁，P16–P22 尚未完整实现或运行。
+> 状态：PARTIALLY IMPLEMENTED / P0-P17 SYNTHETIC-TINY ENGINEERING-VERIFIED + P18 RUNTIME-SKELETON-VERIFIED
+> 说明：本文描述完整目标实现；当前 P0–P17 已通过 synthetic/tiny CPU 工程门禁，P18 仅通过
+> runtime 骨架协议门禁，P19–P22 尚未完整实现或运行。该状态不代表已加载 Qwen3-VL-8B 权重，
+> 也不代表真实训练收敛、在线 SGD 接入或效果验证。
 
 ## 0. 计划目标
 
@@ -407,12 +409,15 @@ online 路径的 detach 只切断 checkpointed 参数梯度，不能把整个 Ad
 functional 边界：online state 下 slow/\(W_0\) 在该计算图中 detach，只有输入与每行两块
 \(W_t\) 获得梯度；它本身不是 P18 的正式在线生命周期管理器。
 
-P18 正式推理通过受管的 `use_fast_state()` 生命周期兼容 P3 既有
+P18 runtime 骨架通过受管的 `use_fast_state()` 生命周期兼容 P3 既有
 `adapter(embeddings, valid_mask, metadata)` 签名。该 module-local binding 负责拒绝 stale module
 gradient，在线期间冻结 checkpointed 参数的 `requires_grad`，并在 exception-safe、非重入的
-context 退出时恢复原标志。P18 仍必须另外证明 video ID 与 batch row/order 对齐、并发调用被正确
-串行化或隔离，以及每次受管调用的 `last_audit.used_runtime_state=True`；这些系统级性质不能由 P5
-模块测试代替，也不能把 bridge 当作全局或并发 fast-state store。
+context 退出时恢复原标志。P18 的 `PerVideoRuntimeManager` 已在 synthetic/tiny CPU 工程门禁中
+验证 video/trajectory owner 对齐、锁内串行生命周期、每次受管调用使用 runtime fast state，以及
+异常路径无条件 release；这些系统级性质不能由 P5 模块测试代替，也不能把 bridge 当作全局或
+跨 manager 的并发 fast-state store。其 next-only update 目前只是 `TTTUpdateStage` 注入与版本转换
+契约，并由 tiny fake updater 验证；生产 `L_TTT` → functional SGD 尚未接入。真实 8B 并发与吞吐
+验证仍归 P19 及后续阶段。
 
 ### 4.3 单步 SGD 与生效顺序
 
@@ -1745,8 +1750,8 @@ E2 使用同一 current-source/previous-target 方向比较：
 - 所有项按有效时间位置求均值；
 - hard FSM、整数计数器和 Bank 记录不参与反向传播。
 
-P14 只定义强类型 source/target loss 与 snapshot 合同；跨 chunk snapshot 建立、pair matching 和
-生命周期编排由 P17 实现。
+P14 只定义强类型 source/target loss 与 snapshot 合同；P17 已在 `meta_trainer.py` 中实现跨 chunk
+snapshot 建立、因果 overlap pair matching 和生命周期编排，并通过 synthetic/tiny CPU 工程门禁。
 
 ### 12.4 为什么没有 O1 无标签 loss
 
@@ -1877,11 +1882,11 @@ P15 已按用户批准的低空间口径完成该阶段的 synthetic/tiny 工程
   finite/clip/skip 和 trainable-only checkpoint 均以小型 case 验证。
 
 P15 产物只允许小型 UTF-8 配置/指标/审计/失败样例/冻结策略/manifest 进入 Git；
-checkpoint 位于忽略输出目录，只保存 allowlisted safetensors 与 optimizer/RNG。只有
-artifact hash、Reader 稳定性、零 Reader/LLM 数字分歧、零 TTT activity、四类 hard rollout、
-reset/cache/FSM/checkpoint 审计和已处理失败样例同时通过 fail-closed exit gate，才能
-开始 P16。P16 尚未开始。该门禁没有下载视频、数据集或 8B 权重，不是训练收敛、
-真实精度、显式状态收益或 TTT 科学增益证据。
+checkpoint 位于忽略输出目录，只保存 allowlisted safetensors 与 optimizer/RNG。artifact hash、
+Reader 稳定性、零 Reader/LLM 数字分歧、零 TTT activity、四类 hard rollout、
+reset/cache/FSM/checkpoint 审计和已处理失败样例已共同通过 fail-closed exit gate，P16–P17 已完成
+对应 synthetic/tiny CPU 工程门禁，P18 已完成 runtime 骨架协议门禁。上述阶段均没有下载视频、
+数据集或 8B 权重，不是训练收敛、真实精度、显式状态收益或 TTT 科学增益证据。
 
 ### Stage B：单步 Meta-TTT
 
@@ -1897,6 +1902,12 @@ reset/cache/FSM/checkpoint 审计和已处理失败样例同时通过 fail-close
 
 先只开启 \(L_{\mathrm{pred}}\)，确认梯度范围、reset 和更新方向。
 
+P16 已实现 A3 工程闭环：`MetaTTTEpisodeRunner` 执行 Support observe → 无标签 TTT loss →
+functional 单步 SGD → 后续 Query outer objective，`MetaTTTTrainer` 随即执行 outer backward、有限性
+检查、梯度裁剪与 optimizer step。门禁同时审计静态 \(W_0\) counterfactual、逐 episode reset、
+next-only 生效顺序、Support 标签不可达、transient \(W_t\) 不进入 outer optimizer，以及
+meta-learned \(W_0\) 获得 outer gradient。当前证据仅来自 synthetic/tiny CPU case。
+
 ### Stage C：加入身份和事件一致性
 
 依次加入：
@@ -1908,7 +1919,16 @@ reset/cache/FSM/checkpoint 审计和已处理失败样例同时通过 fail-close
 
 每个增量必须独立做消融。
 
+P17 已实现 A4=`pred+identity`、A5=`pred+identity+event` 的显式隔离变体，支持 1/4/8 个连续
+Support 和多个后续 Query。工程门禁覆盖因果 overlap matching、detached snapshot、跨 chunk runtime
+detach、每个 Query 独立单次 prefill、逐点 outer loss 后取均值、8-Support 图上界与 episode 后图回收，
+并拒绝未来 Query 或后续标签影响更早路径。这里的“已实现”仍只指 synthetic/tiny CPU 闭环；真实数据
+消融、收敛与科学增益尚未验证。独立 `missed-new` runner 指标仍未接入，bounded CPU graph 回收也
+不能替代尚未完成的 GPU 显存曲线。
+
 ### Stage D：完整 8B 集成
+
+Stage D 从 P19 开始，当前尚未进入真实 8B 集成与效果验证。
 
 - 接入真实 Qwen3-VL-8B checkpoint；
 - 验证 Main Merger 插入点和 DeepStack 不变；
@@ -1958,6 +1978,14 @@ reset Reader audit state
 
 更新顺序必须保证当前 query 不受 query_time 之后信息影响。
 
+P18 已把上述生命周期实现为 `PerVideoRuntimeManager` 与 `run_inference()` 的 synthetic/tiny CPU
+runtime 骨架：每视频 reset/checksum/release、chunk 因果裁剪、Stage A runtime bridge，以及 Query
+侧一次 prefill 和只允许 LLM KV cache 变化的 immutable decode。Reader 的
+valid/empty/unsupported/out_of_scope 四类状态、显式 retry、异常释放和下一视频洁净重置均进入
+fail-closed 审计。但 next-only update 当前仅有 `TTTUpdateStage` 注入/版本契约和 tiny fake 验证，
+生产推理尚未接入真实 `L_TTT` → `functional_sgd_steps_from_ttt`；`GenerationDriver` 也只验证生成协议，
+尚未在真实 Qwen3-VL-8B 上运行 generation。真实时延、显存、并发和答案质量仍在 P19+。
+
 ## 16. 数据与防泄漏约束
 
 测试时允许输入：
@@ -1987,7 +2015,8 @@ reset Reader audit state
 
 ## 17. 推荐实现模块
 
-模块按以下职责拆分；P3–P15 对应模块已通过工程门禁，P16 及后续模块仍按本计划施工：
+模块按以下职责拆分；P3–P17 已通过 synthetic/tiny CPU 工程门禁，P18 仅通过 runtime 骨架协议门禁，
+P19 及后续模块仍按本计划施工：
 
 ~~~text
 src/ttt_svcbench_qwen/
@@ -2008,6 +2037,8 @@ src/ttt_svcbench_qwen/
 ├── stage_a_runtime.py
 ├── stage_a_metrics.py
 ├── p15_artifacts.py
+├── meta_trainer.py
+├── stage_gate_artifacts.py
 ├── trainer.py
 ├── inference.py
 └── config.py
@@ -2029,8 +2060,11 @@ src/ttt_svcbench_qwen/
 - stage_a_runtime.py：Stage A hard Bank/Identity/FSM writer、soft Projector 与 runtime audit；
 - stage_a_metrics.py：O1/O2/E1/E2、operator/time/retrieval 与 Reader/LLM 独立指标；
 - p15_artifacts.py：小型 UTF-8/hash 产物包与 P16 fail-closed exit gate；
+- meta_trainer.py：A3/A4/A5 Support→SGD→Query episode runner、outer step、overlap matching 与图/泄漏审计；
+- stage_gate_artifacts.py：P16/P17/P18 小型产物 bundle、hash/manifest 和 fail-closed exit gate；
 - trainer.py：Stage A episode/typed forward、Outer AdamW allowlist、finite/clip/skip、平衡采样和
   trainable-only checkpoint；
+- inference.py：P18 每视频 runtime reset/observe/update/query/decode/release 骨架协议与 CPU-safe CLI；
 - model.py：只负责 DI、observe/answer/decode 生命周期和统一输出，不重复实现子模块逻辑。
 
 ## 18. 必须通过的验收测试

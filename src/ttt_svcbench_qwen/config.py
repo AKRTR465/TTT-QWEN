@@ -578,6 +578,85 @@ class StageATrainingConfig(FrozenModel):
     checkpoint: StageACheckpointConfig
 
 
+class MetaTTTVariant(StrEnum):
+    """Explicit P16/P17 Meta-TTT ablations; never selected implicitly."""
+
+    A3 = "a3"
+    A4 = "a4"
+    A5 = "a5"
+
+
+class StageBTrainingConfig(FrozenModel):
+    """Single-Support, prediction-only Meta-TTT engineering contract."""
+
+    variant: MetaTTTVariant
+    support_chunks: PositiveInt
+    minimum_query_points: PositiveInt
+    enabled_ttt_terms: tuple[str, ...]
+    inner_sgd_enabled: bool
+    update_effect: str
+    auxiliary_outer_weight: NonNegativeFloat
+    reset_per_episode: bool
+    compare_before_after: bool
+    meta_gradient_mode: str
+    reuse_strategy: str
+    synthetic_engineering_gate_only: bool
+    seed: NonNegativeInt
+
+
+class StageCTrainingConfig(FrozenModel):
+    """Multi-Support and multi-Query Meta-TTT engineering contract."""
+
+    active_variant: MetaTTTVariant
+    variants: tuple[MetaTTTVariant, ...]
+    a4_enabled_ttt_terms: tuple[str, ...]
+    a5_enabled_ttt_terms: tuple[str, ...]
+    support_chunk_schedule: tuple[PositiveInt, ...]
+    maximum_support_chunks: PositiveInt
+    minimum_query_points: PositiveInt
+    multi_query_enabled: bool
+    detach_overlap_snapshots: bool
+    detach_runtime_between_chunks: bool
+    update_effect: str
+    reuse_strategy: str
+    synthetic_engineering_gate_only: bool
+    seed: NonNegativeInt
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_incremental_variants(self) -> Self:
+        if self.variants != (MetaTTTVariant.A4, MetaTTTVariant.A5):
+            raise ValueError("stage_c.variants must be exactly ('a4', 'a5')")
+        if self.active_variant not in self.variants:
+            raise ValueError("stage_c.active_variant must select a4 or a5")
+        if self.a4_enabled_ttt_terms != ("pred", "identity"):
+            raise ValueError("stage_c.a4_enabled_ttt_terms must contain only pred and identity")
+        if self.a5_enabled_ttt_terms != (*self.a4_enabled_ttt_terms, "event"):
+            raise ValueError("stage_c.a5_enabled_ttt_terms must differ from A4 only by event")
+        return self
+
+    @property
+    def enabled_ttt_terms(self) -> tuple[str, ...]:
+        return (
+            self.a4_enabled_ttt_terms
+            if self.active_variant is MetaTTTVariant.A4
+            else self.a5_enabled_ttt_terms
+        )
+
+
+class InferenceRuntimeConfig(FrozenModel):
+    """Managed P18 per-video lifecycle and immutable-decode contract."""
+
+    reset_per_video: bool
+    update_effect: str
+    prefill_once: bool
+    decode_state_immutable: bool
+    release_on_exception: bool
+    checksum_runtime_state: bool
+    repeat_query_policy: str
+    record_skip_reasons: bool
+    synthetic_engineering_gate_only: bool
+
+
 class EvaluationConfig(FrozenModel):
     formal_evaluation_enabled: bool
     official_clean_tuning_forbidden: bool
@@ -624,6 +703,9 @@ class ProjectConfig(FrozenModel):
     predictor: PredictorConfig
     loss: LossConfig
     stage_a: StageATrainingConfig
+    stage_b: StageBTrainingConfig
+    stage_c: StageCTrainingConfig
+    inference: InferenceRuntimeConfig
     evaluation: EvaluationConfig
     parameter_budget: ParameterBudgetConfig
 
@@ -1564,6 +1646,105 @@ class ProjectConfig(FrozenModel):
                 "stage_a.checkpoint.best_metric",
                 self.stage_a.checkpoint.best_metric,
                 "validation_total_loss",
+            ),
+            ("stage_b.variant", self.stage_b.variant, MetaTTTVariant.A3),
+            ("stage_b.support_chunks", self.stage_b.support_chunks, 1),
+            ("stage_b.minimum_query_points", self.stage_b.minimum_query_points, 1),
+            ("stage_b.enabled_ttt_terms", self.stage_b.enabled_ttt_terms, ("pred",)),
+            ("stage_b.inner_sgd_enabled", self.stage_b.inner_sgd_enabled, True),
+            ("stage_b.update_effect", self.stage_b.update_effect, "next_chunk_only"),
+            (
+                "stage_b.auxiliary_outer_weight",
+                self.stage_b.auxiliary_outer_weight,
+                0.1,
+            ),
+            ("stage_b.reset_per_episode", self.stage_b.reset_per_episode, True),
+            ("stage_b.compare_before_after", self.stage_b.compare_before_after, True),
+            (
+                "stage_b.meta_gradient_mode",
+                self.stage_b.meta_gradient_mode,
+                "meta_full_second_order",
+            ),
+            (
+                "stage_b.reuse_strategy",
+                self.stage_b.reuse_strategy,
+                "causal_replay_isolated_prefill",
+            ),
+            (
+                "stage_b.synthetic_engineering_gate_only",
+                self.stage_b.synthetic_engineering_gate_only,
+                True,
+            ),
+            ("stage_b.seed", self.stage_b.seed, 42),
+            (
+                "stage_c.variants",
+                self.stage_c.variants,
+                (MetaTTTVariant.A4, MetaTTTVariant.A5),
+            ),
+            (
+                "stage_c.a4_enabled_ttt_terms",
+                self.stage_c.a4_enabled_ttt_terms,
+                ("pred", "identity"),
+            ),
+            (
+                "stage_c.a5_enabled_ttt_terms",
+                self.stage_c.a5_enabled_ttt_terms,
+                ("pred", "identity", "event"),
+            ),
+            (
+                "stage_c.support_chunk_schedule",
+                self.stage_c.support_chunk_schedule,
+                (1, 4, 8),
+            ),
+            ("stage_c.maximum_support_chunks", self.stage_c.maximum_support_chunks, 8),
+            ("stage_c.minimum_query_points", self.stage_c.minimum_query_points, 2),
+            ("stage_c.multi_query_enabled", self.stage_c.multi_query_enabled, True),
+            (
+                "stage_c.detach_overlap_snapshots",
+                self.stage_c.detach_overlap_snapshots,
+                True,
+            ),
+            (
+                "stage_c.detach_runtime_between_chunks",
+                self.stage_c.detach_runtime_between_chunks,
+                True,
+            ),
+            ("stage_c.update_effect", self.stage_c.update_effect, "next_chunk_only"),
+            (
+                "stage_c.reuse_strategy",
+                self.stage_c.reuse_strategy,
+                "causal_replay_isolated_prefill",
+            ),
+            (
+                "stage_c.synthetic_engineering_gate_only",
+                self.stage_c.synthetic_engineering_gate_only,
+                True,
+            ),
+            ("stage_c.seed", self.stage_c.seed, 42),
+            ("inference.reset_per_video", self.inference.reset_per_video, True),
+            ("inference.update_effect", self.inference.update_effect, "next_chunk_only"),
+            ("inference.prefill_once", self.inference.prefill_once, True),
+            (
+                "inference.decode_state_immutable",
+                self.inference.decode_state_immutable,
+                True,
+            ),
+            ("inference.release_on_exception", self.inference.release_on_exception, True),
+            (
+                "inference.checksum_runtime_state",
+                self.inference.checksum_runtime_state,
+                True,
+            ),
+            (
+                "inference.repeat_query_policy",
+                self.inference.repeat_query_policy,
+                "explicit_new_or_retry",
+            ),
+            ("inference.record_skip_reasons", self.inference.record_skip_reasons, True),
+            (
+                "inference.synthetic_engineering_gate_only",
+                self.inference.synthetic_engineering_gate_only,
+                True,
             ),
             (
                 "evaluation.official_clean_tuning_forbidden",
