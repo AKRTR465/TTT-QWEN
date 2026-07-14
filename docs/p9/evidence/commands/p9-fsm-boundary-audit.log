@@ -1,0 +1,8 @@
+timestamp_utc=2026-07-14T00:48:22.4127670Z
+exit_code=0
+o1=invalid slots preserve committed state; exit clears visibility; same-position timestamp/slot/semantic/overflow drift audited
+e1=FP32 exact 0.7/0.3 boundaries; completion+transition gating; cooldown/NMS; non-prefix mask; padding no-op
+e2=FP32 exact 0.6/0.7/0.5 boundaries; phase-gated single transition; completed hold/re-arm; padding no-op
+history=E1 and E2 513 events retain 512 recent times, evict 1, preserve exact cumulative totals
+isolation=video/trajectory/head/batch owner and tensor storage checks passed
+result=all boundary probes and automated tests passed

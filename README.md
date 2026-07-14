@@ -5,11 +5,12 @@
 完整架构、训练协议和消融方案见 [ARCHITECTURE.md](./ARCHITECTURE.md)。当前对齐版本为
 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。
 
-> 当前施工状态：P0–P8 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
+> 当前施工状态：P0–P9 已通过；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
 > P3 用官方 HF meta 模块和 tiny 随机权重模型完成 Qwen 接口与 DeepStack 工程验收。真实 8B
 > A0/集成仍保留在 P19/P21/P22；P4 已完成 Query Encoder、Operator Router 与 Time Window
 > Resolver 的工程门禁，但尚未训练或校准。P5 Fast Adapter 已通过纯合成张量工程门禁，
-> P6–P8 的空间、时间与四类 soft Observation 路径也已通过纯合成张量工程门禁，P9 允许开始；其余空壳
+> P6–P9 的空间、时间、四类 soft Observation、Semantic Projector、hard Bank 与事件 FSM 也已通过
+> 纯合成张量工程门禁，P10 允许开始；其余空壳
 > 被调用时会明确抛出 `NotImplementedError`。
 
 ## 当前固定条件
@@ -43,8 +44,13 @@
   video/trajectory/query signature隔离，overlap按global position replay/replace，默认detach下一
   chunk cache；主cache严格64，另有不扩大mask的3-position replay margin用于重算固定4-tubelet
   overlap；时间元数据保持FP32/FP64并在cache中统一为FP64；时间路精确48,438,272参数；
-- P8精确参数为O1 2,632,710、O2 2,103,042、E1 9,584,643、E2 7,094,792；当前新增模块
-  分项合计156.718819M（156,718,819），但在线变化的仍只有约1.18M fast参数；
+- P8精确参数为O1 2,632,710、O2 2,103,042、E1 9,584,643、E2 7,094,792；P9 Semantic
+  Projector固定共享`768→1024→512` trunk和四个768维head embedding，精确1,316,864参数；
+- Projector进入模型state_dict和Outer optimizer；hard Bank/FSM/runtime不注册参数/buffer、不进入
+  state_dict或optimizer，写入统一no-grad+detach+clone，snapshot与模型checkpoint分离；
+- O1六个bootstrap阈值为0.5且baseline显式set once；E1使用0.7/0.3 hysteresis及0.5秒
+  cooldown/NMS；E2使用phase-gated三步FSM和0.5低事件re-arm；三者各维护单一aggregate record；
+- 当前新增模块分项合计156.715683M（156,715,683），但在线变化的仍只有约1.18M fast参数；
 - 无标签TTT loss仅由当前chunk内next-tubelet prediction、O2身份一致性和E1/E2事件一致性组成；
 - 问题不再通过关键词规则机械划分；Qwen input embeddings先经4096→768投影、无参sinusoidal
   position encoding和4层双向Transformer，再由三个768→1024→512 GELU输出头形成
@@ -80,7 +86,7 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | :--- | :--- |
 | v5 YAML、完整解析、固定维度/容量/优化器校验 | P1 已实现并有契约测试 |
 | Video/Query/Encoder/Observation/Record/Retriever/Reader/runtime 类型 | P1 已实现并有 shape/dtype/边界测试 |
-| 推荐模块导入与职责边界 | P1 已实现；P3–P8 对应模块已通过各自工程门禁，其余后续入口显式 `NotImplementedError` |
+| 推荐模块导入与职责边界 | P1 已实现；P3–P9 对应模块已通过各自工程门禁，其余后续入口显式 `NotImplementedError` |
 | 数据 schema、防泄漏、因果切分、processor/query token、A0 runner | P2 工程门禁已通过；fold/A0 为明确标注的合成替代 |
 | Qwen video boundary、Main Merger 插入点、DeepStack 保护 | P3 已实现；tiny/meta 工程契约已验证，真实 8B 留至 P19 |
 | Query Encoder、9-prototype Router、Time Window Resolver | P4 已实现；本地结构/参数/offset/fail-closed 契约已验证，模型尚未训练、阈值尚未校准 |
@@ -88,7 +94,8 @@ operator 及检索阈值仍带 `calibration_required` 或 `bootstrap_calibration
 | P6 空间对象编码器 | 已通过本地合成张量工程门禁；真实视频/8B、语义对象 overflow 与端到端 runtime 仍留后续阶段 |
 | P7 时间事件编码器 | 已通过本地合成张量工程门禁；逐层 KV、overlap replay margin、因果滑窗和 runtime 隔离均已验证 |
 | P8 四类 Observation Decoder | 已通过本地合成张量工程门禁；输出/metadata、因果流式 replay、runtime 隔离、精确参数和 online freeze 均已验证 |
-| P9–P19 Bank、Reader、loss、训练、推理 | 尚未实现；P9 允许开始，P10 禁止提前施工 |
+| P9 Semantic Projector、State Bank 与事件 FSM | 已通过小型合成张量工程门禁；统一 records、动态 padded view、O1/E1/E2 hard state、隔离、审计、snapshot 和梯度/持久化边界均已验证 |
+| P10–P19 Identity Bank、Reader、loss、训练、推理 | 尚未实现；P10 允许开始，O2 Candidate→Confirmed 生命周期、P18 跨 runtime reset 与 P19 真实 8B 仍保留 |
 | 真实 8B、消融、校准、clean 评估 | P19–P22 计划设计，尚未运行 |
 
 ## 环境变量

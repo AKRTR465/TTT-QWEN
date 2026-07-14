@@ -185,7 +185,16 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "dropout": 0.0,
         "linear_bias": True,
         "parameter_count": 2_632_710,
-        "threshold_status": CalibrationStatus.CALIBRATION_REQUIRED,
+        "object_threshold": 0.5,
+        "target_threshold": 0.5,
+        "visible_threshold": 0.5,
+        "enter_threshold": 0.5,
+        "exit_threshold": 0.5,
+        "confidence_threshold": 0.5,
+        "baseline_policy": "explicit_set_once_per_trajectory",
+        "count_update_policy": "recompute_from_full_slot_state",
+        "committed_position_policy": "idempotent_preserve_and_audit_drift",
+        "threshold_status": CalibrationStatus.BOOTSTRAP_CALIBRATION_REQUIRED,
     }
     assert heads.o2.model_dump() == {
         "input_dim": 768,
@@ -229,7 +238,12 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "parameter_count": 9_584_643,
         "tau_on": 0.7,
         "tau_off": 0.3,
+        "completion_threshold": 0.7,
+        "transition_threshold": 0.7,
         "min_gap_seconds": 0.5,
+        "fsm_policy": "eventness_hysteresis_completion_transition",
+        "cooldown_nms_source": "min_gap_seconds",
+        "committed_position_policy": "idempotent_ignore_and_audit",
         "threshold_status": CalibrationStatus.BOOTSTRAP_CALIBRATION_REQUIRED,
     }
     assert heads.e2.model_dump() == {
@@ -254,15 +268,67 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "start_threshold": 0.6,
         "end_threshold": 0.6,
         "complete_threshold": 0.7,
+        "rearm_max_event_probability": 0.5,
+        "rearm_phase": "inactive",
+        "completed_hold_positions": 1,
+        "fsm_policy": "phase_gated_single_transition_per_position",
+        "active_evidence_policy": "diagnostic_and_phase_consistency_only",
+        "committed_position_policy": "idempotent_ignore_and_audit",
         "threshold_status": CalibrationStatus.BOOTSTRAP_CALIBRATION_REQUIRED,
     }
-    assert config.state_bank.confirmed_store.initial_capacity == 256
-    assert config.state_bank.confirmed_store.growth_chunk == 256
-    assert config.state_bank.confirmed_store.hard_limit is None
-    assert config.state_bank.confirmed_store.gpu_hot_capacity == 256
-    assert config.state_bank.candidate_store.initial_capacity == 64
-    assert config.state_bank.candidate_store.hard_limit == 512
-    assert config.state_bank.event_history_capacity == 512
+    bank = config.state_bank
+    assert bank.semantic_projector.model_dump() == {
+        "input_dim": 768,
+        "hidden_dim": 1024,
+        "output_dim": 512,
+        "head_type_count": 4,
+        "head_types": ("o1", "o2", "e1", "e2"),
+        "layer_norm_eps": 1.0e-5,
+        "activation": "silu",
+        "dropout": 0.0,
+        "linear_bias": True,
+        "normalization_dtype": "float32",
+        "normalization_eps": 1.0e-8,
+        "zero_norm_fallback": "first_unit_basis",
+        "parameter_count": 1_316_864,
+        "included_in_model_state_dict": True,
+        "included_in_outer_optimizer": True,
+        "included_in_inner_optimizer": False,
+        "online_frozen": True,
+        "online_forward_no_grad": False,
+        "detach_inputs": False,
+    }
+    bank_contract = bank.model_dump(
+        exclude={"semantic_projector", "confirmed_store", "candidate_store"}
+    )
+    assert bank_contract == {
+        "semantic_dim": 512,
+        "identity_dim": 256,
+        "event_history_capacity": 512,
+        "isolation_keys": ("video_id", "trajectory_id", "head_type"),
+        "hard_updates_no_grad": True,
+        "detach_before_write": True,
+        "runtime_in_model_state_dict": False,
+        "runtime_registered_parameters": False,
+        "runtime_registered_buffers": False,
+        "runtime_in_outer_optimizer": False,
+        "runtime_in_inner_optimizer": False,
+        "snapshot_separate_from_model_checkpoint": True,
+        "record_time_metadata_policy": "exactly_one",
+        "record_id_policy": "trajectory_monotonic_never_reuse",
+        "aggregate_record_heads": ("o1", "e1", "e2"),
+        "aggregate_update_mode": "functional_replace",
+        "committed_position_policy": "idempotent_ignore_and_audit",
+        "o2_p9_policy": "generic_crud_only_p10_owns_lifecycle",
+        "dynamic_view_padding": "batch_max",
+        "n_state_definition": "owner_head_present_records_before_filters",
+    }
+    assert bank.confirmed_store.initial_capacity == 256
+    assert bank.confirmed_store.growth_chunk == 256
+    assert bank.confirmed_store.hard_limit is None
+    assert bank.confirmed_store.gpu_hot_capacity == 256
+    assert bank.candidate_store.initial_capacity == 64
+    assert bank.candidate_store.hard_limit == 512
 
 
 def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
@@ -333,7 +399,8 @@ def test_v5_parameter_budget_matches_architecture_rounding() -> None:
         budget.e1_millions,
         budget.e2_millions,
     ) == (2.632710, 2.103042, 9.584643, 7.094792)
-    assert budget.new_modules_total_millions == 156.718819
+    assert budget.semantic_projector_millions == 1.316864
+    assert budget.new_modules_total_millions == 156.715683
     assert (
         abs(component_total - budget.new_modules_total_millions)
         <= budget.rounding_tolerance_millions
@@ -485,6 +552,10 @@ def set_nested(*path_and_value: object) -> Mutation:
             "observation_heads.o1.parameter_count",
         ),
         (
+            set_nested("observation_heads", "o1", "object_threshold", 0.6),
+            "observation_heads.o1.object_threshold",
+        ),
+        (
             set_nested("observation_heads", "o2", "identity_normalization", "l2"),
             "observation_heads.o2.identity_normalization",
         ),
@@ -493,8 +564,32 @@ def set_nested(*path_and_value: object) -> Mutation:
             "observation_heads.e1.history_tubelets",
         ),
         (
+            set_nested("observation_heads", "e1", "completion_threshold", 0.6),
+            "observation_heads.e1.completion_threshold",
+        ),
+        (
             set_nested("observation_heads", "e2", "checkpoint_tubelets", 4),
             "observation_heads.e2.checkpoint_tubelets",
+        ),
+        (
+            set_nested("observation_heads", "e2", "rearm_max_event_probability", 0.4),
+            "observation_heads.e2.rearm_max_event_probability",
+        ),
+        (
+            set_nested("state_bank", "semantic_projector", "parameter_count", 1_320_000),
+            "state_bank.semantic_projector.parameter_count",
+        ),
+        (
+            set_nested("state_bank", "semantic_projector", "included_in_model_state_dict", False),
+            "state_bank.semantic_projector.included_in_model_state_dict",
+        ),
+        (
+            set_nested("state_bank", "runtime_in_model_state_dict", True),
+            "state_bank.runtime_in_model_state_dict",
+        ),
+        (
+            set_nested("state_bank", "record_time_metadata_policy", "timestamp_or_time_range"),
+            "state_bank.record_time_metadata_policy",
         ),
         (
             set_nested("parameter_budget", "temporal_encoder_millions", 48.49),
@@ -503,6 +598,10 @@ def set_nested(*path_and_value: object) -> Mutation:
         (
             set_nested("parameter_budget", "o1_millions", 2.63),
             "parameter budget components|O1 budget",
+        ),
+        (
+            set_nested("parameter_budget", "semantic_projector_millions", 1.32),
+            "parameter budget components|Semantic Projector budget",
         ),
         (
             set_nested("parameter_budget", "new_modules_total_millions", 156.75536),

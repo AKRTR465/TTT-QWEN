@@ -15,7 +15,7 @@ from ttt_svcbench_qwen.data import assert_runtime_payload_safe
 from ttt_svcbench_qwen.fast_ttt import FastWeightsState, OptimizerRuntimeState
 from ttt_svcbench_qwen.identity_bank import IdentityBankRuntimeState
 from ttt_svcbench_qwen.observation_heads import E1RuntimeState, E2RuntimeState
-from ttt_svcbench_qwen.state_bank import HeadType, StateBankRuntimeState
+from ttt_svcbench_qwen.state_bank import StateBankRuntimeState
 from ttt_svcbench_qwen.state_encoder import SpatialSlotRuntimeState, TemporalCache
 from ttt_svcbench_qwen.state_reader import ReaderResult
 
@@ -32,17 +32,20 @@ class PerVideoRuntimeState:
     e2_state: E2RuntimeState | None
     state_bank: StateBankRuntimeState
     identity_bank: IdentityBankRuntimeState
-    fsm_state: tuple[tuple[HeadType, str], ...]
     reader_audit: tuple[ReaderResult, ...]
     released: bool
 
     def __post_init__(self) -> None:
         if not self.video_id or not self.trajectory_id:
             raise ValueError("per-video runtime identifiers must be non-empty")
+        if type(self.released) is not bool:
+            raise TypeError("per-video runtime released flag must be bool")
         if self.state_bank.video_id != self.video_id:
             raise ValueError("State Bank video_id does not match runtime ownership")
         if self.state_bank.trajectory_id != self.trajectory_id:
             raise ValueError("State Bank trajectory_id does not match runtime ownership")
+        if self.state_bank.released != self.released:
+            raise ValueError("State Bank and per-video release state must agree")
         if self.slot_state is not None and self.slot_state.video_id != self.video_id:
             raise ValueError("spatial slot state video_id does not match runtime ownership")
         if self.temporal_cache.hidden.shape[0] != 1:

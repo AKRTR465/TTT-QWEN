@@ -900,11 +900,11 @@ Query learned-attention 的最终标量 scorer 明确不带 bias 外，其余 Li
 | O2 Decoder | 2.103042M（精确 2,103,042） |
 | E1 Decoder | 9.584643M（精确 9,584,643） |
 | E2 Decoder | 7.094792M（精确 7,094,792） |
-| Semantic Projector | 1.32M |
+| Semantic Projector | 1.316864M（精确 1,316,864） |
 | TTT Temporal Predictor | 2.36M |
 | 16-token State Resampler | 14.72M |
 | Operator Router、Time Resolver、empty record | 约 0.14M |
-| **新增模块合计** | **当前分项和 156.718819M（156,718,819）** |
+| **新增模块合计** | **当前分项和 156.715683M（156,715,683）** |
 
 空间对象编码器的精确审计式为：输入 LayerNorm 8,192 + 输入 Linear 3,146,496 + 单一
 q projection 393,984 + shared seed 768 + 两个独立 Stage。每个 Stage 为 Q/K/V/O 2,362,368 +
@@ -925,6 +925,10 @@ identity/score 分支 264,450 = 2,103,042；E1 的输入 LayerNorm/Linear 395,26
 两个各 3,543,552 的标准 GRU layer + 两个输出 Linear 6,152 = 7,094,792。debug probability、mask、
 timestamp、projected history、rollback checkpoint 和 owner metadata 都是零参数。
 
+Semantic Projector 的精确审计式为：四个 768 维 head-type embedding 3,072 + affine LayerNorm
+1,536 + `Linear(768→1024,bias=True)` 787,456 + `Linear(1024→512,bias=True)` 524,800 =
+1,316,864。FP32 L2 normalize、dynamic view、record、FSM、audit 和 runtime snapshot 都是零参数。
+
 新增模块约占 8B 基座的 2%。测试时真正变化的参数只有两个 768 × 768 fast matrix，即
 1,179,648 个参数；其余新增参数只在 Outer Training 中学习，在线推理时冻结。
 
@@ -937,10 +941,11 @@ State Bank 是当前视频的运行时结构化内存，不是模型参数，也
 它按以下 key 隔离：
 
 \[
-(\text{video id},\text{question trajectory id},\text{head type}).
+(\text{video id},\text{trajectory id},\text{head type}).
 \]
 
-每个新视频或问题轨迹结束后释放对应状态。
+其中代码字段 `trajectory_id` 即 question trajectory id。每个新视频或问题轨迹结束后释放对应
+状态；不同 batch row 的 Bank、record、payload、audit 和 snapshot 不共享可变 storage。
 
 ### 7.2 统一记录
 
@@ -956,16 +961,24 @@ confidence
 type-specific payload
 ~~~
 
+`timestamp` 与 `time_range` 严格二选一。`record_id` 在整个 trajectory 内跨 head 单调唯一，记录
+失效或释放后也不得复用。append、update、invalidate、snapshot、query 和 release 都是 functional
+操作：返回独立新状态，不原地修改输入 Bank。
+
 统一语义视图写作：
 
 \[
 E_{\mathrm{state}}
-\in\mathbb R^{B\times N_s\times512}.
+\in\mathbb R^{B\times N_{s,\max}\times512}.
 \]
 
 其中：
 
-- \(N_s\) 是当前轨迹中候选可查询记录数，随视频动态变化；
+- 每行 \(N_s\) 是当前 owner/head 分区中、P11 valid/time/similarity 过滤前的实际 stored record 数，
+  包括 `valid=false` 记录；
+- batch tensor 只 pad 到本 batch 的 \(N_{s,\max}\)，同时返回 `n_state[B]`、present mask、
+  record-valid mask 和对齐 record IDs；padding embedding 严格为零；
+- 空 Bank 合法返回 `[B,0,512]`，而不是伪造一条 empty record；
 - 512 是固定语义检索维度；
 - \(N_s\) 不是活动槽数量、身份容量或时间长度。
 
@@ -979,6 +992,10 @@ E_{\mathrm{state}}
 | E1 | event_count、recent_event_times、cooldown |
 | E2 | completed_count、phase、已完成区间、recent_event_times |
 
+O1、E1、E2 每个 owner/head 分区各维护一条稳定 `record_id` 的聚合记录，更新使用 functional
+replace；因此持续更新不会追加重复 summary。O2 在 P9 只使用 generic CRUD 接口，identity matching、
+Candidate→Confirmed、prototype EMA、容量增长和 `unique_count` 全部属于 P10。
+
 每条对象或事件记录额外保存归一化 512 维 semantic_embedding，表示“这条记录是什么”。
 
 semantic embedding 由共享高容量投影器生成：
@@ -986,14 +1003,15 @@ semantic embedding 由共享高容量投影器生成：
 ~~~text
 object slot / event state [768]
 + learned head-type embedding [768]
-→ LayerNorm
+→ LayerNorm(eps=1e-5)
 → Linear 768→1024 → SiLU
 → Linear 1024→512
-→ L2Norm
+→ FP32 L2Norm(eps=1e-8, zero-norm→first unit basis)
 ~~~
 
-Semantic Projector 约 1.32M 参数。语义检索维度仍保持 512，避免 State Bank 的完整检索成本
-随状态主干宽度同步增长。
+head-type table 顺序固定为 O1/O2/E1/E2，形状 `[4,768]`；共享 trunk 不按 head 复制。LayerNorm
+使用 affine 参数，两个 Linear 带 bias，dropout=0。Semantic Projector 精确为 1,316,864 参数。
+语义检索维度仍保持 512，避免 State Bank 的完整检索成本随状态主干宽度同步增长。
 
 ### 7.4 O2 动态容量
 
@@ -1009,12 +1027,38 @@ Semantic Projector 约 1.32M 参数。语义检索维度仍保持 512，避免 S
 
 ### 7.5 梯度边界
 
-- hard 状态更新统一位于 torch.no_grad；
-- 写入 Bank 前对 soft embedding 执行 detach；
-- Bank 不注册为 nn.Parameter；
-- Bank 不进入 model.state_dict；
-- Bank 不进入 Outer optimizer 或 Inner SGD；
-- TTT loss 使用 detach 前的 soft 输出，保证梯度能到达 Fast Adapter。
+- Semantic Projector 是独立 `nn.Module`：参数进入模型 `state_dict` 和 Outer optimizer，不进入
+  Inner SGD；在线冻结参数，但 forward 不包 `torch.no_grad()`、不 detach 输入；
+- projector 先在正常 autograd 中产生 soft semantic embedding，hard writer 再统一位于
+  `torch.no_grad()` 中对写入 tensor 执行 detach+clone；
+- Bank/FSM/runtime 不注册为 `nn.Parameter` 或 buffer，不进入模型 `state_dict`、Outer optimizer
+  或 Inner SGD；显式 runtime snapshot 与模型 checkpoint 分离；
+- TTT/State Loss 使用 detach 前的 soft 分支，保证梯度能到达 Projector、Observation Head 和
+  Fast Adapter；hard record、payload、audit 与输入不得共享 storage。
+
+### 7.6 O1/E1/E2 hard-state 冻结规则
+
+O1 的 object、target、visible、enter、exit、confidence 六个 bootstrap 阈值均为 0.5，边界采用
+`>=`。baseline 只能由调用方在 trajectory 内显式 set once；P9 不猜测 baseline 时间。每个新
+global position 从完整逐槽 hard state 重算 `current_visible_count`，禁止仅靠 enter/exit 做累计
+增减。同 position 重复输入幂等；证据漂移、低置信度、enter/exit 冲突、invalid slot 和空间 overflow
+只审计并保留已提交状态。
+
+E1 使用 eventness 0.7/0.3 hysteresis：IDLE 在 eventness `>=0.7` 时进入 ACTIVE；只有 ACTIVE 且
+completion、transition 都 `>=0.7` 时才确认一次事件。cooldown 与 Temporal NMS 共用
+`min_gap_seconds=0.5`，eventness `<=0.3` 才 re-arm。recent event times 最多 512；淘汰最旧项必须
+记录 audit，且不得减少累计 `event_count`。
+
+E2 每个 global position 最多迁移一次：INACTIVE→ACTIVE 需要 start `>=0.6` 且 phase argmax 为
+ACTIVE；ACTIVE→END_CANDIDATE 需要 end `>=0.6` 且 phase argmax 为 END_CANDIDATE；
+END_CANDIDATE→COMPLETED 需要 complete `>=0.7` 且 phase argmax 为 COMPLETED。active event
+evidence 只用于诊断和 phase 一致性，不新增未冻结 active threshold。COMPLETED 至少保持一个位置；
+后续只有 phase argmax 为 INACTIVE 且所有 event probability 都 `<=0.5` 时才能 re-arm。只有完整
+三步迁移才增加一次 `completed_count` 并保存完整区间。
+
+P8 overlap 中已提交的 global position 在 hard path 只做幂等检查，不 replay/replace、不得重复计数；
+证据漂移进入 audit。P8 的 E2 GRU runtime 仍归 P8，P9 只拥有 hard FSM；P18 在 reset/release 时
+统一清理两条 runtime。
 
 ## 8. Query Embedding Encoder
 

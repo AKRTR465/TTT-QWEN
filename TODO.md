@@ -789,74 +789,74 @@
 
 #### P9.1 统一记录和隔离键
 
-- [ ] 以 `(video_id, question_trajectory_id, head_type)` 隔离所有 Bank 分区。
-- [ ] 定义统一字段：record_id、head_type、semantic_embedding[512]、timestamp/time_range、valid、confidence、type-specific payload。
-- [ ] record_id 在轨迹内唯一且不可复用。
-- [ ] 支持按分区追加、更新、失效、快照、查询和释放。
-- [ ] 新视频或 trajectory 结束时释放对应状态。
-- [ ] 不同 batch 样本的 Bank 对象和 storage 不共享。
+- [x] 以 `(video_id, trajectory_id, head_type)` 隔离所有 Bank 分区；`trajectory_id` 即 question trajectory。
+- [x] 定义统一字段：record_id、head_type、semantic_embedding[512]、timestamp/time_range、valid、confidence、type-specific payload。
+- [x] record_id 在轨迹内唯一且不可复用。
+- [x] 支持按分区追加、更新、失效、快照、查询和释放。
+- [x] 新视频或 trajectory 结束时释放对应状态。
+- [x] 不同 batch 样本的 Bank 对象和 storage 不共享。
 
 #### P9.2 Semantic Projector
 
-- [ ] 接收 object slot/event state `[768]`。
-- [ ] 加入 learned head-type embedding `[768]`。
-- [ ] 实现 LayerNorm + `Linear 768→1024→512` + SiLU。
-- [ ] 对 semantic embedding L2 normalize。
-- [ ] 对 O1/O2/E1/E2 使用共享投影器和不同 head-type embedding。
-- [ ] 语义检索维保持 512，不随 768 状态主干扩大。
-- [ ] 参数量约 1.32M。
+- [x] 接收 object slot/event state `[768]`。
+- [x] 加入 learned head-type embedding `[768]`。
+- [x] 实现 LayerNorm + `Linear 768→1024→512` + SiLU。
+- [x] 对 semantic embedding L2 normalize。
+- [x] 对 O1/O2/E1/E2 使用共享投影器和不同 head-type embedding。
+- [x] 语义检索维保持 512，不随 768 状态主干扩大。
+- [x] 精确参数量为 1,316,864。
 
 #### P9.3 O1 hard state
 
-- [ ] 根据 object/target/visible/enter/exit/confidence 和 slot mask 更新活动状态。
-- [ ] 维护 current_visible_count。
-- [ ] 在轨迹规定位置建立 baseline_count，定义何时初始化和何时 reset。
-- [ ] 保存每槽 enter/exit/visible、更新时间和置信度。
-- [ ] 防止同一槽在单一时间位置重复增减。
-- [ ] 记录低置信度、槽溢出和状态冲突。
+- [x] 根据 object/target/visible/enter/exit/confidence 和 slot mask 更新活动状态。
+- [x] 维护 current_visible_count。
+- [x] 在轨迹规定位置建立 baseline_count，定义何时初始化和何时 reset。
+- [x] 保存每槽 enter/exit/visible、更新时间和置信度。
+- [x] 防止同一槽在单一时间位置重复增减。
+- [x] 记录低置信度、invalid slot、槽溢出、证据漂移和状态冲突。
 
 #### P9.4 E1 hard FSM
 
-- [ ] 实现双阈值 on/off 状态迁移。
-- [ ] 实现 cooldown。
-- [ ] 实现 Temporal NMS。
-- [ ] 仅在确认完成证据时增加 event_count。
-- [ ] 保存 recent_event_times，容量 512。
-- [ ] 防止一个持续多帧脉冲重复计数。
-- [ ] 记录 duplicate suppression、miss candidate 和 cooldown 命中。
+- [x] 实现双阈值 on/off 状态迁移。
+- [x] 实现 cooldown。
+- [x] 实现 Temporal NMS。
+- [x] 仅在确认完成证据时增加 event_count。
+- [x] 保存 recent_event_times，容量 512。
+- [x] 防止一个持续多帧脉冲重复计数。
+- [x] 记录 duplicate suppression、miss candidate 和 cooldown 命中。
 
 #### P9.5 E2 hard FSM
 
-- [ ] 实现 INACTIVE→ACTIVE→END_CANDIDATE→COMPLETED。
-- [ ] 根据 start/active/end/complete 和 phase logits 更新状态。
-- [ ] 只有确认完整结束后 completed_count +1。
-- [ ] 保存已完成时间区间、当前 phase 和 recent_event_times。
-- [ ] recent_event_times 容量 512，淘汰不得改变累计 completed_count。
-- [ ] reset 时清空 GRU/FSM/runtime history。
+- [x] 实现 INACTIVE→ACTIVE→END_CANDIDATE→COMPLETED。
+- [x] 根据 start/active/end/complete 和 phase logits 更新状态。
+- [x] 只有确认完整结束后 completed_count +1。
+- [x] 保存已完成时间区间、当前 phase 和 recent_event_times。
+- [x] recent_event_times 容量 512，淘汰不得改变累计 completed_count。
+- [x] P9 reset/release 清空 Bank 与 hard FSM runtime；P8 E2 GRU runtime 由 P18 受管生命周期协调清理。
 
 #### P9.6 梯度与持久化边界
 
-- [ ] 所有 hard update 包裹 `torch.no_grad()`。
-- [ ] 写入 semantic/identity/event tensor 前 detach。
-- [ ] Bank 不注册为 `nn.Parameter`。
-- [ ] Bank 不进入 `model.state_dict()`。
-- [ ] Bank 不进入 Outer optimizer 或 Inner SGD。
-- [ ] 提供显式 runtime snapshot 仅用于审计/恢复，和模型 checkpoint 分离。
+- [x] 所有 hard update 包裹 `torch.no_grad()`。
+- [x] 写入 semantic/identity/event tensor 前 detach+clone。
+- [x] Bank/FSM/runtime 不注册为 `nn.Parameter` 或 buffer。
+- [x] Bank/FSM/runtime 不进入 `model.state_dict()`；Semantic Projector 进入模型 `state_dict()`。
+- [x] Bank/FSM/runtime 不进入 Outer optimizer 或 Inner SGD；Projector 进入 Outer optimizer、排除在 Inner SGD 之外。
+- [x] 提供显式 runtime snapshot 仅用于审计/恢复，和模型 checkpoint 分离。
 
 ### 实施后验收项
 
-- [ ] `E_state[B,N_s,512]` 能从动态记录生成，`N_s` 变化不改变任何模型参数 shape。
-- [ ] 每种记录 payload 字段完整：O1、O2 Candidate、O2 Confirmed、E1、E2。
-- [ ] hard Bank/FSM 张量无 `grad_fn`，而 soft outputs 仍可向 Fast Adapter 反传。
-- [ ] event history 超过 512 时审计正确且累计计数不变。
-- [ ] video/trajectory/head_type/batch 隔离测试通过。
-- [ ] reset/release 后无残留记录。
-- [ ] Semantic Projector 输出归一化、有限且参数量约 1.32M。
+- [x] 动态记录可生成 padded `E_state[B,N_max,512]`、`n_state[B]`、present/valid masks 和 record IDs；`N_max` 变化不改变任何模型参数 shape。
+- [x] O1、E1、E2 payload 及 O2 Candidate/Confirmed generic payload/CRUD 字段完整；O2 生命周期留 P10。
+- [x] hard Bank/FSM 张量无 `grad_fn`，而 soft outputs 仍可向 Fast Adapter 反传。
+- [x] event history 超过 512 时审计正确且累计计数不变。
+- [x] video/trajectory/head_type/batch 隔离测试通过。
+- [x] reset/release 后无残留记录。
+- [x] Semantic Projector 输出归一化、有限且精确参数量为 1,316,864。
 
 ### 交付物与退出条件
 
-- [ ] 交付 `state_bank.py`、Semantic Projector、O1/E1/E2 FSM、审计结构和梯度隔离测试。
-- [ ] 任意 hard state 进入 autograd 或模型 state_dict 时阻断后续训练。
+- [x] 交付 `state_bank.py`、Semantic Projector、O1/E1/E2 FSM、审计结构和梯度隔离测试。
+- [x] 任意 hard state 进入 autograd 或模型 state_dict 时阻断后续训练。
 
 ---
 
@@ -1853,7 +1853,7 @@
 - [ ] `tests/test_fast_ttt.py`：shape、参数数、reset、freeze。
 - [ ] `tests/test_state_encoder.py`：slot recurrence、causality、cache。
 - [ ] `tests/test_observation_heads.py`：四 Decoder 输出和参数预算。
-- [ ] `tests/test_state_bank.py`：hard state、FSM、isolation、detach。
+- [x] `tests/test_state_bank.py`：hard state、FSM、isolation、detach。
 - [ ] `tests/test_identity_bank.py`：Candidate/Confirmed、>256 扩容、Hot Cache。
 - [ ] `tests/test_query_encoder.py`：padding、9 prototypes、TimeWindow。
 - [ ] `tests/test_state_retriever.py`：filters、no Top-K、empty/unsupported。
@@ -1989,6 +1989,7 @@
 | `7.3` | typed payload/semantic | P9–P10 | 字段与 projector |
 | `7.4` | O2 动态容量 | P10 | >256/cache 压力测试 |
 | `7.5` | 梯度边界 | P9、P14 | detach/grad audit |
+| `7.6` | O1/E1/E2 hard-state FSM | P9 | `tests/test_state_bank.py` |
 | `8.1` | Query 输入/池化 | P4 | padding/Bi-Attention |
 | `8.2` | 三个 embedding | P4 | shape/独立 head |
 | `8.3` | 9 prototypes | P4、P21 | 路由与校准 |

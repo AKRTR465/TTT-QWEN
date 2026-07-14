@@ -198,6 +198,15 @@ class O1Config(FrozenModel):
     dropout: Probability
     linear_bias: bool
     parameter_count: PositiveInt
+    object_threshold: Probability
+    target_threshold: Probability
+    visible_threshold: Probability
+    enter_threshold: Probability
+    exit_threshold: Probability
+    confidence_threshold: Probability
+    baseline_policy: str
+    count_update_policy: str
+    committed_position_policy: str
     threshold_status: CalibrationStatus
 
 
@@ -244,7 +253,12 @@ class E1Config(FrozenModel):
     parameter_count: PositiveInt
     tau_on: Probability
     tau_off: Probability
+    completion_threshold: Probability
+    transition_threshold: Probability
     min_gap_seconds: NonNegativeFloat
+    fsm_policy: str
+    cooldown_nms_source: str
+    committed_position_policy: str
     threshold_status: CalibrationStatus
 
 
@@ -270,6 +284,12 @@ class E2Config(FrozenModel):
     start_threshold: Probability
     end_threshold: Probability
     complete_threshold: Probability
+    rearm_max_event_probability: Probability
+    rearm_phase: str
+    completed_hold_positions: PositiveInt
+    fsm_policy: str
+    active_evidence_policy: str
+    committed_position_policy: str
     threshold_status: CalibrationStatus
 
 
@@ -295,6 +315,22 @@ class SemanticProjectorConfig(FrozenModel):
     input_dim: PositiveInt
     hidden_dim: PositiveInt
     output_dim: PositiveInt
+    head_type_count: PositiveInt
+    head_types: tuple[str, ...]
+    layer_norm_eps: PositiveFloat
+    activation: str
+    dropout: Probability
+    linear_bias: bool
+    normalization_dtype: str
+    normalization_eps: PositiveFloat
+    zero_norm_fallback: str
+    parameter_count: PositiveInt
+    included_in_model_state_dict: bool
+    included_in_outer_optimizer: bool
+    included_in_inner_optimizer: bool
+    online_frozen: bool
+    online_forward_no_grad: bool
+    detach_inputs: bool
 
 
 class ConfirmedStoreConfig(FrozenModel):
@@ -324,7 +360,20 @@ class StateBankConfig(FrozenModel):
     isolation_keys: tuple[str, ...]
     hard_updates_no_grad: bool
     detach_before_write: bool
-    included_in_state_dict: bool
+    runtime_in_model_state_dict: bool
+    runtime_registered_parameters: bool
+    runtime_registered_buffers: bool
+    runtime_in_outer_optimizer: bool
+    runtime_in_inner_optimizer: bool
+    snapshot_separate_from_model_checkpoint: bool
+    record_time_metadata_policy: str
+    record_id_policy: str
+    aggregate_record_heads: tuple[str, ...]
+    aggregate_update_mode: str
+    committed_position_policy: str
+    o2_p9_policy: str
+    dynamic_view_padding: str
+    n_state_definition: str
 
 
 class QueryEncoderConfig(FrozenModel):
@@ -677,6 +726,101 @@ class ProjectConfig(FrozenModel):
             ("state_bank.semantic_dim", self.state_bank.semantic_dim, 512),
             ("state_bank.identity_dim", self.state_bank.identity_dim, 256),
             (
+                "state_bank.semantic_projector.input_dim",
+                self.state_bank.semantic_projector.input_dim,
+                768,
+            ),
+            (
+                "state_bank.semantic_projector.hidden_dim",
+                self.state_bank.semantic_projector.hidden_dim,
+                1024,
+            ),
+            (
+                "state_bank.semantic_projector.output_dim",
+                self.state_bank.semantic_projector.output_dim,
+                512,
+            ),
+            (
+                "state_bank.semantic_projector.head_types",
+                self.state_bank.semantic_projector.head_types,
+                ("o1", "o2", "e1", "e2"),
+            ),
+            (
+                "state_bank.semantic_projector.head_type_count",
+                self.state_bank.semantic_projector.head_type_count,
+                4,
+            ),
+            (
+                "state_bank.semantic_projector.layer_norm_eps",
+                self.state_bank.semantic_projector.layer_norm_eps,
+                1.0e-5,
+            ),
+            (
+                "state_bank.semantic_projector.activation",
+                self.state_bank.semantic_projector.activation,
+                "silu",
+            ),
+            (
+                "state_bank.semantic_projector.dropout",
+                self.state_bank.semantic_projector.dropout,
+                0.0,
+            ),
+            (
+                "state_bank.semantic_projector.linear_bias",
+                self.state_bank.semantic_projector.linear_bias,
+                True,
+            ),
+            (
+                "state_bank.semantic_projector.normalization_dtype",
+                self.state_bank.semantic_projector.normalization_dtype,
+                "float32",
+            ),
+            (
+                "state_bank.semantic_projector.normalization_eps",
+                self.state_bank.semantic_projector.normalization_eps,
+                1.0e-8,
+            ),
+            (
+                "state_bank.semantic_projector.zero_norm_fallback",
+                self.state_bank.semantic_projector.zero_norm_fallback,
+                "first_unit_basis",
+            ),
+            (
+                "state_bank.semantic_projector.parameter_count",
+                self.state_bank.semantic_projector.parameter_count,
+                1_316_864,
+            ),
+            (
+                "state_bank.semantic_projector.included_in_model_state_dict",
+                self.state_bank.semantic_projector.included_in_model_state_dict,
+                True,
+            ),
+            (
+                "state_bank.semantic_projector.included_in_outer_optimizer",
+                self.state_bank.semantic_projector.included_in_outer_optimizer,
+                True,
+            ),
+            (
+                "state_bank.semantic_projector.included_in_inner_optimizer",
+                self.state_bank.semantic_projector.included_in_inner_optimizer,
+                False,
+            ),
+            (
+                "state_bank.semantic_projector.online_frozen",
+                self.state_bank.semantic_projector.online_frozen,
+                True,
+            ),
+            (
+                "state_bank.semantic_projector.online_forward_no_grad",
+                self.state_bank.semantic_projector.online_forward_no_grad,
+                False,
+            ),
+            (
+                "state_bank.semantic_projector.detach_inputs",
+                self.state_bank.semantic_projector.detach_inputs,
+                False,
+            ),
+            (
                 "state_bank.confirmed_store.initial_capacity",
                 self.state_bank.confirmed_store.initial_capacity,
                 256,
@@ -707,6 +851,78 @@ class ProjectConfig(FrozenModel):
                 512,
             ),
             ("state_bank.event_history_capacity", self.state_bank.event_history_capacity, 512),
+            ("state_bank.hard_updates_no_grad", self.state_bank.hard_updates_no_grad, True),
+            ("state_bank.detach_before_write", self.state_bank.detach_before_write, True),
+            (
+                "state_bank.runtime_in_model_state_dict",
+                self.state_bank.runtime_in_model_state_dict,
+                False,
+            ),
+            (
+                "state_bank.runtime_registered_parameters",
+                self.state_bank.runtime_registered_parameters,
+                False,
+            ),
+            (
+                "state_bank.runtime_registered_buffers",
+                self.state_bank.runtime_registered_buffers,
+                False,
+            ),
+            (
+                "state_bank.runtime_in_outer_optimizer",
+                self.state_bank.runtime_in_outer_optimizer,
+                False,
+            ),
+            (
+                "state_bank.runtime_in_inner_optimizer",
+                self.state_bank.runtime_in_inner_optimizer,
+                False,
+            ),
+            (
+                "state_bank.snapshot_separate_from_model_checkpoint",
+                self.state_bank.snapshot_separate_from_model_checkpoint,
+                True,
+            ),
+            (
+                "state_bank.record_time_metadata_policy",
+                self.state_bank.record_time_metadata_policy,
+                "exactly_one",
+            ),
+            (
+                "state_bank.record_id_policy",
+                self.state_bank.record_id_policy,
+                "trajectory_monotonic_never_reuse",
+            ),
+            (
+                "state_bank.aggregate_record_heads",
+                self.state_bank.aggregate_record_heads,
+                ("o1", "e1", "e2"),
+            ),
+            (
+                "state_bank.aggregate_update_mode",
+                self.state_bank.aggregate_update_mode,
+                "functional_replace",
+            ),
+            (
+                "state_bank.committed_position_policy",
+                self.state_bank.committed_position_policy,
+                "idempotent_ignore_and_audit",
+            ),
+            (
+                "state_bank.o2_p9_policy",
+                self.state_bank.o2_p9_policy,
+                "generic_crud_only_p10_owns_lifecycle",
+            ),
+            (
+                "state_bank.dynamic_view_padding",
+                self.state_bank.dynamic_view_padding,
+                "batch_max",
+            ),
+            (
+                "state_bank.n_state_definition",
+                self.state_bank.n_state_definition,
+                "owner_head_present_records_before_filters",
+            ),
             ("query_encoder.input_dim", self.query_encoder.input_dim, 4096),
             ("query_encoder.hidden_dim", self.query_encoder.hidden_dim, 768),
             ("query_encoder.num_layers", self.query_encoder.num_layers, 4),
@@ -889,6 +1105,27 @@ class ProjectConfig(FrozenModel):
             ("o1.dropout", heads.o1.dropout, 0.0),
             ("o1.linear_bias", heads.o1.linear_bias, True),
             ("o1.parameter_count", heads.o1.parameter_count, 2_632_710),
+            ("o1.object_threshold", heads.o1.object_threshold, 0.5),
+            ("o1.target_threshold", heads.o1.target_threshold, 0.5),
+            ("o1.visible_threshold", heads.o1.visible_threshold, 0.5),
+            ("o1.enter_threshold", heads.o1.enter_threshold, 0.5),
+            ("o1.exit_threshold", heads.o1.exit_threshold, 0.5),
+            ("o1.confidence_threshold", heads.o1.confidence_threshold, 0.5),
+            (
+                "o1.baseline_policy",
+                heads.o1.baseline_policy,
+                "explicit_set_once_per_trajectory",
+            ),
+            (
+                "o1.count_update_policy",
+                heads.o1.count_update_policy,
+                "recompute_from_full_slot_state",
+            ),
+            (
+                "o1.committed_position_policy",
+                heads.o1.committed_position_policy,
+                "idempotent_preserve_and_audit_drift",
+            ),
             ("o2.input_dim", heads.o2.input_dim, 768),
             ("o2.hidden_dims", heads.o2.hidden_dims, (1024, 1024)),
             ("o2.identity_dim", heads.o2.identity_dim, 256),
@@ -934,6 +1171,22 @@ class ProjectConfig(FrozenModel):
             ),
             ("e1.detach_runtime_default", heads.e1.detach_runtime_default, True),
             ("e1.parameter_count", heads.e1.parameter_count, 9_584_643),
+            ("e1.tau_on", heads.e1.tau_on, 0.7),
+            ("e1.tau_off", heads.e1.tau_off, 0.3),
+            ("e1.completion_threshold", heads.e1.completion_threshold, 0.7),
+            ("e1.transition_threshold", heads.e1.transition_threshold, 0.7),
+            ("e1.min_gap_seconds", heads.e1.min_gap_seconds, 0.5),
+            (
+                "e1.fsm_policy",
+                heads.e1.fsm_policy,
+                "eventness_hysteresis_completion_transition",
+            ),
+            ("e1.cooldown_nms_source", heads.e1.cooldown_nms_source, "min_gap_seconds"),
+            (
+                "e1.committed_position_policy",
+                heads.e1.committed_position_policy,
+                "idempotent_ignore_and_audit",
+            ),
             ("e2.input_dim", heads.e2.input_dim, 768),
             ("e2.hidden_dim", heads.e2.hidden_dim, 768),
             ("e2.num_layers", heads.e2.num_layers, 2),
@@ -964,6 +1217,31 @@ class ProjectConfig(FrozenModel):
             ),
             ("e2.detach_runtime_default", heads.e2.detach_runtime_default, True),
             ("e2.parameter_count", heads.e2.parameter_count, 7_094_792),
+            ("e2.start_threshold", heads.e2.start_threshold, 0.6),
+            ("e2.end_threshold", heads.e2.end_threshold, 0.6),
+            ("e2.complete_threshold", heads.e2.complete_threshold, 0.7),
+            (
+                "e2.rearm_max_event_probability",
+                heads.e2.rearm_max_event_probability,
+                0.5,
+            ),
+            ("e2.rearm_phase", heads.e2.rearm_phase, "inactive"),
+            ("e2.completed_hold_positions", heads.e2.completed_hold_positions, 1),
+            (
+                "e2.fsm_policy",
+                heads.e2.fsm_policy,
+                "phase_gated_single_transition_per_position",
+            ),
+            (
+                "e2.active_evidence_policy",
+                heads.e2.active_evidence_policy,
+                "diagnostic_and_phase_consistency_only",
+            ),
+            (
+                "e2.committed_position_policy",
+                heads.e2.committed_position_policy,
+                "idempotent_ignore_and_audit",
+            ),
         )
         for path, actual, required in expected:
             if actual != required:
@@ -972,9 +1250,7 @@ class ProjectConfig(FrozenModel):
         e1_receptive_field = 1 + (heads.e1.kernel_size - 1) * sum(heads.e1.dilations)
         if heads.e1.receptive_field != e1_receptive_field:
             raise ValueError("observation_heads.e1 receptive field does not match its dilations")
-        if heads.e1.history_tubelets != (
-            e1_receptive_field - 1 + heads.e1.overlap_tubelets
-        ):
+        if heads.e1.history_tubelets != (e1_receptive_field - 1 + heads.e1.overlap_tubelets):
             raise ValueError(
                 "observation_heads.e1 streaming history must cover context and overlap"
             )
@@ -982,6 +1258,10 @@ class ProjectConfig(FrozenModel):
             raise ValueError(
                 "observation_heads.e2 rollback checkpoints must cover overlap plus anchor"
             )
+        if heads.e1.completion_threshold != heads.e1.tau_on or (
+            heads.e1.transition_threshold != heads.e1.tau_on
+        ):
+            raise ValueError("P9 E1 completion/transition thresholds must reuse tau_on")
 
     def _validate_state_and_query_contracts(self) -> None:
         prototypes = (
@@ -1001,6 +1281,23 @@ class ProjectConfig(FrozenModel):
             raise ValueError("time_resolver.modes must contain the frozen 4 modes")
         if self.state_bank.isolation_keys != ("video_id", "trajectory_id", "head_type"):
             raise ValueError("state_bank.isolation_keys must isolate video, trajectory, and head")
+        projector = self.state_bank.semantic_projector
+        if projector.head_type_count != len(projector.head_types):
+            raise ValueError("semantic projector head_type_count must match head_types")
+        if projector.output_dim != self.state_bank.semantic_dim:
+            raise ValueError("semantic projector output must match state_bank.semantic_dim")
+        projector_parameter_count = (
+            projector.head_type_count * projector.input_dim
+            + 2 * projector.input_dim
+            + projector.input_dim * projector.hidden_dim
+            + projector.hidden_dim
+            + projector.hidden_dim * projector.output_dim
+            + projector.output_dim
+        )
+        if projector.parameter_count != projector_parameter_count:
+            raise ValueError(
+                "semantic projector parameter_count does not match its frozen topology"
+            )
         if self.fast_ttt.online_parameter_count != (
             self.fast_ttt.fast_matrix_count * self.fast_ttt.bottleneck_dim**2
         ):
@@ -1064,9 +1361,12 @@ class ProjectConfig(FrozenModel):
         for parameter_count, millions, name in exact_head_budgets:
             if abs(parameter_count / 1_000_000 - millions) > 1.0e-9:
                 raise ValueError(f"{name} budget must use the exact P8 parameter count")
-        exact_total_millions = 156_718_819 / 1_000_000
+        exact_projector_millions = self.state_bank.semantic_projector.parameter_count / 1_000_000
+        if abs(exact_projector_millions - budget.semantic_projector_millions) > 1.0e-9:
+            raise ValueError("Semantic Projector budget must use the exact P9 parameter count")
+        exact_total_millions = 156_715_683 / 1_000_000
         if abs(exact_total_millions - budget.new_modules_total_millions) > 1.0e-9:
-            raise ValueError("new module budget must use the frozen P8 component total")
+            raise ValueError("new module budget must use the frozen P9 component total")
 
 
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:

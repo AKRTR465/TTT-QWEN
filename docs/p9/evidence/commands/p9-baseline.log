@@ -1,0 +1,7 @@
+timestamp_utc=2026-07-14T00:48:22.4127670Z
+branch=main
+baseline_commit=bb3747ee404c4cd7ab2808d55dc9767197bb9ba3
+baseline_stage=P8 passed
+baseline_full_pytest=285 passed
+asset_policy=Meta or small synthetic tensors only
+downloads=none

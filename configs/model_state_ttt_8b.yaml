@@ -145,7 +145,16 @@ observation_heads:
     dropout: 0.0
     linear_bias: true
     parameter_count: 2632710
-    threshold_status: calibration_required
+    object_threshold: 0.5
+    target_threshold: 0.5
+    visible_threshold: 0.5
+    enter_threshold: 0.5
+    exit_threshold: 0.5
+    confidence_threshold: 0.5
+    baseline_policy: explicit_set_once_per_trajectory
+    count_update_policy: recompute_from_full_slot_state
+    committed_position_policy: idempotent_preserve_and_audit_drift
+    threshold_status: bootstrap_calibration_required
   o2:
     input_dim: 768
     hidden_dims: [1024, 1024]
@@ -187,7 +196,12 @@ observation_heads:
     parameter_count: 9584643
     tau_on: 0.7
     tau_off: 0.3
+    completion_threshold: 0.7
+    transition_threshold: 0.7
     min_gap_seconds: 0.5
+    fsm_policy: eventness_hysteresis_completion_transition
+    cooldown_nms_source: min_gap_seconds
+    committed_position_policy: idempotent_ignore_and_audit
     threshold_status: bootstrap_calibration_required
   e2:
     input_dim: 768
@@ -211,6 +225,12 @@ observation_heads:
     start_threshold: 0.6
     end_threshold: 0.6
     complete_threshold: 0.7
+    rearm_max_event_probability: 0.5
+    rearm_phase: inactive
+    completed_hold_positions: 1
+    fsm_policy: phase_gated_single_transition_per_position
+    active_evidence_policy: diagnostic_and_phase_consistency_only
+    committed_position_policy: idempotent_ignore_and_audit
     threshold_status: bootstrap_calibration_required
 
 state_bank:
@@ -220,6 +240,22 @@ state_bank:
     input_dim: 768
     hidden_dim: 1024
     output_dim: 512
+    head_type_count: 4
+    head_types: [o1, o2, e1, e2]
+    layer_norm_eps: 1.0e-5
+    activation: silu
+    dropout: 0.0
+    linear_bias: true
+    normalization_dtype: float32
+    normalization_eps: 1.0e-8
+    zero_norm_fallback: first_unit_basis
+    parameter_count: 1316864
+    included_in_model_state_dict: true
+    included_in_outer_optimizer: true
+    included_in_inner_optimizer: false
+    online_frozen: true
+    online_forward_no_grad: false
+    detach_inputs: false
   confirmed_store:
     initial_capacity: 256
     growth_chunk: 256
@@ -237,7 +273,20 @@ state_bank:
   isolation_keys: [video_id, trajectory_id, head_type]
   hard_updates_no_grad: true
   detach_before_write: true
-  included_in_state_dict: false
+  runtime_in_model_state_dict: false
+  runtime_registered_parameters: false
+  runtime_registered_buffers: false
+  runtime_in_outer_optimizer: false
+  runtime_in_inner_optimizer: false
+  snapshot_separate_from_model_checkpoint: true
+  record_time_metadata_policy: exactly_one
+  record_id_policy: trajectory_monotonic_never_reuse
+  aggregate_record_heads: [o1, e1, e2]
+  aggregate_update_mode: functional_replace
+  committed_position_policy: idempotent_ignore_and_audit
+  o2_p9_policy: generic_crud_only_p10_owns_lifecycle
+  dynamic_view_padding: batch_max
+  n_state_definition: owner_head_present_records_before_filters
 
 query_encoder:
   input_dim: 4096
@@ -322,9 +371,9 @@ parameter_budget:
   o2_millions: 2.103042
   e1_millions: 9.584643
   e2_millions: 7.094792
-  semantic_projector_millions: 1.32
+  semantic_projector_millions: 1.316864
   predictor_millions: 2.36
   state_resampler_millions: 14.72
   router_resolver_empty_millions: 0.14
-  new_modules_total_millions: 156.718819
+  new_modules_total_millions: 156.715683
   rounding_tolerance_millions: 0.02

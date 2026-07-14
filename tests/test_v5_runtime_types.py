@@ -272,6 +272,8 @@ def test_encoder_cache_and_observation_output_contracts() -> None:
 
 def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
     prototype = torch.zeros(256)
+    semantic = torch.zeros(512)
+    semantic[0] = 1.0
     candidate = CandidateIdentity("candidate-1", prototype, 1, 8, 0.8)
     confirmed = ConfirmedIdentity("identity-1", prototype, 0.0, 2.0, 3)
     hot = HotCacheEntry("identity-1", prototype, 2.0)
@@ -281,7 +283,7 @@ def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
         video_id="video-a",
         trajectory_id="trajectory-a",
         head_type=HeadType.O1,
-        semantic_embedding=torch.zeros(512),
+        semantic_embedding=semantic,
         timestamp=2.0,
         time_range=None,
         valid=True,
@@ -370,7 +372,6 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
         e2_state=e2_state,
         state_bank=bank,
         identity_bank=identities,
-        fsm_state=(),
         reader_audit=(),
         released=False,
     )
@@ -388,7 +389,6 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
             e2_state=None,
             state_bank=bank,
             identity_bank=identities,
-            fsm_state=(),
             reader_audit=(),
             released=False,
         )
@@ -414,7 +414,6 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
             e2_state=e2_state,
             state_bank=bank,
             identity_bank=identities,
-            fsm_state=(),
             reader_audit=(),
             released=False,
         )

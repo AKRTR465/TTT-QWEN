@@ -6,9 +6,9 @@
 | :--- | :--- |
 | 规范文件 | `ARCHITECTURE.md` |
 | SPEC_VERSION | `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval` |
-| 修订日期 | `2026-07-13` |
+| 修订日期 | `2026-07-14` |
 | 文档状态 | `DOCUMENT-ONLY / UNVERIFIED` |
-| ARCHITECTURE_SHA256 | `edf71c762d742d79fbe9fe8e607c8db2fb2e5df4921e2b9bd32c9d94643fea2b` |
+| ARCHITECTURE_SHA256 | `efd613bc0f73aba8f66c18c2e03692c88762320288b110d897ac8e2a8fb7442a` |
 | 基线 Git commit | `7f0185f8136faf88cc59e5ba2ec7309c36f8d013` |
 | UV_LOCK_SHA256 | `c66d2675c153ce306248b2b97913ff41f162fd3bb8a7514c6ca75888c12b8df2` |
 | 基座模型 | `Qwen/Qwen3-VL-8B-Instruct` |
@@ -36,16 +36,21 @@
    使用 FP32 L2 和 unit-basis 零范数回退。E1 使用 RF63 与无参 66-position projected-history；
    E2 使用单向 batch-first GRU 与 5 个 rollback checkpoint；二者 replay 4-position overlap 并按
    video/trajectory/query signature 隔离。精确参数依次为 2,632,710、2,103,042、9,584,643、
-   7,094,792，当前新增模块分项和为 156,718,819。
+   7,094,792，P8 四头合计 21,415,187。
 6. 四个 Head 只产生 raw-logit soft observation 和 debug probability/mask/timestamp/global
    position；invalid 清零，在线只冻结 Head 参数而不使用 `torch.no_grad()` 或 detach 输入。
-   hard Bank 保存事实，embedding
-   负责路由和检索，Deterministic
-   Reader 使用完整 hard records 做精确算术。
-7. Query Encoder 产生 target/operator/time 三个 512 维 embedding；operator 为 8 个合法类型加
+   hard Bank 保存事实，embedding 负责路由和检索，Deterministic Reader 使用完整 hard records
+   做精确算术。
+7. P9 Semantic Projector 固定四个 768 维 head embedding 和共享 `768→1024→512` SiLU trunk，
+   精确 1,316,864 参数；Projector 进入模型 state_dict/Outer optimizer，Bank/FSM/runtime 全部
+   零参数、零模型持久化并通过独立 snapshot 恢复。O1 六阈值为 0.5 且 baseline 显式 set once；
+   E1 使用 0.7/0.3 hysteresis、0.7 completion/transition 和 0.5 秒 cooldown/NMS；E2 使用
+   phase-gated 三步 FSM，并在 INACTIVE phase 与全部 event probability 不高于 0.5 时 re-arm。
+   当前新增模块分项和为 156,715,683。
+8. Query Encoder 产生 target/operator/time 三个 512 维 embedding；operator 为 8 个合法类型加
    unsupported；State Retriever 使用归一化余弦阈值且不做固定 Top-K。
-8. 16 个 State Token 只提供语义摘要；精确 number payload 由 Reader 给出，LLM 只负责表达。
-9. query_time 之后的帧和答案/计数标签字段不进入 Bank、TTT、Retriever、Reader 或生成输入。
+9. 16 个 State Token 只提供语义摘要；精确 number payload 由 Reader 给出，LLM 只负责表达。
+10. query_time 之后的帧和答案/计数标签字段不进入 Bank、TTT、Retriever、Reader 或生成输入。
 
 ## 第一版禁止项
 
