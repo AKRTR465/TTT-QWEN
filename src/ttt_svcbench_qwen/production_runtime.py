@@ -117,8 +117,13 @@ from ttt_svcbench_qwen.state_encoder import (
     build_spatial_encoder,
     build_temporal_encoder,
 )
-from ttt_svcbench_qwen.state_reader import build_state_reader, build_state_resampler
-from ttt_svcbench_qwen.state_retriever import build_state_retriever
+from ttt_svcbench_qwen.state_reader import (
+    DeterministicStateReader,
+    ReaderResult,
+    build_state_reader,
+    build_state_resampler,
+)
+from ttt_svcbench_qwen.state_retriever import RetrieverOutput, build_state_retriever
 from ttt_svcbench_qwen.trainer import (
     StageAEpisodeAnswerInputs,
     StageAEpisodeInputs,
@@ -755,7 +760,10 @@ class ProductionQueryRuntime(nn.Module):  # type: ignore[misc]
         # signatures remain exact.  The fork prevents these local masks from perturbing global RNG.
         with torch.random.fork_rng(devices=cuda_devices):
             torch.manual_seed(dropout_seed)
-            return self.query_encoder(inputs, inference=inference)
+            output = self.query_encoder(inputs, inference=inference)
+        if not isinstance(output, QueryEncoderOutput):
+            raise TypeError("production Query encoder returned an invalid output")
+        return output
 
     @property
     def query_encoder_config(self) -> ProjectConfig:
@@ -772,9 +780,10 @@ class FastVisualPassThrough:
     def __call__(
         self,
         visual: VisualStageOutput,
-        _query: object,
-        _request: ObservationChunkRequest,
+        query: object,
+        request: ObservationChunkRequest,
     ) -> VisualStageOutput:
+        del query, request
         if not isinstance(visual.audit, ProductionVisualAudit):
             raise TypeError("Fast pass-through requires an audited current visual chunk")
         return visual
@@ -797,7 +806,7 @@ class ProductionSpatialRuntime(nn.Module):  # type: ignore[misc]
             if chunk.spec.reset_soft_state
             else runtime.slot_states
         )
-        return self.encoder(
+        output = self.encoder(
             value.main_visual_embeddings,
             value.visual_valid_mask,
             value.metadata,
@@ -807,6 +816,9 @@ class ProductionSpatialRuntime(nn.Module):  # type: ignore[misc]
             prior_states=prior,
             detach_runtime_state=True,
         )
+        if not isinstance(output, SpatialEncoderOutput):
+            raise TypeError("production Spatial encoder returned an invalid output")
+        return output
 
 
 class ProductionTemporalRuntime(nn.Module):  # type: ignore[misc]
@@ -830,7 +842,7 @@ class ProductionTemporalRuntime(nn.Module):  # type: ignore[misc]
             dtype=temporal_times.dtype,
             device=temporal_value.main_visual_embeddings.device,
         )
-        return self.encoder(
+        output = self.encoder(
             temporal_value.main_visual_embeddings,
             temporal_value.visual_valid_mask,
             temporal_value.metadata,
@@ -844,6 +856,9 @@ class ProductionTemporalRuntime(nn.Module):  # type: ignore[misc]
             cache=cache,
             detach_cache=True,
         )
+        if not isinstance(output, TemporalEncoderOutput):
+            raise TypeError("production Temporal encoder returned an invalid output")
+        return output
 
 
 def _causal_temporal_tail(
@@ -956,7 +971,7 @@ class ProductionObservationRuntime(nn.Module):  # type: ignore[misc]
         else:
             raise TypeError("production Observation runtime requires one current chunk")
         empty = (None,) * len(request.owner.video_ids)
-        return self.heads(
+        output = self.heads(
             spatial,
             temporal,
             query.q_target,
@@ -966,6 +981,84 @@ class ProductionObservationRuntime(nn.Module):  # type: ignore[misc]
             e2_prior_states=empty if reset else runtime.e2_states,
             detach_runtime_state=True,
         )
+        if not isinstance(output, ObservationOutputs):
+            raise TypeError("production Observation heads returned an invalid output")
+        return output
+
+
+class ProductionReaderRuntime:
+    """Adapt the concrete Reader to the model's fail-closed object boundary."""
+
+    def __init__(self, reader: DeterministicStateReader) -> None:
+        self.reader = reader
+
+    def read(self, retrieval: object) -> Sequence[object]:
+        return self.reader.read(self._retrieval(retrieval))
+
+    def audit_results(
+        self,
+        retrieval: object,
+        results: Sequence[object],
+    ) -> Sequence[object]:
+        if any(not isinstance(result, ReaderResult) for result in results):
+            raise TypeError("production Reader audit requires ReaderResult values")
+        typed_results = cast(Sequence[ReaderResult], results)
+        return self.reader.audit_results(self._retrieval(retrieval), typed_results)
+
+    def audit_number_tokens(self, result: object) -> int | None:
+        if not isinstance(result, ReaderResult):
+            raise TypeError("production Reader token audit requires ReaderResult")
+        return self.reader.audit_number_tokens(result)
+
+    @staticmethod
+    def _retrieval(retrieval: object) -> RetrieverOutput:
+        if not isinstance(retrieval, RetrieverOutput):
+            raise TypeError("production Reader requires RetrieverOutput")
+        return retrieval
+
+
+def _compose_production_inputs(
+    *,
+    base_input_ids: object,
+    base_attention_mask: object,
+    state_tokens: object | None,
+    state_token_valid_mask: object | None,
+    reader_results: Sequence[object],
+    tokenizer: object,
+    embedding_owner: object,
+    rope_indexer: object,
+    video_grid_thw: object,
+    include_state: bool,
+    include_number: bool,
+) -> object:
+    tensors = {
+        "base_input_ids": base_input_ids,
+        "base_attention_mask": base_attention_mask,
+    }
+    optional_tensors = {
+        "state_tokens": state_tokens,
+        "state_token_valid_mask": state_token_valid_mask,
+        "video_grid_thw": video_grid_thw,
+    }
+    if any(not isinstance(value, Tensor) for value in tensors.values()):
+        raise TypeError("production Composer requires Tensor IDs and attention mask")
+    if any(
+        value is not None and not isinstance(value, Tensor) for value in optional_tensors.values()
+    ):
+        raise TypeError("production Composer received an invalid optional Tensor")
+    return compose_inputs(
+        base_input_ids=cast(Tensor, base_input_ids),
+        base_attention_mask=cast(Tensor, base_attention_mask),
+        state_tokens=cast(Tensor | None, state_tokens),
+        state_token_valid_mask=cast(Tensor | None, state_token_valid_mask),
+        reader_results=cast(Any, reader_results),
+        tokenizer=cast(Any, tokenizer),
+        embedding_owner=cast(Any, embedding_owner),
+        rope_indexer=cast(Any, rope_indexer),
+        video_grid_thw=cast(Tensor | None, video_grid_thw),
+        include_state=include_state,
+        include_number=include_number,
+    )
 
 
 class ProductionOuterModel(nn.Module):  # type: ignore[misc]
@@ -1450,15 +1543,18 @@ class ProductionA2LossStep:
         call_index = self.progress.begin(record)
         self._active_progress_call = call_index
         batch = self.materializer.a2(source)
+        if not isinstance(batch.model_inputs, StageAEpisodeInputs):
+            raise TypeError("A2 materializer must return StageAEpisodeInputs")
+        model_inputs = batch.model_inputs
         self.progress.emit(
             call_index,
             "materialized",
-            support_count=len(batch.model_inputs.observation_requests) - 1,
+            support_count=len(model_inputs.observation_requests) - 1,
             dataloader_prefetched=True,
         )
         support_specs = tuple(
             request.video_input
-            for request in batch.model_inputs.observation_requests
+            for request in model_inputs.observation_requests
             if isinstance(request.video_input, CurrentChunkSpec)
         )
         self.materializer.video.begin_prefetch(
@@ -1693,14 +1789,14 @@ def build_runtime(
     state_bank: StructuredStateBank = build_state_bank(project)
     identity_bank = build_identity_bank(project)
     writer = StageABankWriter(state_bank, identity_bank)
-    reader = build_state_reader(project, cast(Any, backbone.tokenizer))
+    reader = ProductionReaderRuntime(build_state_reader(project, cast(Any, backbone.tokenizer)))
     register_input_composer_tokens_with_audit(cast(Any, backbone.tokenizer), backbone.model)
     state_model = StateTTTModel(
         project,
         ModelComponents(
             visual_stage=qwen_runtime,
             query_encoder=query_runtime,
-            composer=compose_inputs,
+            composer=_compose_production_inputs,
             qwen_prefill=qwen_runtime,
             qwen_decode=qwen_runtime,
             fast_adapter=FastVisualPassThrough(),
