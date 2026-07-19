@@ -266,10 +266,20 @@ def test_distributed_manifest_samplers_balance_a2_and_align_a5_segments(tmp_path
     local_indices = [global_a5_indices[0][rank::4] for rank in range(4)]
     assert len({len(values) for values in local_indices}) == 1
     for step in range(len(local_indices[0])):
-        segment_counts = {
-            a5_dataset[local_indices[rank][step]].tbptt_segment_count for rank in range(4)
+        rows = [a5_dataset[local_indices[rank][step]] for rank in range(4)]
+        segment_counts = {row.tbptt_segment_count for row in rows}
+        shapes = {
+            (
+                tuple(
+                    min(row.truncation_horizon, row.support_count - start)
+                    for start in range(0, row.support_count, row.truncation_horizon)
+                ),
+                row.query_count,
+            )
+            for row in rows
         }
         assert len(segment_counts) == 1
+        assert len(shapes) == 1
 
 
 def _annotations(

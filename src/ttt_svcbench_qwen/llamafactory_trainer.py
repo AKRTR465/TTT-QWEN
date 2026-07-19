@@ -7,12 +7,13 @@ for the complete episode.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -26,9 +27,12 @@ if __name__ == "__main__":
     sys.modules.setdefault("ttt_svcbench_qwen.llamafactory_trainer", sys.modules[__name__])
 
 import torch
+import transformers
 from torch import Tensor, nn
 
 from ttt_svcbench_qwen.episode_data import (
+    A2QueryRecord,
+    A5EpisodeRecord,
     ManifestStage,
     build_production_train_sampler,
     load_production_manifest_views,
@@ -49,6 +53,10 @@ from ttt_svcbench_qwen.production_factory import (
     load_llamafactory_backbone,
 )
 from ttt_svcbench_qwen.runtime_metrics import flush_runtime_metrics
+from ttt_svcbench_qwen.visual_cost import (
+    VisualCostRecord,
+    make_visual_cost_fingerprint,
+)
 
 
 class ProductionStage(StrEnum):
@@ -208,11 +216,13 @@ class TTTQwenTrainerMixin:
     def _get_train_sampler(self, train_dataset: object | None = None) -> object:
         dataset = self.train_dataset if train_dataset is None else train_dataset  # type: ignore[attr-defined]
         factory = cast(TrainSamplerFactory, self.ttt_runtime.train_sampler_factory)
-        return factory(
+        sampler = factory(
             dataset,
             int(self.args.process_index),  # type: ignore[attr-defined]
             int(self.args.world_size),  # type: ignore[attr-defined]
         )
+        self._ttt_train_sampler = sampler
+        return sampler
 
     def log(self, logs: dict[str, float], *args: object, **kwargs: object) -> None:
         enriched = dict(logs)
@@ -248,6 +258,7 @@ class TTTQwenTrainerMixin:
         inputs: Mapping[str, object],
         num_items_in_batch: Tensor | None = None,
     ) -> Tensor:
+        step_started = time.perf_counter()
         if self.ttt_runtime.stage is ProductionStage.A2:
             result = cast(
                 Tensor,
@@ -260,6 +271,7 @@ class TTTQwenTrainerMixin:
             marker = getattr(self.ttt_runtime.stage_a_loss_step, "mark_backward_returned", None)
             if callable(marker):
                 marker()
+            self._observe_runtime_cost(inputs, time.perf_counter() - step_started)
             return result
         if int(self.args.gradient_accumulation_steps) != 1:  # type: ignore[attr-defined]
             raise ValueError("A5 uses one complete episode/rank and episode-level GA=1")
@@ -298,7 +310,28 @@ class TTTQwenTrainerMixin:
             raise RuntimeError("A5 backward collective count drifted from its segment bucket")
         backward_controller.finalize()
         self.last_meta_output = output
+        self._observe_runtime_cost(inputs, time.perf_counter() - step_started)
         return (output.total * loss_weight).detach().to(self.args.device)  # type: ignore[attr-defined]
+
+    def _observe_runtime_cost(
+        self,
+        inputs: Mapping[str, object],
+        seconds: float,
+    ) -> None:
+        sampler = getattr(self, "_ttt_train_sampler", None)
+        observe = getattr(sampler, "observe_runtime_cost", None)
+        if not callable(observe):
+            return
+        prepared = inputs.get(
+            "prepared_a2"
+            if self.ttt_runtime.stage is ProductionStage.A2
+            else "prepared_a5"
+        )
+        record = getattr(prepared, "record", None)
+        if isinstance(record, A2QueryRecord):
+            observe(record.query.runtime.query_id, seconds)
+        elif isinstance(record, A5EpisodeRecord):
+            observe(record.episode_id, seconds)
 
     def _assert_rank_segment_parity(self, local_count: int) -> None:
         device = self.args.device  # type: ignore[attr-defined]
@@ -349,6 +382,12 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("usage: python -m ttt_svcbench_qwen.llamafactory_trainer CONFIG.yaml")
     started = time.monotonic()
     backbone = load_llamafactory_backbone(arguments[0])
+    balance_mode = backbone.project_config.loss.official_weak_balance.mode.value
+    if balance_mode != "instant_equal" and os.environ.get("TTT_LEGACY_SUM_ABLATION") != "1":
+        raise ValueError(
+            "formal A2/A5 requires instant_equal; set TTT_LEGACY_SUM_ABLATION=1 "
+            "only for an explicit ablation run"
+        )
     unfreeze_audit = fully_unfreeze_qwen(backbone.model, backbone.project_config)
     configured_stage = ProductionStage(backbone.ttt_config.stage)
     if getattr(backbone.training_args, "resume_from_checkpoint", None) is not None:
@@ -359,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.get("TTT_RESUME_CHECKPOINT"),
         configured_stage,
     )
-    from ttt_svcbench_qwen.production_runtime import build_runtime
+    from ttt_svcbench_qwen.production_runtime import _video_pixel_bounds, build_runtime
 
     runtime_raw = build_runtime(backbone, backbone.ttt_config)
     if not isinstance(runtime_raw, ProductionTrainerRuntime):
@@ -376,10 +415,44 @@ def main(argv: list[str] | None = None) -> int:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
     )
-    visual_cost_index: Mapping[str, Sequence[int]] | None = None
+    visual_cost_index: Mapping[str, VisualCostRecord] | None = None
     raw_cost_index = backbone.ttt_config.visual_cost_index
     if raw_cost_index is not None:
-        visual_cost_index = load_visual_cost_index(raw_cost_index)
+        minimum_pixels, maximum_pixels = _video_pixel_bounds(backbone)
+        balance = backbone.project_config.loss.official_weak_balance
+        model_name = str(getattr(backbone.model_args, "model_name_or_path", "unknown-model"))
+        revision = str(getattr(backbone.model_args, "revision", "unknown-revision"))
+        parameter = next(backbone.model.parameters())
+        expected_fingerprint = make_visual_cost_fingerprint(
+            manifest_sha256=hashlib.sha256(
+                Path(manifest_path).read_bytes()
+            ).hexdigest(),
+            model_revision=f"{model_name}@{revision}",
+            transformers_version=transformers.__version__,
+            processor=(
+                f"{type(backbone.processor).__module__}."
+                f"{type(backbone.processor).__qualname__}"
+            ),
+            minimum_pixels=minimum_pixels,
+            maximum_pixels=maximum_pixels,
+            dtype=str(parameter.dtype).removeprefix("torch."),
+            visual_batch_size=backbone.ttt_config.support_visual_batch_size,
+            cache_mode=backbone.ttt_config.preprocess_cache_mode,
+            loss_mode=balance.mode.value,
+            loss_group_weight=balance.group_weight,
+            loss_scale_min=balance.scale_min,
+            loss_scale_max=balance.scale_max,
+            loss_epsilon=balance.epsilon,
+            gpu_model=(
+                torch.cuda.get_device_name(torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else "cpu"
+            ),
+        )
+        visual_cost_index = load_visual_cost_index(
+            raw_cost_index,
+            expected_fingerprint=expected_fingerprint,
+        )
     checkpoint_audit: OuterCheckpointAudit | None = None
     if configured_stage is ProductionStage.A5 and same_stage_resume is None:
         checkpoint = backbone.ttt_config.initialize_from_a2_checkpoint

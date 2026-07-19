@@ -19,7 +19,6 @@ from enum import StrEnum
 from functools import lru_cache
 from itertools import pairwise
 from pathlib import Path, PurePosixPath
-from typing import cast
 
 import av
 from torch.utils.data import Dataset, Sampler
@@ -34,6 +33,11 @@ from ttt_svcbench_qwen.data import (
     extract_explicit_time_values,
 )
 from ttt_svcbench_qwen.query_encoder import Operator, TimeWindowMode
+from ttt_svcbench_qwen.visual_cost import (
+    EpochBoundaryCostEMA,
+    VisualCostRecord,
+    load_visual_cost_index,
+)
 
 
 class EpisodeSplit(StrEnum):
@@ -402,50 +406,6 @@ def _a2_visual_length_key(record: A2QueryRecord) -> tuple[int, int, int]:
     return frame_budget, pixel_rate, encoded_bytes_per_second or file_bytes
 
 
-def load_visual_cost_index(path: str | Path) -> dict[str, tuple[int, int, int]]:
-    """Load an optional offline visual-cost sidecar.
-
-    The sidecar is advisory only.  Malformed or incomplete rows are ignored so a stale index can
-    never prevent a manifest from loading; the sampler falls back to ``_a2_visual_length_key``
-    for those records.
-    """
-
-    source = Path(path)
-    raw = json.loads(source.read_text(encoding="utf-8"))
-    rows: object
-    if isinstance(raw, Mapping) and isinstance(raw.get("records"), list):
-        rows = raw["records"]
-    elif isinstance(raw, list):
-        rows = raw
-    elif isinstance(raw, Mapping):
-        rows = [
-            dict(value, record_id=key)
-            for key, value in raw.items()
-            if isinstance(value, Mapping)
-        ]
-    else:
-        raise ValueError("visual cost index must be a list or object")
-    result: dict[str, tuple[int, int, int]] = {}
-    for row in cast(Sequence[object], rows):
-        if not isinstance(row, Mapping):
-            continue
-        record_id = row.get("record_id")
-        if not isinstance(record_id, str) or not record_id:
-            continue
-        frame_budget = _sidecar_nonnegative_int(row.get("estimated_visual_tokens"))
-        if frame_budget is None:
-            frame_budget = _sidecar_nonnegative_int(row.get("frame_budget"))
-        pixel_rate = _sidecar_nonnegative_int(row.get("pixel_rate"))
-        decode_seconds = _sidecar_nonnegative_float(row.get("estimated_decode_seconds"))
-        encoded_rate = _sidecar_nonnegative_int(row.get("encoded_bytes_per_second"))
-        if decode_seconds is not None:
-            encoded_rate = max(encoded_rate or 0, int(round(decode_seconds * 1.0e6)))
-        if frame_budget is None:
-            continue
-        result[record_id] = (frame_budget, pixel_rate or 0, encoded_rate or 0)
-    return result
-
-
 def _sidecar_nonnegative_int(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -506,7 +466,7 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         world_size: int,
         seed: int = 42,
         visual_length_fn: Callable[[A2QueryRecord], int] | None = None,
-        visual_cost_index: Mapping[str, Sequence[int]] | None = None,
+        visual_cost_index: Mapping[str, VisualCostRecord] | None = None,
     ) -> None:
         if dataset.stage is not ManifestStage.A2 or dataset.split is not EpisodeSplit.TRAIN:
             raise ValueError("balanced A2 sampling requires the A2 train dataset")
@@ -518,6 +478,18 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         self.seed = seed
         self.epoch = 0
         self.visual_cost_index = visual_cost_index or {}
+        self.runtime_cost_ema = EpochBoundaryCostEMA(
+            {
+                record_id: record.predicted_total_seconds
+                for record_id, record in self.visual_cost_index.items()
+            }
+        )
+        if self.visual_cost_index:
+            missing = {
+                _require_a2(record).query.runtime.query_id for record in dataset.records
+            } - set(self.visual_cost_index)
+            if missing:
+                raise ValueError("A2 visual cost index does not cover every manifest record")
         buckets: dict[tuple[str, int], list[int]] = defaultdict(list)
         for index, raw in enumerate(dataset.records):
             record = _require_a2(raw)
@@ -527,7 +499,7 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         if tasks != {"O1", "O2", "E1", "E2"}:
             raise ValueError("balanced A2 production sampling requires all four task classes")
         self._buckets = {name: tuple(values) for name, values in buckets.items()}
-        self._visual_lengths: dict[int, tuple[int, int, int]] = {
+        self._visual_lengths: dict[int, tuple[float, int, int]] = {
             index: self._visual_key(_require_a2(raw), visual_length_fn)
             for index, raw in enumerate(dataset.records)
         }
@@ -548,30 +520,38 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         self,
         record: A2QueryRecord,
         visual_length_fn: Callable[[A2QueryRecord], int] | None,
-    ) -> tuple[int, int, int]:
+    ) -> tuple[float, int, int]:
         if visual_length_fn is not None:
             return int(visual_length_fn(record)), 0, 0
         sidecar = self.visual_cost_index.get(record.query.runtime.query_id)
-        if isinstance(sidecar, Mapping):
-            visual = _sidecar_nonnegative_int(sidecar.get("estimated_visual_tokens"))
-            visual = (
-                visual
-                if visual is not None
-                else _sidecar_nonnegative_int(sidecar.get("frame_budget"))
-            )
-            pixel = _sidecar_nonnegative_int(sidecar.get("pixel_rate")) or 0
-            encoded = _sidecar_nonnegative_int(sidecar.get("encoded_bytes_per_second")) or 0
-            sidecar = (visual or 0, pixel, encoded) if visual is not None else None
-        if sidecar is not None and len(sidecar) >= 3:
-            key = (int(sidecar[0]), int(sidecar[1]), int(sidecar[2]))
-            if all(value >= 0 for value in key):
-                return key
+        if sidecar is not None:
+            if sidecar.support_count != len(
+                adaptive_support_schedule(record.query.runtime.query_time)[1]
+            ):
+                raise ValueError("A2 visual cost Support count disagrees with manifest")
+            return sidecar.sort_key
         return _a2_visual_length_key(record)
 
     def set_epoch(self, epoch: int) -> None:
         if type(epoch) is not int or epoch < 0:
             raise ValueError("sampler epoch must be a non-negative integer")
+        self.runtime_cost_ema.advance_epoch(epoch)
+        for index, raw in enumerate(self.dataset.records):
+            record = _require_a2(raw)
+            sidecar = self.visual_cost_index.get(record.query.runtime.query_id)
+            if sidecar is not None:
+                self._visual_lengths[index] = (
+                    self.runtime_cost_ema.value(
+                        sidecar.record_id,
+                        sidecar.predicted_total_seconds,
+                    ),
+                    sidecar.total_visual_tokens,
+                    sidecar.maximum_visual_tokens,
+                )
         self.epoch = epoch
+
+    def observe_runtime_cost(self, record_id: str, seconds: float) -> None:
+        self.runtime_cost_ema.observe(record_id, seconds)
 
     def __iter__(self) -> Iterator[int]:
         rng = random.Random(self.seed + self.epoch)
@@ -634,6 +614,7 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
         rank: int,
         world_size: int,
         seed: int = 42,
+        visual_cost_index: Mapping[str, VisualCostRecord] | None = None,
     ) -> None:
         if dataset.stage is not ManifestStage.A5 or dataset.split is not EpisodeSplit.TRAIN:
             raise ValueError("rank-aligned A5 sampling requires the A5 train dataset")
@@ -646,17 +627,42 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
         self.world_size = world_size
         self.seed = seed
         self.epoch = 0
+        self.visual_cost_index = visual_cost_index or {}
+        self.runtime_cost_ema = EpochBoundaryCostEMA(
+            {
+                record_id: record.predicted_total_seconds
+                for record_id, record in self.visual_cost_index.items()
+            }
+        )
         self._buckets = tuple(
             bucket for bucket in dataset.manifest.buckets if bucket.split is EpisodeSplit.TRAIN
         )
         if not self._buckets:
             raise ValueError("A5 train manifest contains no segment buckets")
+        record_ids = {_manifest_record_id(record) for record in dataset.records}
+        if self.visual_cost_index and record_ids - set(self.visual_cost_index):
+            raise ValueError("A5 visual cost index does not cover every manifest record")
+        for bucket in self._buckets:
+            shapes = {
+                _a5_alignment_shape(
+                    _require_a5(dataset[dataset.index_by_id[episode_id]])
+                )
+                for episode_id in bucket.episode_ids
+            }
+            if len(shapes) != 1:
+                raise ValueError(
+                    "A5 manifest bucket mixes exact segment lengths or Query counts"
+                )
         self._global_size = sum(len(bucket.episode_ids) for bucket in self._buckets)
 
     def set_epoch(self, epoch: int) -> None:
         if type(epoch) is not int or epoch < 0:
             raise ValueError("sampler epoch must be a non-negative integer")
+        self.runtime_cost_ema.advance_epoch(epoch)
         self.epoch = epoch
+
+    def observe_runtime_cost(self, record_id: str, seconds: float) -> None:
+        self.runtime_cost_ema.observe(record_id, seconds)
 
     def __iter__(self) -> Iterator[int]:
         rng = random.Random(self.seed + self.epoch)
@@ -686,22 +692,44 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
             weights = [records_by_id[episode_id].sampling_weight for episode_id in real_ids]
             sampled = rng.choices(real_ids, weights=weights, k=len(real_ids))
             scheduled_ids = sampled + padding_ids
+            scheduled_ids.sort(key=self._cost_key)
             if len(scheduled_ids) % self.world_size:
                 raise RuntimeError("A5 segment bucket lost its rank-aligned padding")
             for start in range(0, len(scheduled_ids), self.world_size):
                 group = scheduled_ids[start : start + self.world_size]
                 indices = tuple(self.dataset.index_by_id[episode_id] for episode_id in group)
-                segment_counts = {
-                    _require_a5(self.dataset[index]).tbptt_segment_count for index in indices
+                shapes = {
+                    _a5_alignment_shape(_require_a5(self.dataset[index])) for index in indices
                 }
-                if segment_counts != {bucket.tbptt_segment_count}:
-                    raise RuntimeError("A5 sampler mixed segment counts in one global batch")
+                if len(shapes) != 1:
+                    raise RuntimeError("A5 sampler mixed segment lengths or Query counts")
                 global_batches.append(indices)
         rng.shuffle(global_batches)
         global_indices = [index for batch in global_batches for index in batch]
         if len(global_indices) != self._global_size:
             raise RuntimeError("rank-aligned A5 global sampler length drifted")
         return iter(global_indices)
+
+    def _cost_key(self, episode_id: str) -> tuple[float, int, int]:
+        record = _require_a5(self.dataset[self.dataset.index_by_id[episode_id]])
+        sidecar = self.visual_cost_index.get(episode_id)
+        if sidecar is not None:
+            if sidecar.support_count != record.support_count:
+                raise ValueError("A5 visual cost Support count disagrees with manifest")
+            if sidecar.segment_lengths != _a5_segment_lengths(record):
+                raise ValueError("A5 visual cost segment lengths disagree with manifest")
+            if sidecar.query_count != record.query_count:
+                raise ValueError("A5 visual cost Query count disagrees with manifest")
+            return (
+                self.runtime_cost_ema.value(
+                    episode_id,
+                    sidecar.predicted_total_seconds,
+                ),
+                sidecar.total_visual_tokens,
+                sidecar.maximum_visual_tokens,
+            )
+        proxy = record.support_count + record.query_count
+        return float(proxy), proxy, record.support_count
 
     def __len__(self) -> int:
         return self._global_size
@@ -712,7 +740,7 @@ def build_production_train_sampler(
     rank: int,
     world_size: int,
     *,
-    visual_cost_index: Mapping[str, Sequence[int]] | None = None,
+    visual_cost_index: Mapping[str, VisualCostRecord] | None = None,
 ) -> Sampler[int]:
     """Shared runtime-factory hook for A2 task balance and A5 segment parity."""
 
@@ -731,7 +759,22 @@ def build_production_train_sampler(
         rank=rank,
         world_size=world_size,
         seed=dataset.manifest.seed,
+        visual_cost_index=visual_cost_index,
     )
+
+
+def _a5_segment_lengths(record: A5EpisodeRecord) -> tuple[int, ...]:
+    remaining = record.support_count
+    lengths: list[int] = []
+    while remaining:
+        length = min(record.truncation_horizon, remaining)
+        lengths.append(length)
+        remaining -= length
+    return tuple(lengths)
+
+
+def _a5_alignment_shape(record: A5EpisodeRecord) -> tuple[tuple[int, ...], int]:
+    return _a5_segment_lengths(record), record.query_count
 
 
 def official_operator(counting_type: str, counting_subtype: str) -> Operator:
@@ -1198,12 +1241,17 @@ def _build_segment_buckets(
     *,
     world_size: int,
 ) -> tuple[tuple[SegmentBucket, ...], tuple[A5EpisodeRecord, ...]]:
-    grouped: dict[tuple[EpisodeSplit, int], list[A5EpisodeRecord]] = defaultdict(list)
+    grouped: dict[
+        tuple[EpisodeSplit, tuple[int, ...], int],
+        list[A5EpisodeRecord],
+    ] = defaultdict(list)
     for episode in episodes:
-        grouped[(episode.split, episode.tbptt_segment_count)].append(episode)
+        grouped[(episode.split, _a5_segment_lengths(episode), episode.query_count)].append(
+            episode
+        )
     buckets: list[SegmentBucket] = []
     padding_records: list[A5EpisodeRecord] = []
-    for key in sorted(grouped, key=lambda item: (item[0].value, item[1])):
+    for key in sorted(grouped, key=lambda item: (item[0].value, item[1], item[2])):
         rows = sorted(grouped[key], key=lambda item: item.episode_id)
         remainder = len(rows) % world_size
         if remainder:
@@ -1234,7 +1282,7 @@ def _build_segment_buckets(
         buckets.append(
             SegmentBucket(
                 split=key[0],
-                tbptt_segment_count=key[1],
+                tbptt_segment_count=len(key[1]),
                 episode_ids=tuple(row.episode_id for row in rows),
                 loss_weights=tuple(row.loss_weight for row in rows),
                 world_size=world_size,
