@@ -1,7 +1,0 @@
-captured_at_utc: 2026-07-13T17:11:38.0136856Z
-command: uv run python -m ttt_svcbench_qwen.config --config configs/model_state_ttt_8b.yaml
-exit_code: 0
-output_lines: 264
-first_field: spec_version=state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval
-last_field: parameter_budget.rounding_tolerance_millions=0.02
-config_sha256: 70a7497751a9ceb33a2fb4edf8de8b75aea036745571c226026714cbfe6d24da

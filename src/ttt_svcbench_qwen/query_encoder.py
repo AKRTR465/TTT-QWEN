@@ -25,7 +25,7 @@ from ttt_svcbench_qwen.config import (
     QueryEncoderConfig,
     TimeResolverConfig,
 )
-from ttt_svcbench_qwen.data import assert_runtime_payload_safe, extract_explicit_time_values
+from ttt_svcbench_qwen.data import RuntimeQueryInput, extract_explicit_time_values
 from ttt_svcbench_qwen.query_tokens import QuestionTokenBatch
 from ttt_svcbench_qwen.state_bank import E1EventKind, E2EventKind, HeadType
 
@@ -168,33 +168,31 @@ class QueryEncoderInput:
             raise ValueError("explicit_time_values must be finite and non-negative")
 
     @classmethod
-    def from_runtime_payload(
+    def from_runtime_queries(
         cls,
         question_embeddings: Tensor,
         question_tokens: QuestionTokenBatch,
-        payload: Mapping[str, object],
+        queries: Sequence[RuntimeQueryInput],
     ) -> Self:
-        """Bind embeddings to the exact P2 question-only runtime payload."""
+        """Bind embeddings to already validated typed runtime Queries."""
 
-        assert_runtime_payload_safe(payload, layer="QueryEncoder")
         batch_size = question_embeddings.shape[0] if question_embeddings.ndim == 3 else -1
-        questions = _normalize_questions(payload["question"], batch_size)
+        rows = tuple(queries)
+        if len(rows) != batch_size:
+            raise ValueError("runtime Queries must align to question embeddings")
+        questions = tuple(query.question for query in rows)
         if questions != question_tokens.questions:
             raise ValueError("runtime questions must exactly match canonical question tokens")
-        query_time = _normalize_query_time(
-            payload["query_time"],
-            batch_size,
-            question_embeddings.device,
-        )
-        explicit_values = _normalize_explicit_time_values(
-            payload["explicit_time_values"],
-            batch_size,
+        query_time = torch.tensor(
+            [query.query_time for query in rows],
+            dtype=question_embeddings.dtype,
+            device=question_embeddings.device,
         )
         return cls(
             question_embeddings=question_embeddings,
             question_tokens=question_tokens,
             query_time=query_time,
-            explicit_time_values=explicit_values,
+            explicit_time_values=tuple(query.explicit_time_values for query in rows),
         )
 
     @property
@@ -923,55 +921,6 @@ def _sinusoidal_position_encoding(
     encoding[:, 0::2] = torch.sin(positions * frequencies)
     encoding[:, 1::2] = torch.cos(positions * frequencies[: hidden_dim // 2])
     return encoding.to(dtype=dtype)
-
-
-def _normalize_questions(value: object, batch_size: int) -> tuple[str, ...]:
-    if isinstance(value, str):
-        questions = (value,)
-    elif isinstance(value, Sequence):
-        questions = tuple(value)
-    else:
-        raise TypeError("runtime question must be a string or sequence of strings")
-    if len(questions) != batch_size or not all(
-        isinstance(question, str) and question.strip() for question in questions
-    ):
-        raise ValueError("runtime questions must contain one non-empty string per batch item")
-    return cast(tuple[str, ...], questions)
-
-
-def _normalize_query_time(value: object, batch_size: int, device: torch.device) -> Tensor:
-    if isinstance(value, Tensor):
-        result = value.to(device=device)
-    elif isinstance(value, (int, float)) and not isinstance(value, bool):
-        result = torch.tensor([float(value)], dtype=torch.float32, device=device)
-    else:
-        raise TypeError("runtime query_time must be a floating tensor or scalar")
-    if result.shape != (batch_size,) or not torch.is_floating_point(result):
-        raise ValueError("runtime query_time must be floating [B]")
-    return result
-
-
-def _normalize_explicit_time_values(
-    value: object,
-    batch_size: int,
-) -> tuple[tuple[float, ...], ...]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        raise TypeError("runtime explicit_time_values must be a sequence")
-    raw = tuple(value)
-    if batch_size == 1 and all(
-        isinstance(item, (int, float)) and not isinstance(item, bool) for item in raw
-    ):
-        return (tuple(float(cast(float, item)) for item in raw),)
-    if len(raw) != batch_size:
-        raise ValueError("runtime explicit_time_values must contain one sequence per batch item")
-    normalized: list[tuple[float, ...]] = []
-    for row in raw:
-        if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
-            raise TypeError("each explicit_time_values row must be a numeric sequence")
-        if not all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in row):
-            raise TypeError("explicit_time_values rows must contain only numbers")
-        normalized.append(tuple(float(cast(float, item)) for item in row))
-    return tuple(normalized)
 
 
 @dataclass(frozen=True, slots=True)

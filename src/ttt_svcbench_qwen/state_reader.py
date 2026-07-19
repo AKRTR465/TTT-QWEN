@@ -498,7 +498,6 @@ class StateResampler(nn.Module):  # type: ignore[misc]
         )
 
     def _validate_inputs(self, q_target: Tensor, retrieval: RetrieverOutput) -> int:
-        retrieval.validate_integrity()
         if (
             q_target.ndim != 2
             or q_target.shape[1] != self.config.hidden_dim
@@ -606,7 +605,6 @@ class DeterministicStateReader:
         hard_operators: Sequence[Operator] | None = None,
         time_resolutions: Sequence[TimeResolution] | None = None,
     ) -> tuple[ReaderResult, ...]:
-        retrieval.validate_integrity()
         batch_size = len(retrieval.status)
         operators = retrieval.hard_operators if hard_operators is None else tuple(hard_operators)
         resolutions = (

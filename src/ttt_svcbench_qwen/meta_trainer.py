@@ -14,7 +14,6 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, fields, is_dataclass, replace
-from enum import StrEnum
 from itertools import pairwise
 from typing import Protocol, cast
 
@@ -25,7 +24,7 @@ from ttt_svcbench_qwen.config import (
     MetaTTTVariant,
     ProjectConfig,
 )
-from ttt_svcbench_qwen.data import assert_runtime_payload_safe
+from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.fast_ttt import (
     FastReanchorAudit,
     FastTTTForwardAudit,
@@ -63,8 +62,10 @@ from ttt_svcbench_qwen.losses import (
 )
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
+    BatchRuntimeState,
     ObservationChunkOutput,
     ObservationChunkRequest,
+    OnlineOverlapSnapshot,
     PrefillLifecycle,
     RuntimeOwner,
     StateTTTModel,
@@ -111,24 +112,8 @@ class FastStateController(Protocol):
     def collect_meta_fast_parameters(self) -> tuple[nn.Parameter, nn.Parameter]: ...
 
 
-@dataclass(frozen=True, slots=True)
-class MetaModelRuntime:
-    """One freshly reset hard/runtime trajectory, separate from fast/SGD state."""
-
-    runtime_state: object
-    bank_states: tuple[object, ...]
-
-    def validate_for(self, owner: RuntimeOwner) -> None:
-        if self.runtime_state is None:
-            raise ValueError("Meta-TTT runtime resetter returned no runtime state")
-        if len(self.bank_states) != len(owner.video_ids):
-            raise ValueError("Meta-TTT reset Bank states must align to the owner batch")
-        if any(state is None for state in self.bank_states):
-            raise ValueError("Meta-TTT reset Bank states cannot contain None")
-
-
 class EpisodeRuntimeResetter(Protocol):
-    def __call__(self, owner: RuntimeOwner) -> MetaModelRuntime: ...
+    def __call__(self, owner: RuntimeOwner) -> BatchRuntimeState: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,7 +123,7 @@ class MetaCausalChunk:
     request: ObservationChunkRequest
     start_time: float
     end_time: float
-    runtime_payload: Mapping[str, object]
+    query_input: RuntimeQueryInput
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, ObservationChunkRequest):
@@ -152,7 +137,6 @@ class MetaCausalChunk:
             or self.end_time < self.start_time
         ):
             raise ValueError("Meta-TTT chunk times must be finite and ordered")
-        assert_runtime_payload_safe(self.runtime_payload, layer="Meta-TTT Support/Query")
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,72 +198,6 @@ class MetaTTTEpisode:
 
 
 @dataclass(frozen=True, slots=True)
-class DetachedOverlapSnapshot:
-    """Minimal previous-chunk sources; every tensor is detached and storage-isolated."""
-
-    owner: RuntimeOwner
-    end_time: float
-    identity: Tensor
-    identity_valid_mask: Tensor
-    identity_position_ids: Tensor
-    identity_timestamps: Tensor
-    e1_probabilities: Tensor
-    e2_event_probabilities: Tensor
-    e2_phase_probabilities: Tensor
-    event_valid_mask: Tensor
-    event_position_ids: Tensor
-    event_timestamps: Tensor
-
-    def __post_init__(self) -> None:
-        tensors = self.tensors
-        if any(value.requires_grad or value.grad_fn is not None for value in tensors):
-            raise ValueError("overlap snapshots must be detached from autograd")
-        materialized = tuple(value for value in tensors if value.device.type != "meta")
-        if len({_storage_key(value) for value in materialized}) != len(materialized):
-            raise ValueError("overlap snapshot tensors must use isolated storage")
-        if not math.isfinite(self.end_time) or self.end_time < 0.0:
-            raise ValueError("overlap snapshot end_time must be finite and non-negative")
-
-    @property
-    def tensors(self) -> tuple[Tensor, ...]:
-        return (
-            self.identity,
-            self.identity_valid_mask,
-            self.identity_position_ids,
-            self.identity_timestamps,
-            self.e1_probabilities,
-            self.e2_event_probabilities,
-            self.e2_phase_probabilities,
-            self.event_valid_mask,
-            self.event_position_ids,
-            self.event_timestamps,
-        )
-
-    @classmethod
-    def capture(
-        cls,
-        output: ObservationChunkOutput,
-        *,
-        end_time: float,
-    ) -> DetachedOverlapSnapshot:
-        observations = _typed_observations(output)
-        return cls(
-            owner=output.owner,
-            end_time=end_time,
-            identity=observations.o2.identity.detach().clone(),
-            identity_valid_mask=observations.o2.valid_mask.detach().clone(),
-            identity_position_ids=observations.o2.position_ids.detach().clone(),
-            identity_timestamps=observations.o2.timestamps.detach().clone(),
-            e1_probabilities=observations.e1.probabilities.detach().clone(),
-            e2_event_probabilities=observations.e2.event_probabilities.detach().clone(),
-            e2_phase_probabilities=observations.e2.phase_probabilities.detach().clone(),
-            event_valid_mask=observations.e1.valid_mask.detach().clone(),
-            event_position_ids=observations.e1.position_ids.detach().clone(),
-            event_timestamps=observations.e1.timestamps.detach().clone(),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class CrossChunkMatchAudit:
     previous_available: bool
     snapshot_detached: bool
@@ -330,7 +248,7 @@ class CrossChunkMatchAudit:
 @dataclass(frozen=True, slots=True)
 class TTTInputBuildResult:
     inputs: TTTLossInput
-    snapshot: DetachedOverlapSnapshot
+    snapshot: OnlineOverlapSnapshot
     audit: CrossChunkMatchAudit
 
 
@@ -345,7 +263,7 @@ class CausalOverlapTTTInputBuilder:
         self,
         output: ObservationChunkOutput,
         *,
-        previous: DetachedOverlapSnapshot | None,
+        previous: OnlineOverlapSnapshot | None,
         current_end_time: float,
         enabled_terms: tuple[str, ...],
     ) -> TTTInputBuildResult:
@@ -357,7 +275,7 @@ class CausalOverlapTTTInputBuilder:
             term not in _SUPPORTED_TERMS for term in enabled_terms
         ):
             raise ValueError("Meta-TTT enabled terms must be unique pred/identity/event names")
-        snapshot = DetachedOverlapSnapshot.capture(output, end_time=current_end_time)
+        snapshot = OnlineOverlapSnapshot.capture(output, end_time=current_end_time)
         if previous is not None:
             if previous.owner != output.owner:
                 raise ValueError("overlap snapshot owner changed across chunks")
@@ -427,7 +345,7 @@ class CausalOverlapTTTInputBuilder:
     def _identity_input(
         self,
         current: ObservationOutputs,
-        previous: DetachedOverlapSnapshot | None,
+        previous: OnlineOverlapSnapshot | None,
     ) -> tuple[IdentityConsistencyInput, tuple[tuple[int, ...], ...]]:
         batch_size, current_width = current.o2.valid_mask.shape
         if previous is None:
@@ -526,7 +444,7 @@ class CausalOverlapTTTInputBuilder:
     def _match_identity_row(
         self,
         current: ObservationOutputs,
-        previous: DetachedOverlapSnapshot,
+        previous: OnlineOverlapSnapshot,
         row: int,
     ) -> tuple[tuple[int, int, IdentityPairStatus], ...]:
         current_valid = torch.nonzero(current.o2.valid_mask[row], as_tuple=False).flatten().tolist()
@@ -592,7 +510,7 @@ class CausalOverlapTTTInputBuilder:
     def _event_input(
         self,
         current: ObservationOutputs,
-        previous: DetachedOverlapSnapshot | None,
+        previous: OnlineOverlapSnapshot | None,
     ) -> tuple[EventConsistencyInput, tuple[int, ...]]:
         if previous is None:
             batch_size = current.e1.valid_mask.shape[0]
@@ -944,7 +862,7 @@ class MetaTTTEpisodeOutput:
     query_objectives: tuple[MetaQueryObjective, ...]
     final_fast_states: tuple[FastWeightsState, ...]
     final_optimizer_states: tuple[OptimizerRuntimeState, ...]
-    final_runtime: MetaModelRuntime
+    final_runtime: BatchRuntimeState
     audit: MetaTTTEpisodeAudit
 
     def __post_init__(self) -> None:
@@ -955,45 +873,6 @@ class MetaTTTEpisodeOutput:
         expected = torch.stack(tuple(query.outer.total for query in self.query_objectives)).mean()
         if not torch.allclose(self.total.detach(), expected.detach(), atol=1.0e-7, rtol=1.0e-7):
             raise ValueError("multi-Query objective must be the mean of pointwise outer totals")
-
-
-@dataclass(frozen=True, slots=True)
-class MetaOuterStepAudit:
-    optimizer_step_applied: bool
-    skip_reason: str | None
-    gradient_norm: float | None
-    meta_fast_gradient_norms: tuple[float, float] | None
-    meta_fast_delta_norms: tuple[float, float]
-    transient_fast_in_optimizer: bool
-
-    def __post_init__(self) -> None:
-        if self.optimizer_step_applied != (self.skip_reason is None):
-            raise ValueError("Meta-TTT outer step and skip reason disagree")
-        if self.transient_fast_in_optimizer:
-            raise ValueError("transient per-video W_t entered the Outer optimizer")
-        values = (
-            *self.meta_fast_delta_norms,
-            *((self.gradient_norm,) if self.gradient_norm is not None else ()),
-            *(self.meta_fast_gradient_norms or ()),
-        )
-        if any(not math.isfinite(value) or value < 0.0 for value in values):
-            raise ValueError("Meta-TTT outer gradient/delta norms must be finite and non-negative")
-        if self.optimizer_step_applied:
-            if self.meta_fast_gradient_norms is None or min(self.meta_fast_gradient_norms) <= 0.0:
-                raise ValueError("an applied Meta-TTT step requires gradients on both W0 matrices")
-            if min(self.meta_fast_delta_norms) <= 0.0:
-                raise ValueError("an applied Meta-TTT step must change both W0 matrices")
-
-
-@dataclass(frozen=True, slots=True)
-class MetaTTTTrainingStepOutput:
-    episode: MetaTTTEpisodeOutput
-    global_step: int
-    audit: MetaOuterStepAudit
-
-    def __post_init__(self) -> None:
-        if type(self.global_step) is not int or self.global_step < 0:
-            raise ValueError("Meta-TTT global_step must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1126,7 +1005,7 @@ class TruncatedMetaTTTEpisodeOutput:
     support_auxiliary_loss: Tensor
     final_fast_states: tuple[FastWeightsState, ...]
     final_optimizer_states: tuple[OptimizerRuntimeState, ...]
-    final_runtime: MetaModelRuntime
+    final_runtime: BatchRuntimeState
     audit: TruncatedMetaTTTEpisodeAudit
 
     def __post_init__(self) -> None:
@@ -1142,121 +1021,25 @@ class TruncatedMetaTTTEpisodeOutput:
             raise ValueError("truncated A5 total must equal Query plus normalized Support loss")
 
 
-@dataclass(frozen=True, slots=True)
-class TruncatedMetaTTTTrainingStepOutput:
-    episode: TruncatedMetaTTTEpisodeOutput
-    global_step: int
-    audit: MetaOuterStepAudit
-
-    def __post_init__(self) -> None:
-        if type(self.global_step) is not int or self.global_step < 0:
-            raise ValueError("truncated Meta-TTT global_step must be a non-negative integer")
-
-
-class MetaTTTTrainer:
-    """Consume the episode objective immediately and apply one audited Outer step."""
-
-    def __init__(
-        self,
-        *,
-        runner: MetaTTTEpisodeRunner,
-        optimizer: torch.optim.Optimizer,
-        outer_grad_clip_norm: float,
-    ) -> None:
-        if not isinstance(runner, MetaTTTEpisodeRunner):
-            raise TypeError("MetaTTTTrainer requires MetaTTTEpisodeRunner")
-        if not isinstance(optimizer, torch.optim.Optimizer):
-            raise TypeError("MetaTTTTrainer requires a torch optimizer")
-        if not math.isfinite(outer_grad_clip_norm) or outer_grad_clip_norm <= 0.0:
-            raise ValueError("Outer gradient clip norm must be positive and finite")
-        self.runner = runner
-        self.optimizer = optimizer
-        self.outer_grad_clip_norm = outer_grad_clip_norm
-        self.global_step = 0
-        self._optimizer_parameters = _optimizer_parameters(optimizer)
-        meta_fast = runner.fast_controller.collect_meta_fast_parameters()
-        optimizer_ids = {id(parameter) for parameter in self._optimizer_parameters}
-        if any(id(parameter) not in optimizer_ids for parameter in meta_fast):
-            raise ValueError("Outer optimizer must own both meta-learned W0 matrices")
-
-    def train_step(self, episode: MetaTTTEpisode) -> MetaTTTTrainingStepOutput:
-        self.optimizer.zero_grad(set_to_none=True)
-        output = self.runner(episode)
-        transient_ids = {
-            id(value) for state in output.final_fast_states for value in state.fast_parameters
-        }
-        transient_in_optimizer = any(
-            id(parameter) in transient_ids for parameter in self._optimizer_parameters
-        )
-        if transient_in_optimizer:
-            raise ValueError("Outer optimizer captured transient per-video W_t")
-        meta_fast = self.runner.fast_controller.collect_meta_fast_parameters()
-        before = tuple(parameter.detach().clone() for parameter in meta_fast)
-        output.total.backward()
-        gradients = tuple(parameter.grad for parameter in self._optimizer_parameters)
-        present = tuple(value for value in gradients if value is not None)
-        finite = bool(present) and all(bool(torch.isfinite(value).all()) for value in present)
-        skip_reason: str | None = None
-        gradient_norm: float | None = None
-        meta_norms: tuple[float, float] | None = None
-        if finite:
-            if any(parameter.grad is None for parameter in meta_fast):
-                finite = False
-                skip_reason = "missing_meta_fast_gradient"
-            else:
-                meta_norms = cast(
-                    tuple[float, float],
-                    tuple(
-                        float(cast(Tensor, parameter.grad).detach().float().norm().item())
-                        for parameter in meta_fast
-                    ),
-                )
-                if min(meta_norms) <= 0.0:
-                    finite = False
-                    skip_reason = "zero_meta_fast_gradient"
-        if finite:
-            norm = torch.nn.utils.clip_grad_norm_(
-                self._optimizer_parameters,
-                self.outer_grad_clip_norm,
-                error_if_nonfinite=False,
-            )
-            gradient_norm = float(norm.detach().float().item())
-            if math.isfinite(gradient_norm):
-                self.optimizer.step()
-                self.global_step += 1
-            else:
-                finite = False
-                skip_reason = "nonfinite_clipped_gradient"
-        if not finite:
-            if skip_reason is None:
-                skip_reason = "no_gradient" if not present else "nonfinite_gradient"
-            self.optimizer.zero_grad(set_to_none=True)
-        deltas = cast(
-            tuple[float, float],
-            tuple(
-                float((parameter.detach() - start).float().norm().item())
-                for parameter, start in zip(meta_fast, before, strict=True)
-            ),
-        )
-        return MetaTTTTrainingStepOutput(
-            episode=output,
-            global_step=self.global_step,
-            audit=MetaOuterStepAudit(
-                optimizer_step_applied=finite,
-                skip_reason=skip_reason,
-                gradient_norm=gradient_norm,
-                meta_fast_gradient_norms=meta_norms,
-                meta_fast_delta_norms=deltas,
-                transient_fast_in_optimizer=transient_in_optimizer,
-            ),
-        )
-
-
 @dataclass(slots=True)
 class _Trajectory:
-    runtime: MetaModelRuntime
-    fast_states: tuple[FastWeightsState, ...]
-    optimizer_states: tuple[OptimizerRuntimeState, ...]
+    runtime: BatchRuntimeState
+
+    @property
+    def fast_states(self) -> tuple[FastWeightsState, ...]:
+        return self.runtime.fast_states
+
+    @fast_states.setter
+    def fast_states(self, values: tuple[FastWeightsState, ...]) -> None:
+        self.runtime = self.runtime.with_fast_states(values)
+
+    @property
+    def optimizer_states(self) -> tuple[OptimizerRuntimeState, ...]:
+        return self.runtime.optimizer_states
+
+    @optimizer_states.setter
+    def optimizer_states(self, values: tuple[OptimizerRuntimeState, ...]) -> None:
+        self.runtime = self.runtime.with_fast_states(self.fast_states, values)
 
 
 class MetaTTTEpisodeRunner:
@@ -1305,7 +1088,7 @@ class MetaTTTEpisodeRunner:
         versions_before = tuple(parameter._version for parameter in tracked_parameters)
         support_outputs: list[TTTLossOutput] = []
         update_audits: list[InnerUpdateAudit] = []
-        previous_snapshot: DetachedOverlapSnapshot | None = None
+        previous_snapshot: OnlineOverlapSnapshot | None = None
         adapted_lifecycle = PrefillLifecycle(episode.owner)
         baseline_lifecycle = PrefillLifecycle(episode.owner)
 
@@ -1324,12 +1107,8 @@ class MetaTTTEpisodeRunner:
                 seed=episode.seed + support_index,
                 with_grad=False,
             )
-            adapted.runtime = MetaModelRuntime(
-                adapted_observation.runtime_state, adapted_observation.bank_states
-            )
-            baseline.runtime = MetaModelRuntime(
-                baseline_observation.runtime_state, baseline_observation.bank_states
-            )
+            adapted.runtime = _runtime_from_observation(adapted_observation, episode.owner)
+            baseline.runtime = _runtime_from_observation(baseline_observation, episode.owner)
             built = self.ttt_input_builder(
                 adapted_observation,
                 previous=previous_snapshot,
@@ -1357,7 +1136,7 @@ class MetaTTTEpisodeRunner:
                     results=results,
                     ttt_output=ttt_output,
                     match=built.audit,
-                    runtime=adapted.runtime.runtime_state,
+                    runtime=adapted.runtime,
                     after_versions=versions_after_update,
                 )
             )
@@ -1386,12 +1165,8 @@ class MetaTTTEpisodeRunner:
                 seed=seed,
                 with_grad=False,
             )
-            adapted.runtime = MetaModelRuntime(
-                after_observation.runtime_state, after_observation.bank_states
-            )
-            baseline.runtime = MetaModelRuntime(
-                before_observation.runtime_state, before_observation.bank_states
-            )
+            adapted.runtime = _runtime_from_observation(after_observation, episode.owner)
+            baseline.runtime = _runtime_from_observation(before_observation, episode.owner)
             after_versions = _tensor_version_signature(after_observation)
             before_versions = _tensor_version_signature(before_observation)
             after_output = self._answer(query, after_observation, after_lifecycle, with_grad=True)
@@ -1514,11 +1289,8 @@ class MetaTTTEpisodeRunner:
         )
         if any(prewarm_fast_audit.fast_versions):
             raise ValueError("the no-update prewarm must observe the initial W0 generation")
-        adapted.runtime = MetaModelRuntime(
-            prewarm_observation.runtime_state,
-            prewarm_observation.bank_states,
-        )
-        previous_snapshot = DetachedOverlapSnapshot.capture(
+        adapted.runtime = _runtime_from_observation(prewarm_observation, episode.owner)
+        previous_snapshot = OnlineOverlapSnapshot.capture(
             prewarm_observation,
             end_time=prewarm.end_time,
         )
@@ -1532,7 +1304,7 @@ class MetaTTTEpisodeRunner:
                 seed=episode.seed + support_index + 1,
                 with_grad=True,
             )
-            adapted.runtime = MetaModelRuntime(observation.runtime_state, observation.bank_states)
+            adapted.runtime = _runtime_from_observation(observation, episode.owner)
             built = self.ttt_input_builder(
                 observation,
                 previous=previous_snapshot,
@@ -1560,7 +1332,7 @@ class MetaTTTEpisodeRunner:
                     results=results,
                     ttt_output=ttt_output,
                     match=built.audit,
-                    runtime=adapted.runtime.runtime_state,
+                    runtime=adapted.runtime,
                     after_versions=after_versions,
                 )
             )
@@ -1613,7 +1385,7 @@ class MetaTTTEpisodeRunner:
                 seed=episode.seed + 10_000 + query_index,
                 with_grad=True,
             )
-            adapted.runtime = MetaModelRuntime(observation.runtime_state, observation.bank_states)
+            adapted.runtime = _runtime_from_observation(observation, episode.owner)
             observation_versions = _tensor_version_signature(observation)
             output = self._answer(query, observation, query_lifecycle, with_grad=True)
             immutable = observation_versions == _tensor_version_signature(observation)
@@ -1757,8 +1529,8 @@ class MetaTTTEpisodeRunner:
         differentiable: bool,
     ) -> _Trajectory:
         runtime = self.runtime_resetter(owner)
-        if not isinstance(runtime, MetaModelRuntime):
-            raise TypeError("Meta-TTT runtime resetter must return MetaModelRuntime")
+        if not isinstance(runtime, BatchRuntimeState):
+            raise TypeError("Meta-TTT runtime resetter must return BatchRuntimeState")
         runtime.validate_for(owner)
         fast_states = tuple(
             self.fast_controller.reset_fast_state(differentiable=differentiable)
@@ -1773,7 +1545,7 @@ class MetaTTTEpisodeRunner:
             raise ValueError("fresh Meta-TTT fast states must reset all counters")
         if any(state.optimizer_name != "sgd" for state in optimizer_states):
             raise ValueError("fresh Meta-TTT optimizer state must use SGD")
-        return _Trajectory(runtime, fast_states, optimizer_states)
+        return _Trajectory(runtime.with_fast_states(fast_states, optimizer_states))
 
     def _observe(
         self,
@@ -1786,7 +1558,7 @@ class MetaTTTEpisodeRunner:
     ) -> tuple[ObservationChunkOutput, FastTTTForwardAudit]:
         request = replace(
             chunk.request,
-            runtime_state=trajectory.runtime.runtime_state,
+            runtime_state=trajectory.runtime,
             bank_states=trajectory.runtime.bank_states,
         )
         with (
@@ -1825,7 +1597,10 @@ class MetaTTTEpisodeRunner:
             qwen_kwargs=answer.qwen_kwargs,
         )
         with torch.set_grad_enabled(with_grad):
-            return self.model.answer_query(request, lifecycle)
+            return self.model.prefill_answer(
+                self.model.prepare_answer(request, lifecycle),
+                lifecycle,
+            )
 
     def _query_objective(
         self,
@@ -1854,111 +1629,6 @@ class MetaTTTEpisodeRunner:
         return MetaQueryObjective(answer, state, outer, _query_metrics(answer, state))
 
 
-class TruncatedMetaTTTTrainer:
-    """Own the sole episode-level AdamW step after segmented A5 backward calls."""
-
-    def __init__(
-        self,
-        *,
-        runner: MetaTTTEpisodeRunner,
-        optimizer: torch.optim.Optimizer,
-        outer_grad_clip_norm: float,
-        backward: Callable[[Tensor], None] | None = None,
-    ) -> None:
-        if not isinstance(runner, MetaTTTEpisodeRunner):
-            raise TypeError("TruncatedMetaTTTTrainer requires MetaTTTEpisodeRunner")
-        if runner.variant is not MetaTTTVariant.A5:
-            raise ValueError("TruncatedMetaTTTTrainer is production A5-only")
-        if not isinstance(optimizer, torch.optim.Optimizer):
-            raise TypeError("TruncatedMetaTTTTrainer requires a torch optimizer")
-        if not math.isfinite(outer_grad_clip_norm) or outer_grad_clip_norm <= 0.0:
-            raise ValueError("Outer gradient clip norm must be positive and finite")
-        self.runner = runner
-        self.optimizer = optimizer
-        self.outer_grad_clip_norm = outer_grad_clip_norm
-        self.backward = backward or _plain_backward
-        self.global_step = 0
-        self._optimizer_parameters = _optimizer_parameters(optimizer)
-        meta_fast = runner.fast_controller.collect_meta_fast_parameters()
-        optimizer_ids = {id(parameter) for parameter in self._optimizer_parameters}
-        if any(id(parameter) not in optimizer_ids for parameter in meta_fast):
-            raise ValueError("A5 Outer optimizer must own both meta-learned W0 matrices")
-
-    def train_step(self, episode: MetaTTTEpisode) -> TruncatedMetaTTTTrainingStepOutput:
-        """Accumulate every segment gradient, clip once, and step AdamW exactly once."""
-
-        self.optimizer.zero_grad(set_to_none=True)
-        meta_fast = self.runner.fast_controller.collect_meta_fast_parameters()
-        before = tuple(parameter.detach().clone() for parameter in meta_fast)
-        output = self.runner.run_truncated(episode, backward=self.backward)
-        transient_ids = {
-            id(value) for state in output.final_fast_states for value in state.fast_parameters
-        }
-        transient_in_optimizer = any(
-            id(parameter) in transient_ids for parameter in self._optimizer_parameters
-        )
-        if transient_in_optimizer:
-            raise ValueError("Outer optimizer captured transient per-video W_t")
-
-        gradients = tuple(parameter.grad for parameter in self._optimizer_parameters)
-        present = tuple(value for value in gradients if value is not None)
-        finite = bool(present) and all(bool(torch.isfinite(value).all()) for value in present)
-        skip_reason: str | None = None
-        gradient_norm: float | None = None
-        meta_norms: tuple[float, float] | None = None
-        if finite:
-            if any(parameter.grad is None for parameter in meta_fast):
-                finite = False
-                skip_reason = "missing_meta_fast_gradient"
-            else:
-                meta_norms = cast(
-                    tuple[float, float],
-                    tuple(
-                        float(cast(Tensor, parameter.grad).detach().float().norm().item())
-                        for parameter in meta_fast
-                    ),
-                )
-                if min(meta_norms) <= 0.0:
-                    finite = False
-                    skip_reason = "zero_meta_fast_gradient"
-        if finite:
-            norm = torch.nn.utils.clip_grad_norm_(
-                self._optimizer_parameters,
-                self.outer_grad_clip_norm,
-                error_if_nonfinite=False,
-            )
-            gradient_norm = float(norm.detach().float().item())
-            if math.isfinite(gradient_norm):
-                self.optimizer.step()
-                self.global_step += 1
-            else:
-                finite = False
-                skip_reason = "nonfinite_clipped_gradient"
-        if not finite:
-            if skip_reason is None:
-                skip_reason = "no_gradient" if not present else "nonfinite_gradient"
-            self.optimizer.zero_grad(set_to_none=True)
-        deltas = cast(
-            tuple[float, float],
-            tuple(
-                float((parameter.detach() - start).float().norm().item())
-                for parameter, start in zip(meta_fast, before, strict=True)
-            ),
-        )
-        return TruncatedMetaTTTTrainingStepOutput(
-            episode=output,
-            global_step=self.global_step,
-            audit=MetaOuterStepAudit(
-                optimizer_step_applied=finite,
-                skip_reason=skip_reason,
-                gradient_norm=gradient_norm,
-                meta_fast_gradient_norms=meta_norms,
-                meta_fast_delta_norms=deltas,
-                transient_fast_in_optimizer=transient_in_optimizer,
-            ),
-        )
-
-
 def enabled_terms_for(
     config: ProjectConfig,
     variant: MetaTTTVariant,
@@ -1977,239 +1647,6 @@ def enabled_terms_for(
     if tuple(term for term in _SUPPORTED_TERMS if term in terms) != terms:
         raise ValueError("Meta-TTT terms must be an ordered subset of pred/identity/event")
     return terms
-
-
-@dataclass(frozen=True, slots=True)
-class VariantIsolationAudit:
-    a3_terms: tuple[str, ...]
-    a4_terms: tuple[str, ...]
-    a5_terms: tuple[str, ...]
-    a4_minus_a3: tuple[str, ...]
-    a5_minus_a4: tuple[str, ...]
-    isolated: bool
-
-    def __post_init__(self) -> None:
-        if not self.isolated:
-            raise ValueError("A3/A4/A5 objective increments are not isolated")
-
-
-def audit_variant_isolation(config: ProjectConfig) -> VariantIsolationAudit:
-    a3 = enabled_terms_for(config, MetaTTTVariant.A3)
-    a4 = enabled_terms_for(config, MetaTTTVariant.A4)
-    a5 = enabled_terms_for(config, MetaTTTVariant.A5)
-    a4_delta = tuple(term for term in a4 if term not in a3)
-    a5_delta = tuple(term for term in a5 if term not in a4)
-    return VariantIsolationAudit(
-        a3_terms=a3,
-        a4_terms=a4,
-        a5_terms=a5,
-        a4_minus_a3=a4_delta,
-        a5_minus_a4=a5_delta,
-        isolated=a3 == ("pred",)
-        and a4 == ("pred", "identity")
-        and a5 == ("pred", "identity", "event")
-        and a4_delta == ("identity",)
-        and a5_delta == ("event",),
-    )
-
-
-class MetaGradientReferenceMode(StrEnum):
-    """Diagnostic only; the episode runner always uses full second order."""
-
-    FIRST_ORDER = "first_order_reference"
-    FULL_SECOND_ORDER = "full_second_order_reference"
-
-
-class TwoMatrixLoss(Protocol):
-    def __call__(self, first: Tensor, second: Tensor) -> Tensor: ...
-
-
-@dataclass(frozen=True, slots=True)
-class MetaGradientReferenceResult:
-    mode: MetaGradientReferenceMode
-    support_loss: Tensor
-    query_loss: Tensor
-    next_parameters: tuple[Tensor, Tensor]
-    meta_gradients: tuple[Tensor, Tensor]
-
-
-def run_meta_gradient_reference(
-    *,
-    initial_parameters: tuple[Tensor, Tensor],
-    support_loss: TwoMatrixLoss,
-    query_loss: TwoMatrixLoss,
-    learning_rate: float,
-    mode: MetaGradientReferenceMode,
-) -> MetaGradientReferenceResult:
-    """Small-tensor FOMAML/full-MAML reference; never used by the training runner."""
-
-    if not isinstance(mode, MetaGradientReferenceMode):
-        raise TypeError("meta-gradient reference mode must be explicit")
-    if not math.isfinite(learning_rate) or learning_rate <= 0.0:
-        raise ValueError("meta-gradient reference learning_rate must be positive and finite")
-    parameters = initial_parameters
-    if any(
-        value.ndim == 0
-        or not torch.is_floating_point(value)
-        or not value.requires_grad
-        or not value.is_leaf
-        for value in parameters
-    ):
-        raise ValueError("meta-gradient reference inputs must be floating gradient leaves")
-    inner = support_loss(*parameters)
-    _validate_reference_scalar(inner, "support")
-    full = mode is MetaGradientReferenceMode.FULL_SECOND_ORDER
-    gradients_raw = torch.autograd.grad(inner, parameters, create_graph=full)
-    gradients = cast(tuple[Tensor, Tensor], gradients_raw)
-    if not full:
-        gradients = (gradients[0].detach(), gradients[1].detach())
-    next_parameters = (
-        parameters[0] - learning_rate * gradients[0],
-        parameters[1] - learning_rate * gradients[1],
-    )
-    outer = query_loss(*next_parameters)
-    _validate_reference_scalar(outer, "query")
-    meta_raw = torch.autograd.grad(outer, parameters)
-    meta = cast(tuple[Tensor, Tensor], meta_raw)
-    return MetaGradientReferenceResult(mode, inner, outer, next_parameters, meta)
-
-
-@dataclass(frozen=True, slots=True)
-class SyntheticAblationRecord:
-    case_id: str
-    task_name: str
-    metric_name: str
-    variant: MetaTTTVariant
-    value: float
-    failure_cases: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.case_id or not self.task_name or not self.metric_name:
-            raise ValueError("synthetic ablation keys must be non-empty")
-        if not math.isfinite(self.value):
-            raise ValueError("synthetic ablation values must be finite")
-        if any(not value for value in self.failure_cases):
-            raise ValueError("synthetic failure-case identifiers must be non-empty")
-
-
-@dataclass(frozen=True, slots=True)
-class SyntheticAblationComparison:
-    baseline: MetaTTTVariant
-    candidate: MetaTTTVariant
-    task_name: str
-    metric_name: str
-    sample_count: int
-    mean_delta: float
-    ci95_low: float
-    ci95_high: float
-    failure_cases: tuple[str, ...]
-    scientific_claim_allowed: bool = False
-
-    def __post_init__(self) -> None:
-        if self.scientific_claim_allowed:
-            raise ValueError("synthetic engineering ablations cannot support scientific claims")
-        values = (self.mean_delta, self.ci95_low, self.ci95_high)
-        if self.sample_count <= 0 or any(not math.isfinite(value) for value in values):
-            raise ValueError("synthetic ablation comparison statistics are invalid")
-
-
-def compare_synthetic_ablations(
-    records: Sequence[SyntheticAblationRecord],
-) -> tuple[SyntheticAblationComparison, ...]:
-    """Paired A4-vs-A3 and A5-vs-A4 engineering deltas with normal 95% CIs."""
-
-    values = tuple(records)
-    if not values:
-        raise ValueError("synthetic ablation comparison requires records")
-    by_key = {
-        (item.case_id, item.task_name, item.metric_name, item.variant): item for item in values
-    }
-    if len(by_key) != len(values):
-        raise ValueError(
-            "synthetic ablation records must have unique case/task/metric/variant keys"
-        )
-    comparisons: list[SyntheticAblationComparison] = []
-    for baseline, candidate in (
-        (MetaTTTVariant.A3, MetaTTTVariant.A4),
-        (MetaTTTVariant.A4, MetaTTTVariant.A5),
-    ):
-        groups = sorted({(item.task_name, item.metric_name) for item in values})
-        for task_name, metric_name in groups:
-            paired: list[tuple[SyntheticAblationRecord, SyntheticAblationRecord]] = []
-            case_ids = sorted(
-                {
-                    item.case_id
-                    for item in values
-                    if item.task_name == task_name and item.metric_name == metric_name
-                }
-            )
-            for case_id in case_ids:
-                left = by_key.get((case_id, task_name, metric_name, baseline))
-                right = by_key.get((case_id, task_name, metric_name, candidate))
-                if left is not None and right is not None:
-                    paired.append((left, right))
-            if not paired:
-                continue
-            deltas = tuple(right.value - left.value for left, right in paired)
-            mean = math.fsum(deltas) / len(deltas)
-            if len(deltas) == 1:
-                half_width = 0.0
-            else:
-                variance = math.fsum((value - mean) ** 2 for value in deltas) / (len(deltas) - 1)
-                half_width = _CI_Z_95 * math.sqrt(variance / len(deltas))
-            failures = tuple(
-                sorted(
-                    {
-                        failure
-                        for pair in paired
-                        for record in pair
-                        for failure in record.failure_cases
-                    }
-                )
-            )
-            comparisons.append(
-                SyntheticAblationComparison(
-                    baseline=baseline,
-                    candidate=candidate,
-                    task_name=task_name,
-                    metric_name=metric_name,
-                    sample_count=len(deltas),
-                    mean_delta=mean,
-                    ci95_low=mean - half_width,
-                    ci95_high=mean + half_width,
-                    failure_cases=failures,
-                )
-            )
-    if not comparisons:
-        raise ValueError("no paired A3/A4 or A4/A5 synthetic ablation records were found")
-    return tuple(comparisons)
-
-
-def render_synthetic_ablation_report(
-    comparisons: Sequence[SyntheticAblationComparison],
-) -> str:
-    """Render a compact audit artifact with an unavoidable non-scientific disclaimer."""
-
-    values = tuple(comparisons)
-    if not values:
-        raise ValueError("cannot render an empty synthetic ablation report")
-    lines = [
-        "# P17 synthetic engineering ablation report",
-        "",
-        "> Synthetic/tiny engineering evidence only; no scientific gain or SVCBench accuracy "
-        "claim is allowed.",
-        "",
-        "| comparison | task | metric | n | mean delta | 95% CI | failures |",
-        "|---|---|---|---:|---:|---:|---|",
-    ]
-    for item in values:
-        failures = ", ".join(item.failure_cases) if item.failure_cases else "none"
-        lines.append(
-            f"| {item.candidate.value} vs {item.baseline.value} | {item.task_name} | "
-            f"{item.metric_name} | {item.sample_count} | {item.mean_delta:.6f} | "
-            f"[{item.ci95_low:.6f}, {item.ci95_high:.6f}] | {failures} |"
-        )
-    return "\n".join(lines) + "\n"
 
 
 def _make_inner_update_audit(
@@ -2281,7 +1718,7 @@ def _typed_observations(output: ObservationChunkOutput) -> ObservationOutputs:
 
 def _match_event_positions(
     current: ObservationOutputs,
-    previous: DetachedOverlapSnapshot,
+    previous: OnlineOverlapSnapshot,
 ) -> tuple[tuple[tuple[int, int, bool], ...], ...]:
     rows: list[tuple[tuple[int, int, bool], ...]] = []
     for row in range(current.e1.valid_mask.shape[0]):
@@ -2374,7 +1811,7 @@ def _term_float(term: object) -> float | None:
 
 
 def _assert_trajectory_isolation(adapted: _Trajectory, baseline: _Trajectory) -> None:
-    if adapted.runtime.runtime_state is baseline.runtime.runtime_state:
+    if adapted.runtime is baseline.runtime:
         raise ValueError("adapted and baseline runtimes must be independently reset")
     if any(
         left is right
@@ -2393,6 +1830,19 @@ def _assert_trajectory_isolation(adapted: _Trajectory, baseline: _Trajectory) ->
         raise ValueError("adapted/baseline transient fast weights must use isolated storage")
 
 
+def _runtime_from_observation(
+    observation: ObservationChunkOutput,
+    owner: RuntimeOwner,
+) -> BatchRuntimeState:
+    runtime = observation.runtime_state
+    if not isinstance(runtime, BatchRuntimeState):
+        raise TypeError("Meta-TTT observation must return BatchRuntimeState")
+    runtime.validate_for(owner)
+    if tuple(observation.bank_states) != runtime.bank_states:
+        raise ValueError("Meta-TTT observation Bank states disagree with runtime rows")
+    return runtime
+
+
 def _unique_parameters(parameters: Sequence[nn.Parameter]) -> tuple[nn.Parameter, ...]:
     result: list[nn.Parameter] = []
     seen: set[int] = set()
@@ -2401,22 +1851,6 @@ def _unique_parameters(parameters: Sequence[nn.Parameter]) -> tuple[nn.Parameter
             result.append(parameter)
             seen.add(id(parameter))
     return tuple(result)
-
-
-def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> tuple[nn.Parameter, ...]:
-    values: list[nn.Parameter] = []
-    seen: set[int] = set()
-    for group in optimizer.param_groups:
-        for value in group["params"]:
-            if not isinstance(value, nn.Parameter):
-                raise TypeError("Outer optimizer may contain only nn.Parameter values")
-            if id(value) in seen:
-                raise ValueError("Outer optimizer parameter groups cannot contain aliases")
-            values.append(value)
-            seen.add(id(value))
-    if not values:
-        raise ValueError("Outer optimizer cannot be empty")
-    return tuple(values)
 
 
 def _plain_backward(loss: Tensor) -> None:
@@ -2520,10 +1954,3 @@ def _storage_key(value: Tensor) -> tuple[str, int | None, int]:
         value.device.index,
         int(value.untyped_storage().data_ptr()),
     )
-
-
-def _validate_reference_scalar(value: Tensor, name: str) -> None:
-    if value.ndim != 0 or not torch.is_floating_point(value) or not value.requires_grad:
-        raise ValueError(f"meta-gradient {name} loss must be a differentiable scalar")
-    if not bool(torch.isfinite(value.detach()).item()):
-        raise ValueError(f"meta-gradient {name} loss must be finite")

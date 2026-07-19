@@ -1,5 +1,0 @@
-captured_at_utc: 2026-07-13T17:11:38.0136856Z
-command: uv run pytest -q tests/test_v5_config_contract.py tests/test_v5_module_skeletons.py tests/test_v5_runtime_types.py
-exit_code: 0
-......................................                                   [100%]
-38 passed in 6.57s

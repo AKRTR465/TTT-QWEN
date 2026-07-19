@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import gc
 import weakref
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,10 +14,12 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from ttt_svcbench_qwen.config import MetaTTTVariant, ProjectConfig, load_config
+from ttt_svcbench_qwen.data import RuntimeQueryInput, assert_runtime_payload_safe
 from ttt_svcbench_qwen.fast_ttt import FastTTTForwardAudit, FastWeightsState
 from ttt_svcbench_qwen.identity_bank import (
     IdentityDecisionStatus,
     IdentityObservationDecision,
+    build_identity_bank,
 )
 from ttt_svcbench_qwen.losses import (
     AnswerLossInput,
@@ -26,23 +29,15 @@ from ttt_svcbench_qwen.losses import (
 )
 from ttt_svcbench_qwen.meta_trainer import (
     MetaCausalChunk,
-    MetaGradientReferenceMode,
-    MetaModelRuntime,
     MetaQueryLossInput,
     MetaTTTEpisode,
     MetaTTTEpisodeRunner,
     MetaTTTQueryPoint,
-    MetaTTTTrainer,
     StageAQueryLossBuilder,
-    SyntheticAblationRecord,
-    TruncatedMetaTTTTrainer,
-    audit_variant_isolation,
-    compare_synthetic_ablations,
-    render_synthetic_ablation_report,
-    run_meta_gradient_reference,
 )
 from ttt_svcbench_qwen.model import (
     BankWriteOutput,
+    BatchRuntimeState,
     ModelComponents,
     ModelFeatureFlags,
     ObservationChunkRequest,
@@ -50,6 +45,7 @@ from ttt_svcbench_qwen.model import (
     RuntimeOwner,
     StateTTTModel,
     StateTTTModelOutput,
+    TrajectoryRuntimeState,
     VisualStageOutput,
 )
 from ttt_svcbench_qwen.observation_heads import (
@@ -68,7 +64,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     StageATargetBatch,
     TargetProvenance,
 )
-from ttt_svcbench_qwen.state_bank import HeadType
+from ttt_svcbench_qwen.state_bank import HeadType, build_state_bank
 from ttt_svcbench_qwen.state_encoder import TemporalCache, TemporalEncoderOutput
 from ttt_svcbench_qwen.trainer import StageAEpisodeAnswerInputs, StageASupervisionBatch
 
@@ -83,25 +79,36 @@ class _VideoChunk:
     identity_position_id: int = 0
 
 
-@dataclass(frozen=True, slots=True)
-class _TinyRuntime:
-    owner: RuntimeOwner
-    next_chunk_index: int
-
-
-@dataclass(frozen=True, slots=True)
-class _TinyBank:
-    version: int
-
-
 class _RuntimeResetter:
     def __init__(self) -> None:
         self.calls = 0
 
-    def __call__(self, owner: RuntimeOwner) -> MetaModelRuntime:
+    def __call__(self, owner: RuntimeOwner) -> BatchRuntimeState:
         self.calls += 1
-        return MetaModelRuntime(
-            _TinyRuntime(owner, 0), tuple(_TinyBank(0) for _ in owner.video_ids)
+        state_bank = build_state_bank(load_config())
+        identity_bank = build_identity_bank(load_config())
+        return BatchRuntimeState(
+            tuple(
+                TrajectoryRuntimeState(
+                    owner=RuntimeOwner((video_id,), (trajectory_id,)),
+                    next_chunk_index=0,
+                    slot_state=None,
+                    temporal_cache=None,
+                    e1_state=None,
+                    e2_state=None,
+                    state_bank=state_bank.reset(video_id, trajectory_id),
+                    identity_bank=identity_bank.reset(
+                        video_id,
+                        trajectory_id,
+                        hot_cache_enabled=False,
+                    ),
+                )
+                for video_id, trajectory_id in zip(
+                    owner.video_ids,
+                    owner.trajectory_ids,
+                    strict=True,
+                )
+            )
         )
 
 
@@ -191,9 +198,9 @@ class _VisualStage(nn.Module):
 
 class _QueryStage(nn.Module):
     def forward(self, query_input: object, *, inference: bool) -> object:
-        if inference or not isinstance(query_input, Tensor):
-            raise ValueError("tiny query stage requires a training Tensor")
-        return SimpleNamespace(q_target=query_input)
+        if inference or not isinstance(query_input, RuntimeQueryInput):
+            raise ValueError("tiny query stage requires a training RuntimeQueryInput")
+        return SimpleNamespace(q_target=torch.zeros((1, 512)))
 
 
 class _SpatialStage:
@@ -221,7 +228,13 @@ class _TemporalStage:
             timestamps=payload.timestamps,
             position_ids=payload.position_ids,
             valid_mask=payload.valid_mask,
-            cache=_empty_cache(request.owner, visual.value),
+            cache=_cache(
+                request.owner,
+                visual.value,
+                payload.timestamps,
+                payload.position_ids,
+                payload.valid_mask,
+            ),
         )
 
 
@@ -323,13 +336,26 @@ class _BankWriter:
         _query: object,
         request: ObservationChunkRequest,
     ) -> BankWriteOutput:
-        if not isinstance(request.runtime_state, _TinyRuntime):
-            raise TypeError("tiny writer requires _TinyRuntime")
+        if not isinstance(request.runtime_state, BatchRuntimeState):
+            raise TypeError("tiny writer requires BatchRuntimeState")
         runtime = request.runtime_state
-        next_runtime = _TinyRuntime(runtime.owner, runtime.next_chunk_index + 1)
-        next_banks = tuple(
-            _TinyBank(bank.version + 1) if isinstance(bank, _TinyBank) else _TinyBank(1)
-            for bank in request.bank_states
+        if not isinstance(_temporal, TemporalEncoderOutput) or not isinstance(
+            _observations, ObservationOutputs
+        ):
+            raise TypeError("tiny writer requires typed temporal/observation outputs")
+        next_banks = tuple(replace(bank, version=bank.version + 1) for bank in runtime.bank_states)
+        next_runtime = BatchRuntimeState(
+            tuple(
+                replace(
+                    row,
+                    next_chunk_index=runtime.next_chunk_index + 1,
+                    temporal_cache=_temporal.cache,
+                    e1_state=_observations.e1.next_states[index],
+                    e2_state=_observations.e2.next_states[index],
+                    state_bank=next_banks[index],
+                )
+                for index, row in enumerate(runtime.rows)
+            )
         )
         decisions = tuple(
             (
@@ -351,7 +377,7 @@ class _BankWriter:
             chunk_index=runtime.next_chunk_index,
             head_types=(HeadType.O2,) * len(request.owner.video_ids),
             bank_versions_before=tuple(
-                bank.version if isinstance(bank, _TinyBank) else 0 for bank in request.bank_states
+                bank.version for bank in runtime.bank_states
             ),
             bank_versions_after=tuple(bank.version for bank in next_banks),
             record_counts_after=(1,) * len(next_banks),
@@ -374,7 +400,8 @@ class _Retriever:
     ) -> object:
         if len(states) != len(video_ids) or len(states) != len(trajectory_ids):
             raise ValueError("tiny retrieval ownership mismatch")
-        return tuple(state.version if isinstance(state, _TinyBank) else 0 for state in states)
+        versions = tuple(state.version for state in states)
+        return SimpleNamespace(audit=versions, versions=versions)
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,9 +414,10 @@ class _Reader:
         self.calls: list[tuple[_ReaderResult, ...]] = []
 
     def read(self, retrieval: object) -> Sequence[object]:
-        if not isinstance(retrieval, tuple):
-            raise TypeError("tiny Reader requires tuple retrieval")
-        results = tuple(_ReaderResult(int(value)) for value in retrieval)
+        versions = getattr(retrieval, "versions", None)
+        if not isinstance(versions, tuple):
+            raise TypeError("tiny Reader requires typed retrieval versions")
+        results = tuple(_ReaderResult(int(value)) for value in versions)
         self.calls.append(results)
         return results
 
@@ -439,11 +467,6 @@ class _Qwen(nn.Module):
         row = torch.stack((score, -score, zeros), dim=-1)
         logits = row[:, None, :].expand(-1, request.input_ids.shape[1], -1)
         return SimpleNamespace(logits=logits)
-
-
-class _Decode:
-    def __call__(self, _inputs: object) -> object:
-        raise AssertionError("Meta-TTT training must not decode")
 
 
 class _TinyPredictor(TemporalPredictor):
@@ -502,6 +525,7 @@ def _system(
     predictor = _TinyPredictor()
     resetter = _RuntimeResetter()
     reader = _Reader()
+    qwen = _Qwen()
     model = StateTTTModel(
         config,
         ModelComponents(
@@ -516,8 +540,8 @@ def _system(
             retriever=_Retriever(),
             reader=reader,
             composer=_Composer(),
-            qwen_prefill=_Qwen(),
-            qwen_decode=_Decode(),
+            qwen_prefill=qwen,
+            qwen_generate=qwen,  # type: ignore[arg-type]
         ),
         ModelFeatureFlags(
             fast_enabled=True,
@@ -631,24 +655,28 @@ def _chunk(
         position_ids=positions,
         valid_mask=torch.ones((1, width), dtype=torch.bool),
     )
-    runtime_payload: Mapping[str, object] = {
-        "video": "synthetic-video",
-        "question": "how many",
-        "query_time": end_time,
-        "explicit_time_values": (),
-    }
+    query_input = RuntimeQueryInput(
+        video_id=owner.video_ids[0],
+        trajectory_id=owner.trajectory_ids[0],
+        query_id=f"query-{chunk_index}",
+        query_index=chunk_index,
+        video=Path("synthetic-video.mp4"),
+        question="how many",
+        query_time=end_time,
+        explicit_time_values=(),
+    )
     return MetaCausalChunk(
         request=ObservationChunkRequest(
             owner=owner,
             video_input=payload,
-            query_input=torch.zeros((1, 512)),
+            query_input=query_input,
             runtime_state=object(),
             bank_states=(object(),),
             inference=False,
         ),
         start_time=max(0.0, end_time - 1.0),
         end_time=end_time,
-        runtime_payload=runtime_payload,
+        query_input=query_input,
     )
 
 
@@ -678,27 +706,36 @@ def _supervision(label: int = 0) -> StageASupervisionBatch:
     )
 
 
-def _empty_cache(owner: RuntimeOwner, reference: Tensor) -> TemporalCache:
+def _cache(
+    owner: RuntimeOwner,
+    reference: Tensor,
+    timestamps: Tensor,
+    position_ids: Tensor,
+    valid_mask: Tensor,
+) -> TemporalCache:
     batch_size = len(owner.video_ids)
-    empty_hidden = torch.zeros((batch_size, 0, 768), dtype=reference.dtype)
-    empty_kv = tuple(torch.zeros((batch_size, 12, 0, 64), dtype=reference.dtype) for _ in range(6))
+    width = reference.shape[1]
+    hidden = reference.detach().clone()
+    empty_kv = tuple(
+        torch.zeros((batch_size, 12, width, 64), dtype=reference.dtype) for _ in range(6)
+    )
     replay_kv = tuple(torch.zeros((batch_size, 12, 0, 64), dtype=reference.dtype) for _ in range(6))
     return TemporalCache(
-        hidden=empty_hidden,
+        hidden=hidden,
         layer_keys=empty_kv,
         layer_values=tuple(value.clone() for value in empty_kv),
         replay_layer_keys=replay_kv,
         replay_layer_values=tuple(value.clone() for value in replay_kv),
-        timestamps=torch.zeros((batch_size, 0), dtype=torch.float64),
+        timestamps=timestamps.clone(),
         replay_timestamps=torch.zeros((batch_size, 0), dtype=torch.float64),
-        position_ids=torch.zeros((batch_size, 0), dtype=torch.int64),
+        position_ids=position_ids.clone(),
         replay_position_ids=torch.zeros((batch_size, 0), dtype=torch.int64),
-        valid_mask=torch.zeros((batch_size, 0), dtype=torch.bool),
+        valid_mask=valid_mask.clone(),
         replay_valid_mask=torch.zeros((batch_size, 0), dtype=torch.bool),
         video_ids=owner.video_ids,
         trajectory_ids=owner.trajectory_ids,
         query_signatures=torch.zeros((batch_size, 512), dtype=reference.dtype),
-        total_seen=torch.zeros(batch_size, dtype=torch.int64),
+        total_seen=position_ids[:, -1].clone() + 1,
     )
 
 
@@ -765,93 +802,6 @@ def _graph_node_count(value: Tensor) -> int:
         retained_nodes.append(node)
         stack.extend(next_node for next_node, _ in node.next_functions if next_node is not None)
     return len(retained_nodes)
-
-
-def test_variant_isolation_and_explicit_first_order_reference(config: ProjectConfig) -> None:
-    audit = audit_variant_isolation(config)
-    assert audit.a4_minus_a3 == ("identity",)
-    assert audit.a5_minus_a4 == ("event",)
-
-    def support(first: Tensor, second: Tensor) -> Tensor:
-        return 0.5 * (first.square() + 3.0 * second.square()).sum()
-
-    def query(first: Tensor, second: Tensor) -> Tensor:
-        return 0.5 * (first + second).square().sum()
-
-    first_order = run_meta_gradient_reference(
-        initial_parameters=(
-            torch.tensor([1.2], dtype=torch.float64, requires_grad=True),
-            torch.tensor([-0.7], dtype=torch.float64, requires_grad=True),
-        ),
-        support_loss=support,
-        query_loss=query,
-        learning_rate=0.1,
-        mode=MetaGradientReferenceMode.FIRST_ORDER,
-    )
-    full = run_meta_gradient_reference(
-        initial_parameters=(
-            torch.tensor([1.2], dtype=torch.float64, requires_grad=True),
-            torch.tensor([-0.7], dtype=torch.float64, requires_grad=True),
-        ),
-        support_loss=support,
-        query_loss=query,
-        learning_rate=0.1,
-        mode=MetaGradientReferenceMode.FULL_SECOND_ORDER,
-    )
-    adapted_sum = (1.0 - 0.1) * 1.2 + (1.0 - 0.3) * -0.7
-    assert torch.allclose(
-        full.meta_gradients[0], torch.tensor([adapted_sum * 0.9], dtype=torch.float64)
-    )
-    assert torch.allclose(
-        full.meta_gradients[1], torch.tensor([adapted_sum * 0.7], dtype=torch.float64)
-    )
-    assert torch.allclose(
-        first_order.meta_gradients[0], torch.tensor([adapted_sum], dtype=torch.float64)
-    )
-    assert torch.allclose(
-        first_order.meta_gradients[1], torch.tensor([adapted_sum], dtype=torch.float64)
-    )
-    assert not torch.equal(first_order.meta_gradients[0], full.meta_gradients[0])
-
-
-def test_a3_runner_and_outer_step_reach_both_meta_fast_matrices(config: ProjectConfig) -> None:
-    runner, fast, predictor, resetter = _system(config, MetaTTTVariant.A3)
-    episode = _episode(config, MetaTTTVariant.A3, support_count=1, query_count=1)
-    optimizer = torch.optim.SGD((*fast.parameters(), *predictor.parameters()), lr=0.05)
-    trainer = MetaTTTTrainer(runner=runner, optimizer=optimizer, outer_grad_clip_norm=1.0)
-    output = trainer.train_step(episode)
-
-    assert output.global_step == 1
-    assert output.audit.optimizer_step_applied
-    assert output.audit.meta_fast_gradient_norms is not None
-    assert min(output.audit.meta_fast_gradient_norms) > 0.0
-    assert min(output.audit.meta_fast_delta_norms) > 0.0
-    assert output.episode.audit.active_terms == ("pred",)
-    assert output.episode.audit.update_count == 1
-    assert output.episode.audit.updates[0].fast_versions_before == (0,)
-    assert output.episode.audit.updates[0].fast_versions_after == (1,)
-    assert output.episode.audit.queries[0].after_fast_versions == (1,)
-    assert output.episode.audit.queries[0].before_fast_versions == (0,)
-    assert resetter.calls == 2
-
-
-def test_invalid_support_skips_update_but_keeps_causal_query(config: ProjectConfig) -> None:
-    runner, _, _, _ = _system(config, MetaTTTVariant.A3)
-    episode = _episode(
-        config,
-        MetaTTTVariant.A3,
-        support_count=1,
-        query_count=1,
-        invalid_first_support=True,
-    )
-    output = runner(episode)
-    update = output.audit.updates[0]
-    assert update.did_update == (False,)
-    assert update.skip_reasons == ("insufficient_time",)
-    assert update.fast_versions_after == (0,)
-    assert output.final_fast_states[0].skip_count == 1
-    assert output.audit.query_count == 1
-    output.total.backward()
 
 
 def test_stage_c_invalid_chunk_skips_then_later_supports_continue(
@@ -946,61 +896,6 @@ def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectCon
     assert output.audit.segments[0].reanchored
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
     assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
-
-
-def test_truncated_a5_trainer_steps_outer_optimizer_once_per_episode(
-    config: ProjectConfig,
-) -> None:
-    runner, fast, predictor, _ = _system(config, MetaTTTVariant.A5)
-    optimizer = torch.optim.SGD((*fast.parameters(), *predictor.parameters()), lr=0.05)
-    trainer = TruncatedMetaTTTTrainer(
-        runner=runner,
-        optimizer=optimizer,
-        outer_grad_clip_norm=1.0,
-    )
-    calls = 0
-    original_step = optimizer.step
-
-    def counted_step(*args: object, **kwargs: object) -> object:
-        nonlocal calls
-        calls += 1
-        return original_step(*args, **kwargs)
-
-    optimizer.step = counted_step  # type: ignore[method-assign]
-    output = trainer.train_step(_truncated_episode(config, support_count=9))
-
-    assert calls == 1
-    assert output.global_step == 1
-    assert output.audit.optimizer_step_applied
-    assert output.episode.audit.backward_count == 2
-    assert output.episode.audit.training_counterfactual_executed is False
-
-
-def test_a4_a5_terms_multi_query_and_repeatability(config: ProjectConfig) -> None:
-    a4_runner, _, _, _ = _system(config, MetaTTTVariant.A4)
-    a5_runner, _, _, _ = _system(config, MetaTTTVariant.A5)
-    a4_episode = _episode(config, MetaTTTVariant.A4, support_count=4, query_count=2)
-    a5_episode = _episode(config, MetaTTTVariant.A5, support_count=4, query_count=2)
-    a4 = a4_runner(a4_episode)
-    a5 = a5_runner(a5_episode)
-    repeated = a5_runner(a5_episode)
-
-    assert a4.audit.active_terms == ("pred", "identity")
-    assert a5.audit.active_terms == ("pred", "identity", "event")
-    assert all(sum(update.e1_valid_counts) == 0 for update in a4.audit.updates)
-    assert sum(a5.audit.updates[1].e1_valid_counts) > 0
-    assert len(a5.query_objectives) == 2
-    assert all(query.independent_lifecycles for query in a5.audit.queries)
-    assert all(query.observation_immutable for query in a5.audit.queries)
-    assert torch.equal(a5.total.detach(), repeated.total.detach())
-    assert torch.equal(
-        a5.final_fast_states[0].w_t_1.detach(),
-        repeated.final_fast_states[0].w_t_1.detach(),
-    )
-    assert torch.allclose(
-        a5.total,
-        torch.stack(tuple(query.outer.total for query in a5.query_objectives)).mean(),
-    )
 
 
 def test_eight_support_graph_is_released_and_does_not_grow(config: ProjectConfig) -> None:
@@ -1106,47 +1001,17 @@ def test_support_label_poison_is_rejected_before_any_model_call(
     config: ProjectConfig,
     denied: str,
 ) -> None:
-    runner, fast, _, resetter = _system(config, MetaTTTVariant.A3)
+    runner, fast, _, resetter = _system(config, MetaTTTVariant.A5)
     del runner
     owner = RuntimeOwner(("video-a",), ("trajectory-a",))
     clean = _chunk(owner, chunk_index=0, end_time=1.0, width=2)
-    poisoned = dict(clean.runtime_payload)
+    poisoned = dict(clean.query_input.as_payload())
     poisoned[denied] = "forbidden"
     with pytest.raises(ValueError, match="denied fields"):
-        replace(clean, runtime_payload=poisoned)
+        assert_runtime_payload_safe(poisoned, layer="Meta-TTT Support/Query")
     assert resetter.calls == 0
     assert fast.last_audit is None
 
 
 def test_stage_a_query_builder_stays_available_as_production_adapter() -> None:
     assert isinstance(StageAQueryLossBuilder(), StageAQueryLossBuilder)
-
-
-def test_synthetic_ablation_report_has_paired_ci_failures_and_disclaimer() -> None:
-    records = tuple(
-        SyntheticAblationRecord(
-            case_id=f"case-{case}",
-            task_name="count",
-            metric_name="answer/exact_match",
-            variant=variant,
-            value=float(case) + offset,
-            failure_cases=("synthetic-hard-case",) if case == 1 else (),
-        )
-        for case in range(3)
-        for variant, offset in (
-            (MetaTTTVariant.A3, 0.0),
-            (MetaTTTVariant.A4, 0.1),
-            (MetaTTTVariant.A5, 0.15),
-        )
-    )
-    comparisons = compare_synthetic_ablations(records)
-    assert [(item.baseline, item.candidate) for item in comparisons] == [
-        (MetaTTTVariant.A3, MetaTTTVariant.A4),
-        (MetaTTTVariant.A4, MetaTTTVariant.A5),
-    ]
-    assert all(item.sample_count == 3 for item in comparisons)
-    assert all("synthetic-hard-case" in item.failure_cases for item in comparisons)
-    report = render_synthetic_ablation_report(comparisons)
-    assert "Synthetic/tiny engineering evidence only" in report
-    assert "no scientific gain" in report
-    assert "95% CI" in report

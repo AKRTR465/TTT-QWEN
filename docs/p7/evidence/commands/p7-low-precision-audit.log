@@ -1,6 +1,0 @@
-timestamp_utc=2026-07-13T22:52:50.3677002Z
-environment=UV_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-command=uv run pytest -q tests/test_temporal_encoder.py::test_float16_forward_backward_and_dtype_guards_are_finite
-exit_code=0
-result=1 passed in 21.17s
-scope=local FP16 forward/backward; finite input/parameter gradients; hidden/KV dtype; independent FP64 timestamps

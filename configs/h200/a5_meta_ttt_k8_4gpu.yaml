@@ -59,33 +59,10 @@ ttt_qwen:
   stage: a5
   project_config: configs/model_state_ttt_8b.yaml
   dataset_manifest: $SVCBENCH_DATASET_MANIFEST
-  runtime_factory: ttt_svcbench_qwen.production_runtime:build_runtime
   initialize_from_a2_checkpoint: $A2_CHECKPOINT
-  truncation_mode: truncated_second_order
-  truncation_horizon: 8
-  reanchor_to_w0: true
-  support_limit: null
-  minimum_query_points: 2
-  inner_learning_rate: 1.0e-4
-  inner_parameter_names: [w_t_1, w_t_2]
-  inner_momentum: 0.0
-  state_w0_predictor_learning_rate: 5.0e-5
-  auxiliary_ttt_weight: 0.1
-  training_counterfactual_enabled: false
-  bucket_key: tbptt_segment_count
-  world_size: 4
-  deterministic_zero_weight_padding: true
   support_prefetch_depth: 2
   support_decode_coalesce: true
   preprocess_cache_enabled: true
   preprocess_cache_root_env: TTT_PREPROCESS_CACHE_ROOT
   preprocess_cache_max_gb: 200
   preprocess_cache_dtype: float32
-  optimizer_step_scope: episode
-  checkpoint_selection: final_epoch
-  checkpoint_every_epochs: 1
-  exclude_checkpoint_state:
-    - transient_w_t
-    - state_bank_runtime
-    - fsm_runtime
-    - visual_cache

@@ -1,5 +1,0 @@
-captured_after_todo_completion: true
-uv sync --frozen: exit 0; Checked 74 packages in 6ms
-uv run pytest -q: exit 0; 47 passed in 9.04s
-uv run ruff check .: exit 0; All checks passed
-uv run mypy src: exit 0; no issues in 17 source files

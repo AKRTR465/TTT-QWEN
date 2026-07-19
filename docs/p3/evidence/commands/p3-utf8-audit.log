@@ -1,5 +1,0 @@
-timestamp_utc=2026-07-13T19:13:03.7685335Z
-scope=git ls-files with *.py,*.md,*.toml,*.yaml,*.yml,*.json,*.jsonl,*.txt,*.log
-decoder=System.Text.UTF8Encoding(false,true)
-exit_code=0
-result=UTF-8 strict decode passed: 86 staged/tracked text files

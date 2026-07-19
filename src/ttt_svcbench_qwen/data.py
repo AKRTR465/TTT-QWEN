@@ -18,9 +18,7 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
-import torch
 from sklearn.model_selection import GroupKFold  # type: ignore[import-untyped]
-from torch import Tensor
 
 RUNTIME_ALLOWLIST = frozenset({"video", "question", "query_time", "explicit_time_values"})
 RUNTIME_DENYLIST = frozenset(
@@ -83,20 +81,26 @@ class SampleIdentity:
 
 
 @dataclass(frozen=True, slots=True)
-class RuntimeModelInput:
+class RuntimeQueryInput:
+    video_id: str
+    trajectory_id: str
+    query_id: str
+    query_index: int
     video: Path
     question: str
     query_time: float
     explicit_time_values: tuple[float, ...]
+    episode_nonce: int = 0
 
     def __post_init__(self) -> None:
-        if not self.question:
-            raise ValueError("question must be non-empty")
+        if not self.video_id or not self.trajectory_id or not self.query_id or not self.question:
+            raise ValueError("runtime Query identity/question fields must be non-empty")
+        if self.query_index < 0 or self.episode_nonce < 0:
+            raise ValueError("runtime Query indexes must be non-negative")
         if not math.isfinite(self.query_time) or self.query_time < 0.0:
             raise ValueError("query_time must be finite and non-negative")
         if any(not math.isfinite(value) or value < 0.0 for value in self.explicit_time_values):
             raise ValueError("explicit time values must be finite and non-negative")
-        assert_runtime_payload_safe(self.as_payload(), layer="Dataset")
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -110,7 +114,23 @@ class RuntimeModelInput:
 @dataclass(frozen=True, slots=True)
 class RuntimeSample:
     identity: SampleIdentity
-    model_input: RuntimeModelInput
+    model_input: RuntimeQueryInput
+
+    def __post_init__(self) -> None:
+        runtime_identity = (
+            self.model_input.query_id,
+            self.model_input.query_index,
+            self.model_input.video_id,
+            self.model_input.trajectory_id,
+        )
+        expected = (
+            self.identity.query_id,
+            self.identity.query_index,
+            self.identity.video_id,
+            self.identity.trajectory_id,
+        )
+        if runtime_identity != expected:
+            raise ValueError("runtime Query identity must match the dataset sample")
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +186,11 @@ class SVCBenchRecord:
         video_path = video_root / self.source_dataset / Path(self.relative_video_path)
         return RuntimeSample(
             identity=self.identity,
-            model_input=RuntimeModelInput(
+            model_input=RuntimeQueryInput(
+                video_id=self.identity.video_id,
+                trajectory_id=self.identity.trajectory_id,
+                query_id=self.identity.query_id,
+                query_index=self.identity.query_index,
                 video=video_path,
                 question=self.question,
                 query_time=self.query_time,
@@ -211,9 +235,7 @@ class SVCBenchDataset:
         return len(self._annotations.records)
 
     def __getitem__(self, index: int) -> RuntimeSample:
-        sample = self._annotations.records[index].runtime_sample(self._video_root)
-        assert_runtime_payload_safe(sample.model_input.as_payload(), layer="Dataset")
-        return sample
+        return self._annotations.records[index].runtime_sample(self._video_root)
 
     def supervision_for(
         self, index: int, *, consumer: Literal["trainer", "evaluator"]
@@ -232,56 +254,24 @@ class SVCBenchDataset:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeBatch:
-    video: tuple[Path, ...]
-    question: tuple[str, ...]
-    query_time: Tensor
-    explicit_time_values: tuple[tuple[float, ...], ...]
-    identities: tuple[SampleIdentity, ...]
+    queries: tuple[RuntimeQueryInput, ...]
 
     def __post_init__(self) -> None:
-        batch_size = len(self.video)
-        if not batch_size or len(self.question) != batch_size or len(self.identities) != batch_size:
-            raise ValueError("RuntimeBatch fields must have one entry per batch item")
-        if len(self.explicit_time_values) != batch_size:
-            raise ValueError("explicit_time_values must have one entry per batch item")
-        if any(
-            not math.isfinite(value) or value < 0.0
-            for values in self.explicit_time_values
-            for value in values
-        ):
-            raise ValueError("explicit_time_values must be finite and non-negative")
-        if self.query_time.shape != (batch_size,) or not torch.is_floating_point(self.query_time):
-            raise ValueError("query_time must be floating [B]")
-        if not bool(torch.isfinite(self.query_time).all()) or bool(torch.any(self.query_time < 0)):
-            raise ValueError("query_time must be finite and non-negative")
-        assert_runtime_payload_safe(self.as_model_payload(), layer="Collator")
-
-    def as_model_payload(self) -> dict[str, object]:
-        return {
-            "video": self.video,
-            "question": self.question,
-            "query_time": self.query_time,
-            "explicit_time_values": self.explicit_time_values,
-        }
+        if not self.queries:
+            raise ValueError("RuntimeBatch requires at least one typed Query")
+        identities = tuple(
+            (query.video_id, query.trajectory_id, query.query_id, query.query_index)
+            for query in self.queries
+        )
+        if len(set(identities)) != len(identities):
+            raise ValueError("RuntimeBatch Query identities must be unique")
 
 
 class SVCBenchCollator:
     def __call__(self, samples: Sequence[RuntimeSample]) -> RuntimeBatch:
         if not samples:
             raise ValueError("cannot collate an empty sample sequence")
-        batch = RuntimeBatch(
-            video=tuple(sample.model_input.video for sample in samples),
-            question=tuple(sample.model_input.question for sample in samples),
-            query_time=torch.tensor(
-                [sample.model_input.query_time for sample in samples], dtype=torch.float32
-            ),
-            explicit_time_values=tuple(
-                sample.model_input.explicit_time_values for sample in samples
-            ),
-            identities=tuple(sample.identity for sample in samples),
-        )
-        assert_runtime_payload_safe(batch.as_model_payload(), layer="Collator")
-        return batch
+        return RuntimeBatch(tuple(sample.model_input for sample in samples))
 
 
 @dataclass(frozen=True, slots=True)

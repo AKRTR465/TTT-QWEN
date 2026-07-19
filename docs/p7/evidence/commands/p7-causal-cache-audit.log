@@ -1,7 +1,0 @@
-timestamp_utc=2026-07-13T22:52:50.3677002Z
-environment=UV_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-command=uv run pytest -q demo future-invariance eval-full-chunk overlap sliding-window selected P7 tests
-exit_code=0
-result=5 passed in 21.60s
-scope=392-to-8 demo; future mutation invariance; per-layer KV chunk equivalence; 4-tubelet replay/replace; full-64 cache plus 3-position replay margin
-independent_read_only_audit=continuous full-cache overlap max_abs_error 1.45e-6

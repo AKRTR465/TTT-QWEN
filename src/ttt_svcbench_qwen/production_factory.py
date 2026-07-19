@@ -16,9 +16,10 @@ import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Self, cast
 
 import torch
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from safetensors.torch import load_file
 from torch import nn
 from transformers.modeling_utils import load_sharded_checkpoint
@@ -39,7 +40,36 @@ _FORBIDDEN_CHECKPOINT_TOKENS = (
     "temporal_cache",
     "visual_cache",
     "soft_overlap_snapshot",
+    "online_overlap_memory",
+    "optimizer_runtime",
+    "reader_audit",
 )
+
+
+class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
+    """Strict State-TTT extension for production LLaMA-Factory YAML files."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    stage: Literal["a2", "a5"]
+    project_config: str = Field(min_length=1)
+    dataset_manifest: str = Field(min_length=1)
+    visual_cost_index: str | None = Field(default=None, min_length=1)
+    initialize_from_a2_checkpoint: str | None = Field(default=None, min_length=1)
+    support_prefetch_depth: int = Field(gt=0)
+    support_decode_coalesce: bool
+    preprocess_cache_enabled: bool
+    preprocess_cache_root_env: str = Field(min_length=1)
+    preprocess_cache_max_gb: float = Field(gt=0.0)
+    preprocess_cache_dtype: Literal["float32"]
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_stage_checkpoint(self) -> Self:
+        if self.stage == "a2" and self.initialize_from_a2_checkpoint is not None:
+            raise ValueError("A2 must not initialize from an A2 checkpoint")
+        if self.stage == "a5" and self.initialize_from_a2_checkpoint is None:
+            raise ValueError("A5 requires initialize_from_a2_checkpoint")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +106,7 @@ class LlamaFactoryBackboneBundle:
     finetuning_args: object
     generating_args: object
     project_config: ProjectConfig
-    ttt_config: Mapping[str, object]
+    ttt_config: ProductionTTTConfig
     symbols: LlamaFactorySymbols
 
 
@@ -119,21 +149,13 @@ class OuterCheckpointAudit:
     forbidden_runtime_keys: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if not self.checkpoint.is_dir() or not self.format or self.tensor_count <= 0:
+        if not self.checkpoint.exists() or not self.format or self.tensor_count <= 0:
             raise ValueError("A2 checkpoint audit is incomplete")
         if self.missing_keys or self.unexpected_keys or self.forbidden_runtime_keys:
-            raise ValueError("A2 checkpoint does not exactly match the outer model boundary")
+            raise ValueError("outer checkpoint does not exactly match the model boundary")
 
 
-class RuntimeFactory(Protocol):
-    def __call__(
-        self,
-        backbone: LlamaFactoryBackboneBundle,
-        config: Mapping[str, object],
-    ) -> object: ...
-
-
-def load_training_yaml(path: str | Path) -> tuple[dict[str, object], dict[str, object]]:
+def load_training_yaml(path: str | Path) -> tuple[dict[str, object], ProductionTTTConfig]:
     """Split native LLaMA-Factory keys from the namespaced ``ttt_qwen`` extension."""
 
     import yaml
@@ -150,7 +172,7 @@ def load_training_yaml(path: str | Path) -> tuple[dict[str, object], dict[str, o
     extension = values.pop("ttt_qwen", None)
     if not isinstance(extension, dict) or not all(isinstance(key, str) for key in extension):
         raise ValueError("training YAML requires a string-keyed ttt_qwen section")
-    return values, cast(dict[str, object], extension)
+    return values, ProductionTTTConfig.model_validate(extension)
 
 
 def import_llamafactory(
@@ -210,10 +232,8 @@ def load_llamafactory_backbone(
     model = symbols.load_model(tokenizer, model_args, finetuning_args, True)
     if not isinstance(model, nn.Module):
         raise TypeError("LLaMA-Factory model loader returned a non-module")
-    configured_project_path = ttt_config.get("project_config")
+    configured_project_path = ttt_config.project_config
     if project_config_path is None:
-        if not isinstance(configured_project_path, str) or not configured_project_path:
-            raise ValueError("ttt_qwen.project_config is required")
         project_config_path = configured_project_path
     config = load_config(project_config_path)
     return LlamaFactoryBackboneBundle(
@@ -278,6 +298,86 @@ def audit_outer_checkpoint_boundary(model: nn.Module) -> tuple[str, ...]:
     if forbidden:
         raise ValueError(f"outer checkpoint contains transient/hard runtime keys: {forbidden}")
     return keys
+
+
+def load_outer_checkpoint(
+    model: nn.Module,
+    checkpoint: str | Path,
+) -> OuterCheckpointAudit:
+    """Strictly load an outer-only single or sharded safetensors checkpoint."""
+
+    source = Path(checkpoint).resolve()
+    if source.is_dir():
+        single = source / "model.safetensors"
+        index = source / "model.safetensors.index.json"
+        if single.is_file() == index.is_file():
+            raise ValueError(
+                "checkpoint directory must contain exactly one of model.safetensors or its index"
+            )
+        source = single if single.is_file() else index
+    if not source.is_file():
+        raise FileNotFoundError(f"outer checkpoint does not exist: {source}")
+    expected = set(audit_outer_checkpoint_boundary(model))
+    state: dict[str, torch.Tensor] | None = None
+    if source.suffix == ".safetensors":
+        state = load_file(str(source), device="cpu")
+        loaded = set(state)
+        checkpoint_format = "safetensors"
+    elif source.name == "model.safetensors.index.json":
+        raw = json.loads(source.read_text(encoding="utf-8"))
+        weight_map = raw.get("weight_map") if isinstance(raw, dict) else None
+        if not isinstance(weight_map, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in weight_map.items()
+        ):
+            raise ValueError("sharded safetensors index requires a string weight_map")
+        shard_names = set(cast(dict[str, str], weight_map).values())
+        if not shard_names or any(not name.endswith(".safetensors") for name in shard_names):
+            raise ValueError("sharded outer checkpoint may contain safetensors shards only")
+        missing_shards = tuple(
+            sorted(name for name in shard_names if not (source.parent / name).is_file())
+        )
+        if missing_shards:
+            raise FileNotFoundError(f"checkpoint shards are missing: {missing_shards}")
+        loaded = set(cast(dict[str, str], weight_map))
+        checkpoint_format = "sharded_safetensors"
+    else:
+        raise ValueError(
+            "outer checkpoint must be a .safetensors file or model.safetensors.index.json"
+        )
+    forbidden = tuple(
+        sorted(
+            name
+            for name in loaded
+            if any(token in name.casefold() for token in _FORBIDDEN_CHECKPOINT_TOKENS)
+        )
+    )
+    missing = tuple(sorted(expected - loaded))
+    unexpected = tuple(sorted(loaded - expected))
+    if missing or unexpected or forbidden:
+        return OuterCheckpointAudit(
+            checkpoint=source,
+            format=checkpoint_format,
+            tensor_count=len(loaded),
+            missing_keys=missing,
+            unexpected_keys=unexpected,
+            forbidden_runtime_keys=forbidden,
+        )
+    if state is not None:
+        result = model.load_state_dict(state, strict=True)
+    else:
+        loader = cast(Callable[..., Any], load_sharded_checkpoint)
+        result = loader(model, str(source.parent), strict=True, prefer_safe=True)
+    result_missing = tuple(getattr(result, "missing_keys", ()))
+    result_unexpected = tuple(getattr(result, "unexpected_keys", ()))
+    return OuterCheckpointAudit(
+        checkpoint=source,
+        format=checkpoint_format,
+        tensor_count=len(loaded),
+        missing_keys=result_missing,
+        unexpected_keys=result_unexpected,
+        forbidden_runtime_keys=(),
+    )
 
 
 def initialize_outer_model_from_a2(
@@ -346,18 +446,6 @@ def initialize_outer_model_from_a2(
     )
 
 
-def resolve_runtime_factory(specification: str) -> RuntimeFactory:
-    """Resolve ``module:function`` without allowing an implicit remote checkout import."""
-
-    module_name, separator, attribute = specification.partition(":")
-    if not separator or not module_name or not attribute:
-        raise ValueError("runtime_factory must use module:function syntax")
-    value = getattr(importlib.import_module(module_name), attribute, None)
-    if not callable(value):
-        raise TypeError(f"runtime factory is not callable: {specification}")
-    return cast(RuntimeFactory, value)
-
-
 def environment_manifest(bundle: LlamaFactoryBackboneBundle) -> dict[str, object]:
     return {
         "llamafactory_root": str(bundle.symbols.checkout.root),
@@ -365,7 +453,7 @@ def environment_manifest(bundle: LlamaFactoryBackboneBundle) -> dict[str, object
         "llamafactory_dirty": bundle.symbols.checkout.dirty,
         "qwen_model_path": str(getattr(bundle.model_args, "model_name_or_path", "")),
         "project_spec_version": bundle.project_config.spec_version,
-        "ttt_config": json.loads(json.dumps(dict(bundle.ttt_config))),
+        "ttt_config": json.loads(bundle.ttt_config.model_dump_json()),
     }
 
 
@@ -405,6 +493,7 @@ __all__ = [
     "LlamaFactoryCheckoutAudit",
     "LlamaFactorySymbols",
     "OuterCheckpointAudit",
+    "ProductionTTTConfig",
     "audit_outer_checkpoint_boundary",
     "environment_manifest",
     "fully_unfreeze_qwen",
@@ -412,5 +501,4 @@ __all__ = [
     "initialize_outer_model_from_a2",
     "load_llamafactory_backbone",
     "load_training_yaml",
-    "resolve_runtime_factory",
 ]

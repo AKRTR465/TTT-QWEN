@@ -1,4 +1,0 @@
-command: strict UTF-8 decode of git ls-files -co --exclude-standard text extensions
-exit_code: 0
-result: 199 text files passed
-scope: Python, Markdown, YAML, JSON/JSONL, TOML, TXT, LOG, lock files, and .gitignore

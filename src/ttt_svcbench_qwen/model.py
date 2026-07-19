@@ -2,7 +2,7 @@
 
 Inputs: injected P3/P5-P12 components, immutable stage requests, and one explicit
 per-owner prefill lifecycle.
-Outputs: observation intermediates, one audited Qwen prefill, and decode outputs.
+Outputs: observation intermediates, one audited training prefill, or one generated answer.
 Forbidden: local Adapter/SGD, FSM/Bank mutation, Retriever, Reader, Resampler,
 Composer, or Qwen masking implementations.
 
@@ -14,19 +14,39 @@ state rule.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from threading import RLock
-from typing import Protocol, cast
+from typing import Protocol
 
-from torch import nn
+from torch import Tensor, nn
 
 from ttt_svcbench_qwen.config import ProjectConfig
+from ttt_svcbench_qwen.data import RuntimeQueryInput
+from ttt_svcbench_qwen.fast_ttt import FastWeightsState, OptimizerRuntimeState
+from ttt_svcbench_qwen.identity_bank import IdentityBankRuntimeState
+from ttt_svcbench_qwen.input_composer import ComposedInput
+from ttt_svcbench_qwen.observation_heads import (
+    E1RuntimeState,
+    E2RuntimeState,
+    ObservationOutputs,
+)
+from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput
+from ttt_svcbench_qwen.state_bank import StateBankRuntimeState, StructuredStateBank
+from ttt_svcbench_qwen.state_encoder import (
+    SpatialEncoderOutput,
+    SpatialSlotRuntimeState,
+    TemporalCache,
+    TemporalEncoderOutput,
+)
+from ttt_svcbench_qwen.state_reader import ReaderResult, StateResamplerOutput
+from ttt_svcbench_qwen.state_retriever import RetrieverOutput
 
 
 class LifecycleError(RuntimeError):
-    """Raised when an owner attempts an illegal observe/prefill/decode transition."""
+    """Raised when an owner attempts an illegal observe/prefill/generate transition."""
 
 
 class LifecyclePhase(StrEnum):
@@ -51,6 +71,251 @@ class RuntimeOwner:
             raise ValueError("runtime owner IDs must be non-empty")
         if len(set(pairs)) != len(pairs):
             raise ValueError("runtime owner rows must be unique")
+
+
+@dataclass(frozen=True, slots=True)
+class OnlineOverlapSnapshot:
+    """The sole detached adjacent-chunk memory used by training and inference."""
+
+    owner: RuntimeOwner
+    end_time: float
+    identity: Tensor
+    identity_valid_mask: Tensor
+    identity_position_ids: Tensor
+    identity_timestamps: Tensor
+    e1_probabilities: Tensor
+    e2_event_probabilities: Tensor
+    e2_phase_probabilities: Tensor
+    event_valid_mask: Tensor
+    event_position_ids: Tensor
+    event_timestamps: Tensor
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.end_time) or self.end_time < 0.0:
+            raise ValueError("overlap snapshot end_time must be finite and non-negative")
+        tensors = self.tensors
+        if any(value.requires_grad or value.grad_fn is not None for value in tensors):
+            raise ValueError("overlap snapshots must be detached from autograd")
+        materialized = tuple(value for value in tensors if value.device.type != "meta")
+        storage = tuple(
+            (str(value.device), value.untyped_storage().data_ptr()) for value in materialized
+        )
+        if len(set(storage)) != len(storage):
+            raise ValueError("overlap snapshot tensors must use isolated storage")
+
+    @property
+    def tensors(self) -> tuple[Tensor, ...]:
+        return (
+            self.identity,
+            self.identity_valid_mask,
+            self.identity_position_ids,
+            self.identity_timestamps,
+            self.e1_probabilities,
+            self.e2_event_probabilities,
+            self.e2_phase_probabilities,
+            self.event_valid_mask,
+            self.event_position_ids,
+            self.event_timestamps,
+        )
+
+    @classmethod
+    def capture(
+        cls,
+        output: ObservationChunkOutput,
+        *,
+        end_time: float,
+    ) -> OnlineOverlapSnapshot:
+        observations = output.observations
+        if not isinstance(observations, ObservationOutputs):
+            raise TypeError("overlap snapshots require typed ObservationOutputs")
+        return cls(
+            owner=output.owner,
+            end_time=end_time,
+            identity=observations.o2.identity.detach().clone(),
+            identity_valid_mask=observations.o2.valid_mask.detach().clone(),
+            identity_position_ids=observations.o2.position_ids.detach().clone(),
+            identity_timestamps=observations.o2.timestamps.detach().clone(),
+            e1_probabilities=observations.e1.probabilities.detach().clone(),
+            e2_event_probabilities=observations.e2.event_probabilities.detach().clone(),
+            e2_phase_probabilities=observations.e2.phase_probabilities.detach().clone(),
+            event_valid_mask=observations.e1.valid_mask.detach().clone(),
+            event_position_ids=observations.e1.position_ids.detach().clone(),
+            event_timestamps=observations.e1.timestamps.detach().clone(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TrajectoryRuntimeState:
+    """One authoritative trajectory across training and online inference."""
+
+    owner: RuntimeOwner
+    next_chunk_index: int
+    slot_state: SpatialSlotRuntimeState | None
+    temporal_cache: TemporalCache | None
+    e1_state: E1RuntimeState | None
+    e2_state: E2RuntimeState | None
+    state_bank: StateBankRuntimeState
+    identity_bank: IdentityBankRuntimeState
+    fast_weights: FastWeightsState | None = None
+    optimizer: OptimizerRuntimeState | None = None
+    reader_audit: tuple[ReaderResult, ...] = ()
+    online_overlap_memory: OnlineOverlapSnapshot | None = None
+    released: bool = False
+
+    def __post_init__(self) -> None:
+        if len(self.owner.video_ids) != 1:
+            raise ValueError("trajectory runtime owner must contain exactly one row")
+        if type(self.next_chunk_index) is not int or self.next_chunk_index < 0:
+            raise ValueError("trajectory next_chunk_index must be non-negative")
+        if (self.fast_weights is None) != (self.optimizer is None):
+            raise ValueError("fast weights and optimizer state must be both present or both absent")
+        video_id = self.video_id
+        trajectory_id = self.trajectory_id
+        for name, state in (("State Bank", self.state_bank), ("Identity Bank", self.identity_bank)):
+            if (state.video_id, state.trajectory_id) != (video_id, trajectory_id):
+                raise ValueError(f"{name} ownership does not match trajectory runtime")
+            if state.released != self.released:
+                raise ValueError(f"{name} release state does not match trajectory runtime")
+        if self.slot_state is not None and self.slot_state.video_id != video_id:
+            raise ValueError("slot-state ownership does not match trajectory runtime")
+        for name, operator_state in (("E1", self.e1_state), ("E2", self.e2_state)):
+            if operator_state is not None and (
+                operator_state.video_id,
+                operator_state.trajectory_id,
+            ) != (
+                video_id,
+                trajectory_id,
+            ):
+                raise ValueError(f"{name} ownership does not match trajectory runtime")
+        if self.temporal_cache is not None:
+            owners = tuple(
+                zip(
+                    self.temporal_cache.video_ids,
+                    self.temporal_cache.trajectory_ids,
+                    strict=True,
+                )
+            )
+            if (video_id, trajectory_id) not in owners:
+                raise ValueError("temporal-cache ownership does not include trajectory runtime")
+            row_index = owners.index((video_id, trajectory_id))
+            for name, operator_state in (("E1", self.e1_state), ("E2", self.e2_state)):
+                if operator_state is None:
+                    continue
+                if (
+                    operator_state.query_signature.dtype != self.temporal_cache.hidden.dtype
+                    or operator_state.query_signature.device != self.temporal_cache.hidden.device
+                    or not operator_state.query_signature.equal(
+                        self.temporal_cache.query_signatures[row_index]
+                    )
+                ):
+                    raise ValueError(f"{name} state query signature does not match temporal cache")
+                if operator_state.total_seen != int(
+                    self.temporal_cache.total_seen[row_index].item()
+                ):
+                    raise ValueError(f"{name} state position does not match temporal cache")
+
+    @property
+    def video_id(self) -> str:
+        return self.owner.video_ids[0]
+
+    @property
+    def trajectory_id(self) -> str:
+        return self.owner.trajectory_ids[0]
+
+
+@dataclass(frozen=True, slots=True)
+class BatchRuntimeState:
+    """The sole batch representation: an aligned tuple of trajectory rows."""
+
+    rows: tuple[TrajectoryRuntimeState, ...]
+
+    def __post_init__(self) -> None:
+        if not self.rows:
+            raise ValueError("batch runtime requires at least one trajectory row")
+        owners = tuple((row.video_id, row.trajectory_id) for row in self.rows)
+        if len(set(owners)) != len(owners):
+            raise ValueError("batch runtime trajectory owners must be unique")
+        if len({row.next_chunk_index for row in self.rows}) != 1:
+            raise ValueError("batch runtime rows must share one next_chunk_index")
+        caches = tuple(row.temporal_cache for row in self.rows if row.temporal_cache is not None)
+        if caches and any(cache is not caches[0] for cache in caches[1:]):
+            raise ValueError("batch runtime rows must share the authoritative temporal cache")
+
+    @property
+    def owner(self) -> RuntimeOwner:
+        return RuntimeOwner(
+            tuple(row.video_id for row in self.rows),
+            tuple(row.trajectory_id for row in self.rows),
+        )
+
+    @property
+    def next_chunk_index(self) -> int:
+        return self.rows[0].next_chunk_index
+
+    @property
+    def slot_states(self) -> tuple[SpatialSlotRuntimeState | None, ...]:
+        return tuple(row.slot_state for row in self.rows)
+
+    @property
+    def temporal_cache(self) -> TemporalCache | None:
+        return self.rows[0].temporal_cache
+
+    @property
+    def e1_states(self) -> tuple[E1RuntimeState | None, ...]:
+        return tuple(row.e1_state for row in self.rows)
+
+    @property
+    def e2_states(self) -> tuple[E2RuntimeState | None, ...]:
+        return tuple(row.e2_state for row in self.rows)
+
+    @property
+    def state_bank_states(self) -> tuple[StateBankRuntimeState, ...]:
+        return tuple(row.state_bank for row in self.rows)
+
+    @property
+    def identity_bank_states(self) -> tuple[IdentityBankRuntimeState, ...]:
+        return tuple(row.identity_bank for row in self.rows)
+
+    @property
+    def bank_states(self) -> tuple[StateBankRuntimeState, ...]:
+        return self.state_bank_states
+
+    @property
+    def fast_states(self) -> tuple[FastWeightsState, ...]:
+        if any(row.fast_weights is None for row in self.rows):
+            raise ValueError("batch runtime has no fast state")
+        return tuple(row.fast_weights for row in self.rows if row.fast_weights is not None)
+
+    @property
+    def optimizer_states(self) -> tuple[OptimizerRuntimeState, ...]:
+        if any(row.optimizer is None for row in self.rows):
+            raise ValueError("batch runtime has no optimizer state")
+        return tuple(row.optimizer for row in self.rows if row.optimizer is not None)
+
+    def with_fast_states(
+        self,
+        fast_states: Sequence[FastWeightsState],
+        optimizer_states: Sequence[OptimizerRuntimeState] | None = None,
+    ) -> BatchRuntimeState:
+        fast = tuple(fast_states)
+        optimizers = self.optimizer_states if optimizer_states is None else tuple(optimizer_states)
+        if len(fast) != len(self.rows) or len(optimizers) != len(self.rows):
+            raise ValueError("fast/optimizer states must align to batch runtime rows")
+        return BatchRuntimeState(
+            tuple(
+                replace(row, fast_weights=fast_state, optimizer=optimizer_state)
+                for row, fast_state, optimizer_state in zip(
+                    self.rows,
+                    fast,
+                    optimizers,
+                    strict=True,
+                )
+            )
+        )
+
+    def validate_for(self, owner: RuntimeOwner) -> None:
+        if self.owner != owner:
+            raise ValueError("runtime rows do not align to the requested owner")
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +372,19 @@ class PrefillLifecycle:
                 raise LifecycleError("prefill lifecycle operations are not re-entrant")
             if self.phase is not LifecyclePhase.READY or self.prefill_count:
                 raise LifecycleError("observation is forbidden after prefill")
+
+    def _validate_prefill_ready(self, owner: RuntimeOwner) -> None:
+        """Reject repeated preparation before Reader/retrieval work is executed."""
+
+        with self._lock:
+            if owner != self.owner:
+                raise LifecycleError("request owner does not match the prefill lifecycle")
+            if self.phase is LifecyclePhase.FAILED:
+                raise LifecycleError("failed lifecycle must be reset before reuse")
+            if self._active_operation is not None:
+                raise LifecycleError("prefill lifecycle operations are not re-entrant")
+            if self.phase is not LifecyclePhase.READY or self.prefill_count:
+                raise LifecycleError("Qwen prefill may be built exactly once")
 
     def _begin(self, operation: str, owner: RuntimeOwner) -> None:
         with self._lock:
@@ -178,9 +456,9 @@ class ModelFeatureFlags:
 class ObservationChunkRequest:
     owner: RuntimeOwner
     video_input: object
-    query_input: object
-    runtime_state: object
-    bank_states: tuple[object, ...]
+    query_input: RuntimeQueryInput
+    runtime_state: BatchRuntimeState
+    bank_states: tuple[StateBankRuntimeState, ...]
     inference: bool = True
 
     def __post_init__(self) -> None:
@@ -201,8 +479,8 @@ class VisualStageOutput:
 
 @dataclass(frozen=True, slots=True)
 class BankWriteOutput:
-    runtime_state: object
-    bank_states: tuple[object, ...]
+    runtime_state: BatchRuntimeState
+    bank_states: tuple[StateBankRuntimeState, ...]
     audit: object
     soft_write: object | None = None
 
@@ -210,10 +488,10 @@ class BankWriteOutput:
 @dataclass(frozen=True, slots=True)
 class SoftIntermediates:
     adapted_visual: object
-    query: object
-    spatial: object | None
-    temporal: object | None
-    observations: object | None
+    query: QueryEncoderOutput
+    spatial: SpatialEncoderOutput | None
+    temporal: TemporalEncoderOutput | None
+    observations: ObservationOutputs | None
     state_write: object | None = None
 
 
@@ -241,10 +519,10 @@ class SoftObservationChunkOutput:
     owner: RuntimeOwner
     request_identity: int
     visual: VisualStageOutput
-    query: object
-    spatial: object | None
-    temporal: object | None
-    observations: object | None
+    query: QueryEncoderOutput
+    spatial: SpatialEncoderOutput | None
+    temporal: TemporalEncoderOutput | None
+    observations: ObservationOutputs | None
     commit_guard: ObservationCommitGuard
 
 
@@ -252,12 +530,12 @@ class SoftObservationChunkOutput:
 class ObservationChunkOutput:
     owner: RuntimeOwner
     visual: VisualStageOutput
-    query: object
-    spatial: object | None
-    temporal: object | None
-    observations: object | None
-    runtime_state: object
-    bank_states: tuple[object, ...]
+    query: QueryEncoderOutput
+    spatial: SpatialEncoderOutput | None
+    temporal: TemporalEncoderOutput | None
+    observations: ObservationOutputs | None
+    runtime_state: BatchRuntimeState
+    bank_states: tuple[StateBankRuntimeState, ...]
     state_audit: object | None
     soft_intermediates: SoftIntermediates
     lifecycle: LifecycleAudit
@@ -267,10 +545,10 @@ class ObservationChunkOutput:
 class AnswerQueryRequest:
     owner: RuntimeOwner
     observation: ObservationChunkOutput
-    base_input_ids: object
-    base_attention_mask: object
-    pixel_values_videos: object
-    video_grid_thw: object
+    base_input_ids: Tensor
+    base_attention_mask: Tensor
+    pixel_values_videos: Tensor | None
+    video_grid_thw: Tensor | None
     tokenizer: object
     embedding_owner: object
     rope_indexer: object
@@ -308,24 +586,46 @@ class QwenPrefillRequest:
     Composer ``inputs_embeds``.
     """
 
-    input_ids: object
-    attention_mask: object
-    pixel_values_videos: object
-    video_grid_thw: object
+    input_ids: Tensor
+    attention_mask: Tensor
+    pixel_values_videos: Tensor | None
+    video_grid_thw: Tensor | None
     prepared_video_features: object
-    state_position_mask: object | None
-    state_tokens: object | None
-    composer_position_ids_audit: object
-    composer_rope_deltas_audit: object
+    state_position_mask: Tensor | None
+    state_tokens: Tensor | None
+    composer_position_ids_audit: Tensor
+    composer_rope_deltas_audit: Tensor
     qwen_kwargs: tuple[tuple[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class QwenGenerateRequest:
+    prefill: QwenPrefillRequest
+    max_new_tokens: int = 16
+
+    def __post_init__(self) -> None:
+        if type(self.max_new_tokens) is not int or self.max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class QwenGenerateOutput:
+    answer_text: str
+    token_ids: Tensor
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.answer_text, str):
+            raise TypeError("Qwen generation answer must be text")
+        if self.token_ids.ndim != 2 or self.token_ids.shape[0] != 1:
+            raise ValueError("Qwen generated token IDs must be [1, T]")
 
 
 @dataclass(frozen=True, slots=True)
 class StateAudit:
     observation: object | None
     retrieval: object | None
-    reader: tuple[object, ...]
-    resampler: object | None
+    reader: tuple[ReaderResult, ...]
+    resampler: StateResamplerOutput | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,34 +656,43 @@ class NumberAgreementMetrics:
 
 @dataclass(frozen=True, slots=True)
 class StateTTTModelOutput:
-    answer_logits: object
-    qwen_output: object
+    answer_logits: Tensor
+    qwen_output: QwenPrefillOutput
     visual: VisualStageOutput
-    query: object
-    spatial: object | None
-    temporal: object | None
-    observations: object | None
-    retrieval: object | None
-    reader: tuple[object, ...]
-    resampler: object | None
-    composed: object
+    query: QueryEncoderOutput
+    spatial: SpatialEncoderOutput | None
+    temporal: TemporalEncoderOutput | None
+    observations: ObservationOutputs | None
+    retrieval: RetrieverOutput | None
+    reader: tuple[ReaderResult, ...]
+    resampler: StateResamplerOutput | None
+    composed: ComposedInput
     prefill_request: QwenPrefillRequest
-    runtime_state: object
+    runtime_state: BatchRuntimeState
     state_audit: StateAudit
     soft_intermediates: SoftIntermediates
     lifecycle: LifecycleAudit
 
 
 @dataclass(frozen=True, slots=True)
-class DecodeStepRequest:
-    owner: RuntimeOwner
-    model_inputs: object
+class PreparedAnswer:
+    request: AnswerQueryRequest
+    retrieval: RetrieverOutput | None
+    reader: tuple[ReaderResult, ...]
+    resampler: StateResamplerOutput | None
+    composed: ComposedInput
+    qwen_request: QwenPrefillRequest
+    state_audit: StateAudit
 
 
 @dataclass(frozen=True, slots=True)
-class DecodeStepOutput:
-    qwen_output: object
-    runtime_state: object
+class StateTTTGenerationOutput:
+    answer_text: str
+    generated_token_ids: Tensor
+    reader: tuple[ReaderResult, ...]
+    resampler: StateResamplerOutput | None
+    runtime_state: BatchRuntimeState
+    state_audit: StateAudit
     lifecycle: LifecycleAudit
 
 
@@ -392,14 +701,16 @@ class VisualStage(Protocol):
 
 
 class QueryStage(Protocol):
-    def __call__(self, query_input: object, *, inference: bool) -> object: ...
+    def __call__(
+        self, query_input: RuntimeQueryInput, *, inference: bool
+    ) -> QueryEncoderOutput: ...
 
 
 class FastStage(Protocol):
     def __call__(
         self,
         visual: VisualStageOutput,
-        query: object,
+        query: QueryEncoderOutput,
         request: ObservationChunkRequest,
     ) -> VisualStageOutput: ...
 
@@ -408,37 +719,37 @@ class SpatialStage(Protocol):
     def __call__(
         self,
         visual: VisualStageOutput,
-        query: object,
+        query: QueryEncoderOutput,
         request: ObservationChunkRequest,
-    ) -> object: ...
+    ) -> SpatialEncoderOutput: ...
 
 
 class TemporalStage(Protocol):
     def __call__(
         self,
         visual: VisualStageOutput,
-        query: object,
+        query: QueryEncoderOutput,
         request: ObservationChunkRequest,
-    ) -> object: ...
+    ) -> TemporalEncoderOutput: ...
 
 
 class ObservationStage(Protocol):
     def __call__(
         self,
-        spatial: object,
-        temporal: object,
-        query: object,
+        spatial: SpatialEncoderOutput,
+        temporal: TemporalEncoderOutput,
+        query: QueryEncoderOutput,
         request: ObservationChunkRequest,
-    ) -> object: ...
+    ) -> ObservationOutputs: ...
 
 
 class BankWriter(Protocol):
     def __call__(
         self,
-        observations: object,
-        spatial: object,
-        temporal: object,
-        query: object,
+        observations: ObservationOutputs,
+        spatial: SpatialEncoderOutput,
+        temporal: TemporalEncoderOutput,
+        query: QueryEncoderOutput,
         request: ObservationChunkRequest,
     ) -> BankWriteOutput: ...
 
@@ -446,59 +757,59 @@ class BankWriter(Protocol):
 class RetrieverStage(Protocol):
     def retrieve_query(
         self,
-        state_bank: object,
-        states: Sequence[object],
-        query: object,
+        state_bank: StructuredStateBank,
+        states: Sequence[StateBankRuntimeState],
+        query: QueryEncoderOutput,
         *,
         video_ids: Sequence[str],
         trajectory_ids: Sequence[str],
-    ) -> object: ...
+    ) -> RetrieverOutput: ...
 
 
 class ReaderStage(Protocol):
-    def read(self, retrieval: object) -> Sequence[object]: ...
+    def read(self, retrieval: RetrieverOutput) -> Sequence[ReaderResult]: ...
 
     def audit_results(
         self,
-        retrieval: object,
-        results: Sequence[object],
-    ) -> Sequence[object]: ...
+        retrieval: RetrieverOutput,
+        results: Sequence[ReaderResult],
+    ) -> Sequence[ReaderResult]: ...
 
-    def audit_number_tokens(self, result: object) -> int | None: ...
-
-
-class ExactCountResult(Protocol):
-    exact_count: int | None
+    def audit_number_tokens(self, result: ReaderResult) -> int | None: ...
 
 
 class ResamplerStage(Protocol):
-    def __call__(self, q_target: object, retrieval: object) -> object: ...
+    def __call__(self, q_target: Tensor, retrieval: RetrieverOutput) -> StateResamplerOutput: ...
 
 
 class ComposerStage(Protocol):
     def __call__(
         self,
         *,
-        base_input_ids: object,
-        base_attention_mask: object,
-        state_tokens: object | None,
-        state_token_valid_mask: object | None,
-        reader_results: Sequence[object],
+        base_input_ids: Tensor,
+        base_attention_mask: Tensor,
+        state_tokens: Tensor | None,
+        state_token_valid_mask: Tensor | None,
+        reader_results: Sequence[ReaderResult],
         tokenizer: object,
         embedding_owner: object,
         rope_indexer: object,
-        video_grid_thw: object,
+        video_grid_thw: Tensor | None,
         include_state: bool,
         include_number: bool,
-    ) -> object: ...
+    ) -> ComposedInput: ...
 
 
 class QwenPrefillStage(Protocol):
-    def __call__(self, request: QwenPrefillRequest) -> object: ...
+    def __call__(self, request: QwenPrefillRequest) -> QwenPrefillOutput: ...
 
 
-class QwenDecodeStage(Protocol):
-    def __call__(self, model_inputs: object) -> object: ...
+class QwenGenerateStage(Protocol):
+    def __call__(self, request: QwenGenerateRequest) -> QwenGenerateOutput: ...
+
+
+class QwenPrefillOutput(Protocol):
+    logits: Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -507,12 +818,12 @@ class ModelComponents:
     query_encoder: QueryStage
     composer: ComposerStage
     qwen_prefill: QwenPrefillStage
-    qwen_decode: QwenDecodeStage
+    qwen_generate: QwenGenerateStage
     fast_adapter: FastStage | None = None
     spatial_encoder: SpatialStage | None = None
     temporal_encoder: TemporalStage | None = None
     observation_heads: ObservationStage | None = None
-    state_bank: object | None = None
+    state_bank: StructuredStateBank | None = None
     bank_writer: BankWriter | None = None
     retriever: RetrieverStage | None = None
     reader: ReaderStage | None = None
@@ -524,10 +835,10 @@ class ModelComponents:
             "query_encoder": self.query_encoder,
             "composer": self.composer,
             "qwen_prefill": self.qwen_prefill,
-            "qwen_decode": self.qwen_decode,
+            "qwen_generate": self.qwen_generate,
         }
         missing = [name for name, value in always.items() if not callable(value)]
-        if flags.fast_enabled and not callable(self.fast_adapter):
+        if flags.fast_enabled and self.fast_adapter is None:
             missing.append("fast_adapter")
         if flags.bank_enabled:
             bank_dependencies = {
@@ -540,25 +851,55 @@ class ModelComponents:
             missing.extend(
                 name
                 for name, value in bank_dependencies.items()
-                if value is None or (name != "state_bank" and not callable(value))
+                if value is None
             )
-        if (flags.reader_enabled or flags.state_tokens_enabled) and (
-            self.retriever is None or not callable(getattr(self.retriever, "retrieve_query", None))
-        ):
+        if (flags.reader_enabled or flags.state_tokens_enabled) and self.retriever is None:
             missing.append("retriever")
-        if flags.reader_enabled:
-            reader_methods = ("read", "audit_results", "audit_number_tokens")
-            if self.reader is None or any(
-                not callable(getattr(self.reader, name, None)) for name in reader_methods
-            ):
-                missing.append("reader")
-        if flags.state_tokens_enabled and not callable(self.resampler):
+        if flags.reader_enabled and self.reader is None:
+            missing.append("reader")
+        if flags.state_tokens_enabled and self.resampler is None:
             missing.append("resampler")
         if missing:
             raise ValueError(
                 "enabled model features have missing dependencies: "
                 + ", ".join(dict.fromkeys(missing))
             )
+
+    def require_fast_adapter(self) -> FastStage:
+        assert self.fast_adapter is not None
+        return self.fast_adapter
+
+    def require_spatial_encoder(self) -> SpatialStage:
+        assert self.spatial_encoder is not None
+        return self.spatial_encoder
+
+    def require_temporal_encoder(self) -> TemporalStage:
+        assert self.temporal_encoder is not None
+        return self.temporal_encoder
+
+    def require_observation_heads(self) -> ObservationStage:
+        assert self.observation_heads is not None
+        return self.observation_heads
+
+    def require_bank_writer(self) -> BankWriter:
+        assert self.bank_writer is not None
+        return self.bank_writer
+
+    def require_retriever(self) -> RetrieverStage:
+        assert self.retriever is not None
+        return self.retriever
+
+    def require_reader(self) -> ReaderStage:
+        assert self.reader is not None
+        return self.reader
+
+    def require_resampler(self) -> ResamplerStage:
+        assert self.resampler is not None
+        return self.resampler
+
+    def require_state_bank(self) -> StructuredStateBank:
+        assert self.state_bank is not None
+        return self.state_bank
 
 
 class StateTTTModel(nn.Module):  # type: ignore[misc]
@@ -608,18 +949,18 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
         query = self.components.query_encoder(request.query_input, inference=request.inference)
         adapted = visual
         if self.feature_flags.fast_enabled:
-            fast_adapter = cast(FastStage, self.components.fast_adapter)
+            fast_adapter = self.components.require_fast_adapter()
             adapted = fast_adapter(visual, query, request)
             if not isinstance(adapted, VisualStageOutput):
                 raise TypeError("fast_adapter must return VisualStageOutput")
 
-        spatial: object | None = None
-        temporal: object | None = None
-        observations: object | None = None
+        spatial: SpatialEncoderOutput | None = None
+        temporal: TemporalEncoderOutput | None = None
+        observations: ObservationOutputs | None = None
         if self.feature_flags.bank_enabled:
-            spatial_encoder = cast(SpatialStage, self.components.spatial_encoder)
-            temporal_encoder = cast(TemporalStage, self.components.temporal_encoder)
-            heads = cast(ObservationStage, self.components.observation_heads)
+            spatial_encoder = self.components.require_spatial_encoder()
+            temporal_encoder = self.components.require_temporal_encoder()
+            heads = self.components.require_observation_heads()
             spatial = spatial_encoder(adapted, query, request)
             temporal = temporal_encoder(adapted, query, request)
             observations = heads(spatial, temporal, query, request)
@@ -654,7 +995,10 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             bank_audit: object | None = None
             soft_write: object | None = None
             if self.feature_flags.bank_enabled:
-                writer = cast(BankWriter, self.components.bank_writer)
+                writer = self.components.require_bank_writer()
+                assert soft.observations is not None
+                assert soft.spatial is not None
+                assert soft.temporal is not None
                 write = writer(
                     soft.observations,
                     soft.spatial,
@@ -696,110 +1040,114 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             lifecycle._fail("observe")
             raise
 
-    def answer_query(
+    def prepare_answer(
         self,
         request: AnswerQueryRequest,
         lifecycle: PrefillLifecycle,
-    ) -> StateTTTModelOutput:
-        """Audit one Bank snapshot, compose once, and execute one Qwen prefill."""
+    ) -> PreparedAnswer:
+        """Run Reader, retrieval, resampling and composition exactly once."""
 
+        lifecycle._validate_prefill_ready(request.owner)
+        observation = request.observation
+        retrieval: RetrieverOutput | None = None
+        reader_results: tuple[ReaderResult, ...] = ()
+        resampler_output: StateResamplerOutput | None = None
+        if self.feature_flags.reader_enabled or self.feature_flags.state_tokens_enabled:
+            retriever = self.components.require_retriever()
+            retrieval = retriever.retrieve_query(
+                self.components.require_state_bank(),
+                observation.bank_states,
+                observation.query,
+                video_ids=request.owner.video_ids,
+                trajectory_ids=request.owner.trajectory_ids,
+            )
+        if self.feature_flags.reader_enabled:
+            reader = self.components.require_reader()
+            assert retrieval is not None
+            computed = tuple(reader.read(retrieval))
+            reader_results = tuple(reader.audit_results(retrieval, computed))
+            if reader_results != computed:
+                raise ValueError("Reader audit must return the unchanged authoritative results")
+            for result in reader_results:
+                reader.audit_number_tokens(result)
+        if self.feature_flags.state_tokens_enabled:
+            assert retrieval is not None
+            resampler_output = self.components.require_resampler()(
+                observation.query.q_target, retrieval
+            )
+            _validate_answer_provenance(retrieval, reader_results, resampler_output)
+        state_tokens = None if resampler_output is None else resampler_output.state_tokens
+        state_valid = (
+            None if resampler_output is None else resampler_output.state_token_valid_mask
+        )
+        composed = self.components.composer(
+            base_input_ids=request.base_input_ids,
+            base_attention_mask=request.base_attention_mask,
+            state_tokens=state_tokens,
+            state_token_valid_mask=state_valid,
+            reader_results=reader_results,
+            tokenizer=request.tokenizer,
+            embedding_owner=request.embedding_owner,
+            rope_indexer=request.rope_indexer,
+            video_grid_thw=request.video_grid_thw,
+            include_state=self.feature_flags.state_tokens_enabled,
+            include_number=self.feature_flags.reader_enabled,
+        )
+        qwen_request = QwenPrefillRequest(
+            input_ids=composed.input_ids,
+            attention_mask=composed.attention_mask,
+            pixel_values_videos=request.pixel_values_videos,
+            video_grid_thw=request.video_grid_thw,
+            prepared_video_features=observation.visual.prepared_video_features,
+            state_position_mask=composed.state_position_mask,
+            state_tokens=state_tokens,
+            composer_position_ids_audit=composed.position_ids,
+            composer_rope_deltas_audit=composed.rope_deltas,
+            qwen_kwargs=request.qwen_kwargs,
+        )
+        return PreparedAnswer(
+            request=request,
+            retrieval=retrieval,
+            reader=reader_results,
+            resampler=resampler_output,
+            composed=composed,
+            qwen_request=qwen_request,
+            state_audit=StateAudit(
+                observation=observation.state_audit,
+                retrieval=None if retrieval is None else retrieval.audit,
+                reader=reader_results,
+                resampler=resampler_output,
+            ),
+        )
+
+    def prefill_answer(
+        self,
+        prepared: PreparedAnswer,
+        lifecycle: PrefillLifecycle,
+    ) -> StateTTTModelOutput:
+        """Execute the sole teacher-forced Qwen prefill used by A2/A5 training."""
+
+        request = prepared.request
         lifecycle._begin("prefill", request.owner)
         try:
+            qwen_output = self.components.qwen_prefill(prepared.qwen_request)
+            lifecycle._succeed("prefill", request.observation.runtime_state)
             observation = request.observation
-            retrieval: object | None = None
-            reader_results: tuple[object, ...] = ()
-            resampler_output: object | None = None
-            if self.feature_flags.reader_enabled or self.feature_flags.state_tokens_enabled:
-                retriever = cast(RetrieverStage, self.components.retriever)
-                retrieval = retriever.retrieve_query(
-                    self.components.state_bank,
-                    observation.bank_states,
-                    observation.query,
-                    video_ids=request.owner.video_ids,
-                    trajectory_ids=request.owner.trajectory_ids,
-                )
-
-            if self.feature_flags.reader_enabled:
-                reader = cast(ReaderStage, self.components.reader)
-                computed = tuple(reader.read(retrieval))
-                audited = tuple(reader.audit_results(retrieval, computed))
-                if audited != computed:
-                    raise ValueError("Reader audit must return the unchanged authoritative results")
-                for result in audited:
-                    reader.audit_number_tokens(result)
-                reader_results = audited
-
-            if self.feature_flags.state_tokens_enabled:
-                q_target = _required_attribute(observation.query, "q_target", "query output")
-                resampler = cast(ResamplerStage, self.components.resampler)
-                resampler_output = resampler(q_target, retrieval)
-                _validate_answer_provenance(retrieval, reader_results, resampler_output)
-
-            state_tokens = _optional_attribute(resampler_output, "state_tokens")
-            state_token_valid_mask = _optional_attribute(
-                resampler_output,
-                "state_token_valid_mask",
-            )
-            composed = self.components.composer(
-                base_input_ids=request.base_input_ids,
-                base_attention_mask=request.base_attention_mask,
-                state_tokens=state_tokens,
-                state_token_valid_mask=state_token_valid_mask,
-                reader_results=reader_results,
-                tokenizer=request.tokenizer,
-                embedding_owner=request.embedding_owner,
-                rope_indexer=request.rope_indexer,
-                video_grid_thw=request.video_grid_thw,
-                include_state=self.feature_flags.state_tokens_enabled,
-                include_number=self.feature_flags.reader_enabled,
-            )
-            prefill_request = QwenPrefillRequest(
-                input_ids=_required_attribute(composed, "input_ids", "Composer output"),
-                attention_mask=_required_attribute(
-                    composed,
-                    "attention_mask",
-                    "Composer output",
-                ),
-                pixel_values_videos=request.pixel_values_videos,
-                video_grid_thw=request.video_grid_thw,
-                prepared_video_features=observation.visual.prepared_video_features,
-                state_position_mask=_optional_attribute(composed, "state_position_mask"),
-                state_tokens=state_tokens,
-                composer_position_ids_audit=_required_attribute(
-                    composed,
-                    "position_ids",
-                    "Composer output",
-                ),
-                composer_rope_deltas_audit=_required_attribute(
-                    composed,
-                    "rope_deltas",
-                    "Composer output",
-                ),
-                qwen_kwargs=request.qwen_kwargs,
-            )
-            qwen_output = self.components.qwen_prefill(prefill_request)
-            answer_logits = _required_attribute(qwen_output, "logits", "Qwen prefill output")
-            lifecycle._succeed("prefill", observation.runtime_state)
             return StateTTTModelOutput(
-                answer_logits=answer_logits,
+                answer_logits=qwen_output.logits,
                 qwen_output=qwen_output,
                 visual=observation.visual,
                 query=observation.query,
                 spatial=observation.spatial,
                 temporal=observation.temporal,
                 observations=observation.observations,
-                retrieval=retrieval,
-                reader=reader_results,
-                resampler=resampler_output,
-                composed=composed,
-                prefill_request=prefill_request,
+                retrieval=prepared.retrieval,
+                reader=prepared.reader,
+                resampler=prepared.resampler,
+                composed=prepared.composed,
+                prefill_request=prepared.qwen_request,
                 runtime_state=observation.runtime_state,
-                state_audit=StateAudit(
-                    observation=observation.state_audit,
-                    retrieval=_optional_attribute(retrieval, "audit"),
-                    reader=reader_results,
-                    resampler=resampler_output,
-                ),
+                state_audit=prepared.state_audit,
                 soft_intermediates=observation.soft_intermediates,
                 lifecycle=lifecycle.audit(),
             )
@@ -807,27 +1155,33 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             lifecycle._fail("prefill")
             raise
 
-    def decode_step(
+    def generate_answer(
         self,
-        request: DecodeStepRequest,
+        prepared: PreparedAnswer,
         lifecycle: PrefillLifecycle,
-    ) -> DecodeStepOutput:
-        """Run Qwen decode only; no state-writing dependency is reachable here."""
+        *,
+        max_new_tokens: int = 16,
+    ) -> StateTTTGenerationOutput:
+        """Execute one greedy HF generate call; its first pass is the sole Qwen prefill."""
 
-        lifecycle._begin("decode", request.owner)
-        runtime_before = lifecycle.runtime_state()
+        request = prepared.request
+        lifecycle._begin("prefill", request.owner)
         try:
-            output = self.components.qwen_decode(request.model_inputs)
-            if lifecycle.runtime_state() is not runtime_before:
-                raise LifecycleError("decode cannot replace the authoritative runtime state")
-            lifecycle._succeed("decode")
-            return DecodeStepOutput(
-                qwen_output=output,
-                runtime_state=runtime_before,
+            generated = self.components.qwen_generate(
+                QwenGenerateRequest(prepared.qwen_request, max_new_tokens=max_new_tokens)
+            )
+            lifecycle._succeed("prefill", request.observation.runtime_state)
+            return StateTTTGenerationOutput(
+                answer_text=generated.answer_text,
+                generated_token_ids=generated.token_ids,
+                reader=prepared.reader,
+                resampler=prepared.resampler,
+                runtime_state=request.observation.runtime_state,
+                state_audit=prepared.state_audit,
                 lifecycle=lifecycle.audit(),
             )
         except Exception:
-            lifecycle._fail("decode")
+            lifecycle._fail("prefill")
             raise
 
 
@@ -847,7 +1201,7 @@ def build_model(
 
 
 def evaluate_number_agreement(
-    reader_results: Sequence[object],
+    reader_results: Sequence[ReaderResult],
     predicted_numbers: Sequence[int | None],
 ) -> NumberAgreementMetrics:
     """Compare externally parsed answer integers without changing Reader results."""
@@ -858,9 +1212,7 @@ def evaluate_number_agreement(
         raise ValueError("Reader results and predicted numbers must have equal batch size")
     matched = mismatched = missing = comparable = 0
     for result, predicted in zip(results, predictions, strict=True):
-        if not hasattr(result, "exact_count"):
-            raise TypeError("Reader result must expose exact_count")
-        exact = cast(ExactCountResult, result).exact_count
+        exact = result.exact_count
         if exact is None:
             if predicted is not None and type(predicted) is not int:
                 raise TypeError("predicted numbers must contain int or None")
@@ -880,7 +1232,7 @@ def evaluate_number_agreement(
 
 
 def assert_training_number_agreement(
-    reader_results: Sequence[object],
+    reader_results: Sequence[ReaderResult],
     target_numbers: Sequence[int | None],
 ) -> None:
     """Block final-expression supervision whose integer target disagrees with Reader."""
@@ -890,42 +1242,22 @@ def assert_training_number_agreement(
         raise ValueError("answer supervision number must equal the authoritative Reader number")
 
 
-def _required_attribute(value: object, name: str, label: str) -> object:
-    result = getattr(value, name, None)
-    if result is None:
-        raise TypeError(f"{label} must expose {name}")
-    return cast(object, result)
-
-
-def _optional_attribute(value: object | None, name: str) -> object | None:
-    return None if value is None else cast(object | None, getattr(value, name, None))
-
-
 def _validate_answer_provenance(
-    retrieval: object | None,
-    reader_results: tuple[object, ...],
-    resampler: object,
+    retrieval: RetrieverOutput,
+    reader_results: tuple[ReaderResult, ...],
+    resampler: StateResamplerOutput,
 ) -> None:
     """Check IDs/status provenance only; arithmetic remains wholly Reader-owned."""
 
-    retrieval_ids = _optional_attribute(retrieval, "selected_record_ids")
-    resampler_ids = _optional_attribute(resampler, "selected_record_ids")
-    if retrieval_ids is not None and resampler_ids is not None and retrieval_ids != resampler_ids:
+    retrieval_ids = retrieval.selected_record_ids
+    resampler_ids = resampler.selected_record_ids
+    if retrieval_ids != resampler_ids:
         raise ValueError("Resampler must consume the same Retriever selected-record snapshot")
-    if retrieval_ids is not None and reader_results:
-        reader_ids = tuple(
-            _required_attribute(result, "selected_record_ids", "Reader result")
-            for result in reader_results
-        )
+    if reader_results:
+        reader_ids = tuple(result.selected_record_ids for result in reader_results)
         if reader_ids != retrieval_ids:
             raise ValueError("Reader results must preserve Retriever selected-record IDs")
-    retrieval_status = _optional_attribute(retrieval, "status")
-    resampler_status = _optional_attribute(resampler, "retrieval_status")
-    if (
-        retrieval_status is not None
-        and resampler_status is not None
-        and retrieval_status != resampler_status
-    ):
+    if retrieval.status != resampler.retrieval_status:
         raise ValueError("Resampler must preserve Retriever row statuses")
 
 
@@ -935,7 +1267,7 @@ def _component_items(components: ModelComponents) -> tuple[tuple[str, object | N
         ("query_encoder", components.query_encoder),
         ("composer", components.composer),
         ("qwen_prefill", components.qwen_prefill),
-        ("qwen_decode", components.qwen_decode),
+        ("qwen_generate", components.qwen_generate),
         ("fast_adapter", components.fast_adapter),
         ("spatial_encoder", components.spatial_encoder),
         ("temporal_encoder", components.temporal_encoder),

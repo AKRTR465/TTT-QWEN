@@ -1,7 +1,7 @@
 """Build production A2/A5 manifests without exposing supervision to model runtime inputs.
 
 The manifest is a training sidecar.  Runtime construction must still pass through
-``RuntimeModelInput``/``assert_runtime_payload_safe``; labels in this module are consumed only by
+``RuntimeQueryInput``/``assert_runtime_payload_safe``; labels in this module are consumed only by
 the post-forward loss builder.
 """
 
@@ -27,6 +27,7 @@ from torch.utils.data import Dataset, Sampler
 from ttt_svcbench_qwen.data import (
     FoldManifest,
     LoadedAnnotations,
+    RuntimeQueryInput,
     SVCBenchRecord,
     assert_runtime_payload_safe,
     create_group_kfold_manifest,
@@ -72,39 +73,8 @@ class AdaptiveChunkSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class RuntimeQuerySpec:
-    """The only Query fields allowed to reach Qwen/Bank/FSM/Retriever runtime."""
-
-    query_id: str
-    query_index: int
-    question: str
-    query_time: float
-    explicit_time_values: tuple[float, ...]
-
-    def __post_init__(self) -> None:
-        if not self.query_id or self.query_index < 0 or not self.question:
-            raise ValueError("runtime Query identity/question is invalid")
-        if not math.isfinite(self.query_time) or self.query_time < 0.0:
-            raise ValueError("runtime Query time must be finite and non-negative")
-        if any(not math.isfinite(value) or value < 0.0 for value in self.explicit_time_values):
-            raise ValueError("runtime explicit times must be finite and non-negative")
-        assert_runtime_payload_safe(
-            self.as_payload(Path("placeholder.mp4")),
-            layer="Episode manifest",
-        )
-
-    def as_payload(self, video: Path) -> dict[str, object]:
-        return {
-            "video": video,
-            "question": self.question,
-            "query_time": self.query_time,
-            "explicit_time_values": self.explicit_time_values,
-        }
-
-
-@dataclass(frozen=True, slots=True)
 class AnswerSupervisionSidecar:
-    """Answer-only training label kept outside :class:`RuntimeQuerySpec`."""
+    """Answer-only training label kept outside :class:`RuntimeQueryInput`."""
 
     query_id: str
     answer: str | None
@@ -154,7 +124,7 @@ class WeakQuerySidecar:
 class ProductionQueryRecord:
     """One runtime Query plus two loss-only sidecars with aligned identity."""
 
-    runtime: RuntimeQuerySpec
+    runtime: RuntimeQueryInput
     answer: AnswerSupervisionSidecar
     weak: WeakQuerySidecar
 
@@ -185,7 +155,7 @@ class A2QueryRecord:
         if not math.isfinite(self.sampling_weight) or self.sampling_weight <= 0.0:
             raise ValueError("A2 sampling weight must be positive and finite")
         assert_runtime_payload_safe(
-            self.query.runtime.as_payload(Path(self.relative_video_path)),
+            self.query.runtime.as_payload(),
             layer="A2 manifest runtime",
         )
 
@@ -1037,7 +1007,7 @@ def write_production_episode_manifest(
     destination = Path(manifest_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
-        json.dumps(asdict(manifest), ensure_ascii=False, indent=2) + "\n",
+        json.dumps(asdict(manifest), ensure_ascii=False, indent=2, default=_json_default) + "\n",
         encoding="utf-8",
     )
     failure_destination = Path(failed_path)
@@ -1048,6 +1018,12 @@ def write_production_episode_manifest(
         ),
         encoding="utf-8",
     )
+
+
+def _json_default(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"production manifest cannot serialize {type(value).__name__}")
 
 
 def load_production_episode_manifest(path: str | Path) -> ProductionEpisodeManifest:
@@ -1155,9 +1131,12 @@ def _episode_from_group(
 
 
 def _production_query(record: SVCBenchRecord, operator: Operator) -> ProductionQueryRecord:
-    runtime = RuntimeQuerySpec(
+    runtime = RuntimeQueryInput(
+        video_id=record.identity.video_id,
+        trajectory_id=record.identity.trajectory_id,
         query_id=record.identity.query_id,
         query_index=record.identity.query_index,
+        video=Path(record.relative_video_path),
         question=record.question,
         query_time=record.query_time,
         explicit_time_values=extract_explicit_time_values(record.question),
@@ -1303,20 +1282,34 @@ def _parse_chunk(value: object) -> AdaptiveChunkSpec:
     )
 
 
-def _parse_runtime_query(value: object) -> RuntimeQuerySpec:
+def _parse_runtime_query(value: object) -> RuntimeQueryInput:
     row = _object(value, "runtime Query")
     _require_exact_keys(
         row,
-        {"query_id", "query_index", "question", "query_time", "explicit_time_values"},
+        {
+            "video_id",
+            "trajectory_id",
+            "query_id",
+            "query_index",
+            "video",
+            "question",
+            "query_time",
+            "explicit_time_values",
+            "episode_nonce",
+        },
         "runtime Query",
     )
     explicit = _number_list(row, "explicit_time_values")
-    return RuntimeQuerySpec(
+    return RuntimeQueryInput(
+        video_id=_string_value(row, "video_id"),
+        trajectory_id=_string_value(row, "trajectory_id"),
         query_id=_string_value(row, "query_id"),
         query_index=_integer_value(row, "query_index"),
+        video=Path(_string_value(row, "video")),
         question=_string_value(row, "question"),
         query_time=_float_value(row, "query_time"),
         explicit_time_values=explicit,
+        episode_nonce=_integer_value(row, "episode_nonce"),
     )
 
 
@@ -1607,7 +1600,6 @@ __all__ = [
     "ProductionQueryRecord",
     "ProductionManifestDataset",
     "RankAlignedA5SegmentSampler",
-    "RuntimeQuerySpec",
     "SegmentBucket",
     "WeakQuerySidecar",
     "adaptive_support_schedule",

@@ -9,7 +9,12 @@ import torch
 from torch import Tensor, nn
 
 from ttt_svcbench_qwen.config import QueryEncoderConfig, load_config
-from ttt_svcbench_qwen.data import RUNTIME_DENYLIST, extract_explicit_time_values
+from ttt_svcbench_qwen.data import (
+    RUNTIME_DENYLIST,
+    RuntimeQueryInput,
+    assert_runtime_payload_safe,
+    extract_explicit_time_values,
+)
 from ttt_svcbench_qwen.query_encoder import (
     OPERATOR_TO_EVENT_KIND,
     OPERATOR_TO_HEAD_TYPE,
@@ -769,17 +774,27 @@ def test_runtime_payload_and_token_provenance_reject_every_label_field() -> None
         "explicit_time_values": ((),),
     }
 
-    safe = QueryEncoderInput.from_runtime_payload(embeddings, tokens, payload)
+    query = RuntimeQueryInput(
+        "video-0",
+        "trajectory-0",
+        "query-0",
+        0,
+        Path("synthetic.mp4"),
+        "How many?",
+        3.0,
+        (),
+    )
+    safe = QueryEncoderInput.from_runtime_queries(embeddings, tokens, (query,))
     assert safe.question_tokens.questions == ("How many?",)
     for denied_field in RUNTIME_DENYLIST:
         poisoned = {**payload, denied_field: "forbidden"}
         with pytest.raises(ValueError, match="denied fields"):
-            QueryEncoderInput.from_runtime_payload(embeddings, tokens, poisoned)
+            assert_runtime_payload_safe(poisoned, layer="JSON")
     with pytest.raises(ValueError, match="canonical question"):
-        QueryEncoderInput.from_runtime_payload(
+        QueryEncoderInput.from_runtime_queries(
             embeddings,
             tokens,
-            {**payload, "question": ("different",)},
+            (replace(query, question="different"),),
         )
     with pytest.raises(ValueError, match="question-only provenance"):
         replace(tokens, source_fields=("answer",))

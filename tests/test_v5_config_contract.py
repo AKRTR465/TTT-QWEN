@@ -11,6 +11,7 @@ import yaml
 from pydantic import ValidationError
 
 from ttt_svcbench_qwen.config import (
+    AuditLevel,
     CalibrationStatus,
     ProjectConfig,
     load_config,
@@ -33,6 +34,7 @@ def test_v5_yaml_passes_strong_validation_and_serializes_completely() -> None:
     assert serialized["spec_version"] == (
         "state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval"
     )
+    assert serialized["config_schema_version"] == 2
     assert serialized["model"]["revision"] == "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
     assert set(serialized) == set(ProjectConfig.model_fields)
 
@@ -626,6 +628,11 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "outer_step_scope": "episode",
         "synthetic_engineering_gate_only": False,
         "seed": 42,
+        "optimizer": {
+            "state_learning_rate": 5.0e-5,
+            "w0_learning_rate": 5.0e-5,
+            "predictor_learning_rate": 5.0e-5,
+        },
     }
     assert config.inference.model_dump() == {
         "reset_per_video": True,
@@ -633,7 +640,7 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "prefill_once": True,
         "decode_state_immutable": True,
         "release_on_exception": True,
-        "checksum_runtime_state": True,
+        "audit_level": AuditLevel.BOUNDARY,
         "repeat_query_policy": "explicit_new_or_retry",
         "record_skip_reasons": True,
         "synthetic_engineering_gate_only": True,
@@ -1269,7 +1276,7 @@ def test_unknown_config_keys_are_rejected() -> None:
         ProjectConfig.model_validate(raw)
 
 
-def test_active_docs_and_tests_no_longer_claim_v3_is_the_current_v5_config() -> None:
+def test_active_docs_and_tests_describe_only_the_v5_mainline() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     decisions = (ROOT / "DECISIONS.md").read_text(encoding="utf-8")
     active_config_and_tests = "\n".join(
@@ -1279,8 +1286,10 @@ def test_active_docs_and_tests_no_longer_claim_v3_is_the_current_v5_config() -> 
         if path.suffix in {".py", ".yaml"}
     )
 
-    assert "P1 已实现并有契约测试" in readme
-    assert "P1 已验证边界" in decisions
+    assert "仓库只维护两条正式主线" in readme
+    assert "仓库只维护" in decisions
+    assert "P0–P18" not in readme
+    assert "standalone trainer" in decisions
     assert not (ROOT / "tests" / "test_v3_architecture_config.py").exists()
     legacy_yaml_value = "bottleneck_dim" + ": 512"
     legacy_test_assertion = 'bottleneck_dim"]' + " == 512"

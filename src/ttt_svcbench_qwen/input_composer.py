@@ -76,9 +76,14 @@ class EmbeddingOwner(Protocol):
 
 
 class ReaderResultLike(Protocol):
-    status: ReaderStatus | str
-    exact_count: int | None
-    number_token_ids: tuple[int, ...]
+    @property
+    def status(self) -> ReaderStatus | str: ...
+
+    @property
+    def exact_count(self) -> int | None: ...
+
+    @property
+    def number_token_ids(self) -> tuple[int, ...]: ...
 
 
 class RopeIndexer(Protocol):
