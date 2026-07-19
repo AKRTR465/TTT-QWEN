@@ -19,6 +19,7 @@ from enum import StrEnum
 from functools import lru_cache
 from itertools import pairwise
 from pathlib import Path, PurePosixPath
+from typing import cast
 
 import av
 from torch.utils.data import Dataset, Sampler
@@ -431,6 +432,64 @@ def _a2_visual_length_key(record: A2QueryRecord) -> tuple[int, int, int]:
     return frame_budget, pixel_rate, encoded_bytes_per_second or file_bytes
 
 
+def load_visual_cost_index(path: str | Path) -> dict[str, tuple[int, int, int]]:
+    """Load an optional offline visual-cost sidecar.
+
+    The sidecar is advisory only.  Malformed or incomplete rows are ignored so a stale index can
+    never prevent a manifest from loading; the sampler falls back to ``_a2_visual_length_key``
+    for those records.
+    """
+
+    source = Path(path)
+    raw = json.loads(source.read_text(encoding="utf-8"))
+    rows: object
+    if isinstance(raw, Mapping) and isinstance(raw.get("records"), list):
+        rows = raw["records"]
+    elif isinstance(raw, list):
+        rows = raw
+    elif isinstance(raw, Mapping):
+        rows = [
+            dict(value, record_id=key)
+            for key, value in raw.items()
+            if isinstance(value, Mapping)
+        ]
+    else:
+        raise ValueError("visual cost index must be a list or object")
+    result: dict[str, tuple[int, int, int]] = {}
+    for row in cast(Sequence[object], rows):
+        if not isinstance(row, Mapping):
+            continue
+        record_id = row.get("record_id")
+        if not isinstance(record_id, str) or not record_id:
+            continue
+        frame_budget = _sidecar_nonnegative_int(row.get("estimated_visual_tokens"))
+        if frame_budget is None:
+            frame_budget = _sidecar_nonnegative_int(row.get("frame_budget"))
+        pixel_rate = _sidecar_nonnegative_int(row.get("pixel_rate"))
+        decode_seconds = _sidecar_nonnegative_float(row.get("estimated_decode_seconds"))
+        encoded_rate = _sidecar_nonnegative_int(row.get("encoded_bytes_per_second"))
+        if decode_seconds is not None:
+            encoded_rate = max(encoded_rate or 0, int(round(decode_seconds * 1.0e6)))
+        if frame_budget is None:
+            continue
+        result[record_id] = (frame_budget, pixel_rate or 0, encoded_rate or 0)
+    return result
+
+
+def _sidecar_nonnegative_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    integer = int(value)
+    return integer if integer >= 0 else None
+
+
+def _sidecar_nonnegative_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number >= 0.0 else None
+
+
 @lru_cache(maxsize=1_024)
 def _video_decode_rate(path: str) -> tuple[int, int]:
     """Probe one local video header for rank-straggler-aware A2 bucketing."""
@@ -477,6 +536,7 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         world_size: int,
         seed: int = 42,
         visual_length_fn: Callable[[A2QueryRecord], int] | None = None,
+        visual_cost_index: Mapping[str, Sequence[int]] | None = None,
     ) -> None:
         if dataset.stage is not ManifestStage.A2 or dataset.split is not EpisodeSplit.TRAIN:
             raise ValueError("balanced A2 sampling requires the A2 train dataset")
@@ -487,6 +547,7 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         self.world_size = world_size
         self.seed = seed
         self.epoch = 0
+        self.visual_cost_index = visual_cost_index or {}
         buckets: dict[tuple[str, int], list[int]] = defaultdict(list)
         for index, raw in enumerate(dataset.records):
             record = _require_a2(raw)
@@ -497,11 +558,7 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
             raise ValueError("balanced A2 production sampling requires all four task classes")
         self._buckets = {name: tuple(values) for name, values in buckets.items()}
         self._visual_lengths: dict[int, tuple[int, int, int]] = {
-            index: (
-                (int(visual_length_fn(_require_a2(raw))), 0, 0)
-                if visual_length_fn is not None
-                else _a2_visual_length_key(_require_a2(raw))
-            )
+            index: self._visual_key(_require_a2(raw), visual_length_fn)
             for index, raw in enumerate(dataset.records)
         }
         if any(any(value < 0 for value in key) for key in self._visual_lengths.values()):
@@ -516,6 +573,30 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         }
         self._groups_per_task = max(group_counts.values())
         self._global_size = 4 * self._groups_per_task * world_size
+
+    def _visual_key(
+        self,
+        record: A2QueryRecord,
+        visual_length_fn: Callable[[A2QueryRecord], int] | None,
+    ) -> tuple[int, int, int]:
+        if visual_length_fn is not None:
+            return int(visual_length_fn(record)), 0, 0
+        sidecar = self.visual_cost_index.get(record.query.runtime.query_id)
+        if isinstance(sidecar, Mapping):
+            visual = _sidecar_nonnegative_int(sidecar.get("estimated_visual_tokens"))
+            visual = (
+                visual
+                if visual is not None
+                else _sidecar_nonnegative_int(sidecar.get("frame_budget"))
+            )
+            pixel = _sidecar_nonnegative_int(sidecar.get("pixel_rate")) or 0
+            encoded = _sidecar_nonnegative_int(sidecar.get("encoded_bytes_per_second")) or 0
+            sidecar = (visual or 0, pixel, encoded) if visual is not None else None
+        if sidecar is not None and len(sidecar) >= 3:
+            key = (int(sidecar[0]), int(sidecar[1]), int(sidecar[2]))
+            if all(value >= 0 for value in key):
+                return key
+        return _a2_visual_length_key(record)
 
     def set_epoch(self, epoch: int) -> None:
         if type(epoch) is not int or epoch < 0:
@@ -660,6 +741,8 @@ def build_production_train_sampler(
     dataset: object,
     rank: int,
     world_size: int,
+    *,
+    visual_cost_index: Mapping[str, Sequence[int]] | None = None,
 ) -> Sampler[int]:
     """Shared runtime-factory hook for A2 task balance and A5 segment parity."""
 
@@ -671,6 +754,7 @@ def build_production_train_sampler(
             rank=rank,
             world_size=world_size,
             seed=dataset.manifest.seed,
+            visual_cost_index=visual_cost_index,
         )
     return RankAlignedA5SegmentSampler(
         dataset,
@@ -1531,6 +1615,7 @@ __all__ = [
     "build_production_train_sampler",
     "greedy_nonoverlap_query_groups",
     "load_production_episode_manifest",
+    "load_visual_cost_index",
     "official_operator",
     "official_time_mode",
     "write_production_episode_manifest",

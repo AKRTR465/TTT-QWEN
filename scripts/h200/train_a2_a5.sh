@@ -12,7 +12,8 @@ usage:
 If dataset_manifest.json is omitted, the script builds the fixed fold0/K=8 manifest from the
 existing H200 SVCBench conversion. Environment overrides: TTT_PROJECT_ROOT,
 SVCBENCH_DATASET_ROOT, SVCBENCH_DATASET_MANIFEST, RUN_ID, SESSION,
-CUDA_VISIBLE_DEVICES, TTT_RESUME_CHECKPOINT, TTT_H200_VENV. The outer invocation starts a detached tmux;
+CUDA_VISIBLE_DEVICES, TTT_RESUME_CHECKPOINT, TTT_H200_VENV, TTT_PREPROCESS_CACHE_ROOT,
+TTT_DATALOADER_TRACE. The outer invocation starts a detached tmux;
 set RUN_IN_TMUX=1 only when already running inside the intended tmux pane. One-step validation may
 set TTT_SMOKE_MAX_STEPS=1, TTT_SKIP_FINAL_CHECKPOINT=1, and TTT_SMOKE_SHORTEST_FIRST=1.
 EOF
@@ -147,6 +148,9 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
     TTT_SMOKE_SHORTEST_FIRST \
     TTT_RUN_TIMEOUT_SECONDS \
     TTT_A2_PROGRESS_TRACE \
+    TTT_PREPROCESS_CACHE_ROOT \
+    TTT_DATALOADER_TRACE \
+    TTT_A2_SUPPORT_PREFETCH \
     NCCL_DEBUG \
     NCCL_DEBUG_SUBSYS \
     TORCH_DISTRIBUTED_DEBUG \
