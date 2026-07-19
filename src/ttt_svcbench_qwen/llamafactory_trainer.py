@@ -52,7 +52,7 @@ from ttt_svcbench_qwen.production_factory import (
     initialize_outer_model_from_a2,
     load_llamafactory_backbone,
 )
-from ttt_svcbench_qwen.runtime_metrics import flush_runtime_metrics
+from ttt_svcbench_qwen.runtime_metrics import flush_runtime_metrics, trace_cuda_phase
 from ttt_svcbench_qwen.visual_cost import (
     VisualCostRecord,
     make_visual_cost_fingerprint,
@@ -111,13 +111,18 @@ class SegmentBackwardController:
     def backward(self, loss: Tensor) -> None:
         if self.backward_count >= self.expected_count:
             raise RuntimeError("segment runner emitted too many backward calls")
-        if self.is_deepspeed:
-            engine = cast(Any, self.engine)
-            is_final_segment = self.backward_count + 1 == self.expected_count
-            engine.set_gradient_accumulation_boundary(is_boundary=is_final_segment)
-            engine.backward(loss)
-        else:
-            cast(Any, self.accelerator).backward(loss)
+        with trace_cuda_phase(
+            "backward",
+            stage="a5_segment",
+            segment_index=self.backward_count,
+        ):
+            if self.is_deepspeed:
+                engine = cast(Any, self.engine)
+                is_final_segment = self.backward_count + 1 == self.expected_count
+                engine.set_gradient_accumulation_boundary(is_boundary=is_final_segment)
+                engine.backward(loss)
+            else:
+                cast(Any, self.accelerator).backward(loss)
         self.backward_count += 1
 
     def finalize(self) -> None:
@@ -289,7 +294,12 @@ class TTTQwenTrainerMixin:
         expected_segments = math.ceil(
             len(episode.support_chunks) / runner.config.stage_c.truncation_horizon
         )
-        self._assert_rank_segment_parity(expected_segments)
+        horizon = runner.config.stage_c.truncation_horizon
+        segment_lengths = tuple(
+            min(horizon, len(episode.support_chunks) - start)
+            for start in range(0, len(episode.support_chunks), horizon)
+        )
+        self._assert_rank_episode_parity(segment_lengths, len(episode.query_points))
 
         backward_controller = SegmentBackwardController(
             self.accelerator,  # type: ignore[attr-defined]
@@ -333,13 +343,28 @@ class TTTQwenTrainerMixin:
         elif isinstance(record, A5EpisodeRecord):
             observe(record.episode_id, seconds)
 
-    def _assert_rank_segment_parity(self, local_count: int) -> None:
+    def _assert_rank_episode_parity(
+        self,
+        segment_lengths: tuple[int, ...],
+        query_count: int,
+    ) -> None:
         device = self.args.device  # type: ignore[attr-defined]
-        local = torch.tensor([local_count], dtype=torch.int64, device=device)
+        local = torch.tensor(
+            (query_count, *segment_lengths),
+            dtype=torch.int64,
+            device=device,
+        )
         gathered = self.accelerator.gather(local)  # type: ignore[attr-defined]
-        counts = tuple(int(value) for value in gathered.detach().cpu().flatten().tolist())
-        if len(set(counts)) != 1:
-            raise ValueError(f"A5 ranks received unequal segment counts: {counts}")
+        world_size = int(self.args.world_size)  # type: ignore[attr-defined]
+        signatures = tuple(
+            tuple(int(value) for value in row)
+            for row in gathered.detach().cpu().reshape(world_size, -1).tolist()
+        )
+        if len(set(signatures)) != 1:
+            raise ValueError(
+                "A5 ranks received unequal segment lengths or Query counts: "
+                f"{signatures}"
+            )
 
 
 def build_trainer_class(base: type) -> type:
@@ -699,12 +724,27 @@ def make_production_outer_optimizer_factory(
             for name, values in groups.items()
             if values
         ]
-        return torch.optim.AdamW(
+        optimizer = torch.optim.AdamW(
             parameter_groups,
             betas=(float(training_args.adam_beta1), float(training_args.adam_beta2)),
             eps=float(training_args.adam_epsilon),
             weight_decay=float(training_args.weight_decay),
         )
+        active_trace: list[Any] = []
+
+        def optimizer_start(*_args: object, **_kwargs: object) -> None:
+            context = trace_cuda_phase("optimizer", stage=stage.value)
+            context.__enter__()
+            active_trace.append(context)
+
+        def optimizer_end(*_args: object, **_kwargs: object) -> None:
+            if not active_trace:
+                raise RuntimeError("optimizer trace hook order drifted")
+            active_trace.pop().__exit__(None, None, None)
+
+        optimizer.register_step_pre_hook(optimizer_start)
+        optimizer.register_step_post_hook(optimizer_end)
+        return optimizer
 
     return factory
 

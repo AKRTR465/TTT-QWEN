@@ -111,6 +111,7 @@ from ttt_svcbench_qwen.qwen_adapter import (
     PreparedVisualChunk,
     Qwen3VLAdapter,
     QwenVisualOutput,
+    RawVisualChunk,
     StateEmbeddingPayload,
     audit_current_chunk_visual_tokens,
 )
@@ -507,8 +508,14 @@ class VideoChunkMaterializer:
                 )
                 return self._from_cached(spec, cached)
         _loader_trace("support_cache_miss", chunk_id=spec.chunk_id)
+        decode_started = time.perf_counter()
         frames, timestamps = _decode_uniform_interval(
             spec, self.config.video_preprocessing.sample_fps
+        )
+        _loader_trace(
+            "decode",
+            chunk_id=spec.chunk_id,
+            seconds=time.perf_counter() - decode_started,
         )
         materialized = self._materialize_decoded(spec, frames, timestamps, fingerprint)
         _loader_trace(
@@ -579,12 +586,18 @@ class VideoChunkMaterializer:
         timestamps: Tensor,
         fingerprint: PreprocessFingerprint,
     ) -> CurrentChunkMaterialization:
+        processor_started = time.perf_counter()
         frames = _resize_to_pixel_budget(
             frames,
             minimum_pixels=self.minimum_pixels,
             maximum_pixels=self.maximum_pixels,
         )
         processed = self.processor.process(frames)
+        _loader_trace(
+            "processor",
+            chunk_id=spec.chunk_id,
+            seconds=time.perf_counter() - processor_started,
+        )
         tubelet_times = timestamps.reshape(-1, 2).amax(dim=1).unsqueeze(0)
         positions = _strict_tubelet_positions(
             tubelet_times[0],
@@ -643,6 +656,14 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
 
     def _visual(self, request: ObservationChunkRequest) -> VisualStageOutput:
         raw = request.video_input
+        if isinstance(raw, RawVisualChunk):
+            if not isinstance(raw.source, CurrentChunkMaterialization):
+                raise TypeError("raw visual chunk lost its materialized source")
+            prepared_chunk = replace(
+                self.qwen.prepare_raw_visual_chunk(raw),
+                source=raw.source,
+            )
+            return self._visual(replace(request, video_input=prepared_chunk))
         if isinstance(raw, PreparedVisualChunk):
             if not isinstance(raw.source, CurrentChunkMaterialization):
                 raise TypeError("prepared visual chunk lost its materialized source")
@@ -670,18 +691,18 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
         with trace_cuda_phase("vit_forward", stage="visual"):
             self.qwen.get_video_features(pixels, grid)
         captured = self.qwen.last_visual_output
-        prepared = self.qwen.last_prepared_video_features
+        prepared_features = self.qwen.last_prepared_video_features
         if not isinstance(captured, QwenVisualOutput) or not isinstance(
-            prepared, PreparedVideoFeatures
+            prepared_features, PreparedVideoFeatures
         ):
             raise RuntimeError("Qwen visual boundary did not return prepared current features")
-        token_audit = audit_current_chunk_visual_tokens(prepared, pixels, grid)
-        adapted_padded = pad_sequence(prepared.main_features, batch_first=True)
+        token_audit = audit_current_chunk_visual_tokens(prepared_features, pixels, grid)
+        adapted_padded = pad_sequence(prepared_features.main_features, batch_first=True)
         adapted = QwenVisualOutput(
             main_visual_embeddings=adapted_padded,
-            deepstack_features=prepared.deepstack_features,
+            deepstack_features=prepared_features.deepstack_features,
             visual_valid_mask=captured.visual_valid_mask,
-            metadata=prepared.metadata,
+            metadata=prepared_features.metadata,
         )
         materialized = replace(
             chunk,
@@ -693,7 +714,7 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
         )
         return VisualStageOutput(
             value=adapted,
-            prepared_video_features=prepared,
+            prepared_video_features=prepared_features,
             audit=ProductionVisualAudit(materialized, token_audit),
         )
 
@@ -763,6 +784,85 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
                     materialized.video_grid_thw,
                 )
                 outputs.append(replace(row, source=materialized))
+        return tuple(outputs)
+
+    def prepare_raw_support_batch(
+        self,
+        chunks: tuple[MetaCausalChunk, ...],
+        batch_size: int,
+    ) -> tuple[MetaCausalChunk, ...]:
+        """Batch A5 ViT/Main/DeepStack only; Adapter execution remains per Support."""
+
+        if type(batch_size) is not int or batch_size <= 0:
+            raise ValueError("raw Support visual batch_size must be a positive integer")
+        materialized: list[CurrentChunkMaterialization] = []
+        for chunk in chunks:
+            value = chunk.request.video_input
+            if isinstance(value, CurrentChunkSpec):
+                materialized.append(self.materializer(value))
+            elif isinstance(value, CurrentChunkMaterialization):
+                materialized.append(value)
+            else:
+                raise TypeError("raw Support batch accepts specs/materializations only")
+        device = _module_device(self.qwen)
+        outputs: list[MetaCausalChunk] = []
+        for start in range(0, len(chunks), batch_size):
+            source_group = tuple(materialized[start : start + batch_size])
+            chunk_group = chunks[start : start + batch_size]
+            h2d_started = time.perf_counter()
+            pixels = torch.cat(
+                tuple(
+                    source.pixel_values_videos.to(device=device, non_blocking=True)
+                    for source in source_group
+                )
+            )
+            grid = torch.cat(
+                tuple(
+                    source.video_grid_thw.to(device=device, non_blocking=True)
+                    for source in source_group
+                )
+            )
+            _loader_trace(
+                "pin_memory/H2D",
+                stage="a5_raw_support_batch",
+                chunk_count=len(source_group),
+                seconds=time.perf_counter() - h2d_started,
+            )
+            with trace_cuda_phase(
+                "vit_forward",
+                stage="a5_raw_support_batch",
+                chunk_count=len(source_group),
+            ):
+                raw_rows = self.qwen.encode_video_batch_raw(pixels, grid).split()
+            if len(raw_rows) != len(source_group):
+                raise RuntimeError("raw visual batch split did not preserve Support count")
+            patch_offset = 0
+            for chunk, source, raw_row in zip(
+                chunk_group,
+                source_group,
+                raw_rows,
+                strict=True,
+            ):
+                patch_count = source.pixel_values_videos.shape[0]
+                row_pixels = pixels[patch_offset : patch_offset + patch_count]
+                patch_offset += patch_count
+                gpu_source = replace(
+                    source,
+                    pixel_values_videos=row_pixels,
+                    video_grid_thw=source.video_grid_thw.to(device),
+                    tubelet_timestamps=source.tubelet_timestamps.to(device),
+                    tubelet_valid_mask=source.tubelet_valid_mask.to(device),
+                    tubelet_position_ids=source.tubelet_position_ids.to(device),
+                )
+                outputs.append(
+                    replace(
+                        chunk,
+                        request=replace(
+                            chunk.request,
+                            video_input=replace(raw_row, source=gpu_source),
+                        ),
+                    )
+                )
         return tuple(outputs)
 
     def _prefill(self, request: QwenPrefillRequest) -> QwenPrefillOutput:
@@ -877,7 +977,8 @@ class ProductionQueryRuntime(nn.Module):  # type: ignore[misc]
         # signatures remain exact.  The fork prevents these local masks from perturbing global RNG.
         with torch.random.fork_rng(devices=cuda_devices):
             torch.manual_seed(dropout_seed)
-            output = self.query_encoder(inputs, inference=inference)
+            with trace_cuda_phase("query_encoder", query_id=value.query_id):
+                output = self.query_encoder(inputs, inference=inference)
         if not isinstance(output, QueryEncoderOutput):
             raise TypeError("production Query encoder returned an invalid output")
         return output
@@ -923,16 +1024,17 @@ class ProductionSpatialRuntime(nn.Module):  # type: ignore[misc]
             if chunk.spec.reset_soft_state
             else runtime.slot_states
         )
-        output = self.encoder(
-            value.main_visual_embeddings,
-            value.visual_valid_mask,
-            value.metadata,
-            chunk.tubelet_valid_mask,
-            typed_query.q_target,
-            request.owner.video_ids,
-            prior_states=prior,
-            detach_runtime_state=True,
-        )
+        with trace_cuda_phase("state_modules", component="spatial"):
+            output = self.encoder(
+                value.main_visual_embeddings,
+                value.visual_valid_mask,
+                value.metadata,
+                chunk.tubelet_valid_mask,
+                typed_query.q_target,
+                request.owner.video_ids,
+                prior_states=prior,
+                detach_runtime_state=True,
+            )
         if not isinstance(output, SpatialEncoderOutput):
             raise TypeError("production Spatial encoder returned an invalid output")
         return output
@@ -959,20 +1061,21 @@ class ProductionTemporalRuntime(nn.Module):  # type: ignore[misc]
             dtype=temporal_times.dtype,
             device=temporal_value.main_visual_embeddings.device,
         )
-        output = self.encoder(
-            temporal_value.main_visual_embeddings,
-            temporal_value.visual_valid_mask,
-            temporal_value.metadata,
-            temporal_mask,
-            temporal_times,
-            temporal_positions,
-            query_time,
-            typed_query.q_target,
-            request.owner.video_ids,
-            request.owner.trajectory_ids,
-            cache=cache,
-            detach_cache=True,
-        )
+        with trace_cuda_phase("state_modules", component="temporal"):
+            output = self.encoder(
+                temporal_value.main_visual_embeddings,
+                temporal_value.visual_valid_mask,
+                temporal_value.metadata,
+                temporal_mask,
+                temporal_times,
+                temporal_positions,
+                query_time,
+                typed_query.q_target,
+                request.owner.video_ids,
+                request.owner.trajectory_ids,
+                cache=cache,
+                detach_cache=True,
+            )
         if not isinstance(output, TemporalEncoderOutput):
             raise TypeError("production Temporal encoder returned an invalid output")
         return output
@@ -1081,16 +1184,17 @@ class ProductionObservationRuntime(nn.Module):  # type: ignore[misc]
             else raw_chunk.spec.reset_soft_state
         )
         empty = (None,) * len(request.owner.video_ids)
-        output = self.heads(
-            spatial,
-            temporal,
-            query.q_target,
-            request.owner.video_ids,
-            request.owner.trajectory_ids,
-            e1_prior_states=empty if reset else runtime.e1_states,
-            e2_prior_states=empty if reset else runtime.e2_states,
-            detach_runtime_state=True,
-        )
+        with trace_cuda_phase("state_modules", component="observation_heads"):
+            output = self.heads(
+                spatial,
+                temporal,
+                query.q_target,
+                request.owner.video_ids,
+                request.owner.trajectory_ids,
+                e1_prior_states=empty if reset else runtime.e1_states,
+                e2_prior_states=empty if reset else runtime.e2_states,
+                detach_runtime_state=True,
+            )
         if not isinstance(output, ObservationOutputs):
             raise TypeError("production Observation heads returned an invalid output")
         return output
@@ -1656,6 +1760,7 @@ class ProductionA2LossStep:
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
         self.visual_runtime = visual_runtime
         self.support_visual_batch_size = support_visual_batch_size
+        self._backward_started_at: float | None = None
 
     def __call__(self, _model: nn.Module, inputs: Mapping[str, object]) -> Tensor:
         prefetched = inputs.get("prepared_a2")
@@ -1773,6 +1878,7 @@ class ProductionA2LossStep:
 
         def trace_backward_start(gradient: Tensor) -> Tensor:
             self.progress.emit(call_index, "backward_begin")
+            self._backward_started_at = time.perf_counter()
             return gradient
 
         if self.progress.enabled:
@@ -1784,6 +1890,13 @@ class ProductionA2LossStep:
         if call_index is None:
             raise RuntimeError("A2 backward returned without an active loss call")
         self.progress.emit(call_index, "backward_return")
+        if self._backward_started_at is not None:
+            _loader_trace(
+                "backward",
+                stage="a2",
+                seconds=time.perf_counter() - self._backward_started_at,
+            )
+            self._backward_started_at = None
         self._active_progress_call = None
 
 
@@ -1987,6 +2100,8 @@ def build_runtime(
         runtime_resetter=lambda owner: _reset_meta_runtime(writer, owner),
         variant=MetaTTTVariant.A5,
         query_encoder_reuse=config.query_encoder_reuse,
+        raw_support_visual_batcher=qwen_runtime.prepare_raw_support_batch,
+        support_visual_batch_size=config.support_visual_batch_size,
     )
     return ProductionTrainerRuntime(
         stage=stage,
@@ -2135,6 +2250,11 @@ def _current_chunk_input(
     if isinstance(value, (CurrentChunkSpec, CurrentChunkMaterialization)):
         return value
     if isinstance(value, PreparedVisualChunk) and isinstance(
+        value.source,
+        CurrentChunkMaterialization,
+    ):
+        return value.source
+    if isinstance(value, RawVisualChunk) and isinstance(
         value.source,
         CurrentChunkMaterialization,
     ):

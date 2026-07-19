@@ -206,6 +206,17 @@ def load_training_yaml(path: str | Path) -> tuple[dict[str, object], ProductionT
     extension = values.pop("ttt_qwen", None)
     if not isinstance(extension, dict) or not all(isinstance(key, str) for key in extension):
         raise ValueError("training YAML requires a string-keyed ttt_qwen section")
+    visual_batch_override = os.environ.get("TTT_SUPPORT_VISUAL_BATCH_SIZE")
+    if visual_batch_override is not None:
+        try:
+            batch_size = int(visual_batch_override)
+        except ValueError as error:
+            raise ValueError(
+                "TTT_SUPPORT_VISUAL_BATCH_SIZE must be a positive integer"
+            ) from error
+        if batch_size <= 0:
+            raise ValueError("TTT_SUPPORT_VISUAL_BATCH_SIZE must be a positive integer")
+        extension["support_visual_batch_size"] = batch_size
     return values, ProductionTTTConfig.model_validate(extension)
 
 

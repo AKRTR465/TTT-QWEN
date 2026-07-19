@@ -154,6 +154,23 @@ class AddOneAdapter(nn.Module):
         return embeddings + valid_mask.unsqueeze(-1).to(embeddings.dtype)
 
 
+class MutableOffsetAdapter(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.offset = 0.0
+        self.calls = 0
+
+    def forward(
+        self,
+        embeddings: Tensor,
+        valid_mask: Tensor,
+        metadata: MergedVideoMetadata,
+    ) -> Tensor:
+        del metadata
+        self.calls += 1
+        return embeddings + self.offset * valid_mask.unsqueeze(-1).to(embeddings.dtype)
+
+
 class TrainableScaleAdapter(nn.Module):
     def __init__(self, events: list[str] | None = None) -> None:
         super().__init__()
@@ -317,6 +334,25 @@ def test_raw_visual_batch_splits_offsets_then_adapts_each_chunk_exactly() -> Non
     assert torch.equal(prepared[1].value.main_visual_embeddings, torch.full((1, 2, 4096), 3.0))
     assert prepared[0].prepared_video_features.deepstack_features[0].shape == (8, 4096)
     assert prepared[1].prepared_video_features.deepstack_features[0].shape == (2, 4096)
+
+
+def test_raw_chunks_apply_adapter_lazily_with_the_current_fast_generation() -> None:
+    adapter = MutableOffsetAdapter()
+    boundary = QwenVideoFeatureBoundary(load_config(), adapter, adapter_enabled=True)
+    grid = torch.tensor([[1, 2, 2], [1, 2, 2]], dtype=torch.int64)
+    main = (torch.zeros(1, 4096), torch.zeros(1, 4096))
+    deepstack = tuple(torch.zeros(2, 4096) for _ in range(3))
+
+    raw_chunks = boundary.capture_raw(main, deepstack, grid).split()
+    assert adapter.calls == 0
+    adapter.offset = 1.0
+    first = boundary.prepare_raw_chunk(raw_chunks[0])
+    adapter.offset = 2.0
+    second = boundary.prepare_raw_chunk(raw_chunks[1])
+
+    assert adapter.calls == 2
+    assert torch.equal(first.value.main_visual_embeddings, torch.ones(1, 1, 4096))
+    assert torch.equal(second.value.main_visual_embeddings, torch.full((1, 1, 4096), 2.0))
 
 
 def test_visual_output_rejects_invalid_padding_width_and_deepstack_count() -> None:

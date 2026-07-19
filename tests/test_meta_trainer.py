@@ -573,6 +573,8 @@ def _system(
     *,
     query_loss_builder: MetaQueryLossBuilder | None = None,
     query_encoder_reuse: bool = False,
+    raw_support_visual_batcher: object | None = None,
+    support_visual_batch_size: int = 1,
 ) -> tuple[MetaTTTEpisodeRunner, _TinyFastController, _TinyPredictor, _RuntimeResetter]:
     fast = _TinyFastController()
     predictor = _TinyPredictor()
@@ -612,6 +614,8 @@ def _system(
         variant=variant,
         query_loss_builder=query_loss_builder or _TinyQueryLossBuilder(),
         query_encoder_reuse=query_encoder_reuse,
+        raw_support_visual_batcher=raw_support_visual_batcher,  # type: ignore[arg-type]
+        support_visual_batch_size=support_visual_batch_size,
     )
     return runner, fast, predictor, resetter
 
@@ -963,6 +967,33 @@ def test_truncated_a5_t17_k8_has_two_numeric_truncations_and_bounded_graphs(
     assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
     assert predictor.scale.grad is not None and float(predictor.scale.grad.abs()) > 0.0
     assert resetter.calls == 1
+
+
+def test_truncated_a5_batches_raw_visuals_only_within_each_k_segment(
+    config: ProjectConfig,
+) -> None:
+    calls: list[tuple[int, int]] = []
+
+    def raw_batcher(
+        chunks: tuple[MetaCausalChunk, ...],
+        batch_size: int,
+    ) -> tuple[MetaCausalChunk, ...]:
+        calls.append((len(chunks), batch_size))
+        return chunks
+
+    runner, _, _, _ = _system(
+        config,
+        MetaTTTVariant.A5,
+        raw_support_visual_batcher=raw_batcher,
+        support_visual_batch_size=2,
+    )
+
+    output = runner.run_truncated(_truncated_episode(config, support_count=17))
+
+    assert calls == [(8, 2), (8, 2), (1, 2)]
+    assert [segment.support_count for segment in output.audit.segments] == [8, 8, 1]
+    assert all(update.next_only_verified for update in output.audit.updates)
+    assert output.final_fast_states[0].fast_version == 17
 
 
 def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectConfig) -> None:

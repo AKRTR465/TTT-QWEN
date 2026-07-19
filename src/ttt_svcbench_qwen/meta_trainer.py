@@ -81,6 +81,7 @@ from ttt_svcbench_qwen.outer_loss_balance import (
     OfficialWeakOuterLossComposer,
 )
 from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput
+from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase
 from ttt_svcbench_qwen.stage_a_runtime import StageAWriteAudit
 from ttt_svcbench_qwen.stage_a_targets import (
     OfficialWeakStateLossOutput,
@@ -145,6 +146,12 @@ class MetaCausalChunk:
             or self.end_time < self.start_time
         ):
             raise ValueError("Meta-TTT chunk times must be finite and ordered")
+
+
+RawSupportVisualBatcher = Callable[
+    [tuple[MetaCausalChunk, ...], int],
+    tuple[MetaCausalChunk, ...],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1065,6 +1072,8 @@ class MetaTTTEpisodeRunner:
         ttt_input_builder: CausalOverlapTTTInputBuilder | None = None,
         query_loss_builder: MetaQueryLossBuilder | None = None,
         query_encoder_reuse: bool = False,
+        raw_support_visual_batcher: RawSupportVisualBatcher | None = None,
+        support_visual_batch_size: int = 1,
     ) -> None:
         if not isinstance(config, ProjectConfig):
             raise TypeError("Meta-TTT runner requires validated ProjectConfig")
@@ -1084,6 +1093,12 @@ class MetaTTTEpisodeRunner:
         if type(query_encoder_reuse) is not bool:
             raise TypeError("query_encoder_reuse must be bool")
         self.query_encoder_reuse = query_encoder_reuse
+        if raw_support_visual_batcher is not None and not callable(raw_support_visual_batcher):
+            raise TypeError("raw_support_visual_batcher must be callable")
+        if type(support_visual_batch_size) is not int or support_visual_batch_size <= 0:
+            raise ValueError("support_visual_batch_size must be a positive integer")
+        self.raw_support_visual_batcher = raw_support_visual_batcher
+        self.support_visual_batch_size = support_visual_batch_size
         self.outer_composer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
         if config.fast_ttt.optimizer.meta_gradient_mode != "full_second_order":
@@ -1316,7 +1331,28 @@ class MetaTTTEpisodeRunner:
         del prewarm_observation
 
         segment_query: PreparedQueryOutput | None = None
-        for support_index, chunk in enumerate(episode.support_chunks):
+        active_segment: tuple[MetaCausalChunk, ...] = ()
+        for support_index in range(support_count):
+            segment_offset = support_index % horizon
+            if segment_offset == 0:
+                active_segment = episode.support_chunks[
+                    support_index : min(support_index + horizon, support_count)
+                ]
+                if (
+                    self.raw_support_visual_batcher is not None
+                    and self.support_visual_batch_size > 1
+                ):
+                    with _seeded_rng(
+                        episode.seed + support_index + 1,
+                        adapted.fast_states,
+                    ):
+                        prepared_segment = self.raw_support_visual_batcher(
+                            active_segment,
+                            self.support_visual_batch_size,
+                        )
+                    self._validate_prepared_segment(active_segment, prepared_segment)
+                    active_segment = prepared_segment
+            chunk = active_segment[segment_offset]
             if self.query_encoder_reuse and support_index % horizon == 0:
                 segment_query = self._prepare_query(chunk, adapted, with_grad=True)
             elif segment_query is not None:
@@ -1395,6 +1431,7 @@ class MetaTTTEpisodeRunner:
                 )
                 segment_outputs.clear()
                 segment_query = None
+                active_segment = ()
                 del segment_loss, results, ttt_output, built, observation
 
         if not segment_outputs or support_total_detached is None:
@@ -1455,6 +1492,7 @@ class MetaTTTEpisodeRunner:
         )
         final_loss = query_loss + final_segment_loss
         backward_fn(final_loss)
+        active_segment = ()
         final_reanchor_audits = self._reanchor_trajectory(adapted)
         final_support_index = support_count - 1
         segment_audits.append(
@@ -1641,6 +1679,26 @@ class MetaTTTEpisodeRunner:
             )
         return PreparedQueryOutput.bind(query_input, output)
 
+    @staticmethod
+    def _validate_prepared_segment(
+        source: tuple[MetaCausalChunk, ...],
+        prepared: tuple[MetaCausalChunk, ...],
+    ) -> None:
+        if len(prepared) != len(source):
+            raise ValueError("raw visual batcher changed the K-segment length")
+        for before, after in zip(source, prepared, strict=True):
+            if (
+                before.start_time != after.start_time
+                or before.end_time != after.end_time
+                or before.query_input != after.query_input
+                or before.request.owner != after.request.owner
+                or before.request.query_input != after.request.query_input
+                or before.request.inference != after.request.inference
+                or before.request.runtime_state is not after.request.runtime_state
+                or before.request.bank_states is not after.request.bank_states
+            ):
+                raise ValueError("raw visual batcher may replace only request.video_input")
+
     def _answer(
         self,
         query: MetaTTTQueryPoint,
@@ -1674,24 +1732,25 @@ class MetaTTTEpisodeRunner:
         output: StateTTTModelOutput,
         support: tuple[TTTLossOutput, ...],
     ) -> MetaQueryObjective:
-        inputs = self.query_loss_builder(
-            output,
-            answer=query.answer,
-            supervision=query.supervision,
-        )
-        answer = compute_answer_loss(inputs.answer)
-        state = (
-            inputs.state
-            if isinstance(inputs.state, OfficialWeakStateLossOutput)
-            else compute_state_loss(inputs.state)
-        )
-        outer = compute_outer_loss(
-            OuterLossInput(
-                answer_after=answer,
-                state_after=cast(StateLossOutput, state),
-                support_ttt=support,
+        with trace_cuda_phase("outer_loss", stage="a5_query"):
+            inputs = self.query_loss_builder(
+                output,
+                answer=query.answer,
+                supervision=query.supervision,
             )
-        )
+            answer = compute_answer_loss(inputs.answer)
+            state = (
+                inputs.state
+                if isinstance(inputs.state, OfficialWeakStateLossOutput)
+                else compute_state_loss(inputs.state)
+            )
+            outer = compute_outer_loss(
+                OuterLossInput(
+                    answer_after=answer,
+                    state_after=cast(StateLossOutput, state),
+                    support_ttt=support,
+                )
+            )
         return MetaQueryObjective(answer, state, outer, _query_metrics(answer, state))
 
     def _balance_query_objectives(

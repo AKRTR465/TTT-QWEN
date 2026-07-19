@@ -218,6 +218,7 @@ class RawVisualChunk:
     main_feature: Tensor
     deepstack_features: tuple[Tensor, Tensor, Tensor]
     metadata: MergedVideoMetadata
+    source: object | None = None
 
     def __post_init__(self) -> None:
         if len(self.metadata.token_counts) != 1:
