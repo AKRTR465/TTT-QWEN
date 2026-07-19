@@ -40,6 +40,9 @@ _FORBIDDEN_CHECKPOINT_TOKENS = (
     "temporal_cache",
     "visual_cache",
     "soft_overlap_snapshot",
+    "online_overlap_memory",
+    "optimizer_runtime",
+    "reader_audit",
 )
 
 
@@ -146,10 +149,10 @@ class OuterCheckpointAudit:
     forbidden_runtime_keys: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if not self.checkpoint.is_dir() or not self.format or self.tensor_count <= 0:
+        if not self.checkpoint.exists() or not self.format or self.tensor_count <= 0:
             raise ValueError("A2 checkpoint audit is incomplete")
         if self.missing_keys or self.unexpected_keys or self.forbidden_runtime_keys:
-            raise ValueError("A2 checkpoint does not exactly match the outer model boundary")
+            raise ValueError("outer checkpoint does not exactly match the model boundary")
 
 
 def load_training_yaml(path: str | Path) -> tuple[dict[str, object], ProductionTTTConfig]:
@@ -295,6 +298,86 @@ def audit_outer_checkpoint_boundary(model: nn.Module) -> tuple[str, ...]:
     if forbidden:
         raise ValueError(f"outer checkpoint contains transient/hard runtime keys: {forbidden}")
     return keys
+
+
+def load_outer_checkpoint(
+    model: nn.Module,
+    checkpoint: str | Path,
+) -> OuterCheckpointAudit:
+    """Strictly load an outer-only single or sharded safetensors checkpoint."""
+
+    source = Path(checkpoint).resolve()
+    if source.is_dir():
+        single = source / "model.safetensors"
+        index = source / "model.safetensors.index.json"
+        if single.is_file() == index.is_file():
+            raise ValueError(
+                "checkpoint directory must contain exactly one of model.safetensors or its index"
+            )
+        source = single if single.is_file() else index
+    if not source.is_file():
+        raise FileNotFoundError(f"outer checkpoint does not exist: {source}")
+    expected = set(audit_outer_checkpoint_boundary(model))
+    state: dict[str, torch.Tensor] | None = None
+    if source.suffix == ".safetensors":
+        state = load_file(str(source), device="cpu")
+        loaded = set(state)
+        checkpoint_format = "safetensors"
+    elif source.name == "model.safetensors.index.json":
+        raw = json.loads(source.read_text(encoding="utf-8"))
+        weight_map = raw.get("weight_map") if isinstance(raw, dict) else None
+        if not isinstance(weight_map, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in weight_map.items()
+        ):
+            raise ValueError("sharded safetensors index requires a string weight_map")
+        shard_names = set(cast(dict[str, str], weight_map).values())
+        if not shard_names or any(not name.endswith(".safetensors") for name in shard_names):
+            raise ValueError("sharded outer checkpoint may contain safetensors shards only")
+        missing_shards = tuple(
+            sorted(name for name in shard_names if not (source.parent / name).is_file())
+        )
+        if missing_shards:
+            raise FileNotFoundError(f"checkpoint shards are missing: {missing_shards}")
+        loaded = set(cast(dict[str, str], weight_map))
+        checkpoint_format = "sharded_safetensors"
+    else:
+        raise ValueError(
+            "outer checkpoint must be a .safetensors file or model.safetensors.index.json"
+        )
+    forbidden = tuple(
+        sorted(
+            name
+            for name in loaded
+            if any(token in name.casefold() for token in _FORBIDDEN_CHECKPOINT_TOKENS)
+        )
+    )
+    missing = tuple(sorted(expected - loaded))
+    unexpected = tuple(sorted(loaded - expected))
+    if missing or unexpected or forbidden:
+        return OuterCheckpointAudit(
+            checkpoint=source,
+            format=checkpoint_format,
+            tensor_count=len(loaded),
+            missing_keys=missing,
+            unexpected_keys=unexpected,
+            forbidden_runtime_keys=forbidden,
+        )
+    if state is not None:
+        result = model.load_state_dict(state, strict=True)
+    else:
+        loader = cast(Callable[..., Any], load_sharded_checkpoint)
+        result = loader(model, str(source.parent), strict=True, prefer_safe=True)
+    result_missing = tuple(getattr(result, "missing_keys", ()))
+    result_unexpected = tuple(getattr(result, "unexpected_keys", ()))
+    return OuterCheckpointAudit(
+        checkpoint=source,
+        format=checkpoint_format,
+        tensor_count=len(loaded),
+        missing_keys=result_missing,
+        unexpected_keys=result_unexpected,
+        forbidden_runtime_keys=(),
+    )
 
 
 def initialize_outer_model_from_a2(

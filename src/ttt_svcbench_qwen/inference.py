@@ -1,4 +1,4 @@
-"""Run the causal, per-video P18 inference protocol.
+"""Run the causal, per-video online State-TTT inference protocol.
 
 Inputs: one label-free runtime payload, timestamped chunks, injected P13 model
 components, and one explicit TTT update/generation driver.
@@ -23,7 +23,7 @@ from typing import Protocol, cast
 import torch
 from torch import Tensor
 
-from ttt_svcbench_qwen.config import AuditLevel, InnerSGDConfig
+from ttt_svcbench_qwen.config import AuditLevel, InnerSGDConfig, ProjectConfig
 from ttt_svcbench_qwen.data import (
     RUNTIME_DENYLIST,
     RuntimeQueryInput,
@@ -35,20 +35,22 @@ from ttt_svcbench_qwen.fast_ttt import (
     FastWeightsState,
     OptimizerRuntimeState,
 )
-from ttt_svcbench_qwen.functional_sgd import reset_optimizer_state
+from ttt_svcbench_qwen.functional_sgd import (
+    functional_sgd_steps_from_ttt,
+    reset_optimizer_state,
+)
 from ttt_svcbench_qwen.identity_bank import IdentityBank
+from ttt_svcbench_qwen.losses import TemporalPredictor, compute_ttt_loss
+from ttt_svcbench_qwen.meta_trainer import CausalOverlapTTTInputBuilder
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
     BatchRuntimeState,
-    DecodeStepOutput,
-    DecodeStepRequest,
     LifecyclePhase,
     ObservationChunkOutput,
     ObservationChunkRequest,
     PrefillLifecycle,
     RuntimeOwner,
     StateTTTModel,
-    StateTTTModelOutput,
     TrajectoryRuntimeState,
 )
 from ttt_svcbench_qwen.state_bank import StructuredStateBank
@@ -94,6 +96,7 @@ class CausalChunk:
     frames: tuple[object, ...]
     timestamps: tuple[float, ...]
     position_ids: tuple[int, ...]
+    model_input: object | None = None
 
     def __post_init__(self) -> None:
         if not self.chunk_id:
@@ -137,6 +140,7 @@ class CausalChunk:
             frames=self.frames[:keep],
             timestamps=self.timestamps[:keep],
             position_ids=self.position_ids[:keep],
+            model_input=self.model_input,
         )
 
 
@@ -159,7 +163,7 @@ class InferenceRequest:
     chunks: tuple[CausalChunk, ...]
     answer_inputs: AnswerInputs
     attempt: QueryAttempt
-    max_decode_steps: int = 128
+    max_new_tokens: int = 16
 
     def __post_init__(self) -> None:
         if self.query_input.query_id != self.attempt.query_id:
@@ -175,8 +179,8 @@ class InferenceRequest:
         chunk_ids = tuple(chunk.chunk_id for chunk in self.chunks)
         if len(set(chunk_ids)) != len(chunk_ids):
             raise ValueError("inference request chunk IDs must be unique")
-        if type(self.max_decode_steps) is not int or self.max_decode_steps <= 0:
-            raise ValueError("max_decode_steps must be a positive integer")
+        if type(self.max_new_tokens) is not int or self.max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be a positive integer")
 
     @classmethod
     def from_payload(
@@ -189,7 +193,7 @@ class InferenceRequest:
         chunks: tuple[CausalChunk, ...],
         answer_inputs: AnswerInputs,
         attempt: QueryAttempt,
-        max_decode_steps: int = 128,
+        max_new_tokens: int = 16,
     ) -> InferenceRequest:
         """Validate one JSON boundary and immediately convert it to a typed Query."""
 
@@ -213,7 +217,7 @@ class InferenceRequest:
             chunks=chunks,
             answer_inputs=answer_inputs,
             attempt=attempt,
-            max_decode_steps=max_decode_steps,
+            max_new_tokens=max_new_tokens,
         )
 
     @property
@@ -342,21 +346,59 @@ class TTTUpdateStage(Protocol):
         self,
         observation: ObservationChunkOutput,
         runtime_state: TrajectoryRuntimeState,
+        *,
+        current_end_time: float,
     ) -> TTTUpdateOutcome: ...
 
 
-class GenerationDriver(Protocol):
-    """Own token selection/KV inputs while P18 owns state immutability."""
+class OnlineTTTUpdater:
+    """Apply label-free adjacent-chunk State-TTT and publish W_(t+1)."""
 
-    def begin(self, prefill: StateTTTModelOutput) -> object | None: ...
+    def __init__(self, config: ProjectConfig, predictor: TemporalPredictor) -> None:
+        if not isinstance(config, ProjectConfig):
+            raise TypeError("online updater requires validated ProjectConfig")
+        if not isinstance(predictor, TemporalPredictor):
+            raise TypeError("online updater requires TemporalPredictor")
+        self.config = config
+        self.predictor = predictor
+        self.input_builder = CausalOverlapTTTInputBuilder(config)
 
-    def advance(self, step_index: int, decode: DecodeStepOutput) -> object | None: ...
-
-    def finish(
+    def __call__(
         self,
-        prefill: StateTTTModelOutput,
-        decode_steps: Sequence[DecodeStepOutput],
-    ) -> str: ...
+        observation: ObservationChunkOutput,
+        runtime_state: TrajectoryRuntimeState,
+        *,
+        current_end_time: float,
+    ) -> TTTUpdateOutcome:
+        if observation.owner != runtime_state.owner:
+            raise InferenceProtocolError("online update owner does not match observation")
+        previous = runtime_state.online_overlap_memory
+        built = self.input_builder(
+            observation,
+            previous=previous,
+            current_end_time=current_end_time,
+            enabled_terms=("pred", "identity", "event"),
+        )
+        output = compute_ttt_loss(self.predictor, built.inputs)
+        result = functional_sgd_steps_from_ttt(
+            ttt_output=output,
+            fast_states=(_require_fast_state(runtime_state),),
+            optimizer_config=self.config.fast_ttt.optimizer,
+            optimizer_states=(_require_optimizer_state(runtime_state),),
+        )[0]
+        updated = replace(
+            runtime_state,
+            fast_weights=result.fast_state,
+            optimizer=result.optimizer_state,
+            online_overlap_memory=built.snapshot,
+        )
+        return TTTUpdateOutcome(
+            runtime_state=updated,
+            did_update=result.did_update,
+            skip_reason=None if result.skip_reason is None else result.skip_reason.value,
+            valid_term_count=result.valid_term_count,
+            loss_value=float(output.total.detach().item()),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,8 +478,8 @@ class InferenceResult:
     audit_fields: tuple[tuple[str, AuditValue], ...]
 
     def __post_init__(self) -> None:
-        if not self.answer_text:
-            raise ValueError("inference answer_text must be non-empty")
+        if not isinstance(self.answer_text, str):
+            raise TypeError("inference answer_text must be text")
         if self.selected_record_ids != self.reader_result.selected_record_ids:
             raise ValueError("inference selected records must preserve Reader provenance")
         keys = tuple(key for key, _ in self.audit_fields)
@@ -616,13 +658,13 @@ class PerVideoRuntimeManager:
             model_runtime = BatchRuntimeState((runtime,))
             model_bank_states = model_runtime.bank_states
             if not model.feature_flags.fast_enabled:
-                raise InferenceProtocolError("P18 requires the managed Fast Adapter path")
+                raise InferenceProtocolError("online inference requires the managed Fast Adapter")
             self.fast_adapter.last_audit = None
             with self.fast_adapter.use_fast_state(fast):
                 observation = model.observe_chunk(
                     ObservationChunkRequest(
                         owner=owner,
-                        video_input=causal,
+                        video_input=causal if causal.model_input is None else causal.model_input,
                         query_input=query_input,
                         runtime_state=model_runtime,
                         bank_states=model_bank_states,
@@ -633,7 +675,7 @@ class PerVideoRuntimeManager:
             fast_audit = self.fast_adapter.last_audit
             if not isinstance(fast_audit, FastTTTForwardAudit) or not fast_audit.used_runtime_state:
                 raise InferenceProtocolError(
-                    "P18 observe did not consume the manager-bound FastWeightsState"
+                    "observe did not consume the manager-bound FastWeightsState"
                 )
             expected_version = (fast.fast_version,)
             expected_updates = (fast.update_count,)
@@ -666,11 +708,11 @@ class PerVideoRuntimeManager:
                 )
             after_observe_snapshot = self._snapshot(observed)
             hard_stamp = _hard_state_stamp(observed)
-            outcome = updater(observation, observed)
+            outcome = updater(observation, observed, current_end_time=causal.end_time)
             updated = _require_trajectory_runtime(outcome.runtime_state, owner)
             if _hard_state_stamp(updated) != hard_stamp:
                 raise InferenceProtocolError(
-                    "TTT updater may only change fast/optimizer runtime state"
+                    "TTT updater may only change fast/optimizer/overlap runtime state"
                 )
             _validate_update_transition(observed, outcome)
             after_update_snapshot = self._snapshot(updated, content=True)
@@ -709,13 +751,12 @@ class PerVideoRuntimeManager:
         observation: ObservationChunkOutput,
         answer_inputs: AnswerInputs,
         attempt: QueryAttempt,
-        generation_driver: GenerationDriver,
-        max_decode_steps: int,
+        max_new_tokens: int = 16,
     ) -> InferenceResult:
-        """Read/compose/prefill once and prove every decode step leaves state immutable."""
+        """Prepare once, generate once and prove the complete answer leaves state immutable."""
 
-        if type(max_decode_steps) is not int or max_decode_steps <= 0:
-            raise ValueError("max_decode_steps must be a positive integer")
+        if type(max_new_tokens) is not int or max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be a positive integer")
         with self._lock:
             runtime = self._require_live_runtime()
             fast = _require_fast_state(runtime)
@@ -732,7 +773,7 @@ class PerVideoRuntimeManager:
             lifecycle = self._query_lifecycle(owner)
             before_guard = _runtime_guard_stamp(runtime)
             before_snapshot = self._snapshot(runtime, content=True)
-            prefill = model.answer_query(
+            prepared = model.prepare_answer(
                 AnswerQueryRequest(
                     owner=owner,
                     observation=observation,
@@ -747,28 +788,19 @@ class PerVideoRuntimeManager:
                 ),
                 lifecycle,
             )
-            if len(prefill.reader) != 1 or not isinstance(prefill.reader[0], ReaderResult):
-                raise InferenceProtocolError("P18 requires one authoritative ReaderResult")
-            reader_result = prefill.reader[0]
-
-            decode_steps: list[DecodeStepOutput] = []
-            next_inputs = generation_driver.begin(prefill)
-            while next_inputs is not None:
-                if len(decode_steps) >= max_decode_steps:
-                    raise InferenceProtocolError("generation exceeded max_decode_steps")
-                decoded = model.decode_step(
-                    DecodeStepRequest(owner=owner, model_inputs=next_inputs),
-                    lifecycle,
-                )
-                decode_steps.append(decoded)
-                next_inputs = generation_driver.advance(len(decode_steps) - 1, decoded)
-
-            answer_text = generation_driver.finish(prefill, tuple(decode_steps))
+            generated = model.generate_answer(
+                prepared,
+                lifecycle,
+                max_new_tokens=max_new_tokens,
+            )
+            if len(generated.reader) != 1 or not isinstance(generated.reader[0], ReaderResult):
+                raise InferenceProtocolError("online inference requires one ReaderResult")
+            reader_result = generated.reader[0]
             after_guard = _runtime_guard_stamp(runtime)
             if after_guard != before_guard:
                 raise InferenceProtocolError("answer prefill/generation mutated runtime state")
             after_snapshot = self._snapshot(runtime, content=True)
-            state_attention = _state_attention(prefill.resampler)
+            state_attention = _state_attention(generated.resampler)
             self._runtime = replace(
                 runtime,
                 reader_audit=runtime.reader_audit + (reader_result,),
@@ -785,7 +817,7 @@ class PerVideoRuntimeManager:
             )
             result_runtime = self._runtime
             return InferenceResult(
-                answer_text=answer_text,
+                answer_text=generated.answer_text,
                 reader_result=reader_result,
                 runtime_state=result_runtime,
                 selected_record_ids=reader_result.selected_record_ids,
@@ -916,9 +948,8 @@ def run_inference(
     model: StateTTTModel,
     request: InferenceRequest,
     updater: TTTUpdateStage,
-    generation_driver: GenerationDriver,
 ) -> InferenceResult:
-    """Execute reset -> causal chunks -> one prefill/decode -> unconditional release."""
+    """Execute reset -> causal chunks -> one greedy generate -> unconditional release."""
 
     if not isinstance(manager, PerVideoRuntimeManager):
         raise TypeError("run_inference requires PerVideoRuntimeManager")
@@ -946,8 +977,7 @@ def run_inference(
             observation=latest_observation,
             answer_inputs=request.answer_inputs,
             attempt=request.attempt,
-            generation_driver=generation_driver,
-            max_decode_steps=request.max_decode_steps,
+            max_new_tokens=request.max_new_tokens,
         )
         release_audit = manager.release()
         if release_audit is None:  # pragma: no cover - protected by the live result path
@@ -962,7 +992,7 @@ def run_inference(
                 ("release_content_sha256", release_audit.released.content_sha256),
             ),
         )
-    except Exception:
+    except BaseException:
         manager.release()
         raise
 
@@ -1110,39 +1140,39 @@ def _released_fast_state(dtype: torch.dtype) -> FastWeightsState:
 
 def _require_trajectory_runtime(value: object, owner: RuntimeOwner) -> TrajectoryRuntimeState:
     if not isinstance(value, TrajectoryRuntimeState):
-        raise TypeError("P18 update stages must return TrajectoryRuntimeState")
+        raise TypeError("online update stages must return TrajectoryRuntimeState")
     if value.released:
-        raise InferenceProtocolError("P18 stages cannot return a released runtime")
+        raise InferenceProtocolError("online stages cannot return a released runtime")
     if (value.video_id, value.trajectory_id) != (owner.video_ids[0], owner.trajectory_ids[0]):
-        raise InferenceProtocolError("P18 stage returned runtime for a different owner")
+        raise InferenceProtocolError("online stage returned runtime for a different owner")
     return value
 
 
 def _require_batch_runtime(value: object, owner: RuntimeOwner) -> BatchRuntimeState:
     if not isinstance(value, BatchRuntimeState):
-        raise TypeError("P18 model stages must return BatchRuntimeState")
+        raise TypeError("online model stages must return BatchRuntimeState")
     value.validate_for(owner)
     if len(value.rows) != 1:
-        raise InferenceProtocolError("P18 model runtime must contain exactly one trajectory")
+        raise InferenceProtocolError("online runtime must contain exactly one trajectory")
     _require_trajectory_runtime(value.rows[0], owner)
     return value
 
 
 def _require_fast_state(state: TrajectoryRuntimeState) -> FastWeightsState:
     if state.fast_weights is None:
-        raise InferenceProtocolError("P18 trajectory is missing fast weights")
+        raise InferenceProtocolError("online trajectory is missing fast weights")
     return state.fast_weights
 
 
 def _require_optimizer_state(state: TrajectoryRuntimeState) -> OptimizerRuntimeState:
     if state.optimizer is None:
-        raise InferenceProtocolError("P18 trajectory is missing optimizer state")
+        raise InferenceProtocolError("online trajectory is missing optimizer state")
     return state.optimizer
 
 
 def _require_temporal_cache(state: TrajectoryRuntimeState) -> TemporalCache:
     if state.temporal_cache is None:
-        raise InferenceProtocolError("P18 trajectory is missing temporal cache")
+        raise InferenceProtocolError("online trajectory is missing temporal cache")
     return state.temporal_cache
 
 
@@ -1201,8 +1231,14 @@ def _validate_update_transition(before: TrajectoryRuntimeState, outcome: TTTUpda
         actual = (after_fast.fast_version, after_fast.update_count, after_fast.skip_count)
         if actual != expected or after_optimizer.last_skip_reason != outcome.skip_reason:
             raise InferenceProtocolError("skipped TTT update has inconsistent counters/reason")
-        if _boundary_tensor_versions((before_fast.w_t_1, before_fast.w_t_2)) != (
-            _boundary_tensor_versions((after_fast.w_t_1, after_fast.w_t_2))
+        before_tensors = (before_fast.w_t_1, before_fast.w_t_2)
+        after_tensors = (after_fast.w_t_1, after_fast.w_t_2)
+        if any(
+            before.shape != after.shape
+            or before.dtype != after.dtype
+            or before.device != after.device
+            or not torch.equal(before.detach(), after.detach())
+            for before, after in zip(before_tensors, after_tensors, strict=True)
         ):
             raise InferenceProtocolError("skipped TTT update cannot change W_t values")
 
@@ -1398,59 +1434,203 @@ def _is_finite_nonnegative_number(value: object) -> bool:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="P18 causal inference protocol utilities")
-    action = parser.add_mutually_exclusive_group(required=True)
-    action.add_argument("--describe-protocol", action="store_true")
-    action.add_argument("--validate-payload", type=Path, metavar="JSON")
+    parser = argparse.ArgumentParser(description="Online State-TTT video inference")
+    parser.add_argument("--run", type=Path, required=True, metavar="REQUEST_JSON")
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--model-root", type=Path, required=True)
+    parser.add_argument("--device", required=True)
+    parser.add_argument(
+        "--dtype",
+        choices=("bfloat16", "float16", "float32"),
+        default="bfloat16",
+    )
+    parser.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """CPU-safe CLI for protocol discovery and runtime-payload validation."""
+    """Load one strict request, run production inference, and write one fixed JSON result."""
+
+    from ttt_svcbench_qwen.production_runtime import (
+        CurrentChunkSpec,
+        _expand_qwen_video_placeholders,
+        _tokenize_text_only,
+        _user_message,
+        build_inference_runtime_bundle,
+    )
 
     args = _build_parser().parse_args(argv)
-    if args.describe_protocol:
-        print(
-            json.dumps(
-                {
-                    "protocol": "P18",
-                    "order": [
-                        "reset",
-                        "causal_observe",
-                        "ttt_update",
-                        "prefill",
-                        "decode",
-                        "release",
-                    ],
-                    "decode_mutates": ["llm_kv_cache"],
-                    "runtime_payload_fields": [
-                        "video",
-                        "question",
-                        "query_time",
-                        "explicit_time_values",
-                    ],
-                },
-                ensure_ascii=False,
-                sort_keys=True,
+    run_path = cast(Path, args.run)
+    raw: object = json.loads(run_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, Mapping):
+        raise ValueError("request JSON must contain one object")
+    payload = {str(key): value for key, value in raw.items()}
+    required = {
+        "video_id",
+        "trajectory_id",
+        "query_id",
+        "video",
+        "question",
+        "query_time",
+        "explicit_time_values",
+    }
+    if set(payload) != required:
+        raise ValueError(
+            f"request JSON fields must match exactly; missing={sorted(required - set(payload))}, "
+            f"extra={sorted(set(payload) - required)}"
+        )
+    identity = {name: payload[name] for name in ("video_id", "trajectory_id", "query_id")}
+    if any(not isinstance(value, str) or not value for value in identity.values()):
+        raise ValueError("video_id, trajectory_id and query_id must be non-empty strings")
+    runtime_payload = {
+        name: payload[name]
+        for name in ("video", "question", "query_time", "explicit_time_values")
+    }
+    assert_inference_runtime_payload(runtime_payload)
+    video_path = Path(cast(str, payload["video"])).resolve()
+    if not video_path.is_file():
+        raise FileNotFoundError(f"request video does not exist: {video_path}")
+    dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[cast(str, args.dtype)]
+    bundle = build_inference_runtime_bundle(
+        model_root=cast(Path, args.model_root),
+        checkpoint=cast(Path, args.checkpoint),
+        device=cast(str, args.device),
+        dtype=dtype,
+    )
+    query = RuntimeQueryInput(
+        video_id=cast(str, payload["video_id"]),
+        trajectory_id=cast(str, payload["trajectory_id"]),
+        query_id=cast(str, payload["query_id"]),
+        query_index=0,
+        video=video_path,
+        question=cast(str, payload["question"]),
+        query_time=_payload_query_time(runtime_payload),
+        explicit_time_values=tuple(
+            float(value) for value in cast(Sequence[float], payload["explicit_time_values"])
+        ),
+    )
+    encoded = bundle.state_model.components.query_encoder(query, inference=True)
+    query_signature = encoded.q_target[0].detach().clone()
+    chunks: list[CausalChunk] = []
+    specs: list[CurrentChunkSpec] = []
+    end = min(8.0, query.query_time)
+    index = 0
+    while end > 0.0:
+        start = max(0.0, end - 8.0)
+        spec = CurrentChunkSpec(
+            chunk_id=f"chunk-{index:06d}",
+            video_path=video_path,
+            start_time=start,
+            end_time=end,
+            maximum_frames=16,
+            query_time=query.query_time,
+            reset_soft_state=index == 0,
+        )
+        specs.append(spec)
+        tubelet_count = spec.maximum_frames // 2
+        times = tuple(
+            start + (offset + 1) * (end - start) / tubelet_count
+            for offset in range(tubelet_count)
+        )
+        positions = tuple(range(index * tubelet_count, (index + 1) * tubelet_count))
+        chunks.append(
+            CausalChunk(
+                chunk_id=spec.chunk_id,
+                frames=tuple(range(len(times))),
+                timestamps=times,
+                position_ids=positions,
+                model_input=spec,
             )
         )
-        return 0
-    path = cast(Path, args.validate_payload)
-    raw: object = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, Mapping):
-        raise ValueError("payload JSON must contain one object")
-    payload = {str(key): value for key, value in raw.items()}
-    assert_inference_runtime_payload(payload)
-    print(
-        json.dumps(
-            {
-                "safe": True,
-                "query_time": _payload_query_time(payload),
-                "question_length": len(cast(str, payload["question"])),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+        index += 1
+        if end >= query.query_time:
+            break
+        end = min(query.query_time, end + 8.0)
+    if not specs:
+        raise ValueError("query_time must be greater than zero for video inference")
+    materialized = bundle.video_materializer(specs[-1])
+    latest_times = tuple(
+        float(value) for value in materialized.tubelet_timestamps[0].tolist()
+    )
+    latest_positions = tuple(
+        int(value) for value in materialized.tubelet_position_ids[0].tolist()
+    )
+    chunks[-1] = CausalChunk(
+        chunk_id=specs[-1].chunk_id,
+        frames=tuple(range(len(latest_times))),
+        timestamps=latest_times,
+        position_ids=latest_positions,
+        model_input=materialized,
+    )
+    processor = bundle.processor
+    apply_template = getattr(processor, "apply_chat_template", None)
+    if not callable(apply_template):
+        raise TypeError("Qwen processor must provide apply_chat_template()")
+    prompt = apply_template(
+        [_user_message(query.question)], tokenize=False, add_generation_prompt=True
+    )
+    prompt = _expand_qwen_video_placeholders(
+        processor,
+        prompt,
+        materialized.video_grid_thw,
+        materialized.frames.shape[0],
+    )
+    input_ids, attention_mask = _tokenize_text_only(bundle.tokenizer, prompt)
+    request = InferenceRequest(
+        query_input=query,
+        query_signature=query_signature,
+        chunks=tuple(chunks),
+        answer_inputs=AnswerInputs(
+            base_input_ids=input_ids,
+            base_attention_mask=attention_mask,
+            pixel_values_videos=materialized.pixel_values_videos,
+            video_grid_thw=materialized.video_grid_thw,
+            tokenizer=bundle.tokenizer,
+            embedding_owner=bundle.qwen_adapter.qwen_model,
+            rope_indexer=bundle.qwen_adapter.qwen_model,
+        ),
+        attempt=QueryAttempt(query.query_id),
+        max_new_tokens=16,
+    )
+    result = run_inference(
+        manager=cast(PerVideoRuntimeManager, bundle.manager),
+        model=bundle.state_model,
+        request=request,
+        updater=cast(TTTUpdateStage, bundle.updater),
+    )
+    audits = dict(result.audit_fields)
+    output = {
+        "video_id": query.video_id,
+        "trajectory_id": query.trajectory_id,
+        "query_id": query.query_id,
+        "answer": result.answer_text,
+        "reader": {
+            "status": result.reader_result.status.value,
+            "selected_record_ids": list(result.selected_record_ids),
+        },
+        "fast_version": audits["final_fast_version"],
+        "update_count": audits["final_update_count"],
+        "skip_count": audits["final_skip_count"],
+        "audit": {
+            "level": bundle.config.inference.audit_level.value,
+            "prefill_count": result.generate_audit.prefill_count,
+            "decode_count": result.generate_audit.decode_count,
+            "chunk_count": len(result.chunk_audit),
+            "released": result.release_audit is not None,
+            "runtime_unchanged_during_generate": (
+                result.generate_audit.state_before == result.generate_audit.state_after
+            ),
+        },
+    }
+    output_path = cast(Path, args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     return 0
 

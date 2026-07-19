@@ -2,7 +2,7 @@
 
 > 规范版本：state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval
 > 修订日期：2026-07-19
-> 状态：A2/A5 TRAINING MAINLINE IMPLEMENTED；ONLINE INFERENCE CLOSURE IN PROGRESS
+> 状态：A2/A5 TRAINING MAINLINE IMPLEMENTED；ONLINE INFERENCE WIRED
 
 ## 1. 固定目标
 

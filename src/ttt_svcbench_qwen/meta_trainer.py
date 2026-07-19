@@ -65,6 +65,7 @@ from ttt_svcbench_qwen.model import (
     BatchRuntimeState,
     ObservationChunkOutput,
     ObservationChunkRequest,
+    OnlineOverlapSnapshot,
     PrefillLifecycle,
     RuntimeOwner,
     StateTTTModel,
@@ -197,72 +198,6 @@ class MetaTTTEpisode:
 
 
 @dataclass(frozen=True, slots=True)
-class DetachedOverlapSnapshot:
-    """Minimal previous-chunk sources; every tensor is detached and storage-isolated."""
-
-    owner: RuntimeOwner
-    end_time: float
-    identity: Tensor
-    identity_valid_mask: Tensor
-    identity_position_ids: Tensor
-    identity_timestamps: Tensor
-    e1_probabilities: Tensor
-    e2_event_probabilities: Tensor
-    e2_phase_probabilities: Tensor
-    event_valid_mask: Tensor
-    event_position_ids: Tensor
-    event_timestamps: Tensor
-
-    def __post_init__(self) -> None:
-        tensors = self.tensors
-        if any(value.requires_grad or value.grad_fn is not None for value in tensors):
-            raise ValueError("overlap snapshots must be detached from autograd")
-        materialized = tuple(value for value in tensors if value.device.type != "meta")
-        if len({_storage_key(value) for value in materialized}) != len(materialized):
-            raise ValueError("overlap snapshot tensors must use isolated storage")
-        if not math.isfinite(self.end_time) or self.end_time < 0.0:
-            raise ValueError("overlap snapshot end_time must be finite and non-negative")
-
-    @property
-    def tensors(self) -> tuple[Tensor, ...]:
-        return (
-            self.identity,
-            self.identity_valid_mask,
-            self.identity_position_ids,
-            self.identity_timestamps,
-            self.e1_probabilities,
-            self.e2_event_probabilities,
-            self.e2_phase_probabilities,
-            self.event_valid_mask,
-            self.event_position_ids,
-            self.event_timestamps,
-        )
-
-    @classmethod
-    def capture(
-        cls,
-        output: ObservationChunkOutput,
-        *,
-        end_time: float,
-    ) -> DetachedOverlapSnapshot:
-        observations = _typed_observations(output)
-        return cls(
-            owner=output.owner,
-            end_time=end_time,
-            identity=observations.o2.identity.detach().clone(),
-            identity_valid_mask=observations.o2.valid_mask.detach().clone(),
-            identity_position_ids=observations.o2.position_ids.detach().clone(),
-            identity_timestamps=observations.o2.timestamps.detach().clone(),
-            e1_probabilities=observations.e1.probabilities.detach().clone(),
-            e2_event_probabilities=observations.e2.event_probabilities.detach().clone(),
-            e2_phase_probabilities=observations.e2.phase_probabilities.detach().clone(),
-            event_valid_mask=observations.e1.valid_mask.detach().clone(),
-            event_position_ids=observations.e1.position_ids.detach().clone(),
-            event_timestamps=observations.e1.timestamps.detach().clone(),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class CrossChunkMatchAudit:
     previous_available: bool
     snapshot_detached: bool
@@ -313,7 +248,7 @@ class CrossChunkMatchAudit:
 @dataclass(frozen=True, slots=True)
 class TTTInputBuildResult:
     inputs: TTTLossInput
-    snapshot: DetachedOverlapSnapshot
+    snapshot: OnlineOverlapSnapshot
     audit: CrossChunkMatchAudit
 
 
@@ -328,7 +263,7 @@ class CausalOverlapTTTInputBuilder:
         self,
         output: ObservationChunkOutput,
         *,
-        previous: DetachedOverlapSnapshot | None,
+        previous: OnlineOverlapSnapshot | None,
         current_end_time: float,
         enabled_terms: tuple[str, ...],
     ) -> TTTInputBuildResult:
@@ -340,7 +275,7 @@ class CausalOverlapTTTInputBuilder:
             term not in _SUPPORTED_TERMS for term in enabled_terms
         ):
             raise ValueError("Meta-TTT enabled terms must be unique pred/identity/event names")
-        snapshot = DetachedOverlapSnapshot.capture(output, end_time=current_end_time)
+        snapshot = OnlineOverlapSnapshot.capture(output, end_time=current_end_time)
         if previous is not None:
             if previous.owner != output.owner:
                 raise ValueError("overlap snapshot owner changed across chunks")
@@ -410,7 +345,7 @@ class CausalOverlapTTTInputBuilder:
     def _identity_input(
         self,
         current: ObservationOutputs,
-        previous: DetachedOverlapSnapshot | None,
+        previous: OnlineOverlapSnapshot | None,
     ) -> tuple[IdentityConsistencyInput, tuple[tuple[int, ...], ...]]:
         batch_size, current_width = current.o2.valid_mask.shape
         if previous is None:
@@ -509,7 +444,7 @@ class CausalOverlapTTTInputBuilder:
     def _match_identity_row(
         self,
         current: ObservationOutputs,
-        previous: DetachedOverlapSnapshot,
+        previous: OnlineOverlapSnapshot,
         row: int,
     ) -> tuple[tuple[int, int, IdentityPairStatus], ...]:
         current_valid = torch.nonzero(current.o2.valid_mask[row], as_tuple=False).flatten().tolist()
@@ -575,7 +510,7 @@ class CausalOverlapTTTInputBuilder:
     def _event_input(
         self,
         current: ObservationOutputs,
-        previous: DetachedOverlapSnapshot | None,
+        previous: OnlineOverlapSnapshot | None,
     ) -> tuple[EventConsistencyInput, tuple[int, ...]]:
         if previous is None:
             batch_size = current.e1.valid_mask.shape[0]
@@ -1153,7 +1088,7 @@ class MetaTTTEpisodeRunner:
         versions_before = tuple(parameter._version for parameter in tracked_parameters)
         support_outputs: list[TTTLossOutput] = []
         update_audits: list[InnerUpdateAudit] = []
-        previous_snapshot: DetachedOverlapSnapshot | None = None
+        previous_snapshot: OnlineOverlapSnapshot | None = None
         adapted_lifecycle = PrefillLifecycle(episode.owner)
         baseline_lifecycle = PrefillLifecycle(episode.owner)
 
@@ -1355,7 +1290,7 @@ class MetaTTTEpisodeRunner:
         if any(prewarm_fast_audit.fast_versions):
             raise ValueError("the no-update prewarm must observe the initial W0 generation")
         adapted.runtime = _runtime_from_observation(prewarm_observation, episode.owner)
-        previous_snapshot = DetachedOverlapSnapshot.capture(
+        previous_snapshot = OnlineOverlapSnapshot.capture(
             prewarm_observation,
             end_time=prewarm.end_time,
         )
@@ -1662,7 +1597,10 @@ class MetaTTTEpisodeRunner:
             qwen_kwargs=answer.qwen_kwargs,
         )
         with torch.set_grad_enabled(with_grad):
-            return self.model.answer_query(request, lifecycle)
+            return self.model.prefill_answer(
+                self.model.prepare_answer(request, lifecycle),
+                lifecycle,
+            )
 
     def _query_objective(
         self,
@@ -1780,7 +1718,7 @@ def _typed_observations(output: ObservationChunkOutput) -> ObservationOutputs:
 
 def _match_event_positions(
     current: ObservationOutputs,
-    previous: DetachedOverlapSnapshot,
+    previous: OnlineOverlapSnapshot,
 ) -> tuple[tuple[tuple[int, int, bool], ...], ...]:
     rows: list[tuple[tuple[int, int, bool], ...]] = []
     for row in range(current.e1.valid_mask.shape[0]):

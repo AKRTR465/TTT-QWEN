@@ -337,7 +337,10 @@ class StageAEpisodeRunner:
             rope_indexer=answer_inputs.rope_indexer,
             qwen_kwargs=answer_inputs.qwen_kwargs,
         )
-        output = self.model.answer_query(answer_request, lifecycle)
+        output = self.model.prefill_answer(
+            self.model.prepare_answer(answer_request, lifecycle),
+            lifecycle,
+        )
         if not isinstance(output.composed, ComposedInput):
             raise TypeError("Stage A episode Composer must return ComposedInput")
         if not isinstance(output.answer_logits, Tensor):

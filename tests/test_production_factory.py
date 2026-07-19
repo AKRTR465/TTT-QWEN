@@ -28,6 +28,7 @@ from ttt_svcbench_qwen.production_factory import (
     audit_outer_checkpoint_boundary,
     fully_unfreeze_qwen,
     initialize_outer_model_from_a2,
+    load_outer_checkpoint,
     load_training_yaml,
 )
 from ttt_svcbench_qwen.production_runtime import (
@@ -66,6 +67,33 @@ class _QwenOwnerToy(nn.Module):
         self.visual.deepstack_merger_list = nn.ModuleList([nn.Linear(2, 2)])
         self.language_model = nn.Module()
         self.language_model.layers = nn.ModuleList([nn.Linear(2, 2) for _ in range(36)])
+
+
+def test_outer_checkpoint_loader_accepts_only_exact_safetensors(tmp_path: Path) -> None:
+    source = _OuterToy()
+    checkpoint = tmp_path / "outer.safetensors"
+    save_file(source.state_dict(), checkpoint)
+    target = _OuterToy()
+    target.requires_grad_(False)
+    for parameter in target.parameters():
+        parameter.zero_()
+
+    audit = load_outer_checkpoint(target, checkpoint)
+
+    assert audit.format == "safetensors"
+    assert audit.tensor_count == len(source.state_dict())
+    assert all(
+        torch.equal(target.state_dict()[key], value)
+        for key, value in source.state_dict().items()
+    )
+    torch.save(source.state_dict(), tmp_path / "outer.bin")
+    with pytest.raises(ValueError, match="safetensors"):
+        load_outer_checkpoint(target, tmp_path / "outer.bin")
+    bad = dict(source.state_dict())
+    bad["temporal_cache.hidden"] = torch.zeros(1)
+    save_file(bad, tmp_path / "bad.safetensors")
+    with pytest.raises(ValueError, match="exactly match"):
+        load_outer_checkpoint(target, tmp_path / "bad.safetensors")
 
 
 def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(

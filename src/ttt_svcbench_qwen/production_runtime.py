@@ -28,7 +28,7 @@ import transformers
 from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
 
-from ttt_svcbench_qwen.config import MetaTTTVariant, ProjectConfig, StageAVariant
+from ttt_svcbench_qwen.config import MetaTTTVariant, ProjectConfig, StageAVariant, load_config
 from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
@@ -63,6 +63,8 @@ from ttt_svcbench_qwen.model import (
     ModelComponents,
     ModelFeatureFlags,
     ObservationChunkRequest,
+    QwenGenerateOutput,
+    QwenGenerateRequest,
     QwenPrefillOutput,
     QwenPrefillRequest,
     RuntimeOwner,
@@ -83,6 +85,7 @@ from ttt_svcbench_qwen.preprocess_cache import (
 from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
     ProductionTTTConfig,
+    load_outer_checkpoint,
 )
 from ttt_svcbench_qwen.query_encoder import (
     Operator,
@@ -618,22 +621,26 @@ class VideoChunkMaterializer:
 
 
 class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
-    """Single registered owner for visual extraction, native prefill and decode."""
+    """Single registered owner for visual extraction, training prefill and generation."""
 
     def __init__(
         self,
         qwen: Qwen3VLAdapter,
         materializer: VideoChunkMaterializer,
+        tokenizer: object,
     ) -> None:
         super().__init__()
         self.qwen = qwen
         self.materializer = materializer
+        self.tokenizer = tokenizer
 
     def forward(self, request: object) -> object:
         if isinstance(request, ObservationChunkRequest):
             return self._visual(request)
         if isinstance(request, QwenPrefillRequest):
             return self._prefill(request)
+        if isinstance(request, QwenGenerateRequest):
+            return self._generate(request)
         raise TypeError("production Qwen runtime received an unknown request type")
 
     def _visual(self, request: ObservationChunkRequest) -> VisualStageOutput:
@@ -714,6 +721,49 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
         )
         _loader_trace("gpu_step", stage="prefill", seconds=time.perf_counter() - gpu_started)
         return cast(QwenPrefillOutput, output)
+
+    def _generate(self, request: QwenGenerateRequest) -> QwenGenerateOutput:
+        prefill = request.prefill
+        if not isinstance(prefill.prepared_video_features, PreparedVideoFeatures):
+            raise TypeError("production generation requires prepared video features")
+        if not isinstance(prefill.pixel_values_videos, Tensor) or not isinstance(
+            prefill.video_grid_thw, Tensor
+        ):
+            raise TypeError("production generation pixels/grid must be tensors")
+        device = _module_device(self.qwen)
+        input_ids = prefill.input_ids.to(device=device)
+        attention_mask = prefill.attention_mask.to(device=device)
+        pixels = prefill.pixel_values_videos.to(device=device, non_blocking=True)
+        grid = prefill.video_grid_thw.to(device=device, non_blocking=True)
+        audit_current_chunk_visual_tokens(prefill.prepared_video_features, pixels, grid)
+        kwargs = dict(prefill.qwen_kwargs)
+        kwargs.pop("labels", None)
+        kwargs.update(
+            do_sample=False,
+            num_beams=1,
+            use_cache=True,
+            max_new_tokens=request.max_new_tokens,
+        )
+        generated = self.qwen.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values_videos=pixels,
+            video_grid_thw=grid,
+            prepared_video_features=prefill.prepared_video_features,
+            state_embedding_payload=_state_embedding_payload(prefill, input_ids),
+            **kwargs,
+        )
+        sequences = getattr(generated, "sequences", generated)
+        if not isinstance(sequences, Tensor) or sequences.ndim != 2 or sequences.shape[0] != 1:
+            raise TypeError("Qwen generate() must return one [1, T] token tensor")
+        new_tokens = sequences[:, input_ids.shape[1] :]
+        decode = getattr(self.tokenizer, "batch_decode", None)
+        if not callable(decode):
+            raise TypeError("production tokenizer must provide batch_decode()")
+        texts = decode(new_tokens, skip_special_tokens=True)
+        if not isinstance(texts, Sequence) or len(texts) != 1 or not isinstance(texts[0], str):
+            raise TypeError("tokenizer batch_decode() must return one string")
+        return QwenGenerateOutput(texts[0].strip(), new_tokens.detach())
 
 
 class ProductionQueryRuntime(nn.Module):  # type: ignore[misc]
@@ -1699,7 +1749,7 @@ def build_runtime(
         prefetch_depth=support_prefetch_depth,
         decode_coalesce=support_decode_coalesce,
     )
-    qwen_runtime = ProductionQwenRuntime(qwen, chunk_materializer)
+    qwen_runtime = ProductionQwenRuntime(qwen, chunk_materializer, backbone.tokenizer)
     query_runtime = ProductionQueryRuntime(
         build_query_encoder(project), backbone.tokenizer, backbone.model
     )
@@ -1719,7 +1769,7 @@ def build_runtime(
             query_encoder=query_runtime,
             composer=_compose_production_inputs,
             qwen_prefill=qwen_runtime,
-            qwen_decode=qwen_runtime,
+            qwen_generate=qwen_runtime,
             fast_adapter=FastVisualPassThrough(),
             spatial_encoder=spatial,
             temporal_encoder=temporal,
@@ -1792,6 +1842,119 @@ def build_runtime(
         data_collator=collator,
         meta_runner=meta_runner,
         episode_adapter=ProductionA5EpisodeAdapter(materializer),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class StateTTTRuntimeBundle:
+    """Complete production ownership graph for one online inference process."""
+
+    config: ProjectConfig
+    qwen_adapter: Qwen3VLAdapter
+    state_model: StateTTTModel
+    outer_model: ProductionOuterModel
+    manager: object
+    updater: object
+    processor: object
+    tokenizer: object
+    video_materializer: VideoChunkMaterializer
+
+
+def build_inference_runtime_bundle(
+    *,
+    model_root: str | Path,
+    checkpoint: str | Path,
+    device: str | torch.device,
+    dtype: torch.dtype,
+    config_path: str | Path = "configs/model_state_ttt_8b.yaml",
+) -> StateTTTRuntimeBundle:
+    """Load local Qwen assets and assemble the sole online State-TTT runtime."""
+
+    from ttt_svcbench_qwen.inference import OnlineTTTUpdater, PerVideoRuntimeManager
+
+    root = Path(model_root).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Qwen model root does not exist: {root}")
+    config = load_config(config_path)
+    processor = transformers.AutoProcessor.from_pretrained(root, local_files_only=True)
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(root, local_files_only=True)
+    model_type = getattr(transformers, "Qwen3VLForConditionalGeneration", None)
+    if model_type is None:
+        raise RuntimeError("installed transformers has no Qwen3VLForConditionalGeneration")
+    qwen_model = model_type.from_pretrained(
+        root,
+        dtype=dtype,
+        local_files_only=True,
+    )
+    if not isinstance(qwen_model, nn.Module):
+        raise TypeError("Qwen loader returned a non-module")
+    qwen_model.to(device=torch.device(device))
+    qwen_model.eval()
+    fast = build_fast_ttt_adapter(config)
+    qwen = Qwen3VLAdapter(
+        qwen_model,
+        config,
+        adapter=fast,
+        adapter_enabled=True,
+        freeze_base=False,
+    )
+    materializer = VideoChunkMaterializer(
+        config,
+        minimum_pixels=16 * 16,
+        maximum_pixels=262_144,
+    )
+    qwen_runtime = ProductionQwenRuntime(qwen, materializer, tokenizer)
+    query_runtime = ProductionQueryRuntime(build_query_encoder(config), tokenizer, qwen_model)
+    query_runtime.bind_project_config(config)
+    state_bank = build_state_bank(config)
+    identity_bank = build_identity_bank(config)
+    writer = StageABankWriter(state_bank, identity_bank)
+    register_input_composer_tokens_with_audit(cast(Any, tokenizer), qwen_model)
+    state_model = StateTTTModel(
+        config,
+        ModelComponents(
+            visual_stage=qwen_runtime,
+            query_encoder=query_runtime,
+            composer=_compose_production_inputs,
+            qwen_prefill=qwen_runtime,
+            qwen_generate=qwen_runtime,
+            fast_adapter=FastVisualPassThrough(),
+            spatial_encoder=ProductionSpatialRuntime(build_spatial_encoder(config)),
+            temporal_encoder=ProductionTemporalRuntime(build_temporal_encoder(config)),
+            observation_heads=ProductionObservationRuntime(build_observation_heads(config)),
+            state_bank=state_bank,
+            bank_writer=writer,
+            retriever=build_state_retriever(config),
+            reader=ProductionReaderRuntime(
+                build_state_reader(config, cast(Any, tokenizer))
+            ),
+            resampler=build_state_resampler(config),
+        ),
+        ModelFeatureFlags(),
+    )
+    predictor = build_temporal_predictor(config.predictor)
+    outer = ProductionOuterModel(state_model, predictor, qwen_model)
+    load_outer_checkpoint(outer, checkpoint)
+    outer.eval()
+    manager = PerVideoRuntimeManager(
+        fast_adapter=fast,
+        state_bank=state_bank,
+        identity_bank=identity_bank,
+        optimizer_config=config.fast_ttt.optimizer,
+        audit_level=config.inference.audit_level,
+    )
+    return StateTTTRuntimeBundle(
+        config=config,
+        qwen_adapter=qwen,
+        state_model=state_model,
+        outer_model=outer,
+        manager=manager,
+        updater=OnlineTTTUpdater(config, predictor),
+        processor=processor,
+        tokenizer=tokenizer,
+        video_materializer=materializer,
     )
 
 

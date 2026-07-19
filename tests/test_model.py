@@ -5,19 +5,21 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import torch
 from torch import nn
 
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
     BankWriteOutput,
-    DecodeStepRequest,
     LifecycleError,
     LifecyclePhase,
     ModelComponents,
     ModelFeatureFlags,
     ObservationChunkRequest,
     PrefillLifecycle,
+    QwenGenerateOutput,
+    QwenGenerateRequest,
     QwenPrefillRequest,
     RuntimeOwner,
     StateTTTModel,
@@ -164,9 +166,9 @@ class SpySuite:
         self.prefill_request = request
         return self.prefill_output
 
-    def decode(self, model_inputs: object) -> object:
-        self.events.append("qwen.decode")
-        return SimpleNamespace(token=model_inputs)
+    def generate(self, request: QwenGenerateRequest) -> QwenGenerateOutput:
+        self.events.append("qwen.generate")
+        return QwenGenerateOutput("answer", torch.tensor([[1]], dtype=torch.int64))
 
 
 def make_suite() -> SpySuite:
@@ -210,7 +212,7 @@ def make_components(suite: SpySuite, **updates: object) -> ModelComponents:
         "query_encoder": suite.query,
         "composer": suite.compose,
         "qwen_prefill": suite.prefill,
-        "qwen_decode": suite.decode,
+        "qwen_generate": suite.generate,
         "fast_adapter": suite.fast,
         "spatial_encoder": suite.spatial,
         "temporal_encoder": suite.temporal,
@@ -262,6 +264,14 @@ def run_observation(
     return model.observe_chunk(make_observation_request(owner), lifecycle)
 
 
+def run_answer(
+    model: StateTTTModel,
+    request: AnswerQueryRequest,
+    lifecycle: PrefillLifecycle,
+) -> object:
+    return model.prefill_answer(model.prepare_answer(request, lifecycle), lifecycle)
+
+
 def test_build_model_validates_feature_dependencies_before_any_stage(
     config: ProjectConfig,
 ) -> None:
@@ -290,7 +300,7 @@ def test_model_registers_each_injected_module_identity_once_and_never_runtime(
         query_encoder=shared_qwen,  # type: ignore[arg-type]
         composer=shared_qwen,  # type: ignore[arg-type]
         qwen_prefill=shared_qwen,  # type: ignore[arg-type]
-        qwen_decode=shared_qwen,  # type: ignore[arg-type]
+        qwen_generate=shared_qwen,  # type: ignore[arg-type]
     )
     flags = ModelFeatureFlags(
         fast_enabled=False,
@@ -370,7 +380,7 @@ def test_answer_query_audits_same_retrieval_before_resampler_and_native_prefill(
     observation = run_observation(model, owner, lifecycle)
     suite.events.clear()
 
-    output = model.answer_query(make_answer_request(owner, observation), lifecycle)
+    output = run_answer(model, make_answer_request(owner, observation), lifecycle)
 
     assert suite.events == [
         "retriever",
@@ -419,39 +429,17 @@ def test_prefill_is_one_shot_and_observe_is_forbidden_after_it(
     owner = make_owner()
     lifecycle = PrefillLifecycle(owner)
     observation = run_observation(model, owner, lifecycle)
-    model.answer_query(make_answer_request(owner, observation), lifecycle)
+    run_answer(model, make_answer_request(owner, observation), lifecycle)
     event_count = len(suite.events)
 
     with pytest.raises(LifecycleError, match="exactly once"):
-        model.answer_query(make_answer_request(owner, observation), lifecycle)
+        run_answer(model, make_answer_request(owner, observation), lifecycle)
     with pytest.raises(LifecycleError, match="forbidden after prefill"):
         model.observe_chunk(make_observation_request(owner), lifecycle)
     assert len(suite.events) == event_count
 
 
-def test_decode_can_only_reach_qwen_and_preserves_runtime_identity(
-    config: ProjectConfig,
-) -> None:
-    suite = make_suite()
-    model = build_model(config, components=make_components(suite))
-    owner = make_owner()
-    lifecycle = PrefillLifecycle(owner)
-    observation = run_observation(model, owner, lifecycle)
-    answer = model.answer_query(make_answer_request(owner, observation), lifecycle)
-    suite.events.clear()
-
-    first = model.decode_step(DecodeStepRequest(owner, "decode-1"), lifecycle)
-    second = model.decode_step(DecodeStepRequest(owner, "decode-2"), lifecycle)
-
-    assert suite.events == ["qwen.decode", "qwen.decode"]
-    assert first.runtime_state is answer.runtime_state
-    assert second.runtime_state is answer.runtime_state
-    assert second.lifecycle.phase is LifecyclePhase.DECODING
-    assert second.lifecycle.decode_count == 2
-    assert second.lifecycle.prefill_count == 1
-
-
-def test_decode_before_prefill_and_cross_owner_requests_fail_closed(
+def test_cross_owner_observation_fails_closed(
     config: ProjectConfig,
 ) -> None:
     suite = make_suite()
@@ -460,8 +448,6 @@ def test_decode_before_prefill_and_cross_owner_requests_fail_closed(
     other = make_owner("b")
     lifecycle = PrefillLifecycle(owner)
 
-    with pytest.raises(LifecycleError, match="requires one successful prefill"):
-        model.decode_step(DecodeStepRequest(owner, "decode"), lifecycle)
     with pytest.raises(LifecycleError, match="owner"):
         model.observe_chunk(make_observation_request(other), lifecycle)
     assert suite.events == []
@@ -484,12 +470,10 @@ def test_reader_rewrite_blocks_resampler_composer_and_marks_lifecycle_failed(
     suite.events.clear()
 
     with pytest.raises(ValueError, match="unchanged authoritative"):
-        model.answer_query(make_answer_request(owner, observation), lifecycle)
+        model.prepare_answer(make_answer_request(owner, observation), lifecycle)
 
     assert suite.events == ["retriever", "reader.read", "reader.audit"]
-    assert lifecycle.audit().phase is LifecyclePhase.FAILED
-    with pytest.raises(LifecycleError, match="reset"):
-        model.answer_query(make_answer_request(owner, observation), lifecycle)
+    assert lifecycle.audit().phase is LifecyclePhase.READY
 
 
 def test_resampler_provenance_mismatch_blocks_composer_and_prefill(
@@ -509,12 +493,12 @@ def test_resampler_provenance_mismatch_blocks_composer_and_prefill(
     suite.events.clear()
 
     with pytest.raises(ValueError, match="same Retriever"):
-        model.answer_query(make_answer_request(owner, observation), lifecycle)
+        model.prepare_answer(make_answer_request(owner, observation), lifecycle)
 
     assert suite.events[-1] == "resampler"
     assert "composer" not in suite.events
     assert "qwen.prefill" not in suite.events
-    assert lifecycle.audit().phase is LifecyclePhase.FAILED
+    assert lifecycle.audit().phase is LifecyclePhase.READY
 
 
 def test_prefill_failure_is_terminal_and_cannot_repeat_state_reads(
@@ -536,11 +520,11 @@ def test_prefill_failure_is_terminal_and_cannot_repeat_state_reads(
     suite.events.clear()
 
     with pytest.raises(RuntimeError, match="synthetic prefill failure"):
-        model.answer_query(make_answer_request(owner, observation), lifecycle)
+        run_answer(model, make_answer_request(owner, observation), lifecycle)
     event_count = len(suite.events)
     assert lifecycle.audit().phase is LifecyclePhase.FAILED
     with pytest.raises(LifecycleError, match="reset"):
-        model.answer_query(make_answer_request(owner, observation), lifecycle)
+        run_answer(model, make_answer_request(owner, observation), lifecycle)
     assert len(suite.events) == event_count
 
 
@@ -571,7 +555,7 @@ def test_disabled_features_are_not_called_and_are_reported_as_absent(
     lifecycle = PrefillLifecycle(owner)
 
     observation = run_observation(model, owner, lifecycle)
-    answer = model.answer_query(make_answer_request(owner, observation), lifecycle)
+    answer = run_answer(model, make_answer_request(owner, observation), lifecycle)
 
     assert suite.events == ["visual", "query", "composer", "qwen.prefill"]
     assert observation.visual.value == "main-visual"

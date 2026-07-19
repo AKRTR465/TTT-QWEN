@@ -469,11 +469,6 @@ class _Qwen(nn.Module):
         return SimpleNamespace(logits=logits)
 
 
-class _Decode:
-    def __call__(self, _inputs: object) -> object:
-        raise AssertionError("Meta-TTT training must not decode")
-
-
 class _TinyPredictor(TemporalPredictor):
     def __init__(self) -> None:
         nn.Module.__init__(self)
@@ -530,6 +525,7 @@ def _system(
     predictor = _TinyPredictor()
     resetter = _RuntimeResetter()
     reader = _Reader()
+    qwen = _Qwen()
     model = StateTTTModel(
         config,
         ModelComponents(
@@ -544,8 +540,8 @@ def _system(
             retriever=_Retriever(),
             reader=reader,
             composer=_Composer(),
-            qwen_prefill=_Qwen(),
-            qwen_decode=_Decode(),
+            qwen_prefill=qwen,
+            qwen_generate=qwen,  # type: ignore[arg-type]
         ),
         ModelFeatureFlags(
             fast_enabled=True,

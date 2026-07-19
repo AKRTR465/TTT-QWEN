@@ -719,7 +719,7 @@ class StageCTrainingConfig(FrozenModel):
 
 
 class InferenceRuntimeConfig(FrozenModel):
-    """Managed P18 per-video lifecycle and immutable-decode contract."""
+    """Managed per-video lifecycle and immutable-generation contract."""
 
     reset_per_video: bool
     update_effect: str

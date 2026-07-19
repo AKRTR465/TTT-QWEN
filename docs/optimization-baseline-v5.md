@@ -5,8 +5,8 @@ This baseline was captured before the six-stage repository optimization.
 - Baseline commit: `c7126a7b6ccbdc071f93c94554d6612a2cf498e9`.
 - Architecture spec: `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`.
 - Production training entry: `python -m ttt_svcbench_qwen.llamafactory_trainer CONFIG.yaml`.
-- Inference diagnostics entry: `ttt-svcbench-infer --describe-protocol` and
-  `ttt-svcbench-infer --validate-payload REQUEST.json`.
+- Inference entry: `ttt-svcbench-infer --run REQUEST.json --checkpoint CHECKPOINT
+  --model-root MODEL_ROOT --device cuda:0 --dtype bfloat16 --output RESULT.json`.
 - Registered checkpoint state must exclude transient `W_t`, Bank/FSM runtime, temporal caches,
   and other per-video state. Existing checkpoint-boundary tests define the exact policy.
 - The architecture snapshot test fixes the Fast Adapter, spatial/temporal encoders, four

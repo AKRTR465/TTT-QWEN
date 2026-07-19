@@ -47,7 +47,7 @@ bash scripts/h200/launch_qwen3vl8b_ttt_a5_k8_full4.sh
 
 ## 在线推理
 
-`ttt-svcbench-infer` 当前保留严格 payload 校验和 per-video runtime 生命周期。正式 Qwen generation、在线 updater 与 checkpoint factory 在主线推理闭环中统一实现；在真实 8B/H200 证据产生前，不宣称生产性能或科学增益。
+`ttt-svcbench-infer` 是正式 JSON 入口，要求 `--run`、`--checkpoint`、`--model-root`、`--device`、`--dtype` 与 `--output`。Qwen generation、在线 updater、严格 safetensors checkpoint 和 per-video runtime 生命周期均由同一 bundle 组装；在真实 8B/H200 证据产生前，不宣称生产性能或科学增益。
 
 运行时必须保证：
 

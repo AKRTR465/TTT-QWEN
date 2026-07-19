@@ -14,9 +14,9 @@ from ttt_svcbench_qwen.identity_bank import IdentityBank, build_identity_bank
 from ttt_svcbench_qwen.inference import (
     AnswerInputs,
     CausalChunk,
-    GenerationDriver,
     InferenceProtocolError,
     InferenceRequest,
+    OnlineTTTUpdater,
     PerVideoRuntimeManager,
     QueryAttempt,
     QueryAttemptKind,
@@ -25,17 +25,18 @@ from ttt_svcbench_qwen.inference import (
     run_inference,
     runtime_boundary_stamp,
 )
+from ttt_svcbench_qwen.losses import build_temporal_predictor
 from ttt_svcbench_qwen.model import (
     BankWriteOutput,
     BatchRuntimeState,
-    DecodeStepOutput,
     ModelComponents,
     ModelFeatureFlags,
     ObservationChunkOutput,
     ObservationChunkRequest,
+    QwenGenerateOutput,
+    QwenGenerateRequest,
     QwenPrefillRequest,
     StateTTTModel,
-    StateTTTModelOutput,
     TrajectoryRuntimeState,
     VisualStageOutput,
     build_model,
@@ -169,7 +170,8 @@ class _FakeSuite:
         self.fast_versions: list[int] = []
         self.seen_frames: list[tuple[object, ...]] = []
         self.prefill_calls = 0
-        self.decode_calls = 0
+        self.generate_calls = 0
+        self.mutate_manager: PerVideoRuntimeManager | None = None
 
     def visual(self, request: ObservationChunkRequest) -> VisualStageOutput:
         batch = cast(BatchRuntimeState, request.runtime_state)
@@ -299,9 +301,18 @@ class _FakeSuite:
             signature=repr(request.prepared_video_features),
         )
 
-    def decode(self, model_inputs: object) -> object:
-        self.decode_calls += 1
-        return SimpleNamespace(token=model_inputs)
+    def generate(self, request: QwenGenerateRequest) -> QwenGenerateOutput:
+        self.generate_calls += 1
+        if self.mutate_manager is not None:
+            state = self.mutate_manager.active_runtime
+            assert state is not None and state.fast_weights is not None
+            with torch.no_grad():
+                state.fast_weights.w_t_1.add_(0.5)
+        signature = repr(request.prefill.prepared_video_features)
+        return QwenGenerateOutput(
+            f"answer:{signature}",
+            torch.tensor([[1]], dtype=torch.int64),
+        )
 
 
 def _typed_query() -> QueryEncoderOutput:
@@ -502,9 +513,15 @@ class _TypedStageSuite(_FakeSuite):
     def temporal(
         _visual: VisualStageOutput,
         query: object,
-        _request: ObservationChunkRequest,
+        request: ObservationChunkRequest,
     ) -> TemporalEncoderOutput:
-        return _typed_temporal(cast(QueryEncoderOutput, query))
+        output = _typed_temporal(cast(QueryEncoderOutput, query))
+        runtime = cast(BatchRuntimeState, request.runtime_state).rows[0]
+        assert runtime.fast_weights is not None
+        fast_dependency = 1000.0 * (
+            runtime.fast_weights.w_t_1[0, 0] + runtime.fast_weights.w_t_2[0, 0]
+        )
+        return replace(output, hidden=output.hidden + fast_dependency)
 
     @staticmethod
     def heads(
@@ -529,7 +546,7 @@ def _model(dependencies: _Dependencies, suite: _FakeSuite) -> StateTTTModel:
             query_encoder=suite.query,
             composer=suite.compose,
             qwen_prefill=suite.prefill,
-            qwen_decode=suite.decode,
+            qwen_generate=suite.generate,
             fast_adapter=suite.fast,
             spatial_encoder=suite.spatial,
             temporal_encoder=suite.temporal,
@@ -553,7 +570,7 @@ def _stage_a_model(dependencies: _Dependencies, suite: _TypedStageSuite) -> Stat
             query_encoder=suite.query,
             composer=suite.compose,
             qwen_prefill=suite.prefill,
-            qwen_decode=suite.decode,
+            qwen_generate=suite.generate,
             fast_adapter=suite.fast,
             spatial_encoder=suite.spatial,
             temporal_encoder=suite.temporal,
@@ -577,7 +594,10 @@ class _Updater:
         self,
         _observation: ObservationChunkOutput,
         runtime: TrajectoryRuntimeState,
+        *,
+        current_end_time: float,
     ) -> TTTUpdateOutcome:
+        assert current_end_time >= 0.0
         call = self.calls
         self.calls += 1
         fast = runtime.fast_weights
@@ -628,36 +648,6 @@ class _Updater:
         )
 
 
-class _Driver(GenerationDriver):
-    def __init__(
-        self,
-        steps: int,
-        *,
-        mutate_after_first: PerVideoRuntimeManager | None = None,
-    ) -> None:
-        self.steps = steps
-        self.mutate_after_first = mutate_after_first
-
-    def begin(self, _prefill: StateTTTModelOutput) -> object | None:
-        return None if self.steps == 0 else {"step": 0}
-
-    def advance(self, step_index: int, _decode: DecodeStepOutput) -> object | None:
-        if step_index == 0 and self.mutate_after_first is not None:
-            state = self.mutate_after_first.active_runtime
-            assert state is not None
-            with torch.no_grad():
-                state.fast_weights.w_t_1.add_(0.5)
-        next_step = step_index + 1
-        return None if next_step >= self.steps else {"step": next_step}
-
-    @staticmethod
-    def finish(
-        prefill: StateTTTModelOutput,
-        _decode_steps: tuple[DecodeStepOutput, ...],
-    ) -> str:
-        return f"answer:{prefill.qwen_output.signature}"
-
-
 def _answer_inputs() -> AnswerInputs:
     return AnswerInputs(
         base_input_ids=torch.ones((1, 2), dtype=torch.int64),
@@ -687,7 +677,7 @@ def _request(*, future_frame: object = "future") -> InferenceRequest:
         ),
         answer_inputs=_answer_inputs(),
         attempt=QueryAttempt("query-a"),
-        max_decode_steps=8,
+        max_new_tokens=16,
     )
 
 
@@ -721,7 +711,7 @@ def test_reset_isolates_consecutive_videos_and_matches_pristine_stamp(
     manager.release()
 
 
-def test_causal_chunks_next_only_updates_and_decode_immutability(
+def test_causal_chunks_next_only_updates_and_generation_immutability(
     dependencies: _Dependencies,
 ) -> None:
     suite = _FakeSuite()
@@ -731,7 +721,6 @@ def test_causal_chunks_next_only_updates_and_decode_immutability(
         model=_model(dependencies, suite),
         request=_request(),
         updater=_Updater(skip_calls={1}),
-        generation_driver=_Driver(steps=3),
     )
 
     assert suite.fast_versions == [0, 1]
@@ -741,7 +730,7 @@ def test_causal_chunks_next_only_updates_and_decode_immutability(
     assert result.chunk_audit[1].future_frame_count == 1
     assert result.chunk_audit[1].skip_reason == "no_valid_term"
     assert result.generate_audit.prefill_count == 1
-    assert result.generate_audit.decode_count == 3
+    assert result.generate_audit.decode_count == 0
     assert result.generate_audit.state_before == result.generate_audit.state_after
     assert result.reader_result.status is ReaderStatus.OK
     assert result.selected_record_ids == ("record-0",)
@@ -762,7 +751,6 @@ def test_audit_levels_preserve_runtime_results(
         model=_model(dependencies, suite),
         request=_request(),
         updater=_Updater(skip_calls={1}),
-        generation_driver=_Driver(steps=1),
     )
 
     snapshot = result.generate_audit.state_after
@@ -807,7 +795,6 @@ def test_future_frame_perturbation_does_not_change_answer_or_model_input(
             model=_model(dependencies, suite),
             request=_request(future_frame=future),
             updater=_Updater(skip_calls={1}),
-            generation_driver=_Driver(steps=1),
         )
         outputs.append((result.answer_text, suite.seen_frames))
 
@@ -847,8 +834,7 @@ def test_reader_statuses_and_explicit_retry_use_one_prefill_each(
             observation=execution.observation,
             answer_inputs=_answer_inputs(),
             attempt=attempt,
-            generation_driver=_Driver(steps=1),
-            max_decode_steps=4,
+            max_new_tokens=16,
         )
         results.append(result)
         assert result.generate_audit.prefill_count == 1, index
@@ -860,18 +846,18 @@ def test_reader_statuses_and_explicit_retry_use_one_prefill_each(
     manager.release()
 
 
-def test_decode_mutation_fails_closed_and_exception_releases_runtime(
+def test_generation_mutation_fails_closed_and_exception_releases_runtime(
     dependencies: _Dependencies,
 ) -> None:
     suite = _FakeSuite()
     manager = _manager(dependencies)
+    suite.mutate_manager = manager
     with pytest.raises(InferenceProtocolError, match="prefill/generation mutated"):
         run_inference(
             manager=manager,
             model=_model(dependencies, suite),
             request=_request(),
             updater=_Updater(skip_calls={1}),
-            generation_driver=_Driver(steps=2, mutate_after_first=manager),
         )
     assert manager.active_runtime is None
 
@@ -928,6 +914,45 @@ def test_unified_runtime_commits_real_hard_state(dependencies: _Dependencies) ->
     assert runtime.state_bank.records[0].head_type is HeadType.O1
     assert runtime.identity_bank.video_id == "video-a"
     assert runtime.optimizer is not None and runtime.optimizer.attempted_update_count == 1
+    manager.release()
+
+
+def test_online_updater_publishes_overlap_and_next_only_fast_state(
+    dependencies: _Dependencies,
+) -> None:
+    suite = _TypedStageSuite()
+    manager = _manager(dependencies)
+    model = _stage_a_model(dependencies, suite)
+    updater = OnlineTTTUpdater(
+        dependencies.config,
+        build_temporal_predictor(dependencies.config.predictor),
+    )
+    manager.reset("video-a", "trajectory-a", torch.zeros(512))
+
+    first = manager.observe_chunk(
+        model=model,
+        chunk=CausalChunk("chunk-0", ("a", "b"), (0.0, 1.0), (0, 1)),
+        query_input=_request().query_input,
+        query_time=3.0,
+        updater=updater,
+    )
+    assert first.audit.fast_version_used == 0
+    assert first.audit.did_update, first.audit.skip_reason
+    assert first.audit.next_fast_version == 1
+    assert first.runtime_state.online_overlap_memory is not None
+    assert first.runtime_state.online_overlap_memory.end_time == 1.0
+
+    second = manager.observe_chunk(
+        model=model,
+        chunk=CausalChunk("chunk-1", ("c", "d"), (2.0, 3.0), (2, 3)),
+        query_input=_request().query_input,
+        query_time=3.0,
+        updater=updater,
+    )
+    assert second.audit.fast_version_used == 1
+    assert second.audit.next_fast_version == 2
+    assert second.runtime_state.online_overlap_memory is not None
+    assert second.runtime_state.online_overlap_memory.end_time == 3.0
     manager.release()
 
 
