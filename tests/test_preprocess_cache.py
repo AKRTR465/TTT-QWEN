@@ -60,6 +60,33 @@ def test_cache_roundtrip_and_stable_key(tmp_path: Path) -> None:
     assert list((tmp_path / "cache" / "model-a").rglob("*.json"))
 
 
+def test_query_role_and_sampling_policy_cannot_reuse_support_cache_key(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    support = _fingerprint(video)
+    query = build_fingerprint(
+        source_dataset="svcbench",
+        relative_video_path="clip.mp4",
+        video_path=video,
+        start_time=0.0,
+        end_time=1.0,
+        maximum_frames=4,
+        sample_fps=2.0,
+        minimum_pixels=256,
+        maximum_pixels=4096,
+        patch_size=16,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        transformers_version="4.57.1",
+        observation_role="query",
+        frame_sampling="llamafactory_uniform_cap",
+    )
+
+    assert support.digest != query.digest
+
+
 def test_cache_invalidates_media_and_metadata(tmp_path: Path) -> None:
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"video")
@@ -76,9 +103,7 @@ def test_cache_invalidates_media_and_metadata(tmp_path: Path) -> None:
     cache.put(restored, _chunk())
     path = cache._path_for(restored)
     assert path is not None
-    path.with_suffix(".json").write_text(
-        json.dumps({"fingerprint": "wrong"}), encoding="utf-8"
-    )
+    path.with_suffix(".json").write_text(json.dumps({"fingerprint": "wrong"}), encoding="utf-8")
     assert cache.get(restored) is None
 
 

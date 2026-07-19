@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -108,7 +109,7 @@ class SegmentBackwardController:
         elif not callable(getattr(accelerator, "backward", None)):
             raise TypeError("segment controller requires accelerator.backward")
 
-    def backward(self, loss: Tensor) -> None:
+    def backward(self, loss: Tensor, retain_graph: bool = False) -> None:
         if self.backward_count >= self.expected_count:
             raise RuntimeError("segment runner emitted too many backward calls")
         with trace_cuda_phase(
@@ -120,9 +121,12 @@ class SegmentBackwardController:
                 engine = cast(Any, self.engine)
                 is_final_segment = self.backward_count + 1 == self.expected_count
                 engine.set_gradient_accumulation_boundary(is_boundary=is_final_segment)
-                engine.backward(loss)
+                if retain_graph:
+                    engine.backward(loss, retain_graph=True)
+                else:
+                    engine.backward(loss)
             else:
-                cast(Any, self.accelerator).backward(loss)
+                cast(Any, self.accelerator).backward(loss, retain_graph=retain_graph)
         self.backward_count += 1
 
     def finalize(self) -> None:
@@ -294,6 +298,7 @@ class TTTQwenTrainerMixin:
         expected_segments = math.ceil(
             len(episode.support_chunks) / runner.config.stage_c.truncation_horizon
         )
+        expected_backwards = expected_segments + len(episode.query_points) - 1
         horizon = runner.config.stage_c.truncation_horizon
         segment_lengths = tuple(
             min(horizon, len(episode.support_chunks) - start)
@@ -304,11 +309,11 @@ class TTTQwenTrainerMixin:
         backward_controller = SegmentBackwardController(
             self.accelerator,  # type: ignore[attr-defined]
             model,
-            expected_count=expected_segments,
+            expected_count=expected_backwards,
         )
 
-        def distributed_backward(loss: Tensor) -> None:
-            backward_controller.backward(loss * loss_weight)
+        def distributed_backward(loss: Tensor, retain_graph: bool) -> None:
+            backward_controller.backward(loss * loss_weight, retain_graph=retain_graph)
 
         end_prefetch = getattr(adapter, "end_prefetch", None)
         try:
@@ -316,8 +321,8 @@ class TTTQwenTrainerMixin:
         finally:
             if callable(end_prefetch):
                 end_prefetch()
-        if output.audit.backward_count != expected_segments:
-            raise RuntimeError("A5 backward collective count drifted from its segment bucket")
+        if output.audit.backward_count != expected_backwards:
+            raise RuntimeError("A5 streamed backward collective count drifted from its bucket")
         backward_controller.finalize()
         self.last_meta_output = output
         self._observe_runtime_cost(inputs, time.perf_counter() - step_started)
@@ -333,9 +338,7 @@ class TTTQwenTrainerMixin:
         if not callable(observe):
             return
         prepared = inputs.get(
-            "prepared_a2"
-            if self.ttt_runtime.stage is ProductionStage.A2
-            else "prepared_a5"
+            "prepared_a2" if self.ttt_runtime.stage is ProductionStage.A2 else "prepared_a5"
         )
         record = getattr(prepared, "record", None)
         if isinstance(record, A2QueryRecord):
@@ -362,8 +365,7 @@ class TTTQwenTrainerMixin:
         )
         if len(set(signatures)) != 1:
             raise ValueError(
-                "A5 ranks received unequal segment lengths or Query counts: "
-                f"{signatures}"
+                f"A5 ranks received unequal segment lengths or Query counts: {signatures}"
             )
 
 
@@ -449,14 +451,11 @@ def main(argv: list[str] | None = None) -> int:
         revision = str(getattr(backbone.model_args, "revision", "unknown-revision"))
         parameter = next(backbone.model.parameters())
         expected_fingerprint = make_visual_cost_fingerprint(
-            manifest_sha256=hashlib.sha256(
-                Path(manifest_path).read_bytes()
-            ).hexdigest(),
+            manifest_sha256=hashlib.sha256(Path(manifest_path).read_bytes()).hexdigest(),
             model_revision=f"{model_name}@{revision}",
             transformers_version=transformers.__version__,
             processor=(
-                f"{type(backbone.processor).__module__}."
-                f"{type(backbone.processor).__qualname__}"
+                f"{type(backbone.processor).__module__}.{type(backbone.processor).__qualname__}"
             ),
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
@@ -496,6 +495,9 @@ def main(argv: list[str] | None = None) -> int:
                 rank,
                 world_size,
                 visual_cost_index=visual_cost_index,
+                query_visual_mode=backbone.ttt_config.query_visual_mode,
+                query_max_frames=backbone.ttt_config.query_max_frames,
+                query_sample_fps=backbone.ttt_config.query_sample_fps,
             )
         ),
     )
@@ -558,12 +560,24 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
     final_checkpoint = output_dir / "final-checkpoint"
-    audit_outer_checkpoint_boundary(runtime_raw.model)
-    trainer.save_model(str(final_checkpoint))
+    incomplete_checkpoint = output_dir / ".final-checkpoint.incomplete"
+    if trainer.is_world_process_zero() and (
+        final_checkpoint.exists() or incomplete_checkpoint.exists()
+    ):
+        raise FileExistsError("refusing to overwrite an existing final checkpoint")
     trainer.accelerator.wait_for_everyone()
-    trainer.accelerator.save_state(str(final_checkpoint / "resume_state"))
+    audit_outer_checkpoint_boundary(runtime_raw.model)
+    trainer.save_model(str(incomplete_checkpoint))
+    trainer.accelerator.wait_for_everyone()
+    trainer.accelerator.save_state(str(incomplete_checkpoint / "resume_state"))
     if trainer.is_world_process_zero():
-        trainer.state.save_to_json(str(final_checkpoint / "trainer_state.json"))
+        trainer.state.save_to_json(str(incomplete_checkpoint / "trainer_state.json"))
+        _validate_checkpoint_tree(incomplete_checkpoint)
+        incomplete_checkpoint.rename(final_checkpoint)
+        for child in output_dir.glob("checkpoint-*"):
+            if child.is_dir():
+                shutil.rmtree(child)
+    trainer.accelerator.wait_for_everyone()
     trainer.save_state()
     trainer.log_metrics("train", result.metrics)
     trainer.save_metrics("train", result.metrics)
@@ -576,13 +590,49 @@ def main(argv: list[str] | None = None) -> int:
                 "global_step": int(trainer.state.global_step),
                 "elapsed_seconds": time.monotonic() - started,
                 "metrics": result.metrics,
-                "checkpoint_policy": "final_epoch",
+                "checkpoint_policy": "atomic_final_only",
                 "final_checkpoint": str(final_checkpoint),
                 "resume_state": str(final_checkpoint / "resume_state"),
                 "resumed_from": (None if same_stage_resume is None else str(same_stage_resume)),
             },
         )
     return 0
+
+
+def _validate_checkpoint_tree(checkpoint: Path) -> None:
+    """Validate model and resume artifacts before publishing and deleting the prior epoch."""
+
+    if not checkpoint.is_dir():
+        raise FileNotFoundError("incomplete checkpoint directory was not created")
+    model_candidates = (
+        checkpoint / "model.safetensors",
+        checkpoint / "model.safetensors.index.json",
+        checkpoint / "pytorch_model.bin",
+        checkpoint / "pytorch_model.bin.index.json",
+    )
+    present = tuple(path for path in model_candidates if path.is_file() and path.stat().st_size > 0)
+    if len(present) != 1:
+        raise RuntimeError("final checkpoint must contain exactly one model weight entrypoint")
+    entrypoint = present[0]
+    if entrypoint.name.endswith(".index.json"):
+        raw = cast(object, json.loads(entrypoint.read_text(encoding="utf-8")))
+        weight_map = raw.get("weight_map") if isinstance(raw, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise RuntimeError("final checkpoint shard index has no weight_map")
+        shard_names = {value for value in weight_map.values() if isinstance(value, str)}
+        if len(shard_names) != len(set(weight_map.values())):
+            raise RuntimeError("final checkpoint shard index contains invalid shard names")
+        if any(
+            not (checkpoint / name).is_file() or (checkpoint / name).stat().st_size <= 0
+            for name in shard_names
+        ):
+            raise RuntimeError("final checkpoint shard index references a missing/empty shard")
+    trainer_state = checkpoint / "trainer_state.json"
+    resume_state = checkpoint / "resume_state"
+    if not trainer_state.is_file() or trainer_state.stat().st_size <= 0:
+        raise RuntimeError("final checkpoint is missing trainer_state.json")
+    if not resume_state.is_dir() or not any(resume_state.iterdir()):
+        raise RuntimeError("final checkpoint is missing complete Accelerate resume state")
 
 
 def _validate_scalar_loss(loss: Tensor, name: str) -> None:

@@ -58,6 +58,7 @@ class OfficialWeakTermBalanceMetrics:
 @dataclass(frozen=True, slots=True)
 class OfficialWeakBalanceAudit:
     answer_global_mean: float
+    answer_global_count: int
     state_global_mean: float
     terms: tuple[OfficialWeakTermBalanceMetrics, ...]
     auxiliary_to_answer_ratio: float
@@ -67,6 +68,8 @@ class OfficialWeakBalanceAudit:
     def __post_init__(self) -> None:
         if not math.isfinite(self.answer_global_mean) or self.answer_global_mean < 0.0:
             raise ValueError("official-weak Answer mean must be finite and non-negative")
+        if self.answer_global_count <= 0:
+            raise ValueError("official-weak Answer global count must be positive")
         if not math.isfinite(self.state_global_mean) or self.state_global_mean < 0.0:
             raise ValueError("official-weak State mean must be finite and non-negative")
         if tuple(term.name for term in self.terms) != _TERM_NAMES:
@@ -304,6 +307,7 @@ class OfficialWeakOuterLossComposer:
             raise ValueError("official-weak group guard failed to preserve Answer dominance")
         audit = OfficialWeakBalanceAudit(
             answer_global_mean=answer_mean_value,
+            answer_global_count=global_counts[0],
             state_global_mean=weighted_auxiliary,
             terms=term_metrics,
             auxiliary_to_answer_ratio=min(float(self.config.group_weight), ratio_value),
@@ -328,6 +332,48 @@ class OfficialWeakOuterLossComposer:
             audit=audit,
         )
 
+    def compose_one_from_audit(
+        self,
+        answer: AnswerLossOutput,
+        state: OfficialWeakStateLossOutput,
+        *,
+        query_count: int,
+        audit: OfficialWeakBalanceAudit,
+        support_ttt: tuple[TTTLossOutput, ...] = (),
+    ) -> OuterLossOutput:
+        """Apply detached batch/global balance coefficients to one streamed Query graph."""
+
+        if query_count <= 0:
+            raise ValueError("streamed Query balance requires a positive query_count")
+        world_size = self._configured_world_size()
+        answer_sum = _answer_local_sum(answer)
+        answer_contribution = (
+            float(query_count * world_size) * answer_sum / float(audit.answer_global_count)
+        )
+        aligned: list[Tensor] = []
+        for name, metrics in zip(_TERM_NAMES, audit.terms, strict=True):
+            term = getattr(state, name)
+            contribution = term.value * 0.0
+            if metrics.scale is not None and metrics.global_valid_count > 0:
+                contribution = (
+                    float(query_count * world_size)
+                    * float(metrics.scale)
+                    * _weak_local_sum(term)
+                    / float(metrics.global_valid_count)
+                )
+            aligned.append(contribution)
+        state_contribution = (
+            float(self.config.group_weight)
+            * float(audit.group_guard)
+            * torch.stack(tuple(aligned)).sum()
+            / float(_TERM_SLOT_COUNT)
+        )
+        return compose_outer_loss_terms(
+            answer_after=answer_contribution,
+            state_after=state_contribution,
+            support_ttt=support_ttt,
+        )
+
     def _global_sum(self, values: Tensor) -> tuple[Tensor, int]:
         if values.shape != (_STAT_VECTOR_LENGTH,) or values.dtype != torch.float64:
             raise ValueError("official-weak collective payload contract drifted")
@@ -350,6 +396,13 @@ class OfficialWeakOuterLossComposer:
         ):
             raise ValueError("official-weak collective returned an invalid payload")
         return reduced, int(world_size)
+
+    def _configured_world_size(self) -> int:
+        if self._world_size is not None:
+            return int(self._world_size)
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_world_size())
+        return 1
 
 
 def _answer_valid_rows(answer: AnswerLossOutput) -> int:

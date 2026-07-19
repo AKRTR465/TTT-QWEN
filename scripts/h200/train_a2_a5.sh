@@ -152,6 +152,8 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
     TTT_DATALOADER_TRACE \
     TTT_A2_SUPPORT_PREFETCH \
     TTT_SUPPORT_VISUAL_BATCH_SIZE \
+    TTT_SKIP_ENV_SETUP \
+    TTT_QUERY_ACTIVATION_OFFLOAD \
     NCCL_DEBUG \
     NCCL_DEBUG_SUBSYS \
     TORCH_DISTRIBUTED_DEBUG \
@@ -186,6 +188,10 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
 fi
 
 cd "$PROJECT_ROOT"
+if [[ "${TTT_SKIP_ENV_SETUP:-0}" == "1" && ! -x "$PYTHON" ]]; then
+  echo "TTT_SKIP_ENV_SETUP=1 requires an existing project Python: $PYTHON" >&2
+  exit 1
+fi
 if [[ ! -x "$PYTHON" ]]; then
   if [[ ! -x "$BOOTSTRAP_PYTHON" ]]; then
     echo "Python 3.12 bootstrap interpreter not found: $BOOTSTRAP_PYTHON" >&2
@@ -205,6 +211,7 @@ mkdir -p "$PIP_CACHE_DIR"
 # Qwen3-VL contains Conv3D modules. LLaMA-Factory rejects torch 2.9.x for this
 # model because of the upstream Conv3D regression. Keep the CUDA runtime pin
 # separate from the portable lock file and use PJLAB's internal mirrors only.
+if [[ "${TTT_SKIP_ENV_SETUP:-0}" != "1" ]]; then
 RUNTIME_VERSIONS="$("$PYTHON" - <<'PY' 2>/dev/null || true
 try:
     import torch
@@ -239,6 +246,9 @@ if [[ ! -f "$REQUIREMENTS_STAMP" ]] \
     --prefer-binary \
     --requirement "$REQUIREMENTS"
   printf '%s\n' "$REQUIREMENTS_HASH" > "$REQUIREMENTS_STAMP"
+fi
+else
+  "$PYTHON" -c 'import torch, torchvision, torchaudio, transformers, accelerate, deepspeed, av'
 fi
 
 LF_COMMIT="$(git -C "$PLAY_ROOT/LLaMA-Factory" rev-parse --short HEAD)"

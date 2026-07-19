@@ -955,7 +955,23 @@ class OfficialWeakTargetBuilder:
             not isinstance(label, OfficialWeakSupervision) for label in labels
         ):
             raise ValueError("official weak supervision must align to the prediction batch")
-        anchor = observations.o1.logits.float().sum() * 0.0
+        # Every soft head participates in every rank's differentiable graph even when the
+        # official weak label masks a term. This preserves the exact numerical objective while
+        # giving ZeRO-2 a stable, identical parameter-hook surface across mixed task classes.
+        anchor = (
+            observations.o1.logits.float().sum()
+            + observations.o2.identity.float().sum()
+            + observations.o2.score_logits.float().sum()
+            + observations.e1.logits.float().sum()
+            + observations.e2.event_logits.float().sum()
+            + observations.e2.phase_logits.float().sum()
+            + query.route.logits.float().sum()
+            + query.time.logits.mode_logits.float().sum()
+            + query.time.logits.span_start_logits.float().sum()
+            + query.time.logits.span_end_logits.float().sum()
+            + retrieval.state_embeddings.float().sum()
+            + retrieval.scores.float().sum()
+        ) * 0.0
         task_losses: list[Tensor] = []
         operator_losses: list[Tensor] = []
         retrieval_losses: list[Tensor] = []

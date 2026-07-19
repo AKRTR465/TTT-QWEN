@@ -48,6 +48,13 @@ def main() -> int:
         choices=("disabled", "read_write", "readonly"),
     )
     parser.add_argument("--gpu-model", required=True)
+    parser.add_argument(
+        "--query-visual-mode",
+        choices=("recent_chunk", "causal_prefix"),
+        default="causal_prefix",
+    )
+    parser.add_argument("--query-max-frames", type=int, default=256)
+    parser.add_argument("--query-sample-fps", type=float, default=2.0)
     parser.add_argument("--decode-seconds-per-chunk", type=float, default=0.0)
     parser.add_argument("--processor-seconds-per-chunk", type=float, default=0.0)
     parser.add_argument("--vit-seconds-per-token", type=float, default=0.0)
@@ -87,6 +94,9 @@ def main() -> int:
             vit_per_token=args.vit_seconds_per_token,
             query_per_query=args.query_seconds_per_query,
             loss_collective=args.loss_collective_seconds,
+            query_visual_mode=args.query_visual_mode,
+            query_max_frames=args.query_max_frames,
+            query_sample_fps=args.query_sample_fps,
         )
         for record in records
     ]
@@ -115,6 +125,9 @@ def _cost_record(
     vit_per_token: float,
     query_per_query: float,
     loss_collective: float,
+    query_visual_mode: str,
+    query_max_frames: int,
+    query_sample_fps: float,
 ) -> VisualCostRecord:
     coefficients = (
         decode_per_chunk,
@@ -125,36 +138,41 @@ def _cost_record(
     )
     if any(not math.isfinite(value) or value < 0.0 for value in coefficients):
         raise ValueError("cost coefficients must be finite and non-negative")
+    if query_visual_mode not in {"recent_chunk", "causal_prefix"}:
+        raise ValueError("visual cost Query mode is invalid")
+    if query_max_frames < 2 or query_max_frames > 256 or query_max_frames % 2:
+        raise ValueError("visual cost Query frame cap must be even within [2, 256]")
+    if not math.isfinite(query_sample_fps) or query_sample_fps <= 0.0:
+        raise ValueError("visual cost Query FPS must be positive")
+
+    def query_interval(query_time: float) -> tuple[float, float, int, float]:
+        start = 0.0 if query_visual_mode == "causal_prefix" else max(0.0, query_time - 8.0)
+        return start, query_time, query_max_frames, query_sample_fps
+
     if isinstance(record, A2QueryRecord):
         _, supports = adaptive_support_schedule(record.query.runtime.query_time)
         intervals = tuple(
             (chunk.start_time, chunk.end_time, chunk.maximum_frames) for chunk in supports
-        ) + (
-            (
-                max(0.0, record.query.runtime.query_time - 8.0),
-                record.query.runtime.query_time,
-                16,
-            ),
         )
+        interval_fps = tuple(2.0 for _ in intervals) + (query_sample_fps,)
+        intervals = intervals + (query_interval(record.query.runtime.query_time)[:3],)
         record_id = record.query.runtime.query_id
         support_count = len(supports)
         segment_lengths: tuple[int, ...] = ()
         query_count = 1
     elif isinstance(record, A5EpisodeRecord):
-        intervals = (
+        support_intervals = (
             (record.prewarm.start_time, record.prewarm.end_time, record.prewarm.maximum_frames),
             *(
                 (chunk.start_time, chunk.end_time, chunk.maximum_frames)
                 for chunk in record.supports
             ),
-            *(
-                (
-                    max(0.0, query.runtime.query_time - 8.0),
-                    query.runtime.query_time,
-                    16,
-                )
-                for query in record.queries
-            ),
+        )
+        intervals = support_intervals + tuple(
+            query_interval(query.runtime.query_time)[:3] for query in record.queries
+        )
+        interval_fps = tuple(2.0 for _ in support_intervals) + tuple(
+            query_sample_fps for _ in record.queries
         )
         record_id = record.episode_id
         support_count = record.support_count
@@ -162,20 +180,17 @@ def _cost_record(
         query_count = record.query_count
     else:
         raise TypeError("visual cost builder received an unknown manifest record")
-    visual_tokens = tuple(_frame_budget(*interval) for interval in intervals)
+    visual_tokens = tuple(
+        _frame_budget(*interval, sample_fps)
+        for interval, sample_fps in zip(intervals, interval_fps, strict=True)
+    )
     chunk_count = len(visual_tokens)
     total_tokens = sum(visual_tokens)
     decode_seconds = decode_per_chunk * chunk_count
     processor_seconds = processor_per_chunk * chunk_count
     vit_seconds = vit_per_token * total_tokens
     query_seconds = query_per_query * query_count
-    predicted = (
-        decode_seconds
-        + processor_seconds
-        + vit_seconds
-        + query_seconds
-        + loss_collective
-    )
+    predicted = decode_seconds + processor_seconds + vit_seconds + query_seconds + loss_collective
     return VisualCostRecord(
         record_id=record_id,
         support_count=support_count,
@@ -193,8 +208,8 @@ def _cost_record(
     )
 
 
-def _frame_budget(start: float, end: float, maximum: int) -> int:
-    desired = min(maximum, max(2, int(math.floor((end - start) * 2.0)) + 1))
+def _frame_budget(start: float, end: float, maximum: int, sample_fps: float = 2.0) -> int:
+    desired = min(maximum, max(2, int(math.floor((end - start) * sample_fps))))
     return max(2, desired - desired % 2)
 
 

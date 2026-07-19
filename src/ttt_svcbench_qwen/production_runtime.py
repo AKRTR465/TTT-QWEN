@@ -173,8 +173,8 @@ def _cache_stats(owner: object) -> dict[str, object]:
 
 
 @dataclass(frozen=True, slots=True)
-class CurrentChunkSpec:
-    """A lightweight, label-free description of exactly one current chunk."""
+class SupportChunkSpec:
+    """A lightweight, label-free description of exactly one bounded Support chunk."""
 
     chunk_id: str
     video_path: Path
@@ -187,7 +187,7 @@ class CurrentChunkSpec:
 
     def __post_init__(self) -> None:
         if not self.chunk_id or not self.video_path.is_file():
-            raise FileNotFoundError(f"current chunk video does not exist: {self.video_path}")
+            raise FileNotFoundError(f"Support chunk video does not exist: {self.video_path}")
         if (
             not math.isfinite(self.start_time)
             or not math.isfinite(self.end_time)
@@ -195,16 +195,82 @@ class CurrentChunkSpec:
             or self.end_time <= self.start_time
             or self.end_time > self.query_time + 1.0e-6
         ):
-            raise ValueError("current chunk must satisfy 0 <= start < end <= query_time")
+            raise ValueError("Support chunk must satisfy 0 <= start < end <= query_time")
         if self.maximum_frames < 2 or self.maximum_frames > 16:
-            raise ValueError("production current chunks permit 2..16 frames")
+            raise ValueError("production Support chunks permit 2..16 frames")
         if self.history_chunk_ids:
-            raise ValueError("a current chunk specification cannot carry historical chunks")
+            raise ValueError("a Support chunk specification cannot carry historical chunks")
+
+    @property
+    def observation_role(self) -> str:
+        return "support"
+
+    @property
+    def sample_fps(self) -> float | None:
+        return None
+
+    @property
+    def frame_sampling(self) -> str:
+        return "uniform"
+
+
+@dataclass(frozen=True, slots=True)
+class QueryObservationSpec:
+    """One causal Query observation; it is one feature set, never a history container."""
+
+    chunk_id: str
+    video_path: Path
+    start_time: float
+    end_time: float
+    maximum_frames: int
+    query_time: float
+    reset_soft_state: bool = False
+    history_chunk_ids: tuple[str, ...] = ()
+    sampling_fps: float = 2.0
+    sampling_policy: str = "llamafactory_uniform_cap"
+
+    def __post_init__(self) -> None:
+        if not self.chunk_id or not self.video_path.is_file():
+            raise FileNotFoundError(f"Query observation video does not exist: {self.video_path}")
+        if (
+            not math.isfinite(self.start_time)
+            or not math.isfinite(self.end_time)
+            or not math.isfinite(self.query_time)
+            or self.start_time < 0.0
+            or self.end_time <= self.start_time
+            or self.end_time > self.query_time + 1.0e-6
+        ):
+            raise ValueError("Query observation must satisfy 0 <= start < end <= query_time")
+        if self.maximum_frames < 2 or self.maximum_frames > 256 or self.maximum_frames % 2:
+            raise ValueError("production Query observations permit an even 2..256 frames")
+        if not math.isfinite(self.sampling_fps) or self.sampling_fps <= 0.0:
+            raise ValueError("Query sampling_fps must be finite and positive")
+        if self.sampling_policy != "llamafactory_uniform_cap":
+            raise ValueError("unsupported Query frame sampling policy")
+        if self.history_chunk_ids:
+            raise ValueError("a Query observation cannot carry historical feature sets")
+
+    @property
+    def observation_role(self) -> str:
+        return "query"
+
+    @property
+    def sample_fps(self) -> float:
+        return self.sampling_fps
+
+    @property
+    def frame_sampling(self) -> str:
+        return self.sampling_policy
+
+
+# Compatibility surface for existing Support-only callers and ablation tests.
+CurrentChunkSpec = SupportChunkSpec
+ObservationSpec = SupportChunkSpec | QueryObservationSpec
 
 
 @dataclass(frozen=True, slots=True)
 class CurrentChunkMaterialization:
-    spec: CurrentChunkSpec
+    spec: ObservationSpec
     frames: Tensor
     frame_timestamps: Tensor
     tubelet_timestamps: Tensor
@@ -221,6 +287,11 @@ class CurrentChunkMaterialization:
             raise ValueError("materialized current frame count must be even within [2, max]")
         if self.frame_timestamps.shape != (frame_count,):
             raise ValueError("current frame timestamps must align to frames")
+        if bool(
+            torch.any(self.frame_timestamps < self.spec.start_time - 1.0e-6)
+            or torch.any(self.frame_timestamps > self.spec.query_time + 1.0e-6)
+        ):
+            raise ValueError("materialized observation contains a frame outside its causal range")
         tubelets = frame_count // 2
         if (
             self.tubelet_timestamps.shape != (1, tubelets)
@@ -252,7 +323,7 @@ def _bind_runtime_query(
 class PreparedAnswerCPU:
     """CPU-only Query tensors safe to build in a DataLoader worker."""
 
-    spec: CurrentChunkSpec
+    spec: QueryObservationSpec
     base_input_ids: Tensor
     base_attention_mask: Tensor
     target_labels: AnswerTargetLabels
@@ -364,6 +435,35 @@ class ProductionVisualAudit:
         if not self.current_chunk_only or self.chunk.spec.history_chunk_ids:
             raise ValueError("production visual input must contain only the current chunk")
 
+    @property
+    def prepared_video_feature_count(self) -> int:
+        return 1
+
+    @property
+    def history_feature_set_count(self) -> int:
+        return self.token.history_feature_set_count
+
+    @property
+    def observation_role(self) -> str:
+        return self.chunk.spec.observation_role
+
+    @property
+    def selected_frame_count(self) -> int:
+        return int(self.chunk.frames.shape[0])
+
+    @property
+    def visual_token_count(self) -> int:
+        return sum(self.token.merged_token_counts)
+
+    @property
+    def timestamp_range(self) -> tuple[float, float]:
+        timestamps = self.chunk.frame_timestamps
+        return float(timestamps[0].item()), float(timestamps[-1].item())
+
+    @property
+    def video_grid_thw(self) -> tuple[int, int, int]:
+        return tuple(int(value) for value in self.chunk.video_grid_thw[0].tolist())
+
 
 def _identity_chunk(value: object) -> CurrentChunkMaterialization:
     return cast(CurrentChunkMaterialization, value)
@@ -379,6 +479,7 @@ class VideoChunkMaterializer:
         minimum_pixels: int,
         maximum_pixels: int,
         preprocess_cache: PreprocessCache | None = None,
+        cache_query_visuals: bool = True,
         prefetch_depth: int = 2,
         decode_coalesce: bool = True,
     ) -> None:
@@ -391,20 +492,23 @@ class VideoChunkMaterializer:
         self.maximum_pixels = maximum_pixels
         self.processor = QwenVideoPreprocessor(config)
         self.preprocess_cache = preprocess_cache
+        if type(cache_query_visuals) is not bool:
+            raise TypeError("cache_query_visuals must be bool")
+        self.cache_query_visuals = cache_query_visuals
         self.prefetch_depth = prefetch_depth
         self.decode_coalesce = decode_coalesce
         self._source_dataset = "runtime"
         self._executor: ThreadPoolExecutor | None = None
         self._pending_queue: deque[
             tuple[
-                CurrentChunkSpec,
+                SupportChunkSpec,
                 Future[Any],
                 Callable[[object], CurrentChunkMaterialization],
             ]
         ] = deque()
-        self._remaining_specs: deque[CurrentChunkSpec] = deque()
+        self._remaining_specs: deque[SupportChunkSpec] = deque()
 
-    def __call__(self, spec: CurrentChunkSpec) -> CurrentChunkMaterialization:
+    def __call__(self, spec: ObservationSpec) -> CurrentChunkMaterialization:
         if self._pending_queue:
             expected, future, resolver = self._pending_queue[0]
             if expected != spec:
@@ -423,7 +527,7 @@ class VideoChunkMaterializer:
         return self._materialize(spec)
 
     def begin_prefetch(
-        self, specs: Sequence[CurrentChunkSpec], *, source_dataset: str | None = None
+        self, specs: Sequence[SupportChunkSpec], *, source_dataset: str | None = None
     ) -> None:
         """Start a bounded sequence while preserving strict consumption order."""
 
@@ -479,9 +583,7 @@ class VideoChunkMaterializer:
                     def resolve_group(
                         value: object, chunk_id: str = chunk_id
                     ) -> CurrentChunkMaterialization:
-                        return cast(
-                            dict[str, CurrentChunkMaterialization], value
-                        )[chunk_id]
+                        return cast(dict[str, CurrentChunkMaterialization], value)[chunk_id]
 
                     self._pending_queue.append(
                         (
@@ -495,29 +597,34 @@ class VideoChunkMaterializer:
                 future = self._executor.submit(self._materialize, spec)
                 self._pending_queue.append((spec, future, _identity_chunk))
 
-    def _materialize(self, spec: CurrentChunkSpec) -> CurrentChunkMaterialization:
+    def _materialize(self, spec: ObservationSpec) -> CurrentChunkMaterialization:
         started = time.perf_counter()
         fingerprint = self._fingerprint(spec)
-        if self.preprocess_cache is not None:
-            cached = self.preprocess_cache.get(fingerprint)
+        cache = self._cache_for(spec)
+        if cache is not None:
+            cached = cache.get(fingerprint)
             if cached is not None:
                 _loader_trace(
-                    "support_cache_hit",
+                    f"{spec.observation_role}_cache_hit",
                     chunk_id=spec.chunk_id,
                     seconds=time.perf_counter() - started,
                 )
                 return self._from_cached(spec, cached)
-        _loader_trace("support_cache_miss", chunk_id=spec.chunk_id)
+        _loader_trace(f"{spec.observation_role}_cache_miss", chunk_id=spec.chunk_id)
         decode_started = time.perf_counter()
-        frames, timestamps = _decode_uniform_interval(
-            spec, self.config.video_preprocessing.sample_fps
-        )
+        frames, timestamps = _decode_uniform_interval(spec, _sample_fps_for(spec, self.config))
         _loader_trace(
             "decode",
             chunk_id=spec.chunk_id,
             seconds=time.perf_counter() - decode_started,
         )
-        materialized = self._materialize_decoded(spec, frames, timestamps, fingerprint)
+        materialized = self._materialize_decoded(
+            spec,
+            frames,
+            timestamps,
+            fingerprint,
+            cache=cache,
+        )
         _loader_trace(
             "support_materialize_done",
             chunk_id=spec.chunk_id,
@@ -526,7 +633,7 @@ class VideoChunkMaterializer:
         return materialized
 
     def _materialize_group(
-        self, specs: tuple[CurrentChunkSpec, ...]
+        self, specs: tuple[SupportChunkSpec, ...]
     ) -> dict[str, CurrentChunkMaterialization]:
         """Decode one same-video Support group with a single PyAV container."""
 
@@ -536,7 +643,7 @@ class VideoChunkMaterializer:
         if len({spec.video_path for spec in specs}) != 1:
             raise ValueError("coalesced Support group must contain one video path")
         results: dict[str, CurrentChunkMaterialization] = {}
-        misses: list[tuple[CurrentChunkSpec, PreprocessFingerprint]] = []
+        misses: list[tuple[SupportChunkSpec, PreprocessFingerprint]] = []
         for spec in specs:
             fingerprint = self._fingerprint(spec)
             cached = self.preprocess_cache.get(fingerprint) if self.preprocess_cache else None
@@ -581,10 +688,12 @@ class VideoChunkMaterializer:
 
     def _materialize_decoded(
         self,
-        spec: CurrentChunkSpec,
+        spec: ObservationSpec,
         frames: Tensor,
         timestamps: Tensor,
         fingerprint: PreprocessFingerprint,
+        *,
+        cache: PreprocessCache | None = None,
     ) -> CurrentChunkMaterialization:
         processor_started = time.perf_counter()
         frames = _resize_to_pixel_budget(
@@ -601,7 +710,7 @@ class VideoChunkMaterializer:
         tubelet_times = timestamps.reshape(-1, 2).amax(dim=1).unsqueeze(0)
         positions = _strict_tubelet_positions(
             tubelet_times[0],
-            sample_fps=self.config.video_preprocessing.sample_fps,
+            sample_fps=_sample_fps_for(spec, self.config),
         ).unsqueeze(0)
         materialized = CurrentChunkMaterialization(
             spec=spec,
@@ -613,11 +722,17 @@ class VideoChunkMaterializer:
             pixel_values_videos=processed.flatten_for_qwen(),
             video_grid_thw=processed.video_grid_thw,
         )
-        if self.preprocess_cache is not None and self.preprocess_cache.writable:
-            self.preprocess_cache.put(fingerprint, _cached_from_materialized(materialized))
+        target_cache = self._cache_for(spec) if cache is None else cache
+        if target_cache is not None and target_cache.writable:
+            target_cache.put(fingerprint, _cached_from_materialized(materialized))
         return materialized
 
-    def _fingerprint(self, spec: CurrentChunkSpec) -> PreprocessFingerprint:
+    def _cache_for(self, spec: ObservationSpec) -> PreprocessCache | None:
+        if isinstance(spec, QueryObservationSpec) and not self.cache_query_visuals:
+            return None
+        return self.preprocess_cache
+
+    def _fingerprint(self, spec: ObservationSpec) -> PreprocessFingerprint:
         return _build_preprocess_fingerprint(
             spec,
             config=self.config,
@@ -627,7 +742,7 @@ class VideoChunkMaterializer:
         )
 
     @staticmethod
-    def _from_cached(spec: CurrentChunkSpec, cached: CachedChunk) -> CurrentChunkMaterialization:
+    def _from_cached(spec: ObservationSpec, cached: CachedChunk) -> CurrentChunkMaterialization:
         return _materialized_from_cached(spec, cached)
 
 
@@ -677,12 +792,12 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
                 prepared_video_features=raw.prepared_video_features,
                 audit=ProductionVisualAudit(raw.source, token_audit),
             )
-        if isinstance(raw, CurrentChunkSpec):
+        if isinstance(raw, (SupportChunkSpec, QueryObservationSpec)):
             chunk = self.materializer(raw)
         elif isinstance(raw, CurrentChunkMaterialization):
             chunk = raw
         else:
-            raise TypeError("visual runtime accepts one CurrentChunkSpec/materialization only")
+            raise TypeError("visual runtime accepts one observation spec/materialization only")
         device = _module_device(self.qwen)
         h2d_started = time.perf_counter()
         pixels = chunk.pixel_values_videos.to(device=device, non_blocking=True)
@@ -1180,7 +1295,7 @@ class ProductionObservationRuntime(nn.Module):  # type: ignore[misc]
         raw_chunk = _current_chunk_input(request.video_input)
         reset = (
             raw_chunk.reset_soft_state
-            if isinstance(raw_chunk, CurrentChunkSpec)
+            if isinstance(raw_chunk, (SupportChunkSpec, QueryObservationSpec))
             else raw_chunk.spec.reset_soft_state
         )
         empty = (None,) * len(request.owner.video_ids)
@@ -1315,6 +1430,7 @@ class A2PrefetchCollator:
         processor: object,
         tokenizer: object,
         config: ProjectConfig,
+        ttt_config: ProductionTTTConfig,
         minimum_pixels: int,
         maximum_pixels: int,
         preprocess_cache: PreprocessCache | None = None,
@@ -1325,6 +1441,7 @@ class A2PrefetchCollator:
         self.processor = processor
         self.tokenizer = tokenizer
         self.config = config
+        self.ttt_config = ttt_config
         self.minimum_pixels = minimum_pixels
         self.maximum_pixels = maximum_pixels
         self.preprocess_cache = preprocess_cache
@@ -1339,6 +1456,7 @@ class A2PrefetchCollator:
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
+            cache_query_visuals=ttt_config.query_cache_mode == "inherit",
             prefetch_depth=1,
             decode_coalesce=False,
         )
@@ -1354,6 +1472,7 @@ class A2PrefetchCollator:
             video_path,
             record.query.runtime.query_time,
             reset_soft_state=False,
+            config=self.ttt_config,
         )
         answer = _prepare_answer_cpu(
             record.query,
@@ -1363,7 +1482,9 @@ class A2PrefetchCollator:
             config=self.config,
             minimum_pixels=self.minimum_pixels,
             maximum_pixels=self.maximum_pixels,
-            preprocess_cache=self.preprocess_cache,
+            preprocess_cache=(
+                self.preprocess_cache if self.ttt_config.query_cache_mode == "inherit" else None
+            ),
             source_dataset=record.source_dataset,
         )
         supports: tuple[CurrentChunkMaterialization, ...] = ()
@@ -1397,6 +1518,7 @@ class A5PrefetchCollator:
         processor: object,
         tokenizer: object,
         config: ProjectConfig,
+        ttt_config: ProductionTTTConfig,
         minimum_pixels: int,
         maximum_pixels: int,
         preprocess_cache: PreprocessCache | None = None,
@@ -1405,6 +1527,7 @@ class A5PrefetchCollator:
         self.processor = processor
         self.tokenizer = tokenizer
         self.config = config
+        self.ttt_config = ttt_config
         self.minimum_pixels = minimum_pixels
         self.maximum_pixels = maximum_pixels
         self.preprocess_cache = preprocess_cache
@@ -1423,6 +1546,7 @@ class A5PrefetchCollator:
                 video_path,
                 query.runtime.query_time,
                 reset_soft_state=index > 0 and query.runtime.question != primary.question,
+                config=self.ttt_config,
             )
             answers.append(
                 _prepare_answer_cpu(
@@ -1433,7 +1557,11 @@ class A5PrefetchCollator:
                     config=self.config,
                     minimum_pixels=self.minimum_pixels,
                     maximum_pixels=self.maximum_pixels,
-                    preprocess_cache=self.preprocess_cache,
+                    preprocess_cache=(
+                        self.preprocess_cache
+                        if self.ttt_config.query_cache_mode == "inherit"
+                        else None
+                    ),
                     source_dataset=record.source_dataset,
                 )
             )
@@ -1456,6 +1584,7 @@ class ProductionEpisodeMaterializer:
     ) -> None:
         self.backbone = backbone
         self.config = backbone.project_config
+        self.ttt_config = backbone.ttt_config
         self.writer = writer
         self.video = video
         self.tokenizer = backbone.tokenizer
@@ -1476,6 +1605,7 @@ class ProductionEpisodeMaterializer:
             video_path,
             record.query.runtime.query_time,
             reset_soft_state=False,
+            config=self.ttt_config,
         )
         prepared_answer = source.answer
         if prepared_answer.spec != query_chunk:
@@ -1557,6 +1687,7 @@ class ProductionEpisodeMaterializer:
                 video_path,
                 query.runtime.query_time,
                 reset_soft_state=index > 0 and query.runtime.question != primary.question,
+                config=self.ttt_config,
             )
             prepared_answer = prepared.query_answers[index]
             if prepared_answer.spec != spec:
@@ -1809,9 +1940,7 @@ class ProductionA2LossStep:
             for request in model_inputs.observation_requests
             if isinstance(request.video_input, CurrentChunkSpec)
         )
-        self.materializer.video.begin_prefetch(
-            support_specs, source_dataset=record.source_dataset
-        )
+        self.materializer.video.begin_prefetch(support_specs, source_dataset=record.source_dataset)
         try:
             raw = self.runner(batch, training=True)
         finally:
@@ -2002,6 +2131,7 @@ def build_runtime(
         minimum_pixels=minimum_pixels,
         maximum_pixels=maximum_pixels,
         preprocess_cache=preprocess_cache,
+        cache_query_visuals=config.query_cache_mode == "inherit",
         prefetch_depth=support_prefetch_depth,
         decode_coalesce=support_decode_coalesce,
     )
@@ -2046,6 +2176,7 @@ def build_runtime(
             processor=backbone.processor,
             tokenizer=backbone.tokenizer,
             config=project,
+            ttt_config=config,
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
@@ -2064,6 +2195,7 @@ def build_runtime(
             variant=StageAVariant.A2,
             metric_builder=lambda _output, _supervision: ((), ()),
             query_encoder_reuse=config.query_encoder_reuse,
+            query_activation_offload=config.query_activation_offload,
         )
         return ProductionTrainerRuntime(
             stage=stage,
@@ -2087,6 +2219,7 @@ def build_runtime(
         processor=backbone.processor,
         tokenizer=backbone.tokenizer,
         config=project,
+        ttt_config=config,
         minimum_pixels=minimum_pixels,
         maximum_pixels=maximum_pixels,
         preprocess_cache=preprocess_cache,
@@ -2102,6 +2235,7 @@ def build_runtime(
         query_encoder_reuse=config.query_encoder_reuse,
         raw_support_visual_batcher=qwen_runtime.prepare_raw_support_batch,
         support_visual_batch_size=config.support_visual_batch_size,
+        query_activation_offload=config.query_activation_offload,
     )
     return ProductionTrainerRuntime(
         stage=stage,
@@ -2136,6 +2270,8 @@ def build_inference_runtime_bundle(
     device: str | torch.device,
     dtype: torch.dtype,
     config_path: str | Path = "configs/model_state_ttt_8b.yaml",
+    minimum_pixels: int = 16 * 16,
+    maximum_pixels: int = 131_072,
 ) -> StateTTTRuntimeBundle:
     """Load local Qwen assets and assemble the sole online State-TTT runtime."""
 
@@ -2171,8 +2307,9 @@ def build_inference_runtime_bundle(
     )
     materializer = VideoChunkMaterializer(
         config,
-        minimum_pixels=16 * 16,
-        maximum_pixels=262_144,
+        minimum_pixels=minimum_pixels,
+        maximum_pixels=maximum_pixels,
+        cache_query_visuals=False,
     )
     qwen_runtime = ProductionQwenRuntime(qwen, materializer, tokenizer)
     query_runtime = ProductionQueryRuntime(build_query_encoder(config), tokenizer, qwen_model)
@@ -2196,9 +2333,7 @@ def build_inference_runtime_bundle(
             state_bank=state_bank,
             bank_writer=writer,
             retriever=build_state_retriever(config),
-            reader=ProductionReaderRuntime(
-                build_state_reader(config, cast(Any, tokenizer))
-            ),
+            reader=ProductionReaderRuntime(build_state_reader(config, cast(Any, tokenizer))),
             resampler=build_state_resampler(config),
         ),
         ModelFeatureFlags(),
@@ -2236,9 +2371,8 @@ def _stage_inputs(
     query: QueryEncoderOutput,
     request: ObservationChunkRequest,
 ) -> tuple[QwenVisualOutput, CurrentChunkMaterialization, QueryEncoderOutput, BatchRuntimeState]:
-    if (
-        not isinstance(visual.value, QwenVisualOutput)
-        or not isinstance(visual.audit, ProductionVisualAudit)
+    if not isinstance(visual.value, QwenVisualOutput) or not isinstance(
+        visual.audit, ProductionVisualAudit
     ):
         raise TypeError("production state stages require a typed current visual output")
     return visual.value, visual.audit.chunk, query, _stage_runtime(request)
@@ -2246,8 +2380,11 @@ def _stage_inputs(
 
 def _current_chunk_input(
     value: object,
-) -> CurrentChunkSpec | CurrentChunkMaterialization:
-    if isinstance(value, (CurrentChunkSpec, CurrentChunkMaterialization)):
+) -> ObservationSpec | CurrentChunkMaterialization:
+    if isinstance(
+        value,
+        (SupportChunkSpec, QueryObservationSpec, CurrentChunkMaterialization),
+    ):
         return value
     if isinstance(value, PreparedVisualChunk) and isinstance(
         value.source,
@@ -2329,25 +2466,28 @@ def _query_chunk_spec(
     query_time: float,
     *,
     reset_soft_state: bool,
-) -> CurrentChunkSpec:
+    config: ProductionTTTConfig,
+) -> QueryObservationSpec:
     end = query_time
-    start = max(0.0, end - 8.0)
+    start = 0.0 if config.query_visual_mode == "causal_prefix" else max(0.0, end - 8.0)
     if end <= start:
-        raise ValueError("Query point is too early to materialize a current video chunk")
-    return CurrentChunkSpec(
+        raise ValueError("Query point is too early to materialize a causal observation")
+    return QueryObservationSpec(
         chunk_id=chunk_id,
         video_path=video_path,
         start_time=start,
         end_time=end,
-        maximum_frames=16,
+        maximum_frames=config.query_max_frames,
         query_time=query_time,
         reset_soft_state=reset_soft_state,
+        sampling_fps=config.query_sample_fps,
+        sampling_policy=config.query_frame_sampling,
     )
 
 
 def _prepare_answer_cpu(
     query: ProductionQueryRecord,
-    spec: CurrentChunkSpec,
+    spec: QueryObservationSpec,
     *,
     processor: object,
     tokenizer: object,
@@ -2382,7 +2522,7 @@ def _prepare_answer_cpu(
         _loader_trace("query_cache_hit", query_id=query.runtime.query_id)
     else:
         _loader_trace("query_cache_miss", query_id=query.runtime.query_id)
-        frames, timestamps = _decode_uniform_interval(spec, config.video_preprocessing.sample_fps)
+        frames, timestamps = _decode_uniform_interval(spec, spec.sampling_fps)
         frames = _resize_to_pixel_budget(
             frames,
             minimum_pixels=minimum_pixels,
@@ -2452,7 +2592,7 @@ def _prepare_answer_cpu(
 
 
 def _build_preprocess_fingerprint(
-    spec: CurrentChunkSpec,
+    spec: ObservationSpec,
     *,
     config: ProjectConfig,
     minimum_pixels: int,
@@ -2473,13 +2613,15 @@ def _build_preprocess_fingerprint(
         start_time=spec.start_time,
         end_time=spec.end_time,
         maximum_frames=spec.maximum_frames,
-        sample_fps=config.video_preprocessing.sample_fps,
+        sample_fps=_sample_fps_for(spec, config),
         minimum_pixels=minimum_pixels,
         maximum_pixels=maximum_pixels,
         patch_size=config.video_preprocessing.patch_size,
         temporal_patch_size=config.video_preprocessing.temporal_patch_size,
         spatial_merge_size=config.video_preprocessing.spatial_merge_size,
         transformers_version=transformers.__version__,
+        observation_role=spec.observation_role,
+        frame_sampling=spec.frame_sampling,
     )
 
 
@@ -2551,7 +2693,7 @@ def _prepared_a2_record_bytes(
 
 
 def _materialized_from_cached(
-    spec: CurrentChunkSpec, cached: CachedChunk
+    spec: ObservationSpec, cached: CachedChunk
 ) -> CurrentChunkMaterialization:
     return CurrentChunkMaterialization(
         spec=spec,
@@ -2566,7 +2708,7 @@ def _materialized_from_cached(
 
 
 def _build_materialized_query(
-    spec: CurrentChunkSpec,
+    spec: QueryObservationSpec,
     frames: Tensor,
     timestamps: Tensor,
     pixels: Tensor,
@@ -2585,7 +2727,7 @@ def _build_materialized_query(
         tubelet_timestamps=tubelet_times.unsqueeze(0),
         tubelet_valid_mask=torch.ones((1, frames.shape[0] // 2), dtype=torch.bool),
         tubelet_position_ids=_strict_tubelet_positions(
-            tubelet_times, sample_fps=config.video_preprocessing.sample_fps
+            tubelet_times, sample_fps=_sample_fps_for(spec, config)
         ).unsqueeze(0),
         pixel_values_videos=pixels,
         video_grid_thw=grid.to(torch.int64),
@@ -2662,9 +2804,7 @@ def _expand_qwen_video_placeholders(
         raise ValueError("Qwen video placeholder expansion received no frame timestamps")
     timestamps = (timestamps + [timestamps[-1]] * temporal)[:temporal]
     placeholder = "".join(
-        f"<{float(t):.1f} seconds>{vision_start}"
-        + ("<|placeholder|>" * frame_seqlen)
-        + vision_end
+        f"<{float(t):.1f} seconds>{vision_start}" + ("<|placeholder|>" * frame_seqlen) + vision_end
         for t in timestamps
     )
     wrapped = f"{vision_start}{video_token}{vision_end}"
@@ -2752,23 +2892,23 @@ def _module_device(module: nn.Module) -> torch.device:
     return parameter.device
 
 
+def _sample_fps_for(spec: ObservationSpec, config: ProjectConfig) -> float:
+    return (
+        spec.sampling_fps
+        if isinstance(spec, QueryObservationSpec)
+        else config.video_preprocessing.sample_fps
+    )
+
+
 def _decode_uniform_interval(
-    spec: CurrentChunkSpec,
+    spec: ObservationSpec,
     sample_fps: float,
 ) -> tuple[Tensor, Tensor]:
-    desired = min(
-        spec.maximum_frames,
-        max(2, int(math.floor((spec.end_time - spec.start_time) * sample_fps)) + 1),
+    target_times = (
+        _llamafactory_query_target_times(spec, sample_fps)
+        if isinstance(spec, QueryObservationSpec)
+        else _uniform_target_times(spec, sample_fps)
     )
-    desired -= desired % 2
-    if desired < 2:
-        raise ValueError(f"current chunk {spec.chunk_id} has no complete temporal tubelet")
-    target_times = torch.linspace(
-        spec.start_time,
-        spec.end_time,
-        desired,
-        dtype=torch.float64,
-    ).tolist()
     # Re-seeking for every target is efficient for a 2,048-second geometric interval but very
     # expensive for the overlapping 8-second recent windows (up to 16 keyframe seeks instead of
     # one short scan).  Stream short intervals once; retain target frames only, so residency is
@@ -2807,7 +2947,7 @@ def _decode_uniform_interval(
 
 
 def _decode_coalesced_intervals(
-    specs: tuple[CurrentChunkSpec, ...], sample_fps: float
+    specs: tuple[SupportChunkSpec, ...], sample_fps: float
 ) -> dict[str, tuple[Tensor, Tensor]]:
     """Decode multiple overlapping intervals from one PyAV demux pass.
 
@@ -2825,9 +2965,7 @@ def _decode_coalesced_intervals(
     frame_map: dict[str, list[Tensor]] = {spec.chunk_id: [] for spec in specs}
     time_map: dict[str, list[float]] = {spec.chunk_id: [] for spec in specs}
     next_target = {spec.chunk_id: 0 for spec in specs}
-    last_candidate: dict[str, tuple[Any, float] | None] = {
-        spec.chunk_id: None for spec in specs
-    }
+    last_candidate: dict[str, tuple[Any, float] | None] = {spec.chunk_id: None for spec in specs}
     min_start = min(spec.start_time for spec in specs)
     max_end = max(spec.end_time for spec in specs)
     with av.open(str(path)) as container:
@@ -2861,10 +2999,7 @@ def _decode_coalesced_intervals(
                     converted = _rgb_frame_tensor(frame)
                 frame_map[key].append(converted)
                 time_map[key].append(timestamp)
-                while (
-                    target_index < len(targets)
-                    and timestamp + 1.0e-9 >= targets[target_index]
-                ):
+                while target_index < len(targets) and timestamp + 1.0e-9 >= targets[target_index]:
                     target_index += 1
                 next_target[key] = target_index
     for spec in specs:
@@ -2889,10 +3024,10 @@ def _decode_coalesced_intervals(
     }
 
 
-def _uniform_target_times(spec: CurrentChunkSpec, sample_fps: float) -> list[float]:
+def _uniform_target_times(spec: ObservationSpec, sample_fps: float) -> list[float]:
     desired = min(
         spec.maximum_frames,
-        max(2, int(math.floor((spec.end_time - spec.start_time) * sample_fps)) + 1),
+        max(2, int(math.floor((spec.end_time - spec.start_time) * sample_fps))),
     )
     desired -= desired % 2
     if desired < 2:
@@ -2903,8 +3038,73 @@ def _uniform_target_times(spec: CurrentChunkSpec, sample_fps: float) -> list[flo
     )
 
 
+def _llamafactory_uniform_frame_indices(
+    *,
+    total_frames: int,
+    duration: float,
+    video_fps: float,
+    video_maxlen: int,
+) -> tuple[int, ...]:
+    """Mirror LLaMA-Factory commit 523f801 ``_get_video_sample_indices`` exactly."""
+
+    if total_frames < 0 or video_maxlen <= 0:
+        raise ValueError("LLaMA-Factory frame counts/cap must be non-negative and positive")
+    if not math.isfinite(duration) or duration < 0.0:
+        raise ValueError("LLaMA-Factory sampling duration must be finite and non-negative")
+    if not math.isfinite(video_fps) or video_fps <= 0.0:
+        raise ValueError("LLaMA-Factory sampling FPS must be finite and positive")
+    if total_frames == 0:
+        return tuple(range(video_maxlen))
+    sample_frames = max(1, math.floor(duration * video_fps))
+    sample_frames = min(total_frames, video_maxlen, sample_frames)
+    return tuple(
+        int(value) for value in torch.linspace(0, total_frames - 1, sample_frames).tolist()
+    )
+
+
+def _llamafactory_query_target_times(
+    spec: QueryObservationSpec,
+    sample_fps: float,
+) -> list[float]:
+    """Map LLaMA-Factory's uniform frame indices onto one causal source-video interval."""
+
+    try:
+        with av.open(str(spec.video_path)) as container:
+            stream = container.streams.video[0]
+            rate = stream.average_rate or stream.base_rate or stream.guessed_rate
+            source_fps = float(rate) if rate is not None else 0.0
+            total_source_frames = int(stream.frames or 0)
+    except (OSError, ValueError, TypeError, IndexError, av.error.FFmpegError):
+        source_fps = 0.0
+        total_source_frames = 0
+    if source_fps <= 0.0 or not math.isfinite(source_fps) or total_source_frames <= 0:
+        return _uniform_target_times(spec, sample_fps)
+
+    first_index = max(0, int(math.ceil(spec.start_time * source_fps - 1.0e-9)))
+    stop_index = min(
+        total_source_frames,
+        max(first_index + 1, int(math.floor(spec.end_time * source_fps + 1.0e-9))),
+    )
+    available = stop_index - first_index
+    if available <= 0:
+        return [spec.start_time]
+    relative = _llamafactory_uniform_frame_indices(
+        total_frames=available,
+        duration=spec.end_time - spec.start_time,
+        video_fps=sample_fps,
+        video_maxlen=spec.maximum_frames,
+    )
+    # Qwen temporal patches require pairs. Preserve the full temporal span by recomputing an
+    # even uniform grid; only a truly single-frame causal prefix is duplicated after decoding.
+    if len(relative) > 1 and len(relative) % 2:
+        relative = tuple(
+            int(value) for value in torch.linspace(0, available - 1, len(relative) - 1).tolist()
+        )
+    return [min(spec.query_time, (first_index + index) / source_fps) for index in relative]
+
+
 def _finalize_decoded_frames(
-    frames: list[Tensor], timestamps: list[float], spec: CurrentChunkSpec
+    frames: list[Tensor], timestamps: list[float], spec: ObservationSpec
 ) -> tuple[list[Tensor], list[float]]:
     if not frames:
         raise ValueError(f"current chunk {spec.chunk_id} contains no causal decoded frame")
@@ -2929,7 +3129,7 @@ class _TargetSeekUnavailable(RuntimeError):
 
 
 def _decode_targets_with_seek(
-    spec: CurrentChunkSpec,
+    spec: ObservationSpec,
     target_times: Sequence[float],
 ) -> tuple[list[Tensor], list[float]]:
     """Decode nearest unique frames around target timestamps with bounded residency.
@@ -3008,7 +3208,7 @@ def _decode_nearest_seek_target(
 
 
 def _decode_targets_streaming(
-    spec: CurrentChunkSpec,
+    spec: ObservationSpec,
     target_times: Sequence[float],
 ) -> tuple[list[Tensor], list[float]]:
     """Memory-bounded streaming decoder for media without reliable random access."""
@@ -3116,6 +3316,8 @@ __all__ = [
     "A5PrefetchCollator",
     "CurrentChunkMaterialization",
     "CurrentChunkSpec",
+    "QueryObservationSpec",
+    "SupportChunkSpec",
     "PreparedA2Record",
     "PreparedA5Record",
     "PreparedAnswerCPU",
