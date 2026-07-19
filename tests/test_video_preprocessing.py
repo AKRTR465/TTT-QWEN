@@ -81,7 +81,7 @@ def test_real_tiny_video_is_sampled_and_cut_before_future_frames(tmp_path: Path)
     assert torch.all(decoded.timestamps <= 1.0)
 
 
-def test_support_materializer_prefetches_exactly_one_chunk_ahead(tmp_path: Path) -> None:
+def test_support_materializer_prefetches_in_order_with_bounded_queue(tmp_path: Path) -> None:
     path = tmp_path / "placeholder.mp4"
     path.touch()
     specs = tuple(
@@ -96,9 +96,10 @@ def test_support_materializer_prefetches_exactly_one_chunk_ahead(tmp_path: Path)
         for index in range(3)
     )
     materializer = VideoChunkMaterializer.__new__(VideoChunkMaterializer)
+    materializer.prefetch_depth = 2
+    materializer.decode_coalesce = False
     materializer._executor = None
-    materializer._pending_future = None
-    materializer._pending_spec = None
+    materializer._pending_queue = deque()
     materializer._remaining_specs = deque()
     calls: list[str] = []
 
@@ -109,13 +110,13 @@ def test_support_materializer_prefetches_exactly_one_chunk_ahead(tmp_path: Path)
     materializer._materialize = fake_materialize  # type: ignore[method-assign]
     try:
         materializer.begin_prefetch(specs)
-        assert materializer._pending_spec == specs[0]
+        assert [entry[0] for entry in materializer._pending_queue] == list(specs[:2])
         assert materializer(specs[0]) == specs[0]
-        assert materializer._pending_spec == specs[1]
+        assert [entry[0] for entry in materializer._pending_queue] == list(specs[1:3])
         assert materializer(specs[1]) == specs[1]
-        assert materializer._pending_spec == specs[2]
+        assert [entry[0] for entry in materializer._pending_queue] == [specs[2]]
         assert materializer(specs[2]) == specs[2]
-        assert materializer._pending_spec is None
+        assert not materializer._pending_queue
         assert calls == [spec.chunk_id for spec in specs]
     finally:
         materializer.end_prefetch()

@@ -25,7 +25,7 @@ template: qwen3_vl_nothink
 cutoff_len: 4096
 packing: false
 preprocessing_num_workers: 1
-dataloader_num_workers: 1
+dataloader_num_workers: 2
 dataloader_prefetch_factor: 2
 dataloader_persistent_workers: true
 dataloader_pin_memory: true
@@ -71,7 +71,12 @@ ttt_qwen:
   weak_supervision_provenance: official_weak
   visual_length_bucketing: distributed_task_support_then_visual
   visual_length_proxy: causal_frame_budget_then_decode_rate
-  support_prefetch_depth: 1
+  support_prefetch_depth: 2
+  support_decode_coalesce: true
+  preprocess_cache_enabled: true
+  preprocess_cache_root_env: TTT_PREPROCESS_CACHE_ROOT
+  preprocess_cache_max_gb: 200
+  preprocess_cache_dtype: float32
   loss_terms: [state, answer]
   checkpoint_selection: final_epoch
   exclude_checkpoint_state:

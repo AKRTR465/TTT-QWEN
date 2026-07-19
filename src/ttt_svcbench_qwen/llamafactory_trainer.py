@@ -12,7 +12,7 @@ import math
 import os
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -32,6 +32,7 @@ from ttt_svcbench_qwen.episode_data import (
     ManifestStage,
     build_production_train_sampler,
     load_production_manifest_views,
+    load_visual_cost_index,
 )
 from ttt_svcbench_qwen.meta_trainer import (
     MetaTTTEpisode,
@@ -273,7 +274,12 @@ class TTTQwenTrainerMixin:
         def distributed_backward(loss: Tensor) -> None:
             backward_controller.backward(loss * loss_weight)
 
-        output = runner.run_truncated(episode, backward=distributed_backward)
+        end_prefetch = getattr(adapter, "end_prefetch", None)
+        try:
+            output = runner.run_truncated(episode, backward=distributed_backward)
+        finally:
+            if callable(end_prefetch):
+                end_prefetch()
         if output.audit.backward_count != expected_segments:
             raise RuntimeError("A5 backward collective count drifted from its segment bucket")
         backward_controller.finalize()
@@ -359,6 +365,10 @@ def main(argv: list[str] | None = None) -> int:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
     )
+    visual_cost_index: Mapping[str, Sequence[int]] | None = None
+    raw_cost_index = backbone.ttt_config.get("visual_cost_index")
+    if isinstance(raw_cost_index, str) and raw_cost_index:
+        visual_cost_index = load_visual_cost_index(raw_cost_index)
     checkpoint_audit: OuterCheckpointAudit | None = None
     if configured_stage is ProductionStage.A5 and same_stage_resume is None:
         checkpoint = backbone.ttt_config.get("initialize_from_a2_checkpoint")
@@ -371,7 +381,14 @@ def main(argv: list[str] | None = None) -> int:
             backbone,
             configured_stage,
         ),
-        train_sampler_factory=build_production_train_sampler,
+        train_sampler_factory=(
+            lambda dataset, rank, world_size: build_production_train_sampler(
+                dataset,
+                rank,
+                world_size,
+                visual_cost_index=visual_cost_index,
+            )
+        ),
     )
     parameter_audit = _audit_outer_parameters(backbone, runtime_raw)
     audit_outer_checkpoint_boundary(runtime_raw.model)

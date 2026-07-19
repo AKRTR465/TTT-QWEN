@@ -1409,7 +1409,11 @@ class MetaTTTEpisodeRunner:
                     supervision=query.supervision,
                 )
                 before_answer = compute_answer_loss(before_inputs.answer)
-                before_state = compute_state_loss(before_inputs.state)
+                before_state = (
+                    before_inputs.state
+                    if isinstance(before_inputs.state, OfficialWeakStateLossOutput)
+                    else compute_state_loss(before_inputs.state)
+                )
                 before_metrics = _query_metrics(before_answer, before_state)
             query_objectives.append(after_objective)
             query_audits.append(

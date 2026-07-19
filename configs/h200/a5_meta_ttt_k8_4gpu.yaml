@@ -18,7 +18,10 @@ template: qwen3_vl_nothink
 cutoff_len: 4096
 packing: false
 preprocessing_num_workers: 1
-dataloader_num_workers: 0
+dataloader_num_workers: 2
+dataloader_prefetch_factor: 2
+dataloader_persistent_workers: true
+dataloader_pin_memory: true
 data_shared_file_system: true
 remove_unused_columns: false
 
@@ -72,6 +75,12 @@ ttt_qwen:
   bucket_key: tbptt_segment_count
   world_size: 4
   deterministic_zero_weight_padding: true
+  support_prefetch_depth: 2
+  support_decode_coalesce: true
+  preprocess_cache_enabled: true
+  preprocess_cache_root_env: TTT_PREPROCESS_CACHE_ROOT
+  preprocess_cache_max_gb: 200
+  preprocess_cache_dtype: float32
   optimizer_step_scope: episode
   checkpoint_selection: final_epoch
   checkpoint_every_epochs: 1
