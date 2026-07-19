@@ -7,11 +7,14 @@ Forbidden: deriving dense labels from an answer, final count, occurrence times, 
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
 import torch
 from torch import Tensor
+from torch.nn import functional as F
 
 from ttt_svcbench_qwen.losses import (
     E1StateTarget,
@@ -28,7 +31,9 @@ from ttt_svcbench_qwen.query_encoder import (
     OPERATOR_TO_HEAD_TYPE,
     OPERATORS,
     TIME_MODES,
+    Operator,
     QueryEncoderOutput,
+    TimeWindowMode,
 )
 from ttt_svcbench_qwen.state_bank import HeadType
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
@@ -38,6 +43,7 @@ class TargetProvenance(StrEnum):
     """The complete and intentionally closed set of Stage A label origins."""
 
     OFFICIAL_EXPLICIT = "official_explicit"
+    OFFICIAL_WEAK = "official_weak"
     SYNTHETIC_EXPLICIT = "synthetic_explicit"
     MISSING = "missing"
 
@@ -839,6 +845,359 @@ def _require_masked_zero(values: Tensor, mask: Tensor, name: str) -> None:
         raise ValueError(f"masked {name} must be zero")
 
 
+@dataclass(frozen=True, slots=True)
+class OfficialWeakSupervision:
+    """One official training sidecar consumed strictly after model forward."""
+
+    query_id: str
+    operator: Operator
+    time_mode: TimeWindowMode
+    count: int
+    query_time: float
+    occurrence_points: tuple[float, ...]
+    occurrence_intervals: tuple[tuple[float, float], ...]
+    numeric_token_span: tuple[int, int] | None = None
+    provenance: TargetProvenance = TargetProvenance.OFFICIAL_WEAK
+
+    def __post_init__(self) -> None:
+        if not self.query_id:
+            raise ValueError("official weak supervision requires a non-empty query_id")
+        if self.operator is Operator.UNSUPPORTED:
+            raise ValueError("official weak supervision requires one of eight operators")
+        if self.count < 0 or not math.isfinite(self.query_time) or self.query_time < 0.0:
+            raise ValueError("official weak count/query_time is invalid")
+        if self.provenance is not TargetProvenance.OFFICIAL_WEAK:
+            raise ValueError("official weak supervision requires official_weak provenance")
+        if any(not math.isfinite(value) or value < 0.0 for value in self.occurrence_points):
+            raise ValueError("official weak occurrence points must be finite and non-negative")
+        for start, end in self.occurrence_intervals:
+            if not math.isfinite(start) or not math.isfinite(end) or start < 0.0 or end < start:
+                raise ValueError(
+                    "official weak occurrence intervals must satisfy 0 <= start <= end"
+                )
+        if self.numeric_token_span is not None:
+            start, end = self.numeric_token_span
+            if type(start) is not int or type(end) is not int or start < 0 or end < start:
+                raise ValueError("numeric token span must use inclusive non-negative indices")
+
+
+@dataclass(frozen=True, slots=True)
+class OfficialWeakLossTerm:
+    value: Tensor
+    valid_rows: int
+
+    def __post_init__(self) -> None:
+        if self.value.ndim != 0 or self.value.dtype != torch.float32:
+            raise ValueError("official weak losses must be FP32 scalars")
+        if self.value.device.type != "meta" and not bool(torch.isfinite(self.value).item()):
+            raise ValueError("official weak losses must be finite")
+        if type(self.valid_rows) is not int or self.valid_rows < 0:
+            raise ValueError("official weak valid_rows must be a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
+class OfficialWeakLossAudit:
+    labels_joined_after_forward: bool
+    runtime_payload_reused_for_labels: bool
+    identity_target_fabricated: bool
+    unique_retrieval_id_fabricated: bool
+    future_occurrences_ignored: int
+    retrieval_bag_sizes: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.labels_joined_after_forward:
+            raise ValueError("official weak labels must be joined only after forward")
+        if (
+            self.runtime_payload_reused_for_labels
+            or self.identity_target_fabricated
+            or self.unique_retrieval_id_fabricated
+        ):
+            raise ValueError("official weak loss audit detected label leakage or pseudo labels")
+        if self.future_occurrences_ignored < 0 or any(
+            value < 0 for value in self.retrieval_bag_sizes
+        ):
+            raise ValueError("official weak audit counts must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class OfficialWeakStateLossOutput:
+    task: OfficialWeakLossTerm
+    operator: OfficialWeakLossTerm
+    retrieval: OfficialWeakLossTerm
+    time: OfficialWeakLossTerm
+    total: Tensor
+    audit: OfficialWeakLossAudit
+
+    def __post_init__(self) -> None:
+        if self.total.ndim != 0 or self.total.dtype != torch.float32:
+            raise ValueError("official weak state total must be an FP32 scalar")
+        expected = self.task.value + self.operator.value + self.retrieval.value + self.time.value
+        if not torch.allclose(self.total.detach(), expected.detach(), atol=1.0e-7, rtol=1.0e-7):
+            raise ValueError("official weak L_state must equal task+operator+retrieval+time")
+
+
+class OfficialWeakTargetBuilder:
+    """Build official weak losses from predictions, never runtime inputs or hard-state writes."""
+
+    __slots__ = ()
+
+    def __call__(
+        self,
+        observations: ObservationOutputs,
+        query: QueryEncoderOutput,
+        retrieval: RetrieverOutput,
+        supervision: Sequence[OfficialWeakSupervision],
+    ) -> OfficialWeakStateLossOutput:
+        return self.build(observations, query, retrieval, supervision)
+
+    def build(
+        self,
+        observations: ObservationOutputs,
+        query: QueryEncoderOutput,
+        retrieval: RetrieverOutput,
+        supervision: Sequence[OfficialWeakSupervision],
+    ) -> OfficialWeakStateLossOutput:
+        batch_size, _ = _validate_builder_inputs(
+            observations,
+            query,
+            retrieval,
+            StageATargetBatch(),
+        )
+        labels = tuple(supervision)
+        if len(labels) != batch_size or any(
+            not isinstance(label, OfficialWeakSupervision) for label in labels
+        ):
+            raise ValueError("official weak supervision must align to the prediction batch")
+        anchor = observations.o1.logits.float().sum() * 0.0
+        task_losses: list[Tensor] = []
+        operator_losses: list[Tensor] = []
+        retrieval_losses: list[Tensor] = []
+        time_losses: list[Tensor] = []
+        future_ignored = 0
+        bag_sizes: list[int] = []
+
+        for row, label in enumerate(labels):
+            operator_index = OPERATORS.index(label.operator)
+            operator_target = torch.tensor(
+                [operator_index], dtype=torch.int64, device=query.route.logits.device
+            )
+            operator_losses.append(
+                F.cross_entropy(query.route.logits[row : row + 1].float(), operator_target)
+            )
+
+            mode_index = TIME_MODES.index(label.time_mode)
+            mode_target = torch.tensor(
+                [mode_index], dtype=torch.int64, device=query.time.logits.mode_logits.device
+            )
+            row_time = F.cross_entropy(
+                query.time.logits.mode_logits[row : row + 1].float(), mode_target
+            )
+            if label.numeric_token_span is not None:
+                start, end = label.numeric_token_span
+                valid_tokens = ~query.time.logits.padding_mask[row]
+                if end >= valid_tokens.shape[0] or not bool(
+                    valid_tokens[start] & valid_tokens[end]
+                ):
+                    raise ValueError(
+                        "official weak numeric span targets must point to valid tokens"
+                    )
+                start_target = torch.tensor(
+                    [start], dtype=torch.int64, device=query.time.logits.span_start_logits.device
+                )
+                end_target = torch.tensor(
+                    [end], dtype=torch.int64, device=query.time.logits.span_end_logits.device
+                )
+                row_time = (
+                    row_time
+                    + F.cross_entropy(
+                        query.time.logits.span_start_logits[row : row + 1].float(),
+                        start_target,
+                    )
+                    + F.cross_entropy(
+                        query.time.logits.span_end_logits[row : row + 1].float(),
+                        end_target,
+                    )
+                )
+            time_losses.append(row_time)
+
+            task_losses.append(_official_weak_task_loss(observations, row, label))
+            retrieval_loss, bag_size = _official_weak_retrieval_loss(retrieval, row, label)
+            bag_sizes.append(bag_size)
+            if retrieval_loss is not None:
+                retrieval_losses.append(retrieval_loss)
+            future_ignored += sum(point > label.query_time for point in label.occurrence_points)
+            future_ignored += sum(
+                start > label.query_time or end > label.query_time
+                for start, end in label.occurrence_intervals
+            )
+
+        task = _official_weak_term(task_losses, anchor)
+        operator = _official_weak_term(operator_losses, anchor)
+        retrieval_term = _official_weak_term(retrieval_losses, anchor)
+        time = _official_weak_term(time_losses, anchor)
+        total = task.value + operator.value + retrieval_term.value + time.value
+        return OfficialWeakStateLossOutput(
+            task=task,
+            operator=operator,
+            retrieval=retrieval_term,
+            time=time,
+            total=total,
+            audit=OfficialWeakLossAudit(
+                labels_joined_after_forward=True,
+                runtime_payload_reused_for_labels=False,
+                identity_target_fabricated=False,
+                unique_retrieval_id_fabricated=False,
+                future_occurrences_ignored=future_ignored,
+                retrieval_bag_sizes=tuple(bag_sizes),
+            ),
+        )
+
+
+def _official_weak_task_loss(
+    observations: ObservationOutputs,
+    row: int,
+    label: OfficialWeakSupervision,
+) -> Tensor:
+    target_count = torch.tensor(
+        float(label.count), dtype=torch.float32, device=observations.o1.logits.device
+    )
+    if label.operator in (Operator.O1_SNAP, Operator.O1_DELTA):
+        prediction = observations.o1.soft_count[row].float()
+        return F.mse_loss(prediction, target_count)
+    if label.operator in (Operator.O2_UNIQUE, Operator.O2_GAIN):
+        valid = observations.o2.valid_mask[row]
+        novelty = observations.o2.score_probabilities[row, :, 0].float()
+        prediction = novelty[valid].sum()
+        return F.mse_loss(prediction, target_count)
+    if label.operator in (Operator.E1_ACTION, Operator.E1_TRANSIT):
+        valid = observations.e1.valid_mask[row]
+        if not bool(valid.any().item()):
+            return observations.e1.logits[row].float().sum() * 0.0
+        logits = observations.e1.logits[row][valid].float()
+        timestamps = observations.e1.timestamps[row][valid]
+        targets = torch.zeros_like(logits)
+        causal_points = tuple(
+            point for point in label.occurrence_points if point <= label.query_time
+        )
+        for point in causal_points:
+            index = _nearest_timestamp_index(timestamps, point)
+            if index is not None:
+                targets[index] = 1.0
+        dense = F.binary_cross_entropy_with_logits(logits, targets)
+        predicted_count = torch.sigmoid(logits[:, 1]).sum()
+        return dense + F.mse_loss(predicted_count, target_count)
+    if label.operator in (Operator.E2_PERIODIC, Operator.E2_EPISODE):
+        valid = observations.e2.valid_mask[row]
+        if not bool(valid.any().item()):
+            return observations.e2.event_logits[row].float().sum() * 0.0
+        event_logits = observations.e2.event_logits[row][valid].float()
+        phase_logits = observations.e2.phase_logits[row][valid].float()
+        timestamps = observations.e2.timestamps[row][valid]
+        event_targets = torch.zeros_like(event_logits)
+        phase_targets = torch.zeros(
+            timestamps.shape[0], dtype=torch.int64, device=timestamps.device
+        )
+        for start, end in label.occurrence_intervals:
+            if start > label.query_time:
+                continue
+            causal_end = min(end, label.query_time)
+            active = (timestamps >= start) & (timestamps <= causal_end)
+            event_targets[active, 1] = 1.0
+            phase_targets[active] = 1
+            start_index = _nearest_timestamp_index(timestamps, start)
+            if start_index is not None:
+                event_targets[start_index, 0] = 1.0
+                phase_targets[start_index] = 1
+            if end <= label.query_time:
+                end_index = _nearest_timestamp_index(timestamps, end)
+                if end_index is not None:
+                    event_targets[end_index, 2:] = 1.0
+                    phase_targets[end_index] = 3
+                    completed = timestamps > end
+                    phase_targets[completed] = 3
+        dense = F.binary_cross_entropy_with_logits(event_logits, event_targets)
+        phase = F.cross_entropy(phase_logits, phase_targets)
+        predicted_count = torch.sigmoid(event_logits[:, 3]).sum()
+        return dense + phase + F.mse_loss(predicted_count, target_count)
+    raise ValueError(f"unsupported official weak operator: {label.operator}")
+
+
+def _official_weak_retrieval_loss(
+    retrieval: RetrieverOutput,
+    row: int,
+    label: OfficialWeakSupervision,
+) -> tuple[Tensor | None, int]:
+    present_columns = torch.nonzero(retrieval.present_mask[row], as_tuple=False).flatten()
+    if not present_columns.numel():
+        return None, 0
+    positive_columns: list[int] = []
+    for column_tensor in present_columns:
+        column = int(column_tensor.item())
+        record = retrieval.candidate_records[row][column]
+        if record is None:
+            raise ValueError("present Retriever candidate is missing its typed record")
+        if _record_end_time(record) > label.query_time + 1.0e-6:
+            raise ValueError("official weak retrieval candidate contains future state")
+        if _record_matches_causal_occurrence(record, label):
+            positive_columns.append(column)
+    if not positive_columns:
+        return None, 0
+    all_logits = retrieval.scores[row].index_select(0, present_columns).float()
+    positive_index = torch.tensor(
+        positive_columns, dtype=torch.int64, device=retrieval.scores.device
+    )
+    positive_logits = retrieval.scores[row].index_select(0, positive_index).float()
+    loss = torch.logsumexp(all_logits, dim=0) - torch.logsumexp(positive_logits, dim=0)
+    return loss, len(positive_columns)
+
+
+def _record_matches_causal_occurrence(
+    record: object,
+    label: OfficialWeakSupervision,
+) -> bool:
+    timestamp = getattr(record, "timestamp", None)
+    time_range = getattr(record, "time_range", None)
+    points = tuple(point for point in label.occurrence_points if point <= label.query_time)
+    intervals = tuple(
+        (start, min(end, label.query_time))
+        for start, end in label.occurrence_intervals
+        if start <= label.query_time
+    )
+    if timestamp is not None:
+        value = float(timestamp)
+        return any(abs(value - point) <= 0.5 for point in points) or any(
+            start <= value <= end for start, end in intervals
+        )
+    if time_range is None:
+        return False
+    record_start, record_end = (float(value) for value in time_range)
+    return any(record_start <= point <= record_end for point in points) or any(
+        record_start <= start and record_end >= end for start, end in intervals
+    )
+
+
+def _record_end_time(record: object) -> float:
+    timestamp = getattr(record, "timestamp", None)
+    if timestamp is not None:
+        return float(timestamp)
+    time_range = getattr(record, "time_range", None)
+    if time_range is None:
+        raise ValueError("Retriever candidate record has no temporal metadata")
+    return float(time_range[1])
+
+
+def _nearest_timestamp_index(timestamps: Tensor, target: float) -> int | None:
+    if not timestamps.numel():
+        return None
+    return int(torch.argmin(torch.abs(timestamps.float() - target)).item())
+
+
+def _official_weak_term(losses: Sequence[Tensor], anchor: Tensor) -> OfficialWeakLossTerm:
+    values = tuple(loss.float() for loss in losses)
+    value = torch.stack(values).mean() if values else anchor
+    return OfficialWeakLossTerm(value=value, valid_rows=len(values))
+
+
 # Short aliases keep the public vocabulary discoverable without creating more provenance values.
 Provenance = TargetProvenance
 O1Labels = O1TargetLabels
@@ -856,6 +1215,11 @@ __all__ = [
     "E1TargetLabels",
     "E2Labels",
     "E2TargetLabels",
+    "OfficialWeakLossAudit",
+    "OfficialWeakLossTerm",
+    "OfficialWeakStateLossOutput",
+    "OfficialWeakSupervision",
+    "OfficialWeakTargetBuilder",
     "O1Labels",
     "O1TargetLabels",
     "O2Labels",

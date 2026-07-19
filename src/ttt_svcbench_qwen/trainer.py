@@ -51,6 +51,7 @@ from ttt_svcbench_qwen.observation_heads import ObservationOutputs
 from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput
 from ttt_svcbench_qwen.stage_a_targets import (
     AnswerTargetLabels,
+    OfficialWeakSupervision,
     StageATargetBatch,
     StageATargetBuilder,
     TargetProvenance,
@@ -221,10 +222,16 @@ class StageAExecutionAudit:
             )
             if any(value != self.row_count for value in row_aligned):
                 raise ValueError("A2 router/time/retrieval/Reader/reset must cover every row")
-            if self.bank_write_count <= 0 or self.cache_advance_count <= 0:
-                raise ValueError("A2 requires Bank writes and temporal cache advancement")
-            if self.fsm_rollout_count <= 0:
-                raise ValueError("A2 requires an auditable hard FSM rollout")
+            if self.cache_advance_count <= 0:
+                raise ValueError("A2 requires temporal cache advancement")
+            # A randomly initialized label-free router may legitimately choose UNSUPPORTED for
+            # every row in an early batch.  The hard writer still ran (the episode runner checks
+            # its typed audit), but there is intentionally no Bank write to commit.  Requiring a
+            # write here would force official operator labels into the runtime path and leak
+            # supervision before the loss builder.
+            # O1/O2 counting rows legitimately exercise Bank state without an event FSM.
+            # Dataset-level task balancing guarantees E1/E2 coverage; a per-batch FSM
+            # requirement would reject every valid one-row O1/O2 production batch.
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,12 +240,19 @@ class StageASupervisionBatch:
 
     answer: AnswerTargetLabels
     state: StageATargetBatch | None
+    official_weak: tuple[OfficialWeakSupervision, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.answer, AnswerTargetLabels):
             raise TypeError("Stage A Answer supervision has the wrong type")
         if self.state is not None and not isinstance(self.state, StageATargetBatch):
             raise TypeError("Stage A State supervision has the wrong type")
+        if any(not isinstance(value, OfficialWeakSupervision) for value in self.official_weak):
+            raise TypeError("Stage A official-weak supervision has the wrong type")
+        if self.official_weak and len(self.official_weak) != self.answer.batch_size:
+            raise ValueError("Stage A official-weak supervision must align to Answer rows")
+        if self.state is not None and self.official_weak:
+            raise ValueError("one Stage A batch cannot mix dense and official-weak State labels")
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,7 +438,19 @@ class StageAEpisodeRunner:
         bank_write_count = fsm_rollout_count = cache_advance_count = 0
         for chunk_index, template in enumerate(episode.observation_requests):
             request = replace(template, runtime_state=runtime, bank_states=bank_states)
-            observed = self.model.observe_chunk(request, lifecycle)
+            is_current_query_chunk = chunk_index + 1 == len(episode.observation_requests)
+            if self.variant is StageAVariant.A2 and not is_current_query_chunk:
+                # A2's loss is defined on the current Query chunk.  Earlier Support chunks
+                # only causally commit detached Bank/FSM/temporal state, so retaining their
+                # Qwen activation graphs both violates the bounded-current-token design and
+                # lets variable Support counts change the distributed autograd hook schedule.
+                # Keep their numerical state transition exactly the same, but do not retain
+                # activations.  A5 deliberately does not take this path: its supports carry
+                # the differentiable Inner-SGD computation.
+                with torch.no_grad():
+                    observed = self.model.observe_chunk(request, lifecycle)
+            else:
+                observed = self.model.observe_chunk(request, lifecycle)
             observations.append(observed)
             runtime = observed.runtime_state
             bank_states = observed.bank_states
@@ -433,6 +459,8 @@ class StageAEpisodeRunner:
                     raise ValueError("Stage A runtime chunk index did not advance causally")
                 cache_advance_count += len(episode.owner.video_ids)
             audit = observed.state_audit
+            if self.variant is StageAVariant.A2 and not isinstance(audit, StageAWriteAudit):
+                raise TypeError("A2 observation must execute the typed hard-state writer")
             if isinstance(audit, StageAWriteAudit):
                 bank_write_count += len(audit.head_types) - len(audit.skipped_rows)
                 fsm_rollout_count += sum(
@@ -485,7 +513,10 @@ class StageAEpisodeRunner:
                 raise TypeError("A2 episode must expose QueryEncoderOutput")
             if not isinstance(retrieval_output, RetrieverOutput):
                 raise TypeError("A2 episode must expose RetrieverOutput")
-            hard_state_rows = sum(head is not None for head in query_output.head_types)
+            # This is execution coverage, not the number of currently supported predictions.
+            # UNSUPPORTED is a valid pre-training model decision; the official weak operator
+            # target is joined only after this label-free runtime forward has completed.
+            hard_state_rows = row_count
             router_rows = time_rows = retrieval_rows = row_count
             reader_rows = len(output.reader)
         else:
@@ -673,7 +704,7 @@ def configure_stage_a_parameters(
     *,
     variant: StageAVariant | None = None,
 ) -> StageAParameterAudit:
-    """Freeze the complete model, then enable only the explicit P15 allowlist."""
+    """Apply the production A2 full-outer policy or the retained A1 allowlist."""
 
     active_variant = config.stage_a.variant if variant is None else variant
     if not isinstance(active_variant, StageAVariant):
@@ -687,13 +718,7 @@ def configure_stage_a_parameters(
     for name, parameter in named:
         inner_owned = "predictor" in name or "functional_sgd" in name or "transient_w_t" in name
         if active_variant is StageAVariant.A2:
-            allowed = any(
-                name == f"component_modules.{component}"
-                or name.startswith(f"component_modules.{component}.")
-                or name == component
-                or name.startswith(f"{component}.")
-                for component in config.stage_a.trainable_components
-            )
+            allowed = True
         else:
             allowed = any(
                 fnmatch.fnmatchcase(name, pattern)
@@ -743,10 +768,35 @@ def build_stage_a_optimizer(
         raise ValueError("Stage A optimizer received a frozen allowlisted parameter")
     optimizer_config = config.stage_a.optimizer
     if optimizer_config.name != "adamw":
-        raise ValueError("P15 engineering gate supports only explicit AdamW")
+        raise ValueError("production A2 supports only explicit AdamW")
+    qwen_tokens = ("qwen", "vision", "visual_stage", "merger", "decoder", "llm")
+    w0_tokens = ("w0_1", "w0_2", "meta_fast")
+    named_parameters = [(name, parameters_by_name[name]) for name in audit.trainable_names]
+    w0 = [
+        parameter
+        for name, parameter in named_parameters
+        if any(token in name for token in w0_tokens)
+    ]
+    qwen = [
+        parameter
+        for name, parameter in named_parameters
+        if not any(token in name for token in w0_tokens)
+        and any(token in name.casefold() for token in qwen_tokens)
+    ]
+    state = [
+        parameter
+        for name, parameter in named_parameters
+        if not any(token in name for token in w0_tokens)
+        and not any(token in name.casefold() for token in qwen_tokens)
+    ]
+    groups = [
+        {"params": qwen, "lr": optimizer_config.qwen_learning_rate, "group_name": "qwen"},
+        {"params": state, "lr": optimizer_config.state_learning_rate, "group_name": "state"},
+        {"params": w0, "lr": optimizer_config.w0_learning_rate, "group_name": "w0"},
+    ]
+    groups = [group for group in groups if group["params"]]
     return torch.optim.AdamW(
-        parameters,
-        lr=optimizer_config.learning_rate,
+        groups,
         betas=optimizer_config.betas,
         eps=optimizer_config.epsilon,
         weight_decay=optimizer_config.weight_decay,
@@ -761,6 +811,7 @@ class StageATrainer:
         model: nn.Module,
         forward_step: StageAForward,
         optimizer: torch.optim.Optimizer | None = None,
+        scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
         variant: StageAVariant | None = None,
     ) -> None:
         self.config = config
@@ -775,6 +826,7 @@ class StageATrainer:
             variant=self.variant,
         )
         self.optimizer = optimizer or build_stage_a_optimizer(model, config, self.parameter_audit)
+        self.scheduler = scheduler
         self._validate_optimizer_ownership()
         self.global_step = 0
         self.nonfinite_skip_count = 0
@@ -806,6 +858,8 @@ class StageATrainer:
             gradient_norm = float(norm.detach().float().item())
             if math.isfinite(gradient_norm):
                 self.optimizer.step()
+                if self.scheduler is not None:
+                    self.scheduler.step()
                 self.global_step += 1
             else:
                 finite = False
@@ -870,6 +924,7 @@ class StageATrainer:
             directory,
             model=self.model,
             optimizer=self.optimizer,
+            scheduler=self.scheduler,
             config=self.config,
             parameter_audit=self.parameter_audit,
             variant=self.variant,
@@ -916,7 +971,15 @@ class StageATrainer:
         if not isinstance(self.optimizer, torch.optim.AdamW):
             raise TypeError("Stage A outer optimizer must be AdamW")
         expected_config = self.config.stage_a.optimizer
+        expected_lrs = {
+            "qwen": expected_config.qwen_learning_rate,
+            "state": expected_config.state_learning_rate,
+            "w0": expected_config.w0_learning_rate,
+        }
         for group in self.optimizer.param_groups:
+            group_name = group.get("group_name")
+            if not isinstance(group_name, str) or group_name not in expected_lrs:
+                raise ValueError("Stage A AdamW groups require qwen/state/w0 ownership labels")
             actual_values = (
                 group["lr"],
                 group["weight_decay"],
@@ -924,7 +987,7 @@ class StageATrainer:
                 group["eps"],
             )
             expected_values = (
-                expected_config.learning_rate,
+                expected_lrs[group_name],
                 expected_config.weight_decay,
                 expected_config.betas,
                 expected_config.epsilon,
@@ -939,6 +1002,7 @@ def build_trainer(
     model: nn.Module,
     forward_step: StageAForward,
     optimizer: torch.optim.Optimizer | None = None,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     variant: StageAVariant | None = None,
 ) -> StageATrainer:
     return StageATrainer(
@@ -946,6 +1010,7 @@ def build_trainer(
         model=model,
         forward_step=forward_step,
         optimizer=optimizer,
+        scheduler=scheduler,
         variant=variant,
     )
 
@@ -990,6 +1055,7 @@ def save_stage_a_checkpoint(
     *,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     config: ProjectConfig,
     parameter_audit: StageAParameterAudit,
     variant: StageAVariant,
@@ -1001,11 +1067,21 @@ def save_stage_a_checkpoint(
     architecture_sha256: str,
     git_commit: str,
 ) -> Path:
-    """Atomically write trainable tensors plus compact optimizer/RNG metadata."""
+    """Atomically write the configured A2 model and complete resume metadata.
+
+    The production LLaMA-Factory path uses its native distributed save hooks.  This
+    standalone serializer mirrors the same ownership policy for CPU/tiny audits:
+    checkpointed module state is complete, while transient fast weights and hard
+    Bank/FSM/cache runtime are excluded by name and by registration contract.
+    """
 
     checkpoint = config.stage_a.checkpoint
-    if not checkpoint.trainable_only or checkpoint.save_full_model or checkpoint.save_runtime_state:
-        raise ValueError("P15 checkpoints must be trainable-only and runtime-free")
+    if checkpoint.trainable_only or not checkpoint.save_full_model:
+        raise ValueError("production A2 checkpoints must save the complete module state")
+    if checkpoint.save_runtime_state:
+        raise ValueError("production A2 checkpoints must exclude hard runtime state")
+    if checkpoint.include_scheduler and scheduler is None:
+        raise ValueError("production A2 checkpoint requires scheduler state")
     if global_step < 0 or fold < 0:
         raise ValueError("checkpoint global_step/fold must be non-negative")
     required_text = {
@@ -1018,25 +1094,43 @@ def save_stage_a_checkpoint(
         raise ValueError("checkpoint provenance strings must be non-empty")
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
-    parameters = dict(model.named_parameters())
-    trainable = {
-        name: parameters[name].detach().cpu().contiguous()
-        for name in parameter_audit.trainable_names
-    }
-    weights_path = root / "trainable.safetensors"
+    forbidden_tokens = (
+        "transient_w_t",
+        "state_bank_runtime",
+        "identity_bank_runtime",
+        "fsm_runtime",
+        "temporal_cache",
+        "visual_cache",
+        "soft_overlap_snapshot",
+    )
+    full_state = model.state_dict()
+    forbidden_registered = tuple(
+        name for name in full_state if any(token in name.casefold() for token in forbidden_tokens)
+    )
+    if forbidden_registered:
+        raise ValueError(
+            "hard/transient runtime state was registered on the checkpointed model: "
+            f"{forbidden_registered}"
+        )
+    saved_state = {name: value.detach().cpu().contiguous() for name, value in full_state.items()}
+    weights_path = root / "model.safetensors"
     state_path = root / "training_state.pt"
     manifest_path = root / "manifest.json"
     nonce = f".tmp-{os.getpid()}-{uuid.uuid4().hex}"
-    temporary_weights = root / f"trainable{nonce}.safetensors"
+    temporary_weights = root / f"model{nonce}.safetensors"
     temporary_state = root / f"training_state{nonce}.pt"
     temporary_manifest = root / f"manifest{nonce}.json"
-    save_file(trainable, str(temporary_weights))
+    save_file(saved_state, str(temporary_weights))
     training_state: dict[str, object] = {
         "global_step": global_step,
         "variant": variant.value,
     }
     if checkpoint.include_optimizer:
         training_state["optimizer"] = optimizer.state_dict()
+    if checkpoint.include_scheduler:
+        if scheduler is None:  # guarded above; keeps the resume artifact type explicit
+            raise RuntimeError("scheduler disappeared during checkpoint serialization")
+        training_state["scheduler"] = scheduler.state_dict()
     if checkpoint.include_rng:
         training_state["python_rng"] = random.getstate()
         training_state["torch_rng"] = torch.get_rng_state()
@@ -1061,6 +1155,7 @@ def save_stage_a_checkpoint(
         "tokenizer_manifest_sha256": config.state_reader.tokenizer_manifest_sha256,
         "composer_special_token_ids": list(config.input_composer.special_token_ids),
         "qwen_strategy": config.stage_a.qwen_strategy,
+        "saved_state_names": list(saved_state),
         "trainable_names": list(parameter_audit.trainable_names),
         "frozen_names": list(parameter_audit.frozen_names),
         "trainable_parameter_count": parameter_audit.trainable_parameter_count,
@@ -1079,7 +1174,7 @@ def save_stage_a_checkpoint(
     temporary_weights.replace(weights_path)
     temporary_state.replace(state_path)
     manifest["artifacts"] = {
-        "trainable.safetensors": _sha256_file(weights_path),
+        "model.safetensors": _sha256_file(weights_path),
         "training_state.pt": _sha256_file(state_path),
     }
     temporary_manifest.write_text(
@@ -1095,15 +1190,16 @@ def load_stage_a_checkpoint(
     *,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     config: ProjectConfig,
     parameter_audit: StageAParameterAudit,
     variant: StageAVariant,
     restore_rng: bool = True,
 ) -> int:
-    """Verify compact artifacts and restore only allowlisted tensors/outer state."""
+    """Verify and restore complete A2 module/optimizer/scheduler/RNG state."""
 
     root = Path(directory)
-    weights_path = root / "trainable.safetensors"
+    weights_path = root / "model.safetensors"
     state_path = root / "training_state.pt"
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1117,22 +1213,25 @@ def load_stage_a_checkpoint(
     config_sha = hashlib.sha256(config.model_dump_json().encode("utf-8")).hexdigest()
     if manifest.get("config_sha256") != config_sha:
         raise ValueError("Stage A checkpoint config hash mismatch")
-    expected_names = list(parameter_audit.trainable_names)
-    if manifest.get("trainable_names") != expected_names:
+    expected_trainable_names = list(parameter_audit.trainable_names)
+    if manifest.get("trainable_names") != expected_trainable_names:
         raise ValueError("Stage A checkpoint trainable allowlist mismatch")
+    current_state = model.state_dict()
+    expected_state_names = list(current_state)
+    if manifest.get("saved_state_names") != expected_state_names:
+        raise ValueError("Stage A checkpoint complete module-state names mismatch")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict) or artifacts != {
-        "trainable.safetensors": _sha256_file(weights_path),
+        "model.safetensors": _sha256_file(weights_path),
         "training_state.pt": _sha256_file(state_path),
     }:
         raise ValueError("Stage A checkpoint artifact hash mismatch")
     saved = load_file(str(weights_path))
-    if set(saved) != set(expected_names):
+    if set(saved) != set(expected_state_names):
         raise ValueError("Stage A checkpoint tensor names mismatch")
-    parameters = dict(model.named_parameters())
     with torch.no_grad():
-        for name in expected_names:
-            target = parameters[name]
+        for name in expected_state_names:
+            target = current_state[name]
             source = saved[name].to(device=target.device, dtype=target.dtype)
             if source.shape != target.shape:
                 raise ValueError(f"Stage A checkpoint tensor shape mismatch: {name}")
@@ -1142,6 +1241,10 @@ def load_stage_a_checkpoint(
         raise ValueError("Stage A training-state variant mismatch")
     if config.stage_a.checkpoint.include_optimizer:
         optimizer.load_state_dict(state["optimizer"])
+    if config.stage_a.checkpoint.include_scheduler:
+        if scheduler is None:
+            raise ValueError("restoring production A2 requires a scheduler instance")
+        scheduler.load_state_dict(state["scheduler"])
     if restore_rng and config.stage_a.checkpoint.include_rng:
         random.setstate(state["python_rng"])
         torch.set_rng_state(state["torch_rng"])

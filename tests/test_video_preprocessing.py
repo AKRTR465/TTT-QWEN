@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from fractions import Fraction
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import numpy as np
 import torch
 
 from ttt_svcbench_qwen.config import load_config
+from ttt_svcbench_qwen.production_runtime import CurrentChunkSpec, VideoChunkMaterializer
 from ttt_svcbench_qwen.video_preprocessing import (
     QwenVideoPreprocessor,
     build_demo_video,
@@ -77,6 +79,48 @@ def test_real_tiny_video_is_sampled_and_cut_before_future_frames(tmp_path: Path)
     assert decoded.timestamps.tolist() == [0.0, 0.5, 1.0]
     assert decoded.source_fps == 4.0
     assert torch.all(decoded.timestamps <= 1.0)
+
+
+def test_support_materializer_prefetches_exactly_one_chunk_ahead(tmp_path: Path) -> None:
+    path = tmp_path / "placeholder.mp4"
+    path.touch()
+    specs = tuple(
+        CurrentChunkSpec(
+            chunk_id=f"chunk-{index}",
+            video_path=path,
+            start_time=float(index),
+            end_time=float(index + 1),
+            maximum_frames=2,
+            query_time=3.0,
+        )
+        for index in range(3)
+    )
+    materializer = VideoChunkMaterializer.__new__(VideoChunkMaterializer)
+    materializer._executor = None
+    materializer._pending_future = None
+    materializer._pending_spec = None
+    materializer._remaining_specs = deque()
+    calls: list[str] = []
+
+    def fake_materialize(spec: CurrentChunkSpec) -> CurrentChunkSpec:
+        calls.append(spec.chunk_id)
+        return spec
+
+    materializer._materialize = fake_materialize  # type: ignore[method-assign]
+    try:
+        materializer.begin_prefetch(specs)
+        assert materializer._pending_spec == specs[0]
+        assert materializer(specs[0]) == specs[0]
+        assert materializer._pending_spec == specs[1]
+        assert materializer(specs[1]) == specs[1]
+        assert materializer._pending_spec == specs[2]
+        assert materializer(specs[2]) == specs[2]
+        assert materializer._pending_spec is None
+        assert calls == [spec.chunk_id for spec in specs]
+    finally:
+        materializer.end_prefetch()
+        if materializer._executor is not None:
+            materializer._executor.shutdown(wait=True)
 
 
 def test_overlapping_chunks_audit_tail_padding_tubelets_and_alignment() -> None:

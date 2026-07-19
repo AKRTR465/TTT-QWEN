@@ -154,10 +154,13 @@ def test_meta_structure_and_parameter_budget_are_exact() -> None:
         assert parameter_count(stage.output_projection) == HIDDEN_DIM * HIDDEN_DIM + HIDDEN_DIM
         assert parameter_count(stage.gru) == 3_543_552
         assert parameter_count(stage.ffn_in) + parameter_count(stage.ffn_out) == 4_722_432
-        assert sum(
-            parameter_count(norm)
-            for norm in (stage.token_norm, stage.slot_norm, stage.ffn_norm)
-        ) == 4_608
+        assert (
+            sum(
+                parameter_count(norm)
+                for norm in (stage.token_norm, stage.slot_norm, stage.ffn_norm)
+            )
+            == 4_608
+        )
         stage_parameter_ids.append({id(parameter) for parameter in stage.parameters()})
 
     assert stages[0] is not stages[1]
@@ -254,6 +257,7 @@ def test_refinements_call_the_same_stage_parameters_three_times(
     handles = []
     stages = (encoder.stage_1, encoder.stage_2)
     for index, stage in enumerate(stages):
+
         def record(
             module: nn.Module,
             _args: tuple[Any, ...],
@@ -307,11 +311,7 @@ def test_slot_stage_matches_frozen_qkvo_gru_ffn_formula(
     expected_confidence = torch.zeros(1, ACTIVE_SLOTS)
     for _ in range(3):
         conditioned = stage.slot_norm(expected) + query_condition.unsqueeze(1)
-        queries = (
-            stage.q_projection(conditioned)
-            .reshape(1, ACTIVE_SLOTS, 12, 64)
-            .transpose(1, 2)
-        )
+        queries = stage.q_projection(conditioned).reshape(1, ACTIVE_SLOTS, 12, 64).transpose(1, 2)
         logits = torch.einsum("bhkd,bhsd->bhks", queries, keys) / math.sqrt(64)
         logits = logits.masked_fill(
             ~slot_mask[:, None, :, None],
@@ -322,9 +322,7 @@ def test_slot_stage_matches_frozen_qkvo_gru_ffn_formula(
         assignments = torch.where(valid_pairs, assignments, 0.0)
         expected_confidence = assignments.sum(dim=-1).mean(dim=1)
         expected_confidence = torch.where(slot_mask, expected_confidence, 0.0)
-        weights = assignments / (
-            assignments.sum(dim=-1, keepdim=True) + stage.attention_epsilon
-        )
+        weights = assignments / (assignments.sum(dim=-1, keepdim=True) + stage.attention_epsilon)
         updates = torch.einsum("bhks,bhsd->bhkd", weights, values)
         updates = updates.transpose(1, 2).reshape(1, ACTIVE_SLOTS, HIDDEN_DIM)
         updates = stage.output_projection(updates)
@@ -923,8 +921,7 @@ def test_float16_invalid_slot_forward_backward_has_only_finite_gradients() -> No
         output.slots.float().square().mean().backward()
     except RuntimeError as error:
         unsupported_half = device.type == "cpu" and (
-            "not implemented for 'Half'" in str(error)
-            or "not implemented for Half" in str(error)
+            "not implemented for 'Half'" in str(error) or "not implemented for Half" in str(error)
         )
         if unsupported_half:
             pytest.skip(f"CPU float16 kernel unavailable: {error}")
@@ -1057,9 +1054,7 @@ def test_spatial_and_joint_builders_require_config_and_p7_builder_is_implemented
     assert isinstance(encoders.spatial, SpatialObjectEncoder)
     assert isinstance(encoders.temporal, TemporalEventEncoder)
 
-    source = (ROOT / "src" / "ttt_svcbench_qwen" / "state_encoder.py").read_text(
-        encoding="utf-8"
-    )
+    source = (ROOT / "src" / "ttt_svcbench_qwen" / "state_encoder.py").read_text(encoding="utf-8")
     assert "torch.optim" not in source
     assert "from ttt_svcbench_qwen.state_bank" not in source
     assert "from ttt_svcbench_qwen.observation_heads" not in source

@@ -336,6 +336,30 @@ def test_observe_chunk_is_composition_only_and_returns_soft_intermediates(
     assert output.lifecycle.observation_count == 1
 
 
+def test_soft_observation_recompute_boundary_cannot_duplicate_hard_commit(
+    config: ProjectConfig,
+) -> None:
+    suite = make_suite()
+    model = build_model(config, components=make_components(suite))
+    owner = make_owner()
+    lifecycle = PrefillLifecycle(owner)
+    request = make_observation_request(owner)
+
+    soft = model.observe_chunk_soft(request)
+
+    assert suite.events == ["visual", "query", "fast", "spatial", "temporal", "heads"]
+    assert "bank" not in suite.events
+    assert lifecycle.audit().observation_count == 0
+    output = model.commit_observation(request, soft, lifecycle)
+    assert output.runtime_state == "runtime-1"
+    assert suite.events.count("bank") == 1
+    assert soft.commit_guard.committed
+
+    with pytest.raises(LifecycleError, match="already committed"):
+        model.commit_observation(request, soft, lifecycle)
+    assert suite.events.count("bank") == 1
+
+
 def test_answer_query_audits_same_retrieval_before_resampler_and_native_prefill(
     config: ProjectConfig,
 ) -> None:

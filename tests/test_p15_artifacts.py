@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ttt_svcbench_qwen.config import load_config
+from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.p15_artifacts import (
     P15FailureExample,
     evaluate_p15_exit_gate,
@@ -59,11 +59,25 @@ def _audit(architecture_sha256: str) -> dict[str, object]:
     }
 
 
+def _historical_p15_config() -> ProjectConfig:
+    """Keep the retired low-space P15 artifact gate independent of production A2."""
+
+    config = load_config()
+    stage_a = config.stage_a.model_copy(
+        update={
+            "qwen_strategy": "frozen_synthetic_engineering_gate",
+            "supervision_provenance": "synthetic_explicit",
+            "synthetic_engineering_gate_only": True,
+        }
+    )
+    return config.model_copy(update={"stage_a": stage_a})
+
+
 def test_p15_artifact_bundle_is_utf8_hashed_and_opens_p16_gate(tmp_path: Path) -> None:
     architecture_sha256 = "a" * 64
     bundle = write_p15_artifact_bundle(
         tmp_path / "artifacts",
-        config=load_config(),
+        config=_historical_p15_config(),
         metrics=_metrics(),
         audit=_audit(architecture_sha256),
         failure_examples=(
@@ -100,7 +114,7 @@ def test_p15_exit_gate_fails_closed_on_unhandled_case_and_checkpoint_drift(
     checkpoint = _checkpoint(tmp_path / "checkpoint")
     bundle = write_p15_artifact_bundle(
         tmp_path / "artifacts",
-        config=load_config(),
+        config=_historical_p15_config(),
         metrics=_metrics(),
         audit=_audit(architecture_sha256),
         failure_examples=(P15FailureExample("case", "negative", False, "not handled"),),

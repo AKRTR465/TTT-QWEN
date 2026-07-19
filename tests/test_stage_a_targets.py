@@ -37,6 +37,8 @@ from ttt_svcbench_qwen.stage_a_targets import (
     E2TargetLabels,
     O1TargetLabels,
     O2TargetLabels,
+    OfficialWeakSupervision,
+    OfficialWeakTargetBuilder,
     QueryTargetLabels,
     RetrievalTargetLabels,
     StageATargetBatch,
@@ -113,7 +115,7 @@ def _record(row: int, column: int) -> StateRecord:
         trajectory_id=f"trajectory-{row}",
         head_type=HeadType.O1,
         semantic_embedding=semantic,
-        timestamp=1.0,
+        timestamp=float(column + 1),
         time_range=None,
         valid=True,
         confidence=0.9,
@@ -620,6 +622,7 @@ def test_label_shape_finite_detach_and_device_contracts_fail_closed(
 def test_closed_provenance_and_training_only_api_cannot_accept_answer_derived_fields() -> None:
     assert tuple(source.value for source in TargetProvenance) == (
         "official_explicit",
+        "official_weak",
         "synthetic_explicit",
         "missing",
     )
@@ -642,3 +645,80 @@ def test_closed_provenance_and_training_only_api_cannot_accept_answer_derived_fi
     }
     assert forbidden.isdisjoint(public_fields)
     assert forbidden.isdisjoint(inspect.signature(StageATargetBuilder.build).parameters)
+
+
+def test_official_weak_post_forward_loss_uses_masks_bags_and_no_identity_pseudolabels() -> None:
+    observations, query, retrieval, leaves = _typed_predictions(4)
+    weak = (
+        OfficialWeakSupervision(
+            query_id="weak-o1",
+            operator=Operator.O1_SNAP,
+            time_mode=TimeWindowMode.NOW,
+            count=1,
+            query_time=10.0,
+            occurrence_points=(1.0, 20.0),
+            occurrence_intervals=(),
+            numeric_token_span=(1, 2),
+        ),
+        OfficialWeakSupervision(
+            query_id="weak-o2",
+            operator=Operator.O2_UNIQUE,
+            time_mode=TimeWindowMode.HISTORY,
+            count=2,
+            query_time=10.0,
+            occurrence_points=(1.0,),
+            occurrence_intervals=(),
+        ),
+        OfficialWeakSupervision(
+            query_id="weak-e1",
+            operator=Operator.E1_ACTION,
+            time_mode=TimeWindowMode.HISTORY,
+            count=1,
+            query_time=10.0,
+            occurrence_points=(1.0,),
+            occurrence_intervals=(),
+        ),
+        OfficialWeakSupervision(
+            query_id="weak-e2",
+            operator=Operator.E2_EPISODE,
+            time_mode=TimeWindowMode.HISTORY,
+            count=1,
+            query_time=10.0,
+            occurrence_points=(),
+            occurrence_intervals=((0.5, 1.5),),
+        ),
+    )
+
+    output = OfficialWeakTargetBuilder().build(observations, query, retrieval, weak)
+
+    assert output.task.valid_rows == 4
+    assert output.operator.valid_rows == 4
+    assert output.time.valid_rows == 4
+    assert output.retrieval.valid_rows == 4
+    assert output.audit.future_occurrences_ignored == 1
+    assert output.audit.retrieval_bag_sizes == (1, 1, 1, 1)
+    assert not output.audit.identity_target_fabricated
+    assert not output.audit.unique_retrieval_id_fabricated
+    assert torch.equal(
+        output.total.detach(),
+        (
+            output.task.value + output.operator.value + output.retrieval.value + output.time.value
+        ).detach(),
+    )
+
+    output.total.backward()
+    for name in (
+        "o1",
+        "o2_score",
+        "e1",
+        "e2_event",
+        "e2_phase",
+        "operator",
+        "time_mode",
+        "span_start",
+        "span_end",
+        "retrieval",
+    ):
+        assert leaves[name].grad is not None, name
+        assert float(leaves[name].grad.norm()) > 0.0, name
+    assert leaves["o2_identity"].grad is None

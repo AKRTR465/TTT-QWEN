@@ -457,34 +457,51 @@ stage_a:
   variant: a2
   inner_sgd_enabled: false
   fast_adapter_mode: static_w0_no_inner_sgd
-  qwen_strategy: frozen_synthetic_engineering_gate
+  qwen_strategy: full_unfreeze_qwen3_vl_8b
   qwen_parameter_allowlist: []
   trainable_components:
-    - fast_adapter
+    - qwen_vit
+    - qwen_main_merger
+    - qwen_deepstack_mergers
+    - qwen_decoder_36
+    - fast_adapter_w0
     - query_encoder
     - spatial_encoder
     - temporal_encoder
     - observation_heads
     - state_bank
     - resampler
+  predictor_trainable: false
+  epochs: 8
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 4
+  world_size: 4
+  global_batch_size: 16
+  loss_terms: [state, answer]
+  supervision_provenance: official_weak
+  load_best_model_at_end: false
   balanced_task_sampling: true
-  synthetic_engineering_gate_only: true
+  synthetic_engineering_gate_only: false
   seed: 42
   optimizer:
     name: adamw
-    learning_rate: 3.0e-4
+    qwen_learning_rate: 1.0e-5
+    state_learning_rate: 1.0e-4
+    w0_learning_rate: 1.0e-4
     weight_decay: 0.01
     betas: [0.9, 0.999]
     epsilon: 1.0e-8
     grad_clip_norm: 1.0
   checkpoint:
-    format: trainable_safetensors_plus_pt_state_v1
-    trainable_only: true
+    format: full_model_optimizer_scheduler_rng_v1
+    trainable_only: false
     include_optimizer: true
+    include_scheduler: true
     include_rng: true
-    save_full_model: false
+    save_full_model: true
     save_runtime_state: false
-    best_metric: validation_total_loss
+    save_every_epochs: 2
+    selection_policy: final_epoch
 
 stage_b:
   variant: a3
@@ -506,15 +523,23 @@ stage_c:
   variants: [a4, a5]
   a4_enabled_ttt_terms: [pred, identity]
   a5_enabled_ttt_terms: [pred, identity, event]
-  support_chunk_schedule: [1, 4, 8]
-  maximum_support_chunks: 8
+  support_chunk_schedule: []
+  maximum_support_chunks: null
   minimum_query_points: 2
   multi_query_enabled: true
   detach_overlap_snapshots: true
   detach_runtime_between_chunks: true
   update_effect: next_chunk_only
   reuse_strategy: causal_replay_isolated_prefill
-  synthetic_engineering_gate_only: true
+  direct_from_stage_a: true
+  meta_gradient_mode: truncated_second_order
+  truncation_horizon: 8
+  reanchor_to_w0: true
+  segment_auxiliary_backward: true
+  training_counterfactual_enabled: false
+  prewarm_support_chunks: 1
+  outer_step_scope: episode
+  synthetic_engineering_gate_only: false
   seed: 42
 
 inference:

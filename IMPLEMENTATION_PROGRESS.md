@@ -1,6 +1,19 @@
 # 当前实施进展与服务器迁移说明
 
-更新日期：2026-07-14
+更新日期：2026-07-15
+
+## 生产路径更新（取代下方旧 P19 施工计划）
+
+当前源码已经实现直接 A2 → A5 的生产控制面：A2 全量解冻、A5 无限数值 Support 与
+`K=8` 截断二阶梯度、`W0` 重锚、逐段 backward/episode 单次 Outer step、远端数据 manifest、
+official weak sidecar、防泄漏、四卡 segment bucket、LLaMA-Factory/ZeRO-2 bridge、完整
+checkpoint 边界和同阶段 resume。操作说明见
+[docs/production-a2-a5.md](./docs/production-a2-a5.md)。
+
+内置 production runtime 已按远端“每 Query 一个因果视频”的布局完成接线，并保证每一步只
+物化当前 chunk、允许动态视觉 Token 数、绝不累加历史视觉 Token。尚待补齐的是四卡 8B
+one-step、显存平台、20-episode resume 与正式 A2/A5 的 H200 实机证据。下方 P0–P18 文字保留
+为此前工程门禁历史，不再描述当前生产 stage 选择。
 
 ## 1. 当前结论
 

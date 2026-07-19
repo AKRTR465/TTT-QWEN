@@ -7,27 +7,18 @@
 当前实施边界、验证结果与服务器迁移顺序见
 [IMPLEMENTATION_PROGRESS.md](./IMPLEMENTATION_PROGRESS.md)。
 
-> 当前施工状态：P0–P17 已通过本机 synthetic/tiny/小张量 CPU 工程门禁，P18 已通过 runtime
-> 骨架门禁；P2 按用户批准的低空间口径，以合成 fold/A0 完成工程门禁，
-> P3 用官方 HF meta 模块和 tiny 随机权重模型完成 Qwen 接口与 DeepStack 工程验收。真实 8B
-> A0/集成仍保留在 P19/P21/P22；P4 已完成 Query Encoder、Operator Router 与 Time Window
-> Resolver 的工程门禁，但尚未训练或校准。P5 Fast Adapter 已通过纯合成张量工程门禁，
-> P6–P9 的空间、时间、四类 soft Observation、Semantic Projector、hard Bank 与事件 FSM 也已通过
-> 纯合成张量工程门禁；P10 的 Candidate/Confirmed、CPU exact matching 和非权威 Hot Cache 已用
-> 小型合成 identity 向量通过工程门禁；P11 的 FP32 exact threshold Retriever、hard filters、
-> typed records/status/audit 已用小型合成 Bank 通过工程门禁；P12 的 16-token Resampler、
-> Deterministic Reader、record operands、状态隔离与 tokenizer-only SHA256 审计也已通过；P13
-> Composer、原生 Qwen prefill/DeepStack/mRoPE 桥与一次性模型编排已用 synthetic/tiny 资产通过；
-> P14 typed loss、逐视频 functional SGD、full-second-order meta 路与梯度/delta 审计也已用合成
-> case 通过；P15 已以 synthetic/tiny A2 接通 typed target、hard Bank/FSM、Retriever/Reader、
-> Composer/Qwen prefill、`L_state+L_answer`、Outer AdamW、独立指标与 trainable-only checkpoint。
-> P16 已以 A3 接通单 Support→functional SGD→后续 Query→outer gradient 的 Stage B 闭环；P17
-> 已以 A4/A5 接通 identity/event consistency、1/4/8 Support 与多 Query 的 Stage C CPU 工程闭环，
-> 但独立 missed-new runner 指标与 GPU 显存证据仍待补；P18 runtime 骨架已接通逐视频
-> reset/release、因果 chunk、Fast Adapter state 绑定、update stage 注入契约、单次 prefill 与
-> immutable decode。生产 `TTTUpdateStage` 尚未把真实 `L_TTT`→functional SGD 接入 manager，真实
-> Qwen3-VL-8B `GenerationDriver` 也尚未运行；真实加载、训练、生成、收敛与效果验证仍从 P19 开始，
-> 并在 P21/P22 完成校准、消融和 clean 评估。
+正式 A2 → A5 四卡入口、数据 manifest、LLaMA-Factory bridge、checkpoint 与续训说明见
+[docs/production-a2-a5.md](./docs/production-a2-a5.md)。
+
+> 当前生产代码已固定为直接 A2 → A5：A2 全量解冻 Qwen 与状态路径；A5 支持无限数值在线
+> Support、`K=8` 截断二阶梯度、重锚 `W0`、逐段 backward 与 episode 末单次 Outer AdamW。
+> 数据 manifest、official weak sidecar、防泄漏、四卡 segment bucket/零权重 padding、ZeRO-2、
+> 内置真实视频 runtime、LLaMA-Factory Trainer bridge、完整 checkpoint 与同阶段续训入口已实现
+> 并通过本机定向测试。
+> P0–P18 文档是历史 synthetic/tiny 门禁记录；正式长训尚未在本次 H200 预检中启动。
+> H200 入口沿用 `play/projects/qwen3vl_dist_train` 的薄 wrapper + 公共 launcher
+> 风格：A2 使用 `scripts/h200/launch_qwen3vl8b_ttt_a2_full4.sh`，A5 使用
+> `scripts/h200/launch_qwen3vl8b_ttt_a5_k8_full4.sh`，两者都会自动进入 tmux。
 
 ## 当前固定条件
 
@@ -91,16 +82,11 @@
 - O2 Confirmed身份库从256开始按块动态增长；Candidate从64开始并设512安全上限；
 - 每个新视频重置fast weights、SGD状态、时序缓存和State Bank；
 - 测试时禁止使用答案、count、occurrence_times、counting_type和counting_subtype。
-- P15 工程配置固定 A2、`static_w0_no_inner_sgd` 和冻结 Qwen；只有 static `W0`
-  与显式状态模块进入 Outer AdamW，Predictor、functional SGD、transient `W_t`、
-  hard runtime 与 Qwen 参数均排除。
-- P16 Stage B 固定 A3、单 Support 与仅 `L_pred` 的 inner step；P17 Stage C 固定 A4/A5 隔离
-  identity/event 增量，并覆盖 1/4/8 Support 与多后续 Query；两阶段只验证 synthetic/tiny CPU
-  调度、梯度、因果和图生命周期；P17 独立 missed-new runner 指标与 CUDA 显存曲线尚未完成。
-- P18 runtime 骨架固定逐视频原子 reset/release、因果裁剪、Fast Adapter state 绑定、注入式 update
-  stage 的 next-only 边界、单次 read/compose/prefill 与不修改 runtime 的 decode；生产
-  `L_TTT`→functional SGD updater 与真实 8B `GenerationDriver` 未接通，BF16、FlashAttention、
-  DeepSpeed 和多 GPU 仍属于 P19+。
+- 正式 A2 全量解冻 Qwen、状态模块与 `W0`，冻结 Predictor，禁用 Inner SGD；A3/A4 只保留作消融。
+- 正式 A5 使用完整 `L_pred+0.5L_id+0.5L_event`，Support 不设上限，`K=8` 截断二阶梯度，
+  每段重锚 `W0`，训练时不运行 static-W0 counterfactual。
+- 四卡路径使用 BF16、TF32、SDPA、non-reentrant gradient checkpointing 与 ZeRO-2；真实 H200
+  验收结果必须来自独立 run 目录，不能用本机 synthetic/tiny 结果替代。
 
 ## 本机安装
 
