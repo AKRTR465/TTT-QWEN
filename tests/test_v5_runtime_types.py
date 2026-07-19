@@ -11,7 +11,7 @@ from ttt_svcbench_qwen.identity_bank import (
     HotCacheEntry,
     build_identity_bank,
 )
-from ttt_svcbench_qwen.inference import PerVideoRuntimeState
+from ttt_svcbench_qwen.model import RuntimeOwner, TrajectoryRuntimeState
 from ttt_svcbench_qwen.observation_heads import (
     E1RuntimeState,
     E1SoftOutput,
@@ -438,36 +438,32 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
         position_ids=torch.zeros(0, dtype=torch.int64),
         total_seen=0,
     )
-    runtime = PerVideoRuntimeState(
-        video_id="video-a",
-        trajectory_id="trajectory-a",
-        fast_weights=fast,
-        optimizer=optimizer,
-        slot_state=None,
-        temporal_cache=cache,
-        e1_state=e1_state,
-        e2_state=e2_state,
-        state_bank=bank,
-        identity_bank=identities,
-        reader_audit=(),
-        released=False,
-    )
+    owner = RuntimeOwner(("video-a",), ("trajectory-a",))
+    values = {
+        "owner": owner,
+        "next_chunk_index": 0,
+        "fast_weights": fast,
+        "optimizer": optimizer,
+        "slot_state": None,
+        "temporal_cache": cache,
+        "e1_state": e1_state,
+        "e2_state": e2_state,
+        "state_bank": bank,
+        "identity_bank": identities,
+        "reader_audit": (),
+        "released": False,
+    }
+    runtime = TrajectoryRuntimeState(**values)
 
     assert runtime.fast_weights.fast_version == 0
-    with pytest.raises(ValueError, match="video_id"):
-        PerVideoRuntimeState(
-            video_id="video-b",
-            trajectory_id="trajectory-a",
-            fast_weights=fast,
-            optimizer=optimizer,
-            slot_state=None,
-            temporal_cache=cache,
-            e1_state=None,
-            e2_state=None,
-            state_bank=bank,
-            identity_bank=identities,
-            reader_audit=(),
-            released=False,
+    with pytest.raises(ValueError, match="State Bank ownership"):
+        TrajectoryRuntimeState(
+            **{
+                **values,
+                "owner": RuntimeOwner(("video-b",), ("trajectory-a",)),
+                "e1_state": None,
+                "e2_state": None,
+            }
         )
 
     mismatched_identities = identity_operator.reset(
@@ -475,36 +471,12 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
         "trajectory-a",
         hot_cache_enabled=False,
     )
-    with pytest.raises(ValueError, match="Identity Bank video_id"):
-        PerVideoRuntimeState(
-            video_id="video-a",
-            trajectory_id="trajectory-a",
-            fast_weights=fast,
-            optimizer=optimizer,
-            slot_state=None,
-            temporal_cache=cache,
-            e1_state=e1_state,
-            e2_state=e2_state,
-            state_bank=bank,
-            identity_bank=mismatched_identities,
-            reader_audit=(),
-            released=False,
-        )
+    with pytest.raises(ValueError, match="Identity Bank ownership"):
+        TrajectoryRuntimeState(**{**values, "identity_bank": mismatched_identities})
 
-    with pytest.raises(ValueError, match="Identity Bank and per-video release"):
-        PerVideoRuntimeState(
-            video_id="video-a",
-            trajectory_id="trajectory-a",
-            fast_weights=fast,
-            optimizer=optimizer,
-            slot_state=None,
-            temporal_cache=cache,
-            e1_state=e1_state,
-            e2_state=e2_state,
-            state_bank=bank,
-            identity_bank=identity_operator.release(identities),
-            reader_audit=(),
-            released=False,
+    with pytest.raises(ValueError, match="Identity Bank release"):
+        TrajectoryRuntimeState(
+            **{**values, "identity_bank": identity_operator.release(identities)}
         )
 
     mismatched_e1 = E1RuntimeState(
@@ -517,17 +489,4 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
         total_seen=0,
     )
     with pytest.raises(ValueError, match="E1 state query signature"):
-        PerVideoRuntimeState(
-            video_id="video-a",
-            trajectory_id="trajectory-a",
-            fast_weights=fast,
-            optimizer=optimizer,
-            slot_state=None,
-            temporal_cache=cache,
-            e1_state=mismatched_e1,
-            e2_state=e2_state,
-            state_bank=bank,
-            identity_bank=identities,
-            reader_audit=(),
-            released=False,
-        )
+        TrajectoryRuntimeState(**{**values, "e1_state": mismatched_e1})

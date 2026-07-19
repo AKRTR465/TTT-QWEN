@@ -8,7 +8,7 @@ from torch import Tensor
 
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.identity_bank import build_identity_bank
-from ttt_svcbench_qwen.model import ObservationChunkRequest, RuntimeOwner
+from ttt_svcbench_qwen.model import BatchRuntimeState, ObservationChunkRequest, RuntimeOwner
 from ttt_svcbench_qwen.observation_heads import (
     E1RuntimeState,
     E1SoftOutput,
@@ -34,7 +34,6 @@ from ttt_svcbench_qwen.query_encoder import (
 )
 from ttt_svcbench_qwen.stage_a_runtime import (
     StageABankWriter,
-    StageABatchRuntime,
     StageASoftWriteOutput,
     StageAWriteAudit,
 )
@@ -320,7 +319,7 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
         ),
     )
 
-    assert isinstance(result.runtime_state, StageABatchRuntime)
+    assert isinstance(result.runtime_state, BatchRuntimeState)
     assert result.runtime_state.next_chunk_index == 1
     assert isinstance(result.audit, StageAWriteAudit)
     assert result.audit.head_types == (HeadType.O1, HeadType.O2, HeadType.E1, HeadType.E2)
@@ -372,23 +371,8 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
     assert tuple(value.operator for value in reader_results) == retrieval_query.hard_operators
 
 
-def test_stage_a_runtime_rejects_any_inner_sgd_counter() -> None:
+def test_stage_a_runtime_has_no_fast_or_optimizer_state() -> None:
     owner = RuntimeOwner(("video",), ("trajectory",))
     writer = StageABankWriter(build_state_bank(load_config()), build_identity_bank(load_config()))
     runtime = writer.reset(owner)
-    try:
-        StageABatchRuntime(
-            owner=owner,
-            next_chunk_index=0,
-            slot_states=runtime.slot_states,
-            temporal_cache=None,
-            e1_states=runtime.e1_states,
-            e2_states=runtime.e2_states,
-            state_bank_states=runtime.state_bank_states,
-            identity_bank_states=runtime.identity_bank_states,
-            inner_sgd_attempted=1,
-        )
-    except ValueError as error:
-        assert "forbids every Inner-SGD" in str(error)
-    else:  # pragma: no cover - fail-closed assertion
-        raise AssertionError("Stage A accepted an Inner-SGD attempt")
+    assert all(row.fast_weights is None and row.optimizer is None for row in runtime.rows)

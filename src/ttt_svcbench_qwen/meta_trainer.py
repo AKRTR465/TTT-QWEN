@@ -25,7 +25,7 @@ from ttt_svcbench_qwen.config import (
     MetaTTTVariant,
     ProjectConfig,
 )
-from ttt_svcbench_qwen.data import assert_runtime_payload_safe
+from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.fast_ttt import (
     FastReanchorAudit,
     FastTTTForwardAudit,
@@ -63,6 +63,7 @@ from ttt_svcbench_qwen.losses import (
 )
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
+    BatchRuntimeState,
     ObservationChunkOutput,
     ObservationChunkRequest,
     PrefillLifecycle,
@@ -111,24 +112,8 @@ class FastStateController(Protocol):
     def collect_meta_fast_parameters(self) -> tuple[nn.Parameter, nn.Parameter]: ...
 
 
-@dataclass(frozen=True, slots=True)
-class MetaModelRuntime:
-    """One freshly reset hard/runtime trajectory, separate from fast/SGD state."""
-
-    runtime_state: object
-    bank_states: tuple[object, ...]
-
-    def validate_for(self, owner: RuntimeOwner) -> None:
-        if self.runtime_state is None:
-            raise ValueError("Meta-TTT runtime resetter returned no runtime state")
-        if len(self.bank_states) != len(owner.video_ids):
-            raise ValueError("Meta-TTT reset Bank states must align to the owner batch")
-        if any(state is None for state in self.bank_states):
-            raise ValueError("Meta-TTT reset Bank states cannot contain None")
-
-
 class EpisodeRuntimeResetter(Protocol):
-    def __call__(self, owner: RuntimeOwner) -> MetaModelRuntime: ...
+    def __call__(self, owner: RuntimeOwner) -> BatchRuntimeState: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,7 +123,7 @@ class MetaCausalChunk:
     request: ObservationChunkRequest
     start_time: float
     end_time: float
-    runtime_payload: Mapping[str, object]
+    query_input: RuntimeQueryInput
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, ObservationChunkRequest):
@@ -152,7 +137,6 @@ class MetaCausalChunk:
             or self.end_time < self.start_time
         ):
             raise ValueError("Meta-TTT chunk times must be finite and ordered")
-        assert_runtime_payload_safe(self.runtime_payload, layer="Meta-TTT Support/Query")
 
 
 @dataclass(frozen=True, slots=True)
@@ -944,7 +928,7 @@ class MetaTTTEpisodeOutput:
     query_objectives: tuple[MetaQueryObjective, ...]
     final_fast_states: tuple[FastWeightsState, ...]
     final_optimizer_states: tuple[OptimizerRuntimeState, ...]
-    final_runtime: MetaModelRuntime
+    final_runtime: BatchRuntimeState
     audit: MetaTTTEpisodeAudit
 
     def __post_init__(self) -> None:
@@ -1126,7 +1110,7 @@ class TruncatedMetaTTTEpisodeOutput:
     support_auxiliary_loss: Tensor
     final_fast_states: tuple[FastWeightsState, ...]
     final_optimizer_states: tuple[OptimizerRuntimeState, ...]
-    final_runtime: MetaModelRuntime
+    final_runtime: BatchRuntimeState
     audit: TruncatedMetaTTTEpisodeAudit
 
     def __post_init__(self) -> None:
@@ -1254,9 +1238,23 @@ class MetaTTTTrainer:
 
 @dataclass(slots=True)
 class _Trajectory:
-    runtime: MetaModelRuntime
-    fast_states: tuple[FastWeightsState, ...]
-    optimizer_states: tuple[OptimizerRuntimeState, ...]
+    runtime: BatchRuntimeState
+
+    @property
+    def fast_states(self) -> tuple[FastWeightsState, ...]:
+        return self.runtime.fast_states
+
+    @fast_states.setter
+    def fast_states(self, values: tuple[FastWeightsState, ...]) -> None:
+        self.runtime = self.runtime.with_fast_states(values)
+
+    @property
+    def optimizer_states(self) -> tuple[OptimizerRuntimeState, ...]:
+        return self.runtime.optimizer_states
+
+    @optimizer_states.setter
+    def optimizer_states(self, values: tuple[OptimizerRuntimeState, ...]) -> None:
+        self.runtime = self.runtime.with_fast_states(self.fast_states, values)
 
 
 class MetaTTTEpisodeRunner:
@@ -1324,12 +1322,8 @@ class MetaTTTEpisodeRunner:
                 seed=episode.seed + support_index,
                 with_grad=False,
             )
-            adapted.runtime = MetaModelRuntime(
-                adapted_observation.runtime_state, adapted_observation.bank_states
-            )
-            baseline.runtime = MetaModelRuntime(
-                baseline_observation.runtime_state, baseline_observation.bank_states
-            )
+            adapted.runtime = _runtime_from_observation(adapted_observation, episode.owner)
+            baseline.runtime = _runtime_from_observation(baseline_observation, episode.owner)
             built = self.ttt_input_builder(
                 adapted_observation,
                 previous=previous_snapshot,
@@ -1357,7 +1351,7 @@ class MetaTTTEpisodeRunner:
                     results=results,
                     ttt_output=ttt_output,
                     match=built.audit,
-                    runtime=adapted.runtime.runtime_state,
+                    runtime=adapted.runtime,
                     after_versions=versions_after_update,
                 )
             )
@@ -1386,12 +1380,8 @@ class MetaTTTEpisodeRunner:
                 seed=seed,
                 with_grad=False,
             )
-            adapted.runtime = MetaModelRuntime(
-                after_observation.runtime_state, after_observation.bank_states
-            )
-            baseline.runtime = MetaModelRuntime(
-                before_observation.runtime_state, before_observation.bank_states
-            )
+            adapted.runtime = _runtime_from_observation(after_observation, episode.owner)
+            baseline.runtime = _runtime_from_observation(before_observation, episode.owner)
             after_versions = _tensor_version_signature(after_observation)
             before_versions = _tensor_version_signature(before_observation)
             after_output = self._answer(query, after_observation, after_lifecycle, with_grad=True)
@@ -1514,10 +1504,7 @@ class MetaTTTEpisodeRunner:
         )
         if any(prewarm_fast_audit.fast_versions):
             raise ValueError("the no-update prewarm must observe the initial W0 generation")
-        adapted.runtime = MetaModelRuntime(
-            prewarm_observation.runtime_state,
-            prewarm_observation.bank_states,
-        )
+        adapted.runtime = _runtime_from_observation(prewarm_observation, episode.owner)
         previous_snapshot = DetachedOverlapSnapshot.capture(
             prewarm_observation,
             end_time=prewarm.end_time,
@@ -1532,7 +1519,7 @@ class MetaTTTEpisodeRunner:
                 seed=episode.seed + support_index + 1,
                 with_grad=True,
             )
-            adapted.runtime = MetaModelRuntime(observation.runtime_state, observation.bank_states)
+            adapted.runtime = _runtime_from_observation(observation, episode.owner)
             built = self.ttt_input_builder(
                 observation,
                 previous=previous_snapshot,
@@ -1560,7 +1547,7 @@ class MetaTTTEpisodeRunner:
                     results=results,
                     ttt_output=ttt_output,
                     match=built.audit,
-                    runtime=adapted.runtime.runtime_state,
+                    runtime=adapted.runtime,
                     after_versions=after_versions,
                 )
             )
@@ -1613,7 +1600,7 @@ class MetaTTTEpisodeRunner:
                 seed=episode.seed + 10_000 + query_index,
                 with_grad=True,
             )
-            adapted.runtime = MetaModelRuntime(observation.runtime_state, observation.bank_states)
+            adapted.runtime = _runtime_from_observation(observation, episode.owner)
             observation_versions = _tensor_version_signature(observation)
             output = self._answer(query, observation, query_lifecycle, with_grad=True)
             immutable = observation_versions == _tensor_version_signature(observation)
@@ -1757,8 +1744,8 @@ class MetaTTTEpisodeRunner:
         differentiable: bool,
     ) -> _Trajectory:
         runtime = self.runtime_resetter(owner)
-        if not isinstance(runtime, MetaModelRuntime):
-            raise TypeError("Meta-TTT runtime resetter must return MetaModelRuntime")
+        if not isinstance(runtime, BatchRuntimeState):
+            raise TypeError("Meta-TTT runtime resetter must return BatchRuntimeState")
         runtime.validate_for(owner)
         fast_states = tuple(
             self.fast_controller.reset_fast_state(differentiable=differentiable)
@@ -1773,7 +1760,7 @@ class MetaTTTEpisodeRunner:
             raise ValueError("fresh Meta-TTT fast states must reset all counters")
         if any(state.optimizer_name != "sgd" for state in optimizer_states):
             raise ValueError("fresh Meta-TTT optimizer state must use SGD")
-        return _Trajectory(runtime, fast_states, optimizer_states)
+        return _Trajectory(runtime.with_fast_states(fast_states, optimizer_states))
 
     def _observe(
         self,
@@ -1786,7 +1773,7 @@ class MetaTTTEpisodeRunner:
     ) -> tuple[ObservationChunkOutput, FastTTTForwardAudit]:
         request = replace(
             chunk.request,
-            runtime_state=trajectory.runtime.runtime_state,
+            runtime_state=trajectory.runtime,
             bank_states=trajectory.runtime.bank_states,
         )
         with (
@@ -2374,7 +2361,7 @@ def _term_float(term: object) -> float | None:
 
 
 def _assert_trajectory_isolation(adapted: _Trajectory, baseline: _Trajectory) -> None:
-    if adapted.runtime.runtime_state is baseline.runtime.runtime_state:
+    if adapted.runtime is baseline.runtime:
         raise ValueError("adapted and baseline runtimes must be independently reset")
     if any(
         left is right
@@ -2391,6 +2378,19 @@ def _assert_trajectory_isolation(adapted: _Trajectory, baseline: _Trajectory) ->
     )
     if len({_storage_key(value) for value in fast_values}) != len(fast_values):
         raise ValueError("adapted/baseline transient fast weights must use isolated storage")
+
+
+def _runtime_from_observation(
+    observation: ObservationChunkOutput,
+    owner: RuntimeOwner,
+) -> BatchRuntimeState:
+    runtime = observation.runtime_state
+    if not isinstance(runtime, BatchRuntimeState):
+        raise TypeError("Meta-TTT observation must return BatchRuntimeState")
+    runtime.validate_for(owner)
+    if tuple(observation.bank_states) != runtime.bank_states:
+        raise ValueError("Meta-TTT observation Bank states disagree with runtime rows")
+    return runtime
 
 
 def _unique_parameters(parameters: Sequence[nn.Parameter]) -> tuple[nn.Parameter, ...]:

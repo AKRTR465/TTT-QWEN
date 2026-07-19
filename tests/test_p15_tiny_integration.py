@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -9,9 +10,11 @@ from torch import Tensor, nn
 
 from test_stage_a_runtime import _cache, _observations, _query, _spatial
 from ttt_svcbench_qwen.config import StageAVariant, load_config
+from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.identity_bank import build_identity_bank
 from ttt_svcbench_qwen.input_composer import EXACT_NUMBER_INSTRUCTION, compose_inputs
 from ttt_svcbench_qwen.model import (
+    BatchRuntimeState,
     ModelComponents,
     ModelFeatureFlags,
     ObservationChunkRequest,
@@ -24,7 +27,6 @@ from ttt_svcbench_qwen.model import (
 from ttt_svcbench_qwen.query_encoder import Operator, QueryEncoderOutput
 from ttt_svcbench_qwen.stage_a_runtime import (
     StageABankWriter,
-    StageABatchRuntime,
     StageASoftWriteOutput,
 )
 from ttt_svcbench_qwen.stage_a_targets import (
@@ -448,12 +450,23 @@ def test_tiny_a2_runs_real_hard_state_reader_composer_and_state_answer_loss() ->
         ),
     )
     batch = StageATrainingBatch(
-        runtime_payloads=tuple(
-            {"video_id": video_id, "trajectory_id": trajectory_id}
-            for video_id, trajectory_id in zip(
+        runtime_queries=tuple(
+            RuntimeQueryInput(
+                video_id=video_id,
+                trajectory_id=trajectory_id,
+                query_id=f"query-{row}",
+                query_index=row,
+                video=Path(f"video-{row}.mp4"),
+                question="how many",
+                query_time=2.0,
+                explicit_time_values=(),
+            )
+            for row, (video_id, trajectory_id) in enumerate(
+                zip(
                 owner.video_ids,
                 owner.trajectory_ids,
                 strict=True,
+                )
             )
         ),
         model_inputs=episode,
@@ -482,9 +495,11 @@ def test_tiny_a2_runs_real_hard_state_reader_composer_and_state_answer_loss() ->
         adapted.audit.inner_sgd_updated,
         adapted.audit.inner_sgd_skipped,
     ) == (0, 0, 0)
-    assert isinstance(output.runtime_state, StageABatchRuntime)
+    assert isinstance(output.runtime_state, BatchRuntimeState)
     assert output.runtime_state.next_chunk_index == 1
-    assert output.runtime_state.inner_sgd_attempted == 0
+    assert all(
+        row.fast_weights is None and row.optimizer is None for row in output.runtime_state.rows
+    )
     hard_head_types = tuple(
         state.records[0].head_type for state in output.runtime_state.state_bank_states
     )

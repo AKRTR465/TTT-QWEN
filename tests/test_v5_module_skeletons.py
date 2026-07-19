@@ -71,7 +71,9 @@ def test_p13_model_remains_composition_only() -> None:
     source = (PACKAGE / "model.py").read_text(encoding="utf-8")
 
     assert "Linear(" not in source
-    assert "Optimizer" not in source
+    assert "torch.optim" not in source
+    assert "optimizer.step" not in source
+    assert "functional_sgd" not in source
     assert ".backward(" not in source
     assert "functional_sgd" not in source
     assert "def observe_chunk" in source

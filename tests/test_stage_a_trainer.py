@@ -10,6 +10,7 @@ from safetensors.torch import load_file
 from torch import Tensor, nn
 
 from ttt_svcbench_qwen.config import StageAVariant, load_config
+from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.losses import (
     AnswerLossInput,
     O1StateTarget,
@@ -127,19 +128,22 @@ class _ToyForward:
         )
 
 
-def _batch(*, leaked: bool = False) -> StageATrainingBatch:
-    payloads = tuple(
-        {
-            "video": Path(f"synthetic-{row}.mp4"),
-            "question": f"synthetic question {row}",
-            "query_time": 2.0,
-            "explicit_time_values": (),
-            **({"count": 3} if leaked else {}),
-        }
+def _batch() -> StageATrainingBatch:
+    queries = tuple(
+        RuntimeQueryInput(
+            video_id=f"video-{row}",
+            trajectory_id=f"trajectory-{row}",
+            query_id=f"query-{row}",
+            query_index=row,
+            video=Path(f"synthetic-{row}.mp4"),
+            question=f"synthetic question {row}",
+            query_time=2.0,
+            explicit_time_values=(),
+        )
         for row in range(4)
     )
     return StageATrainingBatch(
-        runtime_payloads=payloads,
+        runtime_queries=queries,
         model_inputs=torch.arange(16, dtype=torch.float32).reshape(4, 4) / 16.0,
         supervision=StageASupervisionBatch(
             answer=AnswerTargetLabels(
@@ -238,11 +242,7 @@ def test_stage_a_nonfinite_gradient_skips_without_partial_parameter_update() -> 
     assert all(torch.equal(before[name], value) for name, value in model.named_parameters())
 
 
-def test_stage_a_runtime_payload_leak_and_inner_sgd_audit_fail_closed() -> None:
-    model = _ToyStageAModel()
-    trainer = build_trainer(config=load_config(), model=model, forward_step=_ToyForward(model))
-    with pytest.raises(ValueError, match="denied fields"):
-        trainer.train_step(_batch(leaked=True))
+def test_stage_a_inner_sgd_audit_fails_closed() -> None:
     with pytest.raises(ValueError, match="Inner SGD"):
         StageAExecutionAudit(
             row_count=1,

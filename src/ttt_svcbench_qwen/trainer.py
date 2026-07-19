@@ -25,7 +25,7 @@ from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
 
 from ttt_svcbench_qwen.config import ProjectConfig, StageAVariant
-from ttt_svcbench_qwen.data import assert_runtime_payload_safe
+from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.input_composer import ComposedInput, map_teacher_forced_targets
 from ttt_svcbench_qwen.losses import (
     AnswerLossInput,
@@ -40,6 +40,7 @@ from ttt_svcbench_qwen.losses import (
 )
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
+    BatchRuntimeState,
     ObservationChunkOutput,
     ObservationChunkRequest,
     PrefillLifecycle,
@@ -257,17 +258,19 @@ class StageASupervisionBatch:
 
 @dataclass(frozen=True, slots=True)
 class StageATrainingBatch:
-    runtime_payloads: tuple[Mapping[str, object], ...]
+    runtime_queries: tuple[RuntimeQueryInput, ...]
     model_inputs: object
     supervision: StageASupervisionBatch
 
     def __post_init__(self) -> None:
-        if not self.runtime_payloads:
-            raise ValueError("Stage A batch requires at least one runtime payload")
+        if not self.runtime_queries:
+            raise ValueError("Stage A batch requires at least one runtime Query")
+        if any(not isinstance(value, RuntimeQueryInput) for value in self.runtime_queries):
+            raise TypeError("Stage A runtime rows must use RuntimeQueryInput")
         if not isinstance(self.supervision, StageASupervisionBatch):
             raise TypeError("Stage A supervision must use StageASupervisionBatch")
-        if self.supervision.answer.batch_size != len(self.runtime_payloads):
-            raise ValueError("Stage A Answer labels must align to runtime payload rows")
+        if self.supervision.answer.batch_size != len(self.runtime_queries):
+            raise ValueError("Stage A Answer labels must align to runtime Query rows")
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,22 +422,19 @@ class StageAEpisodeRunner:
         episode = batch.model_inputs
         if not isinstance(episode, StageAEpisodeInputs):
             raise TypeError("Stage A episode runner requires StageAEpisodeInputs")
-        from ttt_svcbench_qwen.stage_a_runtime import (
-            StageABatchRuntime,
-            StageAWriteAudit,
-        )
+        from ttt_svcbench_qwen.stage_a_runtime import StageAWriteAudit
 
         initial = episode.observation_requests[0].runtime_state
-        if not isinstance(initial, StageABatchRuntime):
-            raise TypeError("Stage A episode must begin from a reset StageABatchRuntime")
+        if not isinstance(initial, BatchRuntimeState):
+            raise TypeError("Stage A episode must begin from a reset BatchRuntimeState")
         if initial.next_chunk_index != 0 or any(
             state.version != 0 for state in initial.state_bank_states
         ):
             raise ValueError("Stage A episode must reset every owner before the batch")
         lifecycle = PrefillLifecycle(episode.owner)
         observations: list[ObservationChunkOutput] = []
-        runtime: object = initial
-        bank_states: tuple[object, ...] = tuple(initial.state_bank_states)
+        runtime = initial
+        bank_states = initial.state_bank_states
         bank_write_count = fsm_rollout_count = cache_advance_count = 0
         for chunk_index, template in enumerate(episode.observation_requests):
             request = replace(template, runtime_state=runtime, bank_states=bank_states)
@@ -454,10 +454,9 @@ class StageAEpisodeRunner:
             observations.append(observed)
             runtime = observed.runtime_state
             bank_states = observed.bank_states
-            if isinstance(runtime, StageABatchRuntime):
-                if runtime.next_chunk_index != chunk_index + 1:
-                    raise ValueError("Stage A runtime chunk index did not advance causally")
-                cache_advance_count += len(episode.owner.video_ids)
+            if runtime.next_chunk_index != chunk_index + 1:
+                raise ValueError("Stage A runtime chunk index did not advance causally")
+            cache_advance_count += len(episode.owner.video_ids)
             audit = observed.state_audit
             if self.variant is StageAVariant.A2 and not isinstance(audit, StageAWriteAudit):
                 raise TypeError("A2 observation must execute the typed hard-state writer")
@@ -938,13 +937,11 @@ class StageATrainer:
         )
 
     def _forward(self, batch: StageATrainingBatch, *, training: bool) -> StageAForwardOutput:
-        for payload in batch.runtime_payloads:
-            assert_trainer_runtime_payload(payload)
         output = self.forward_step(batch, training=training)
         if not isinstance(output, StageAForwardOutput):
             raise TypeError("Stage A forward adapter must return StageAForwardOutput")
         output.audit.validate_for(self.variant)
-        if output.audit.row_count != len(batch.runtime_payloads):
+        if output.audit.row_count != len(batch.runtime_queries):
             raise ValueError("Stage A forward audit must align to runtime payload rows")
         if self.variant is StageAVariant.A1 and output.state_loss_input is not None:
             raise ValueError("A1 forward adapter cannot emit State supervision")
@@ -1254,12 +1251,6 @@ def load_stage_a_checkpoint(
     if type(global_step) is not int or global_step < 0:
         raise ValueError("Stage A checkpoint global_step is invalid")
     return global_step
-
-
-def assert_trainer_runtime_payload(payload: Mapping[str, object]) -> None:
-    """P2 leakage guard applied before any trainer/model handoff."""
-
-    assert_runtime_payload_safe(payload, layer="Trainer")
 
 
 def _stage_a_metrics(

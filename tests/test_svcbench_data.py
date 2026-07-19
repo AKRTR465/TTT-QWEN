@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import pytest
-import torch
 
 from ttt_svcbench_qwen.data import (
     RUNTIME_ALLOWLIST,
@@ -12,9 +11,7 @@ from ttt_svcbench_qwen.data import (
     DatasetPurpose,
     DatasetSource,
     LoadedAnnotations,
-    RuntimeBatch,
-    RuntimeModelInput,
-    SampleIdentity,
+    RuntimeQueryInput,
     SVCBenchCollator,
     SVCBenchDataset,
     assert_runtime_payload_safe,
@@ -24,7 +21,6 @@ from ttt_svcbench_qwen.data import (
     write_fold_manifest,
 )
 from ttt_svcbench_qwen.inference import assert_inference_runtime_payload
-from ttt_svcbench_qwen.trainer import assert_trainer_runtime_payload
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "svcbench"
@@ -64,24 +60,20 @@ def test_dataset_collator_trainer_and_inference_keep_labels_out_of_runtime_paylo
     dataset = SVCBenchDataset(load_fixture("grouped.jsonl"), FIXTURES / "videos")
     sample = dataset[0]
     batch = SVCBenchCollator()([dataset[0], dataset[1]])
-    payloads = (sample.model_input.as_payload(), batch.as_model_payload())
+    payload = sample.model_input.as_payload()
 
-    assert set(payloads[0]) == RUNTIME_ALLOWLIST
-    assert set(payloads[1]) == RUNTIME_ALLOWLIST
-    assert not (set(payloads[0]) & RUNTIME_DENYLIST)
-    assert_trainer_runtime_payload(payloads[1])
-    assert_inference_runtime_payload(payloads[1])
+    assert set(payload) == RUNTIME_ALLOWLIST
+    assert not (set(payload) & RUNTIME_DENYLIST)
+    assert batch.queries == (dataset[0].model_input, dataset[1].model_input)
+    assert_inference_runtime_payload(payload)
     assert dataset.supervision_for(0, consumer="evaluator").count == 2
     with pytest.raises(PermissionError, match="training dataset"):
         dataset.supervision_for(0, consumer="trainer")
 
     for denied_field in sorted(RUNTIME_DENYLIST):
-        poisoned = {**payloads[0], denied_field: "forbidden"}
-        for layer in ("Dataset", "Collator"):
-            with pytest.raises(ValueError, match="denied fields"):
-                assert_runtime_payload_safe(poisoned, layer=layer)
+        poisoned = {**payload, denied_field: "forbidden"}
         with pytest.raises(ValueError, match="denied fields"):
-            assert_trainer_runtime_payload(poisoned)
+            assert_runtime_payload_safe(poisoned, layer="JSON")
         with pytest.raises(ValueError, match="denied fields"):
             assert_inference_runtime_payload(poisoned)
 
@@ -112,28 +104,27 @@ def test_explicit_time_parser_accepts_only_question_visible_values() -> None:
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -1.0])
 def test_runtime_time_fields_reject_non_finite_and_negative_values(bad_value: float) -> None:
     with pytest.raises(ValueError, match="finite and non-negative"):
-        RuntimeModelInput(Path("synthetic.mp4"), "question", bad_value, ())
-    with pytest.raises(ValueError, match="finite and non-negative"):
-        RuntimeModelInput(Path("synthetic.mp4"), "question", 1.0, (bad_value,))
-
-    identity = SampleIdentity("query-0", 0, "video-0", "trajectory-0")
-    with pytest.raises(ValueError, match="finite and non-negative"):
-        RuntimeBatch(
-            video=(Path("synthetic.mp4"),),
-            question=("question",),
-            query_time=torch.tensor([bad_value], dtype=torch.float32),
-            explicit_time_values=((),),
-            identities=(identity,),
+        RuntimeQueryInput(
+            "video-0",
+            "trajectory-0",
+            "query-0",
+            0,
+            Path("synthetic.mp4"),
+            "question",
+            bad_value,
+            (),
         )
     with pytest.raises(ValueError, match="finite and non-negative"):
-        RuntimeBatch(
-            video=(Path("synthetic.mp4"),),
-            question=("question",),
-            query_time=torch.tensor([1.0]),
-            explicit_time_values=((bad_value,),),
-            identities=(identity,),
+        RuntimeQueryInput(
+            "video-0",
+            "trajectory-0",
+            "query-0",
+            0,
+            Path("synthetic.mp4"),
+            "question",
+            1.0,
+            (bad_value,),
         )
-
 
 def test_group_kfold_keeps_all_query_points_from_each_video_together(tmp_path: Path) -> None:
     rows = []

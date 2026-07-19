@@ -7,7 +7,7 @@ Forbidden: Inner SGD, transient fast weights, labels, future chunks, or checkpoi
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 import torch
@@ -15,13 +15,14 @@ from torch import Tensor
 
 from ttt_svcbench_qwen.identity_bank import (
     IdentityBank,
-    IdentityBankRuntimeState,
     IdentityObservationDecision,
 )
 from ttt_svcbench_qwen.model import (
     BankWriteOutput,
+    BatchRuntimeState,
     ObservationChunkRequest,
     RuntimeOwner,
+    TrajectoryRuntimeState,
 )
 from ttt_svcbench_qwen.observation_heads import (
     E1RuntimeState,
@@ -38,76 +39,13 @@ from ttt_svcbench_qwen.state_bank import (
     E1EventKind,
     E2EventKind,
     HeadType,
-    StateBankRuntimeState,
     StructuredStateBank,
 )
 from ttt_svcbench_qwen.state_encoder import (
     SpatialEncoderOutput,
     SpatialSlotRuntimeState,
-    TemporalCache,
     TemporalEncoderOutput,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class StageABatchRuntime:
-    """External per-owner state; it is deliberately not an ``nn.Module``."""
-
-    owner: RuntimeOwner
-    next_chunk_index: int
-    slot_states: tuple[SpatialSlotRuntimeState | None, ...]
-    temporal_cache: TemporalCache | None
-    e1_states: tuple[E1RuntimeState | None, ...]
-    e2_states: tuple[E2RuntimeState | None, ...]
-    state_bank_states: tuple[StateBankRuntimeState, ...]
-    identity_bank_states: tuple[IdentityBankRuntimeState, ...]
-    inner_sgd_attempted: int = 0
-    inner_sgd_updated: int = 0
-    inner_sgd_skipped: int = 0
-
-    def __post_init__(self) -> None:
-        batch_size = len(self.owner.video_ids)
-        aligned = (
-            self.slot_states,
-            self.e1_states,
-            self.e2_states,
-            self.state_bank_states,
-            self.identity_bank_states,
-        )
-        if any(len(values) != batch_size for values in aligned):
-            raise ValueError("Stage A runtime fields must align to the owner batch")
-        if type(self.next_chunk_index) is not int or self.next_chunk_index < 0:
-            raise ValueError("Stage A next_chunk_index must be non-negative")
-        counters = (
-            self.inner_sgd_attempted,
-            self.inner_sgd_updated,
-            self.inner_sgd_skipped,
-        )
-        if any(type(value) is not int or value != 0 for value in counters):
-            raise ValueError("Stage A forbids every Inner-SGD attempt, update, and skip")
-        for row, (video_id, trajectory_id) in enumerate(
-            zip(self.owner.video_ids, self.owner.trajectory_ids, strict=True)
-        ):
-            bank = self.state_bank_states[row]
-            identity = self.identity_bank_states[row]
-            if (bank.video_id, bank.trajectory_id) != (video_id, trajectory_id):
-                raise ValueError("Stage A State Bank ownership mismatch")
-            if (identity.video_id, identity.trajectory_id) != (video_id, trajectory_id):
-                raise ValueError("Stage A Identity Bank ownership mismatch")
-            slot = self.slot_states[row]
-            if slot is not None and slot.video_id != video_id:
-                raise ValueError("Stage A slot-state ownership mismatch")
-            for name, state in (("E1", self.e1_states[row]), ("E2", self.e2_states[row])):
-                if state is not None and (state.video_id, state.trajectory_id) != (
-                    video_id,
-                    trajectory_id,
-                ):
-                    raise ValueError(f"Stage A {name} ownership mismatch")
-        if self.temporal_cache is not None and (
-            self.temporal_cache.video_ids != self.owner.video_ids
-            or self.temporal_cache.trajectory_ids != self.owner.trajectory_ids
-        ):
-            raise ValueError("Stage A temporal-cache ownership mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,7 +180,7 @@ class StageABankWriter:
         self.state_bank = state_bank
         self.identity_bank = identity_bank
 
-    def reset(self, owner: RuntimeOwner) -> StageABatchRuntime:
+    def reset(self, owner: RuntimeOwner) -> BatchRuntimeState:
         banks = tuple(
             self.state_bank.reset(video_id, trajectory_id)
             for video_id, trajectory_id in zip(
@@ -259,37 +197,37 @@ class StageABankWriter:
                 strict=True,
             )
         )
-        empty = (None,) * len(owner.video_ids)
-        return StageABatchRuntime(
-            owner=owner,
-            next_chunk_index=0,
-            slot_states=empty,
-            temporal_cache=None,
-            e1_states=empty,
-            e2_states=empty,
-            state_bank_states=banks,
-            identity_bank_states=identities,
+        return BatchRuntimeState(
+            tuple(
+                TrajectoryRuntimeState(
+                    owner=RuntimeOwner((video_id,), (trajectory_id,)),
+                    next_chunk_index=0,
+                    slot_state=None,
+                    temporal_cache=None,
+                    e1_state=None,
+                    e2_state=None,
+                    state_bank=bank,
+                    identity_bank=identity,
+                )
+                for video_id, trajectory_id, bank, identity in zip(
+                    owner.video_ids,
+                    owner.trajectory_ids,
+                    banks,
+                    identities,
+                    strict=True,
+                )
+            )
         )
 
     def __call__(
         self,
-        observations: object,
-        spatial: object,
-        temporal: object,
-        query: object,
+        observations: ObservationOutputs,
+        spatial: SpatialEncoderOutput,
+        temporal: TemporalEncoderOutput,
+        query: QueryEncoderOutput,
         request: ObservationChunkRequest,
     ) -> BankWriteOutput:
-        if not isinstance(observations, ObservationOutputs):
-            raise TypeError("Stage A writer requires ObservationOutputs")
-        if not isinstance(spatial, SpatialEncoderOutput) or not isinstance(
-            temporal, TemporalEncoderOutput
-        ):
-            raise TypeError("Stage A writer requires typed spatial/temporal outputs")
-        if not isinstance(query, QueryEncoderOutput):
-            raise TypeError("Stage A writer requires QueryEncoderOutput")
         runtime = request.runtime_state
-        if not isinstance(runtime, StageABatchRuntime):
-            raise TypeError("Stage A writer requires StageABatchRuntime")
         if runtime.owner != request.owner:
             raise ValueError("Stage A writer request owner does not match runtime")
         if len(request.bank_states) != len(runtime.state_bank_states) or any(
@@ -370,15 +308,31 @@ class StageABankWriter:
             else:
                 skipped.append(row)
 
-        next_runtime = StageABatchRuntime(
-            owner=request.owner,
-            next_chunk_index=runtime.next_chunk_index + 1,
-            slot_states=cast(tuple[SpatialSlotRuntimeState | None, ...], spatial.next_states),
-            temporal_cache=temporal.cache,
-            e1_states=cast(tuple[E1RuntimeState | None, ...], observations.e1.next_states),
-            e2_states=cast(tuple[E2RuntimeState | None, ...], observations.e2.next_states),
-            state_bank_states=tuple(next_banks),
-            identity_bank_states=tuple(next_identities),
+        slot_states = cast(tuple[SpatialSlotRuntimeState | None, ...], spatial.next_states)
+        e1_states = cast(tuple[E1RuntimeState | None, ...], observations.e1.next_states)
+        e2_states = cast(tuple[E2RuntimeState | None, ...], observations.e2.next_states)
+        next_runtime = BatchRuntimeState(
+            tuple(
+                replace(
+                    previous,
+                    next_chunk_index=runtime.next_chunk_index + 1,
+                    slot_state=slot_state,
+                    temporal_cache=temporal.cache,
+                    e1_state=e1_state,
+                    e2_state=e2_state,
+                    state_bank=bank,
+                    identity_bank=identity,
+                )
+                for previous, slot_state, e1_state, e2_state, bank, identity in zip(
+                    runtime.rows,
+                    slot_states,
+                    e1_states,
+                    e2_states,
+                    next_banks,
+                    next_identities,
+                    strict=True,
+                )
+            )
         )
         audit = StageAWriteAudit(
             chunk_index=runtime.next_chunk_index,

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import gc
 import weakref
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,10 +14,12 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from ttt_svcbench_qwen.config import MetaTTTVariant, ProjectConfig, load_config
+from ttt_svcbench_qwen.data import RuntimeQueryInput, assert_runtime_payload_safe
 from ttt_svcbench_qwen.fast_ttt import FastTTTForwardAudit, FastWeightsState
 from ttt_svcbench_qwen.identity_bank import (
     IdentityDecisionStatus,
     IdentityObservationDecision,
+    build_identity_bank,
 )
 from ttt_svcbench_qwen.losses import (
     AnswerLossInput,
@@ -27,7 +30,6 @@ from ttt_svcbench_qwen.losses import (
 from ttt_svcbench_qwen.meta_trainer import (
     MetaCausalChunk,
     MetaGradientReferenceMode,
-    MetaModelRuntime,
     MetaQueryLossInput,
     MetaTTTEpisode,
     MetaTTTEpisodeRunner,
@@ -43,6 +45,7 @@ from ttt_svcbench_qwen.meta_trainer import (
 )
 from ttt_svcbench_qwen.model import (
     BankWriteOutput,
+    BatchRuntimeState,
     ModelComponents,
     ModelFeatureFlags,
     ObservationChunkRequest,
@@ -50,6 +53,7 @@ from ttt_svcbench_qwen.model import (
     RuntimeOwner,
     StateTTTModel,
     StateTTTModelOutput,
+    TrajectoryRuntimeState,
     VisualStageOutput,
 )
 from ttt_svcbench_qwen.observation_heads import (
@@ -68,7 +72,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     StageATargetBatch,
     TargetProvenance,
 )
-from ttt_svcbench_qwen.state_bank import HeadType
+from ttt_svcbench_qwen.state_bank import HeadType, build_state_bank
 from ttt_svcbench_qwen.state_encoder import TemporalCache, TemporalEncoderOutput
 from ttt_svcbench_qwen.trainer import StageAEpisodeAnswerInputs, StageASupervisionBatch
 
@@ -83,25 +87,36 @@ class _VideoChunk:
     identity_position_id: int = 0
 
 
-@dataclass(frozen=True, slots=True)
-class _TinyRuntime:
-    owner: RuntimeOwner
-    next_chunk_index: int
-
-
-@dataclass(frozen=True, slots=True)
-class _TinyBank:
-    version: int
-
-
 class _RuntimeResetter:
     def __init__(self) -> None:
         self.calls = 0
 
-    def __call__(self, owner: RuntimeOwner) -> MetaModelRuntime:
+    def __call__(self, owner: RuntimeOwner) -> BatchRuntimeState:
         self.calls += 1
-        return MetaModelRuntime(
-            _TinyRuntime(owner, 0), tuple(_TinyBank(0) for _ in owner.video_ids)
+        state_bank = build_state_bank(load_config())
+        identity_bank = build_identity_bank(load_config())
+        return BatchRuntimeState(
+            tuple(
+                TrajectoryRuntimeState(
+                    owner=RuntimeOwner((video_id,), (trajectory_id,)),
+                    next_chunk_index=0,
+                    slot_state=None,
+                    temporal_cache=None,
+                    e1_state=None,
+                    e2_state=None,
+                    state_bank=state_bank.reset(video_id, trajectory_id),
+                    identity_bank=identity_bank.reset(
+                        video_id,
+                        trajectory_id,
+                        hot_cache_enabled=False,
+                    ),
+                )
+                for video_id, trajectory_id in zip(
+                    owner.video_ids,
+                    owner.trajectory_ids,
+                    strict=True,
+                )
+            )
         )
 
 
@@ -191,9 +206,9 @@ class _VisualStage(nn.Module):
 
 class _QueryStage(nn.Module):
     def forward(self, query_input: object, *, inference: bool) -> object:
-        if inference or not isinstance(query_input, Tensor):
-            raise ValueError("tiny query stage requires a training Tensor")
-        return SimpleNamespace(q_target=query_input)
+        if inference or not isinstance(query_input, RuntimeQueryInput):
+            raise ValueError("tiny query stage requires a training RuntimeQueryInput")
+        return SimpleNamespace(q_target=torch.zeros((1, 512)))
 
 
 class _SpatialStage:
@@ -221,7 +236,13 @@ class _TemporalStage:
             timestamps=payload.timestamps,
             position_ids=payload.position_ids,
             valid_mask=payload.valid_mask,
-            cache=_empty_cache(request.owner, visual.value),
+            cache=_cache(
+                request.owner,
+                visual.value,
+                payload.timestamps,
+                payload.position_ids,
+                payload.valid_mask,
+            ),
         )
 
 
@@ -323,13 +344,26 @@ class _BankWriter:
         _query: object,
         request: ObservationChunkRequest,
     ) -> BankWriteOutput:
-        if not isinstance(request.runtime_state, _TinyRuntime):
-            raise TypeError("tiny writer requires _TinyRuntime")
+        if not isinstance(request.runtime_state, BatchRuntimeState):
+            raise TypeError("tiny writer requires BatchRuntimeState")
         runtime = request.runtime_state
-        next_runtime = _TinyRuntime(runtime.owner, runtime.next_chunk_index + 1)
-        next_banks = tuple(
-            _TinyBank(bank.version + 1) if isinstance(bank, _TinyBank) else _TinyBank(1)
-            for bank in request.bank_states
+        if not isinstance(_temporal, TemporalEncoderOutput) or not isinstance(
+            _observations, ObservationOutputs
+        ):
+            raise TypeError("tiny writer requires typed temporal/observation outputs")
+        next_banks = tuple(replace(bank, version=bank.version + 1) for bank in runtime.bank_states)
+        next_runtime = BatchRuntimeState(
+            tuple(
+                replace(
+                    row,
+                    next_chunk_index=runtime.next_chunk_index + 1,
+                    temporal_cache=_temporal.cache,
+                    e1_state=_observations.e1.next_states[index],
+                    e2_state=_observations.e2.next_states[index],
+                    state_bank=next_banks[index],
+                )
+                for index, row in enumerate(runtime.rows)
+            )
         )
         decisions = tuple(
             (
@@ -351,7 +385,7 @@ class _BankWriter:
             chunk_index=runtime.next_chunk_index,
             head_types=(HeadType.O2,) * len(request.owner.video_ids),
             bank_versions_before=tuple(
-                bank.version if isinstance(bank, _TinyBank) else 0 for bank in request.bank_states
+                bank.version for bank in runtime.bank_states
             ),
             bank_versions_after=tuple(bank.version for bank in next_banks),
             record_counts_after=(1,) * len(next_banks),
@@ -374,7 +408,8 @@ class _Retriever:
     ) -> object:
         if len(states) != len(video_ids) or len(states) != len(trajectory_ids):
             raise ValueError("tiny retrieval ownership mismatch")
-        return tuple(state.version if isinstance(state, _TinyBank) else 0 for state in states)
+        versions = tuple(state.version for state in states)
+        return SimpleNamespace(audit=versions, versions=versions)
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,9 +422,10 @@ class _Reader:
         self.calls: list[tuple[_ReaderResult, ...]] = []
 
     def read(self, retrieval: object) -> Sequence[object]:
-        if not isinstance(retrieval, tuple):
-            raise TypeError("tiny Reader requires tuple retrieval")
-        results = tuple(_ReaderResult(int(value)) for value in retrieval)
+        versions = getattr(retrieval, "versions", None)
+        if not isinstance(versions, tuple):
+            raise TypeError("tiny Reader requires typed retrieval versions")
+        results = tuple(_ReaderResult(int(value)) for value in versions)
         self.calls.append(results)
         return results
 
@@ -631,24 +667,28 @@ def _chunk(
         position_ids=positions,
         valid_mask=torch.ones((1, width), dtype=torch.bool),
     )
-    runtime_payload: Mapping[str, object] = {
-        "video": "synthetic-video",
-        "question": "how many",
-        "query_time": end_time,
-        "explicit_time_values": (),
-    }
+    query_input = RuntimeQueryInput(
+        video_id=owner.video_ids[0],
+        trajectory_id=owner.trajectory_ids[0],
+        query_id=f"query-{chunk_index}",
+        query_index=chunk_index,
+        video=Path("synthetic-video.mp4"),
+        question="how many",
+        query_time=end_time,
+        explicit_time_values=(),
+    )
     return MetaCausalChunk(
         request=ObservationChunkRequest(
             owner=owner,
             video_input=payload,
-            query_input=torch.zeros((1, 512)),
+            query_input=query_input,
             runtime_state=object(),
             bank_states=(object(),),
             inference=False,
         ),
         start_time=max(0.0, end_time - 1.0),
         end_time=end_time,
-        runtime_payload=runtime_payload,
+        query_input=query_input,
     )
 
 
@@ -678,27 +718,36 @@ def _supervision(label: int = 0) -> StageASupervisionBatch:
     )
 
 
-def _empty_cache(owner: RuntimeOwner, reference: Tensor) -> TemporalCache:
+def _cache(
+    owner: RuntimeOwner,
+    reference: Tensor,
+    timestamps: Tensor,
+    position_ids: Tensor,
+    valid_mask: Tensor,
+) -> TemporalCache:
     batch_size = len(owner.video_ids)
-    empty_hidden = torch.zeros((batch_size, 0, 768), dtype=reference.dtype)
-    empty_kv = tuple(torch.zeros((batch_size, 12, 0, 64), dtype=reference.dtype) for _ in range(6))
+    width = reference.shape[1]
+    hidden = reference.detach().clone()
+    empty_kv = tuple(
+        torch.zeros((batch_size, 12, width, 64), dtype=reference.dtype) for _ in range(6)
+    )
     replay_kv = tuple(torch.zeros((batch_size, 12, 0, 64), dtype=reference.dtype) for _ in range(6))
     return TemporalCache(
-        hidden=empty_hidden,
+        hidden=hidden,
         layer_keys=empty_kv,
         layer_values=tuple(value.clone() for value in empty_kv),
         replay_layer_keys=replay_kv,
         replay_layer_values=tuple(value.clone() for value in replay_kv),
-        timestamps=torch.zeros((batch_size, 0), dtype=torch.float64),
+        timestamps=timestamps.clone(),
         replay_timestamps=torch.zeros((batch_size, 0), dtype=torch.float64),
-        position_ids=torch.zeros((batch_size, 0), dtype=torch.int64),
+        position_ids=position_ids.clone(),
         replay_position_ids=torch.zeros((batch_size, 0), dtype=torch.int64),
-        valid_mask=torch.zeros((batch_size, 0), dtype=torch.bool),
+        valid_mask=valid_mask.clone(),
         replay_valid_mask=torch.zeros((batch_size, 0), dtype=torch.bool),
         video_ids=owner.video_ids,
         trajectory_ids=owner.trajectory_ids,
         query_signatures=torch.zeros((batch_size, 512), dtype=reference.dtype),
-        total_seen=torch.zeros(batch_size, dtype=torch.int64),
+        total_seen=position_ids[:, -1].clone() + 1,
     )
 
 
@@ -1110,10 +1159,10 @@ def test_support_label_poison_is_rejected_before_any_model_call(
     del runner
     owner = RuntimeOwner(("video-a",), ("trajectory-a",))
     clean = _chunk(owner, chunk_index=0, end_time=1.0, width=2)
-    poisoned = dict(clean.runtime_payload)
+    poisoned = dict(clean.query_input.as_payload())
     poisoned[denied] = "forbidden"
     with pytest.raises(ValueError, match="denied fields"):
-        replace(clean, runtime_payload=poisoned)
+        assert_runtime_payload_safe(poisoned, layer="Meta-TTT Support/Query")
     assert resetter.calls == 0
     assert fast.last_audit is None
 

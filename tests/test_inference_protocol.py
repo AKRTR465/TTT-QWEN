@@ -18,16 +18,15 @@ from ttt_svcbench_qwen.inference import (
     InferenceProtocolError,
     InferenceRequest,
     PerVideoRuntimeManager,
-    PerVideoRuntimeState,
     QueryAttempt,
     QueryAttemptKind,
-    StageARuntimeBridge,
     TTTUpdateOutcome,
     assert_inference_runtime_payload,
     run_inference,
 )
 from ttt_svcbench_qwen.model import (
     BankWriteOutput,
+    BatchRuntimeState,
     DecodeStepOutput,
     ModelComponents,
     ModelFeatureFlags,
@@ -36,6 +35,7 @@ from ttt_svcbench_qwen.model import (
     QwenPrefillRequest,
     StateTTTModel,
     StateTTTModelOutput,
+    TrajectoryRuntimeState,
     VisualStageOutput,
     build_model,
 )
@@ -167,7 +167,9 @@ class _FakeSuite:
         self.decode_calls = 0
 
     def visual(self, request: ObservationChunkRequest) -> VisualStageOutput:
-        runtime = cast(PerVideoRuntimeState, request.runtime_state)
+        batch = cast(BatchRuntimeState, request.runtime_state)
+        runtime = batch.rows[0]
+        assert runtime.fast_weights is not None
         chunk = cast(CausalChunk, request.video_input)
         self.fast_versions.append(runtime.fast_weights.fast_version)
         self.seen_frames.append(chunk.frames)
@@ -190,7 +192,8 @@ class _FakeSuite:
         if self.fast_mode == "skip":
             return visual
         if self.fast_mode == "reenter":
-            runtime = cast(PerVideoRuntimeState, request.runtime_state)
+            runtime = cast(BatchRuntimeState, request.runtime_state).rows[0]
+            assert runtime.fast_weights is not None
             with self.fast_adapter.use_fast_state(runtime.fast_weights):
                 pass
             return visual
@@ -232,11 +235,12 @@ class _FakeSuite:
         _query: object,
         request: ObservationChunkRequest,
     ) -> BankWriteOutput:
-        runtime = cast(PerVideoRuntimeState, request.runtime_state)
+        batch = cast(BatchRuntimeState, request.runtime_state)
+        runtime = batch.rows[0]
         bank = replace(runtime.state_bank, version=runtime.state_bank.version + 1)
         next_runtime = replace(runtime, state_bank=bank)
         return BankWriteOutput(
-            runtime_state=next_runtime,
+            runtime_state=BatchRuntimeState((next_runtime,)),
             bank_states=(bank,),
             audit=("bank_version", bank.version),
         )
@@ -567,12 +571,13 @@ class _Updater:
     def __call__(
         self,
         _observation: ObservationChunkOutput,
-        runtime: PerVideoRuntimeState,
+        runtime: TrajectoryRuntimeState,
     ) -> TTTUpdateOutcome:
         call = self.calls
         self.calls += 1
         fast = runtime.fast_weights
         optimizer = runtime.optimizer
+        assert fast is not None and optimizer is not None
         if call in self.skip_calls:
             reason = "no_valid_term"
             return TTTUpdateOutcome(
@@ -661,7 +666,7 @@ def _answer_inputs() -> AnswerInputs:
 
 
 def _request(*, future_frame: object = "future") -> InferenceRequest:
-    return InferenceRequest(
+    return InferenceRequest.from_payload(
         video_id="video-a",
         trajectory_id="trajectory-a",
         payload={
@@ -841,7 +846,7 @@ def test_fast_binding_is_fail_closed_and_not_reentrant(dependencies: _Dependenci
         assert manager.active_runtime is None
 
 
-def test_stage_a_runtime_bridge_commits_real_hard_state(dependencies: _Dependencies) -> None:
+def test_unified_runtime_commits_real_hard_state(dependencies: _Dependencies) -> None:
     suite = _TypedStageSuite()
     manager = PerVideoRuntimeManager(
         fast_adapter=dependencies.fast_adapter,
@@ -849,7 +854,6 @@ def test_stage_a_runtime_bridge_commits_real_hard_state(dependencies: _Dependenc
         identity_bank=dependencies.identity_bank,
         optimizer_config=dependencies.config.fast_ttt.optimizer,
         hot_cache_enabled=False,
-        runtime_bridge=StageARuntimeBridge(),
     )
     manager.reset("video-a", "trajectory-a", torch.zeros(512))
     execution = manager.observe_chunk(
@@ -862,15 +866,17 @@ def test_stage_a_runtime_bridge_commits_real_hard_state(dependencies: _Dependenc
 
     runtime = execution.runtime_state
     assert isinstance(execution.observation, ObservationChunkOutput)
-    assert execution.observation.runtime_state is runtime
+    assert isinstance(execution.observation.runtime_state, BatchRuntimeState)
+    assert execution.observation.runtime_state.rows[0] is runtime
     assert runtime.slot_state is not None
+    assert runtime.temporal_cache is not None
     assert runtime.temporal_cache.hidden.shape == (1, 2, 768)
     assert runtime.e1_state is not None and runtime.e1_state.total_seen == 2
     assert runtime.e2_state is not None and runtime.e2_state.total_seen == 2
     assert len(runtime.state_bank.records) == 1
     assert runtime.state_bank.records[0].head_type is HeadType.O1
     assert runtime.identity_bank.video_id == "video-a"
-    assert runtime.optimizer.attempted_update_count == 1
+    assert runtime.optimizer is not None and runtime.optimizer.attempted_update_count == 1
     manager.release()
 
 

@@ -94,7 +94,7 @@ def test_production_manifest_has_fold0_buckets_padding_and_explicit_failures(
     assert train_videos.isdisjoint(validation_videos)
     assert all(episode.sampling_weight == 0.2 for episode in real)
     assert all(query.sampling_weight == 0.1 for query in manifest.a2_queries)
-    runtime = manifest.a2_queries[0].query.runtime.as_payload(Path("video.mp4"))
+    runtime = manifest.a2_queries[0].query.runtime.as_payload()
     assert set(runtime) == {"video", "question", "query_time", "explicit_time_values"}
     assert "count" not in runtime and "answer" not in runtime
 

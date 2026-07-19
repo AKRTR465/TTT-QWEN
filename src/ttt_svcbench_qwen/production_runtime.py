@@ -29,13 +29,12 @@ from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
 
 from ttt_svcbench_qwen.config import MetaTTTVariant, ProjectConfig, StageAVariant
-from ttt_svcbench_qwen.data import assert_runtime_payload_safe
+from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
     A5EpisodeRecord,
     AdaptiveChunkSpec,
     ProductionQueryRecord,
-    RuntimeQuerySpec,
     adaptive_support_schedule,
 )
 from ttt_svcbench_qwen.fast_ttt import build_fast_ttt_adapter
@@ -55,15 +54,16 @@ from ttt_svcbench_qwen.losses import (
 )
 from ttt_svcbench_qwen.meta_trainer import (
     MetaCausalChunk,
-    MetaModelRuntime,
     MetaTTTEpisode,
     MetaTTTEpisodeRunner,
     MetaTTTQueryPoint,
 )
 from ttt_svcbench_qwen.model import (
+    BatchRuntimeState,
     ModelComponents,
     ModelFeatureFlags,
     ObservationChunkRequest,
+    QwenPrefillOutput,
     QwenPrefillRequest,
     RuntimeOwner,
     StateTTTModel,
@@ -103,7 +103,7 @@ from ttt_svcbench_qwen.qwen_adapter import (
     StateEmbeddingPayload,
     audit_current_chunk_visual_tokens,
 )
-from ttt_svcbench_qwen.stage_a_runtime import StageABankWriter, StageABatchRuntime
+from ttt_svcbench_qwen.stage_a_runtime import StageABankWriter
 from ttt_svcbench_qwen.stage_a_targets import (
     AnswerTargetLabels,
     OfficialWeakSupervision,
@@ -210,22 +210,6 @@ class CurrentChunkSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class CurrentQueryInput:
-    video_path: Path
-    runtime: RuntimeQuerySpec
-    episode_nonce: int
-
-    def __post_init__(self) -> None:
-        if type(self.episode_nonce) is not int or self.episode_nonce < 0:
-            raise ValueError("production Query input requires a non-negative episode nonce")
-        assert_runtime_payload_safe(self.payload, layer="production current Query")
-
-    @property
-    def payload(self) -> dict[str, object]:
-        return self.runtime.as_payload(self.video_path)
-
-
-@dataclass(frozen=True, slots=True)
 class CurrentChunkMaterialization:
     spec: CurrentChunkSpec
     frames: Tensor
@@ -261,6 +245,14 @@ class CurrentChunkMaterialization:
             raise ValueError("current Qwen video grid must be [1, 3]")
         if int(self.video_grid_thw[0, 0].item()) != tubelets:
             raise ValueError("Qwen temporal grid must equal the current chunk tubelet count")
+
+
+def _bind_runtime_query(
+    query: RuntimeQueryInput,
+    video_path: Path,
+    episode_nonce: int,
+) -> RuntimeQueryInput:
+    return replace(query, video=video_path, episode_nonce=episode_nonce)
 
 
 @dataclass(frozen=True, slots=True)
@@ -688,7 +680,7 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
             audit=ProductionVisualAudit(materialized, token_audit),
         )
 
-    def _prefill(self, request: QwenPrefillRequest) -> object:
+    def _prefill(self, request: QwenPrefillRequest) -> QwenPrefillOutput:
         if not isinstance(request.prepared_video_features, PreparedVideoFeatures):
             raise TypeError("production prefill requires one current PreparedVideoFeatures")
         if not isinstance(request.pixel_values_videos, Tensor) or not isinstance(
@@ -721,7 +713,7 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
             **kwargs,
         )
         _loader_trace("gpu_step", stage="prefill", seconds=time.perf_counter() - gpu_started)
-        return output
+        return cast(QwenPrefillOutput, output)
 
 
 class ProductionQueryRuntime(nn.Module):  # type: ignore[misc]
@@ -734,10 +726,8 @@ class ProductionQueryRuntime(nn.Module):  # type: ignore[misc]
         self._qwen_ref = weakref.ref(qwen_model)
         self._token_cache: dict[str, QuestionTokenBatch] = {}
 
-    def forward(self, value: object, *, inference: bool) -> QueryEncoderOutput:
-        if not isinstance(value, CurrentQueryInput):
-            raise TypeError("production Query runtime requires CurrentQueryInput")
-        question = value.runtime.question
+    def forward(self, value: RuntimeQueryInput, *, inference: bool) -> QueryEncoderOutput:
+        question = value.question
         tokens = self._token_cache.get(question)
         if tokens is None:
             tokens = tokenize_questions(cast(Any, self.tokenizer), (question,))
@@ -746,9 +736,9 @@ class ProductionQueryRuntime(nn.Module):  # type: ignore[misc]
         if qwen is None:
             raise RuntimeError("Qwen embedding owner was released")
         embeddings = embed_question_tokens(cast(Any, qwen), tokens, self.query_encoder_config)
-        inputs = QueryEncoderInput.from_runtime_payload(embeddings, tokens, value.payload)
+        inputs = QueryEncoderInput.from_runtime_queries(embeddings, tokens, (value,))
         seed_bytes = hashlib.sha256(
-            f"{value.episode_nonce}:{value.runtime.query_id}".encode()
+            f"{value.episode_nonce}:{value.query_id}".encode()
         ).digest()[:8]
         dropout_seed = int.from_bytes(seed_bytes, "little") % (2**63 - 1)
         cuda_devices: list[int] = []
@@ -783,7 +773,7 @@ class FastVisualPassThrough:
     def __call__(
         self,
         visual: VisualStageOutput,
-        query: object,
+        query: QueryEncoderOutput,
         request: ObservationChunkRequest,
     ) -> VisualStageOutput:
         del query, request
@@ -800,7 +790,7 @@ class ProductionSpatialRuntime(nn.Module):  # type: ignore[misc]
     def forward(
         self,
         visual: VisualStageOutput,
-        query: object,
+        query: QueryEncoderOutput,
         request: ObservationChunkRequest,
     ) -> SpatialEncoderOutput:
         value, chunk, typed_query, runtime = _stage_inputs(visual, query, request)
@@ -832,7 +822,7 @@ class ProductionTemporalRuntime(nn.Module):  # type: ignore[misc]
     def forward(
         self,
         visual: VisualStageOutput,
-        query: object,
+        query: QueryEncoderOutput,
         request: ObservationChunkRequest,
     ) -> TemporalEncoderOutput:
         value, chunk, typed_query, runtime = _stage_inputs(visual, query, request)
@@ -954,17 +944,11 @@ class ProductionObservationRuntime(nn.Module):  # type: ignore[misc]
 
     def forward(
         self,
-        spatial: object,
-        temporal: object,
-        query: object,
+        spatial: SpatialEncoderOutput,
+        temporal: TemporalEncoderOutput,
+        query: QueryEncoderOutput,
         request: ObservationChunkRequest,
     ) -> ObservationOutputs:
-        if (
-            not isinstance(spatial, SpatialEncoderOutput)
-            or not isinstance(temporal, TemporalEncoderOutput)
-            or not isinstance(query, QueryEncoderOutput)
-        ):
-            raise TypeError("production Observation runtime requires typed stage outputs")
         runtime = _stage_runtime(request)
         raw_chunk = request.video_input
         if isinstance(raw_chunk, CurrentChunkSpec):
@@ -990,75 +974,49 @@ class ProductionObservationRuntime(nn.Module):  # type: ignore[misc]
 
 
 class ProductionReaderRuntime:
-    """Adapt the concrete Reader to the model's fail-closed object boundary."""
+    """Expose the concrete Reader through the shared typed model boundary."""
 
     def __init__(self, reader: DeterministicStateReader) -> None:
         self.reader = reader
 
-    def read(self, retrieval: object) -> Sequence[object]:
-        return self.reader.read(self._retrieval(retrieval))
+    def read(self, retrieval: RetrieverOutput) -> Sequence[ReaderResult]:
+        return self.reader.read(retrieval)
 
     def audit_results(
         self,
-        retrieval: object,
-        results: Sequence[object],
-    ) -> Sequence[object]:
-        if any(not isinstance(result, ReaderResult) for result in results):
-            raise TypeError("production Reader audit requires ReaderResult values")
-        typed_results = cast(Sequence[ReaderResult], results)
-        return self.reader.audit_results(self._retrieval(retrieval), typed_results)
+        retrieval: RetrieverOutput,
+        results: Sequence[ReaderResult],
+    ) -> Sequence[ReaderResult]:
+        return self.reader.audit_results(retrieval, results)
 
-    def audit_number_tokens(self, result: object) -> int | None:
-        if not isinstance(result, ReaderResult):
-            raise TypeError("production Reader token audit requires ReaderResult")
+    def audit_number_tokens(self, result: ReaderResult) -> int | None:
         return self.reader.audit_number_tokens(result)
-
-    @staticmethod
-    def _retrieval(retrieval: object) -> RetrieverOutput:
-        if not isinstance(retrieval, RetrieverOutput):
-            raise TypeError("production Reader requires RetrieverOutput")
-        return retrieval
 
 
 def _compose_production_inputs(
     *,
-    base_input_ids: object,
-    base_attention_mask: object,
-    state_tokens: object | None,
-    state_token_valid_mask: object | None,
-    reader_results: Sequence[object],
+    base_input_ids: Tensor,
+    base_attention_mask: Tensor,
+    state_tokens: Tensor | None,
+    state_token_valid_mask: Tensor | None,
+    reader_results: Sequence[ReaderResult],
     tokenizer: object,
     embedding_owner: object,
     rope_indexer: object,
-    video_grid_thw: object,
+    video_grid_thw: Tensor | None,
     include_state: bool,
     include_number: bool,
-) -> object:
-    tensors = {
-        "base_input_ids": base_input_ids,
-        "base_attention_mask": base_attention_mask,
-    }
-    optional_tensors = {
-        "state_tokens": state_tokens,
-        "state_token_valid_mask": state_token_valid_mask,
-        "video_grid_thw": video_grid_thw,
-    }
-    if any(not isinstance(value, Tensor) for value in tensors.values()):
-        raise TypeError("production Composer requires Tensor IDs and attention mask")
-    if any(
-        value is not None and not isinstance(value, Tensor) for value in optional_tensors.values()
-    ):
-        raise TypeError("production Composer received an invalid optional Tensor")
+) -> ComposedInput:
     return compose_inputs(
-        base_input_ids=cast(Tensor, base_input_ids),
-        base_attention_mask=cast(Tensor, base_attention_mask),
-        state_tokens=cast(Tensor | None, state_tokens),
-        state_token_valid_mask=cast(Tensor | None, state_token_valid_mask),
-        reader_results=cast(Any, reader_results),
+        base_input_ids=base_input_ids,
+        base_attention_mask=base_attention_mask,
+        state_tokens=state_tokens,
+        state_token_valid_mask=state_token_valid_mask,
+        reader_results=reader_results,
         tokenizer=cast(Any, tokenizer),
         embedding_owner=cast(Any, embedding_owner),
         rope_indexer=cast(Any, rope_indexer),
-        video_grid_thw=cast(Tensor | None, video_grid_thw),
+        video_grid_thw=video_grid_thw,
         include_state=include_state,
         include_number=include_number,
     )
@@ -1282,11 +1240,7 @@ class ProductionEpisodeMaterializer:
             ObservationChunkRequest(
                 owner=owner,
                 video_input=materialized_query,
-                query_input=CurrentQueryInput(
-                    video_path,
-                    record.query.runtime,
-                    episode_nonce,
-                ),
+                query_input=_bind_runtime_query(record.query.runtime, video_path, episode_nonce),
                 runtime_state=runtime,
                 bank_states=runtime.state_bank_states,
                 inference=False,
@@ -1297,9 +1251,9 @@ class ProductionEpisodeMaterializer:
             state=None,
             official_weak=(_official_weak(record.query),),
         )
-        payload = record.query.runtime.as_payload(video_path)
+        runtime_query = _bind_runtime_query(record.query.runtime, video_path, episode_nonce)
         return StageATrainingBatch(
-            runtime_payloads=(payload,),
+            runtime_queries=(runtime_query,),
             model_inputs=StageAEpisodeInputs(owner, requests, answer),
             supervision=supervision,
         )
@@ -1349,15 +1303,19 @@ class ProductionEpisodeMaterializer:
             request = ObservationChunkRequest(
                 owner=owner,
                 video_input=materialized,
-                query_input=CurrentQueryInput(video_path, query.runtime, episode_nonce),
+                query_input=_bind_runtime_query(query.runtime, video_path, episode_nonce),
                 runtime_state=runtime,
                 bank_states=runtime.state_bank_states,
                 inference=False,
             )
-            payload = query.runtime.as_payload(video_path)
             queries.append(
                 MetaTTTQueryPoint(
-                    chunk=MetaCausalChunk(request, spec.start_time, spec.end_time, payload),
+                    chunk=MetaCausalChunk(
+                        request,
+                        spec.start_time,
+                        spec.end_time,
+                        _bind_runtime_query(query.runtime, video_path, episode_nonce),
+                    ),
                     query_time=query.runtime.query_time,
                     answer=answer,
                     supervision=StageASupervisionBatch(
@@ -1380,9 +1338,9 @@ class ProductionEpisodeMaterializer:
     def _meta_chunk(
         self,
         owner: RuntimeOwner,
-        runtime: StageABatchRuntime,
+        runtime: BatchRuntimeState,
         video_path: Path,
-        query: RuntimeQuerySpec,
+        query: RuntimeQueryInput,
         chunk: AdaptiveChunkSpec,
         suffix: str,
         episode_nonce: int,
@@ -1398,21 +1356,24 @@ class ProductionEpisodeMaterializer:
         request = ObservationChunkRequest(
             owner=owner,
             video_input=spec,
-            query_input=CurrentQueryInput(video_path, query, episode_nonce),
+            query_input=_bind_runtime_query(query, video_path, episode_nonce),
             runtime_state=runtime,
             bank_states=runtime.state_bank_states,
             inference=False,
         )
         return MetaCausalChunk(
-            request, spec.start_time, spec.end_time, query.as_payload(video_path)
+            request,
+            spec.start_time,
+            spec.end_time,
+            _bind_runtime_query(query, video_path, episode_nonce),
         )
 
     def _request(
         self,
         owner: RuntimeOwner,
-        runtime: StageABatchRuntime,
+        runtime: BatchRuntimeState,
         video_path: Path,
-        query: RuntimeQuerySpec,
+        query: RuntimeQueryInput,
         chunk: AdaptiveChunkSpec,
         index: int,
         episode_nonce: int,
@@ -1427,7 +1388,7 @@ class ProductionEpisodeMaterializer:
                 maximum_frames=chunk.maximum_frames,
                 query_time=query.query_time,
             ),
-            query_input=CurrentQueryInput(video_path, query, episode_nonce),
+            query_input=_bind_runtime_query(query, video_path, episode_nonce),
             runtime_state=runtime,
             bank_states=runtime.state_bank_states,
             inference=False,
@@ -1832,28 +1793,24 @@ def build_runtime(
     )
 
 
-def _reset_meta_runtime(writer: StageABankWriter, owner: RuntimeOwner) -> MetaModelRuntime:
-    runtime = writer.reset(owner)
-    return MetaModelRuntime(runtime, tuple(runtime.state_bank_states))
+def _reset_meta_runtime(writer: StageABankWriter, owner: RuntimeOwner) -> BatchRuntimeState:
+    return writer.reset(owner)
 
 
 def _stage_inputs(
     visual: VisualStageOutput,
-    query: object,
+    query: QueryEncoderOutput,
     request: ObservationChunkRequest,
-) -> tuple[QwenVisualOutput, CurrentChunkMaterialization, QueryEncoderOutput, StageABatchRuntime]:
+) -> tuple[QwenVisualOutput, CurrentChunkMaterialization, QueryEncoderOutput, BatchRuntimeState]:
     if (
         not isinstance(visual.value, QwenVisualOutput)
         or not isinstance(visual.audit, ProductionVisualAudit)
-        or not isinstance(query, QueryEncoderOutput)
     ):
-        raise TypeError("production state stages require typed current visual/query outputs")
+        raise TypeError("production state stages require a typed current visual output")
     return visual.value, visual.audit.chunk, query, _stage_runtime(request)
 
 
-def _stage_runtime(request: ObservationChunkRequest) -> StageABatchRuntime:
-    if not isinstance(request.runtime_state, StageABatchRuntime):
-        raise TypeError("production state stages require StageABatchRuntime")
+def _stage_runtime(request: ObservationChunkRequest) -> BatchRuntimeState:
     return request.runtime_state
 
 
