@@ -182,11 +182,15 @@ class StageASoftWriteOutput:
                 valid = values[mask]
                 if valid.numel():
                     norms = torch.linalg.vector_norm(valid.float(), dim=-1)
+                    norm_tolerance = max(
+                        5.0e-4,
+                        2.0 * float(torch.finfo(valid.dtype).eps),
+                    )
                     if not torch.allclose(
                         norms,
                         torch.ones_like(norms),
-                        atol=5.0e-4,
-                        rtol=5.0e-4,
+                        atol=norm_tolerance,
+                        rtol=0.0,
                     ):
                         raise ValueError("valid Stage A semantics must have unit norm")
 

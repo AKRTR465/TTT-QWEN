@@ -545,7 +545,9 @@ class StageAVariant(StrEnum):
 
 class StageAOptimizerConfig(FrozenModel):
     name: str
-    learning_rate: PositiveFloat
+    qwen_learning_rate: PositiveFloat
+    state_learning_rate: PositiveFloat
+    w0_learning_rate: PositiveFloat
     weight_decay: NonNegativeFloat
     betas: tuple[Probability, Probability]
     epsilon: PositiveFloat
@@ -556,14 +558,16 @@ class StageACheckpointConfig(FrozenModel):
     format: str
     trainable_only: bool
     include_optimizer: bool
+    include_scheduler: bool
     include_rng: bool
     save_full_model: bool
     save_runtime_state: bool
-    best_metric: str
+    save_every_epochs: PositiveInt
+    selection_policy: str
 
 
 class StageATrainingConfig(FrozenModel):
-    """Low-space P15 engineering gate; scientific choices remain a P21 concern."""
+    """Production full-unfreeze A2 before the direct A5 transition."""
 
     variant: StageAVariant
     inner_sgd_enabled: bool
@@ -571,11 +575,44 @@ class StageATrainingConfig(FrozenModel):
     qwen_strategy: str
     qwen_parameter_allowlist: tuple[str, ...]
     trainable_components: tuple[str, ...]
+    predictor_trainable: bool
+    epochs: PositiveInt
+    per_device_train_batch_size: PositiveInt
+    gradient_accumulation_steps: PositiveInt
+    world_size: PositiveInt
+    global_batch_size: PositiveInt
+    loss_terms: tuple[str, ...]
+    supervision_provenance: str
+    load_best_model_at_end: bool
     balanced_task_sampling: bool
     synthetic_engineering_gate_only: bool
     seed: NonNegativeInt
     optimizer: StageAOptimizerConfig
     checkpoint: StageACheckpointConfig
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_production_a2(self) -> Self:
+        if self.variant is not StageAVariant.A2:
+            raise ValueError("stage_a.variant must be a2 in the production path")
+        if self.inner_sgd_enabled:
+            raise ValueError("stage_a.inner_sgd_enabled must be false during A2")
+        if self.qwen_strategy != "full_unfreeze_qwen3_vl_8b":
+            raise ValueError("production A2 must fully unfreeze Qwen3-VL-8B")
+        if self.predictor_trainable:
+            raise ValueError("Predictor remains frozen during A2")
+        if self.epochs != 8 or self.load_best_model_at_end:
+            raise ValueError("production A2 uses eight epochs and the final checkpoint")
+        if self.global_batch_size != (
+            self.per_device_train_batch_size * self.gradient_accumulation_steps * self.world_size
+        ):
+            raise ValueError("A2 global batch must equal per-device batch * GA * world size")
+        if self.loss_terms != ("state", "answer"):
+            raise ValueError("A2 loss must contain only state and answer")
+        if self.supervision_provenance != "official_weak":
+            raise ValueError("production A2 requires official_weak state supervision")
+        if self.synthetic_engineering_gate_only:
+            raise ValueError("production A2 cannot be marked synthetic-only")
+        return self
 
 
 class MetaTTTVariant(StrEnum):
@@ -605,20 +642,28 @@ class StageBTrainingConfig(FrozenModel):
 
 
 class StageCTrainingConfig(FrozenModel):
-    """Multi-Support and multi-Query Meta-TTT engineering contract."""
+    """Direct A5 contract with unbounded numeric state and bounded meta gradients."""
 
     active_variant: MetaTTTVariant
     variants: tuple[MetaTTTVariant, ...]
     a4_enabled_ttt_terms: tuple[str, ...]
     a5_enabled_ttt_terms: tuple[str, ...]
     support_chunk_schedule: tuple[PositiveInt, ...]
-    maximum_support_chunks: PositiveInt
+    maximum_support_chunks: PositiveInt | None
     minimum_query_points: PositiveInt
     multi_query_enabled: bool
     detach_overlap_snapshots: bool
     detach_runtime_between_chunks: bool
     update_effect: str
     reuse_strategy: str
+    direct_from_stage_a: bool
+    meta_gradient_mode: str
+    truncation_horizon: PositiveInt
+    reanchor_to_w0: bool
+    segment_auxiliary_backward: bool
+    training_counterfactual_enabled: bool
+    prewarm_support_chunks: NonNegativeInt
+    outer_step_scope: str
     synthetic_engineering_gate_only: bool
     seed: NonNegativeInt
 
@@ -632,6 +677,18 @@ class StageCTrainingConfig(FrozenModel):
             raise ValueError("stage_c.a4_enabled_ttt_terms must contain only pred and identity")
         if self.a5_enabled_ttt_terms != (*self.a4_enabled_ttt_terms, "event"):
             raise ValueError("stage_c.a5_enabled_ttt_terms must differ from A4 only by event")
+        if self.direct_from_stage_a and self.active_variant is not MetaTTTVariant.A5:
+            raise ValueError("direct Stage A transition must enter A5")
+        if self.meta_gradient_mode != "truncated_second_order":
+            raise ValueError("Stage C production mode must use truncated_second_order")
+        if self.maximum_support_chunks is not None:
+            raise ValueError("Stage C production must not cap the numeric Support stream")
+        if not self.reanchor_to_w0 or not self.segment_auxiliary_backward:
+            raise ValueError("truncated Stage C requires segment backward and W0 re-anchoring")
+        if self.prewarm_support_chunks != 1:
+            raise ValueError("Stage C requires exactly one no-update prewarm chunk")
+        if self.outer_step_scope != "episode":
+            raise ValueError("Stage C outer optimizer scope must be one complete episode")
         return self
 
     @property
@@ -1595,14 +1652,18 @@ class ProjectConfig(FrozenModel):
             (
                 "stage_a.qwen_strategy",
                 self.stage_a.qwen_strategy,
-                "frozen_synthetic_engineering_gate",
+                "full_unfreeze_qwen3_vl_8b",
             ),
             ("stage_a.qwen_parameter_allowlist", self.stage_a.qwen_parameter_allowlist, ()),
             (
                 "stage_a.trainable_components",
                 self.stage_a.trainable_components,
                 (
-                    "fast_adapter",
+                    "qwen_vit",
+                    "qwen_main_merger",
+                    "qwen_deepstack_mergers",
+                    "qwen_decoder_36",
+                    "fast_adapter_w0",
                     "query_encoder",
                     "spatial_encoder",
                     "temporal_encoder",
@@ -1611,15 +1672,54 @@ class ProjectConfig(FrozenModel):
                     "resampler",
                 ),
             ),
+            ("stage_a.predictor_trainable", self.stage_a.predictor_trainable, False),
+            ("stage_a.epochs", self.stage_a.epochs, 8),
+            (
+                "stage_a.per_device_train_batch_size",
+                self.stage_a.per_device_train_batch_size,
+                1,
+            ),
+            (
+                "stage_a.gradient_accumulation_steps",
+                self.stage_a.gradient_accumulation_steps,
+                4,
+            ),
+            ("stage_a.world_size", self.stage_a.world_size, 4),
+            ("stage_a.global_batch_size", self.stage_a.global_batch_size, 16),
+            ("stage_a.loss_terms", self.stage_a.loss_terms, ("state", "answer")),
+            (
+                "stage_a.supervision_provenance",
+                self.stage_a.supervision_provenance,
+                "official_weak",
+            ),
+            (
+                "stage_a.load_best_model_at_end",
+                self.stage_a.load_best_model_at_end,
+                False,
+            ),
             ("stage_a.balanced_task_sampling", self.stage_a.balanced_task_sampling, True),
             (
                 "stage_a.synthetic_engineering_gate_only",
                 self.stage_a.synthetic_engineering_gate_only,
-                True,
+                False,
             ),
             ("stage_a.seed", self.stage_a.seed, 42),
             ("stage_a.optimizer.name", self.stage_a.optimizer.name, "adamw"),
-            ("stage_a.optimizer.learning_rate", self.stage_a.optimizer.learning_rate, 3.0e-4),
+            (
+                "stage_a.optimizer.qwen_learning_rate",
+                self.stage_a.optimizer.qwen_learning_rate,
+                1.0e-5,
+            ),
+            (
+                "stage_a.optimizer.state_learning_rate",
+                self.stage_a.optimizer.state_learning_rate,
+                1.0e-4,
+            ),
+            (
+                "stage_a.optimizer.w0_learning_rate",
+                self.stage_a.optimizer.w0_learning_rate,
+                1.0e-4,
+            ),
             ("stage_a.optimizer.weight_decay", self.stage_a.optimizer.weight_decay, 0.01),
             ("stage_a.optimizer.betas", self.stage_a.optimizer.betas, (0.9, 0.999)),
             ("stage_a.optimizer.epsilon", self.stage_a.optimizer.epsilon, 1.0e-8),
@@ -1627,25 +1727,35 @@ class ProjectConfig(FrozenModel):
             (
                 "stage_a.checkpoint.format",
                 self.stage_a.checkpoint.format,
-                "trainable_safetensors_plus_pt_state_v1",
+                "full_model_optimizer_scheduler_rng_v1",
             ),
-            ("stage_a.checkpoint.trainable_only", self.stage_a.checkpoint.trainable_only, True),
+            ("stage_a.checkpoint.trainable_only", self.stage_a.checkpoint.trainable_only, False),
             (
                 "stage_a.checkpoint.include_optimizer",
                 self.stage_a.checkpoint.include_optimizer,
                 True,
             ),
+            (
+                "stage_a.checkpoint.include_scheduler",
+                self.stage_a.checkpoint.include_scheduler,
+                True,
+            ),
             ("stage_a.checkpoint.include_rng", self.stage_a.checkpoint.include_rng, True),
-            ("stage_a.checkpoint.save_full_model", self.stage_a.checkpoint.save_full_model, False),
+            ("stage_a.checkpoint.save_full_model", self.stage_a.checkpoint.save_full_model, True),
             (
                 "stage_a.checkpoint.save_runtime_state",
                 self.stage_a.checkpoint.save_runtime_state,
                 False,
             ),
             (
-                "stage_a.checkpoint.best_metric",
-                self.stage_a.checkpoint.best_metric,
-                "validation_total_loss",
+                "stage_a.checkpoint.save_every_epochs",
+                self.stage_a.checkpoint.save_every_epochs,
+                2,
+            ),
+            (
+                "stage_a.checkpoint.selection_policy",
+                self.stage_a.checkpoint.selection_policy,
+                "final_epoch",
             ),
             ("stage_b.variant", self.stage_b.variant, MetaTTTVariant.A3),
             ("stage_b.support_chunks", self.stage_b.support_chunks, 1),
@@ -1694,9 +1804,9 @@ class ProjectConfig(FrozenModel):
             (
                 "stage_c.support_chunk_schedule",
                 self.stage_c.support_chunk_schedule,
-                (1, 4, 8),
+                (),
             ),
-            ("stage_c.maximum_support_chunks", self.stage_c.maximum_support_chunks, 8),
+            ("stage_c.maximum_support_chunks", self.stage_c.maximum_support_chunks, None),
             ("stage_c.minimum_query_points", self.stage_c.minimum_query_points, 2),
             ("stage_c.multi_query_enabled", self.stage_c.multi_query_enabled, True),
             (
@@ -1715,10 +1825,30 @@ class ProjectConfig(FrozenModel):
                 self.stage_c.reuse_strategy,
                 "causal_replay_isolated_prefill",
             ),
+            ("stage_c.direct_from_stage_a", self.stage_c.direct_from_stage_a, True),
+            (
+                "stage_c.meta_gradient_mode",
+                self.stage_c.meta_gradient_mode,
+                "truncated_second_order",
+            ),
+            ("stage_c.truncation_horizon", self.stage_c.truncation_horizon, 8),
+            ("stage_c.reanchor_to_w0", self.stage_c.reanchor_to_w0, True),
+            (
+                "stage_c.segment_auxiliary_backward",
+                self.stage_c.segment_auxiliary_backward,
+                True,
+            ),
+            (
+                "stage_c.training_counterfactual_enabled",
+                self.stage_c.training_counterfactual_enabled,
+                False,
+            ),
+            ("stage_c.prewarm_support_chunks", self.stage_c.prewarm_support_chunks, 1),
+            ("stage_c.outer_step_scope", self.stage_c.outer_step_scope, "episode"),
             (
                 "stage_c.synthetic_engineering_gate_only",
                 self.stage_c.synthetic_engineering_gate_only,
-                True,
+                False,
             ),
             ("stage_c.seed", self.stage_c.seed, 42),
             ("inference.reset_per_video", self.inference.reset_per_video, True),

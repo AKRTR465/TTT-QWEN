@@ -101,6 +101,32 @@ class FastParameterGroups:
 
 
 @dataclass(frozen=True, slots=True)
+class FastReanchorAudit:
+    """Detached evidence for one truncated-meta fast-state boundary."""
+
+    fast_version: int
+    update_count: int
+    skip_count: int
+    max_abs_value_drift: tuple[float, float]
+    old_graph_truncated: bool
+    w0_identity_path_restored: bool
+    storage_isolated: bool
+
+    def __post_init__(self) -> None:
+        counters = (self.fast_version, self.update_count, self.skip_count)
+        if any(type(value) is not int or value < 0 for value in counters):
+            raise ValueError("Fast re-anchor counters must be non-negative integers")
+        if self.fast_version != self.update_count:
+            raise ValueError("Fast re-anchor version must equal accepted updates")
+        if any(not math.isfinite(value) or value < 0.0 for value in self.max_abs_value_drift):
+            raise ValueError("Fast re-anchor value drift must be finite and non-negative")
+        if not self.old_graph_truncated or not self.w0_identity_path_restored:
+            raise ValueError("Fast re-anchor must truncate history and restore the W0 path")
+        if not self.storage_isolated:
+            raise ValueError("Fast re-anchor tensors must use isolated storage")
+
+
+@dataclass(frozen=True, slots=True)
 class FastTTTForwardAudit:
     fast_versions: tuple[int, ...]
     update_counts: tuple[int, ...]
@@ -306,9 +332,7 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
         if differentiable is not None and type(differentiable) is not bool:
             raise TypeError("differentiable reset mode must be a bool")
         mode = (
-            state.differentiable
-            if state is not None and differentiable is None
-            else differentiable
+            state.differentiable if state is not None and differentiable is None else differentiable
         )
         return self.initialize_fast_state(differentiable=bool(mode))
 
@@ -490,6 +514,86 @@ def collect_fast_parameters(state: FastWeightsState) -> tuple[Tensor, Tensor]:
     return state.fast_parameters
 
 
+def reanchor_fast_state(
+    state: FastWeightsState,
+) -> tuple[FastWeightsState, FastReanchorAudit]:
+    """Truncate the old inner graph while preserving values and an identity path to W0.
+
+    The straight-through expression ``stopgrad(W_t) + W0 - stopgrad(W0)`` is
+    numerically equal to the incoming fast value.  Its derivative with respect to
+    the checkpointed meta parameter is the identity, while no edge to the old
+    ``W_t`` graph remains.  Runtime counters and hard-state ownership are untouched.
+    """
+
+    if not isinstance(state, FastWeightsState):
+        raise TypeError("reanchor_fast_state requires one FastWeightsState")
+    if not state.differentiable:
+        raise ValueError("only differentiable meta-training fast states may be re-anchored")
+    if not state.w0_1.requires_grad or not state.w0_2.requires_grad:
+        raise ValueError("re-anchoring requires trainable W0 tensors")
+
+    old_values = tuple(value.detach() for value in state.fast_parameters)
+    next_1 = old_values[0] + (state.w0_1 - state.w0_1.detach())
+    next_2 = old_values[1] + (state.w0_2 - state.w0_2.detach())
+    next_state = FastWeightsState(
+        w0_1=state.w0_1,
+        w0_2=state.w0_2,
+        w_t_1=next_1,
+        w_t_2=next_2,
+        fast_version=state.fast_version,
+        update_count=state.update_count,
+        skip_count=state.skip_count,
+        differentiable=True,
+    )
+    isolated = all(
+        not _shares_storage(new, old)
+        for new, old in zip(next_state.fast_parameters, state.fast_parameters, strict=True)
+    )
+    isolated = isolated and all(
+        not _shares_storage(new, base)
+        for new, base in zip(
+            next_state.fast_parameters,
+            (state.w0_1, state.w0_2),
+            strict=True,
+        )
+    )
+    drift: tuple[float, float]
+    if state.w_t_1.device.type == "meta":
+        drift = (0.0, 0.0)
+    else:
+        drift = (
+            float(
+                (next_state.fast_parameters[0].detach() - old_values[0])
+                .abs()
+                .max()
+                .float()
+                .cpu()
+                .item()
+            ),
+            float(
+                (next_state.fast_parameters[1].detach() - old_values[1])
+                .abs()
+                .max()
+                .float()
+                .cpu()
+                .item()
+            ),
+        )
+    audit = FastReanchorAudit(
+        fast_version=state.fast_version,
+        update_count=state.update_count,
+        skip_count=state.skip_count,
+        max_abs_value_drift=(drift[0], drift[1]),
+        old_graph_truncated=all(
+            new.grad_fn is not old.grad_fn
+            for new, old in zip(next_state.fast_parameters, state.fast_parameters, strict=True)
+        ),
+        w0_identity_path_restored=all(value.requires_grad for value in next_state.fast_parameters),
+        storage_isolated=isolated,
+    )
+    return next_state, audit
+
+
 def adapter_parameter_count(module: FastTTTAdapter) -> int:
     return sum(parameter.numel() for parameter in module.parameters())
 
@@ -519,11 +623,7 @@ def _shares_storage(left: Tensor, right: Tensor) -> bool:
 
 
 def _assert_batched_state_storage_isolated(states: Sequence[FastWeightsState]) -> None:
-    online_tensors = tuple(
-        tensor
-        for state in states
-        for tensor in (state.w_t_1, state.w_t_2)
-    )
+    online_tensors = tuple(tensor for state in states for tensor in (state.w_t_1, state.w_t_2))
     for left_index, left in enumerate(online_tensors):
         for right in online_tensors[left_index + 1 :]:
             if _shares_storage(left, right):

@@ -1,0 +1,78 @@
+model_name_or_path: $MODEL
+trust_remote_code: true
+flash_attn: sdpa
+# Match the proven Qwen3-VL-8B SVCBench full-training profile in play/.  Aspect ratio and
+# adaptive frame caps still make the actual current-chunk visual token count dynamic.
+image_max_pixels: 131072
+video_max_pixels: 131072
+
+stage: sft
+do_train: true
+finetuning_type: full
+freeze_vision_tower: false
+freeze_multi_modal_projector: false
+freeze_language_model: false
+# The State/weak-loss graph is intentionally sample-dependent. ZeRO-2 reduces
+# from per-parameter backward hooks and can therefore build different buckets
+# on ranks that receive different operator classes. ZeRO-1 waits until backward
+# completes and reduces the fully anchored gradients in model order.
+deepspeed: configs/h200/deepspeed_zero1_dynamic_graph.json
+
+dataset_dir: $DATASET_DIR
+dataset: $DATASET_NAME
+template: qwen3_vl_nothink
+cutoff_len: 4096
+packing: false
+preprocessing_num_workers: 1
+dataloader_num_workers: 1
+dataloader_prefetch_factor: 2
+dataloader_persistent_workers: true
+dataloader_pin_memory: true
+data_shared_file_system: true
+remove_unused_columns: false
+
+output_dir: $OUTPUT_DIR
+logging_steps: 1
+save_strategy: "no"
+save_only_model: false
+overwrite_output_dir: false
+report_to: none
+load_best_model_at_end: false
+
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-5
+num_train_epochs: 4.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.01
+max_grad_norm: 1.0
+optim: adamw_torch
+bf16: true
+tf32: true
+gradient_checkpointing: true
+use_reentrant_gc: false
+ddp_timeout: 180000000
+seed: 42
+data_seed: 42
+resume_from_checkpoint: null
+
+ttt_qwen:
+  stage: a2
+  project_config: configs/model_state_ttt_8b.yaml
+  dataset_manifest: $SVCBENCH_DATASET_MANIFEST
+  runtime_factory: ttt_svcbench_qwen.production_runtime:build_runtime
+  state_learning_rate: 1.0e-4
+  w0_learning_rate: 1.0e-4
+  predictor_trainable: false
+  weak_supervision_provenance: official_weak
+  visual_length_bucketing: distributed_task_support_then_visual
+  visual_length_proxy: causal_frame_budget_then_decode_rate
+  support_prefetch_depth: 1
+  loss_terms: [state, answer]
+  checkpoint_selection: final_epoch
+  exclude_checkpoint_state:
+    - transient_w_t
+    - state_bank_runtime
+    - fsm_runtime
+    - visual_cache

@@ -95,6 +95,19 @@ class PrefillLifecycle:
         with self._lock:
             return self._runtime_state
 
+    def _validate_observation_ready(self, owner: RuntimeOwner) -> None:
+        """Fail before expensive soft work without claiming the observe capability."""
+
+        with self._lock:
+            if owner != self.owner:
+                raise LifecycleError("request owner does not match the prefill lifecycle")
+            if self.phase is LifecyclePhase.FAILED:
+                raise LifecycleError("failed lifecycle must be reset before reuse")
+            if self._active_operation is not None:
+                raise LifecycleError("prefill lifecycle operations are not re-entrant")
+            if self.phase is not LifecyclePhase.READY or self.prefill_count:
+                raise LifecycleError("observation is forbidden after prefill")
+
     def _begin(self, operation: str, owner: RuntimeOwner) -> None:
         with self._lock:
             if owner != self.owner:
@@ -202,6 +215,37 @@ class SoftIntermediates:
     temporal: object | None
     observations: object | None
     state_write: object | None = None
+
+
+@dataclass(slots=True)
+class ObservationCommitGuard:
+    """Single-use capability preventing checkpoint recompute from repeating a hard write."""
+
+    owner: RuntimeOwner
+    committed: bool = False
+    _lock: RLock = field(default_factory=RLock, init=False, repr=False, compare=False)
+
+    def claim(self, owner: RuntimeOwner) -> None:
+        with self._lock:
+            if owner != self.owner:
+                raise LifecycleError("soft observation commit owner changed")
+            if self.committed:
+                raise LifecycleError("soft observation hard state was already committed")
+            self.committed = True
+
+
+@dataclass(frozen=True, slots=True)
+class SoftObservationChunkOutput:
+    """Checkpoint-safe soft path with no Bank/FSM mutation."""
+
+    owner: RuntimeOwner
+    request_identity: int
+    visual: VisualStageOutput
+    query: object
+    spatial: object | None
+    temporal: object | None
+    observations: object | None
+    commit_guard: ObservationCommitGuard
 
 
 @dataclass(frozen=True, slots=True)
@@ -546,37 +590,78 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
         request: ObservationChunkRequest,
         lifecycle: PrefillLifecycle,
     ) -> ObservationChunkOutput:
-        """Run the soft observation pipeline and delegate the sole hard write."""
+        """Compose the checkpoint-safe soft path with exactly one hard commit."""
 
+        lifecycle._validate_observation_ready(request.owner)
+        soft = self.observe_chunk_soft(request)
+        return self.commit_observation(request, soft, lifecycle)
+
+    def observe_chunk_soft(
+        self,
+        request: ObservationChunkRequest,
+    ) -> SoftObservationChunkOutput:
+        """Run only differentiable observation stages; safe to recompute for checkpointing."""
+
+        visual = self.components.visual_stage(request)
+        if not isinstance(visual, VisualStageOutput):
+            raise TypeError("visual_stage must return VisualStageOutput")
+        query = self.components.query_encoder(request.query_input, inference=request.inference)
+        adapted = visual
+        if self.feature_flags.fast_enabled:
+            fast_adapter = cast(FastStage, self.components.fast_adapter)
+            adapted = fast_adapter(visual, query, request)
+            if not isinstance(adapted, VisualStageOutput):
+                raise TypeError("fast_adapter must return VisualStageOutput")
+
+        spatial: object | None = None
+        temporal: object | None = None
+        observations: object | None = None
+        if self.feature_flags.bank_enabled:
+            spatial_encoder = cast(SpatialStage, self.components.spatial_encoder)
+            temporal_encoder = cast(TemporalStage, self.components.temporal_encoder)
+            heads = cast(ObservationStage, self.components.observation_heads)
+            spatial = spatial_encoder(adapted, query, request)
+            temporal = temporal_encoder(adapted, query, request)
+            observations = heads(spatial, temporal, query, request)
+        return SoftObservationChunkOutput(
+            owner=request.owner,
+            request_identity=id(request),
+            visual=adapted,
+            query=query,
+            spatial=spatial,
+            temporal=temporal,
+            observations=observations,
+            commit_guard=ObservationCommitGuard(request.owner),
+        )
+
+    def commit_observation(
+        self,
+        request: ObservationChunkRequest,
+        soft: SoftObservationChunkOutput,
+        lifecycle: PrefillLifecycle,
+    ) -> ObservationChunkOutput:
+        """Consume one soft result and execute the sole hard Bank/FSM write."""
+
+        if not isinstance(soft, SoftObservationChunkOutput):
+            raise TypeError("hard observation commit requires SoftObservationChunkOutput")
+        if soft.owner != request.owner or soft.request_identity != id(request):
+            raise LifecycleError("soft observation must commit with its exact originating request")
         lifecycle._begin("observe", request.owner)
         try:
-            visual = self.components.visual_stage(request)
-            if not isinstance(visual, VisualStageOutput):
-                raise TypeError("visual_stage must return VisualStageOutput")
-            query = self.components.query_encoder(request.query_input, inference=request.inference)
-            adapted = visual
-            if self.feature_flags.fast_enabled:
-                fast_adapter = cast(FastStage, self.components.fast_adapter)
-                adapted = fast_adapter(visual, query, request)
-                if not isinstance(adapted, VisualStageOutput):
-                    raise TypeError("fast_adapter must return VisualStageOutput")
-
-            spatial: object | None = None
-            temporal: object | None = None
-            observations: object | None = None
+            soft.commit_guard.claim(request.owner)
             runtime_state = request.runtime_state
             bank_states = request.bank_states
             bank_audit: object | None = None
             soft_write: object | None = None
             if self.feature_flags.bank_enabled:
-                spatial_encoder = cast(SpatialStage, self.components.spatial_encoder)
-                temporal_encoder = cast(TemporalStage, self.components.temporal_encoder)
-                heads = cast(ObservationStage, self.components.observation_heads)
                 writer = cast(BankWriter, self.components.bank_writer)
-                spatial = spatial_encoder(adapted, query, request)
-                temporal = temporal_encoder(adapted, query, request)
-                observations = heads(spatial, temporal, query, request)
-                write = writer(observations, spatial, temporal, query, request)
+                write = writer(
+                    soft.observations,
+                    soft.spatial,
+                    soft.temporal,
+                    soft.query,
+                    request,
+                )
                 if not isinstance(write, BankWriteOutput):
                     raise TypeError("bank_writer must return BankWriteOutput")
                 if len(write.bank_states) != len(request.owner.video_ids):
@@ -589,20 +674,20 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             lifecycle._succeed("observe", runtime_state)
             return ObservationChunkOutput(
                 owner=request.owner,
-                visual=adapted,
-                query=query,
-                spatial=spatial,
-                temporal=temporal,
-                observations=observations,
+                visual=soft.visual,
+                query=soft.query,
+                spatial=soft.spatial,
+                temporal=soft.temporal,
+                observations=soft.observations,
                 runtime_state=runtime_state,
                 bank_states=bank_states,
                 state_audit=bank_audit,
                 soft_intermediates=SoftIntermediates(
-                    adapted_visual=adapted.value,
-                    query=query,
-                    spatial=spatial,
-                    temporal=temporal,
-                    observations=observations,
+                    adapted_visual=soft.visual.value,
+                    query=soft.query,
+                    spatial=soft.spatial,
+                    temporal=soft.temporal,
+                    observations=soft.observations,
                     state_write=soft_write,
                 ),
                 lifecycle=lifecycle.audit(),

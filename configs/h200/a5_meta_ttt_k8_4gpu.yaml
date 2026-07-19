@@ -1,0 +1,82 @@
+model_name_or_path: $MODEL
+trust_remote_code: true
+flash_attn: sdpa
+image_max_pixels: 131072
+video_max_pixels: 131072
+
+stage: sft
+do_train: true
+finetuning_type: full
+freeze_vision_tower: false
+freeze_multi_modal_projector: false
+freeze_language_model: false
+deepspeed: configs/h200/deepspeed_zero2.json
+
+dataset_dir: $DATASET_DIR
+dataset: $DATASET_NAME
+template: qwen3_vl_nothink
+cutoff_len: 4096
+packing: false
+preprocessing_num_workers: 1
+dataloader_num_workers: 0
+data_shared_file_system: true
+remove_unused_columns: false
+
+output_dir: $OUTPUT_DIR
+logging_steps: 1
+save_strategy: steps
+save_steps: 0.5
+save_total_limit: 2
+save_only_model: false
+overwrite_output_dir: false
+report_to: none
+load_best_model_at_end: false
+
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 5.0e-6
+num_train_epochs: 2.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.01
+max_grad_norm: 1.0
+optim: adamw_torch
+bf16: true
+tf32: true
+gradient_checkpointing: true
+use_reentrant_gc: false
+ddp_timeout: 180000000
+seed: 42
+data_seed: 42
+# A5 initializes model/module weights from A2 through the TTT runtime factory, but
+# intentionally starts a fresh A5 optimizer/scheduler and Trainer state.
+resume_from_checkpoint: null
+
+ttt_qwen:
+  stage: a5
+  project_config: configs/model_state_ttt_8b.yaml
+  dataset_manifest: $SVCBENCH_DATASET_MANIFEST
+  runtime_factory: ttt_svcbench_qwen.production_runtime:build_runtime
+  initialize_from_a2_checkpoint: $A2_CHECKPOINT
+  truncation_mode: truncated_second_order
+  truncation_horizon: 8
+  reanchor_to_w0: true
+  support_limit: null
+  minimum_query_points: 2
+  inner_learning_rate: 1.0e-4
+  inner_parameter_names: [w_t_1, w_t_2]
+  inner_momentum: 0.0
+  state_w0_predictor_learning_rate: 5.0e-5
+  auxiliary_ttt_weight: 0.1
+  training_counterfactual_enabled: false
+  bucket_key: tbptt_segment_count
+  world_size: 4
+  deterministic_zero_weight_padding: true
+  optimizer_step_scope: episode
+  checkpoint_selection: final_epoch
+  checkpoint_every_epochs: 1
+  exclude_checkpoint_state:
+    - transient_w_t
+    - state_bank_runtime
+    - fsm_runtime
+    - visual_cache

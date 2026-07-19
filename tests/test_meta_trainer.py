@@ -35,6 +35,7 @@ from ttt_svcbench_qwen.meta_trainer import (
     MetaTTTTrainer,
     StageAQueryLossBuilder,
     SyntheticAblationRecord,
+    TruncatedMetaTTTTrainer,
     audit_variant_isolation,
     compare_synthetic_ablations,
     render_synthetic_ablation_report,
@@ -575,6 +576,44 @@ def _episode(
     return MetaTTTEpisode(owner, supports, queries, seed)
 
 
+def _truncated_episode(
+    config: ProjectConfig,
+    *,
+    support_count: int,
+    query_count: int = 2,
+) -> MetaTTTEpisode:
+    base = _episode(
+        config,
+        MetaTTTVariant.A5,
+        support_count=support_count,
+        query_count=query_count,
+    )
+    prewarm = _chunk(base.owner, chunk_index=0, end_time=0.5, width=2)
+    supports = tuple(
+        _chunk(
+            base.owner,
+            chunk_index=index + 1,
+            end_time=float(index) + 1.5,
+            width=2,
+        )
+        for index in range(support_count)
+    )
+    queries = tuple(
+        replace(
+            query,
+            chunk=_chunk(
+                base.owner,
+                chunk_index=support_count + index + 1,
+                end_time=float(support_count + index) + 2.0,
+                width=2,
+            ),
+            query_time=float(support_count + index) + 2.0,
+        )
+        for index, query in enumerate(base.query_points)
+    )
+    return replace(base, prewarm_chunk=prewarm, support_chunks=supports, query_points=queries)
+
+
 def _chunk(
     owner: RuntimeOwner,
     *,
@@ -861,6 +900,80 @@ def test_a5_support_schedule_is_bounded_and_next_only(
         assert output.audit.updates[1].match.snapshot_storage_isolated
         assert output.audit.updates[1].match.authoritative_identity_update_evidence
         assert output.audit.updates[1].match.identity_decision_storage_free
+
+
+def test_truncated_a5_t17_k8_has_two_numeric_truncations_and_bounded_graphs(
+    config: ProjectConfig,
+) -> None:
+    runner, fast, predictor, resetter = _system(config, MetaTTTVariant.A5)
+    episode = _truncated_episode(config, support_count=17)
+    output = runner.run_truncated(episode)
+
+    assert output.audit.support_count == 17
+    assert output.audit.truncation_horizon == 8
+    assert output.audit.truncation_count == 2
+    assert output.audit.segment_count == 3
+    assert output.audit.backward_count == 3
+    assert output.audit.maximum_retained_support_graphs == 8
+    assert [segment.support_count for segment in output.audit.segments] == [8, 8, 1]
+    assert [segment.includes_query_backward for segment in output.audit.segments] == [
+        False,
+        False,
+        True,
+    ]
+    assert all(segment.reanchored for segment in output.audit.segments)
+    assert output.final_fast_states[0].fast_version == 17
+    assert output.final_fast_states[0].update_count == 17
+    assert output.final_fast_states[0].w_t_1.grad_fn is not None
+    assert output.final_fast_states[0].w_t_2.grad_fn is not None
+    assert output.total.grad_fn is None and not output.total.requires_grad
+    assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
+    assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
+    assert predictor.scale.grad is not None and float(predictor.scale.grad.abs()) > 0.0
+    assert resetter.calls == 1
+
+
+def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectConfig) -> None:
+    runner, fast, _, _ = _system(config, MetaTTTVariant.A5)
+
+    output = runner.run_truncated(_truncated_episode(config, support_count=8))
+
+    assert output.audit.segment_count == 1
+    assert output.audit.backward_count == 1
+    assert output.audit.truncation_count == 1
+    assert output.audit.segments[0].support_count == 8
+    assert output.audit.segments[0].includes_query_backward
+    assert output.audit.segments[0].reanchored
+    assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
+    assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
+
+
+def test_truncated_a5_trainer_steps_outer_optimizer_once_per_episode(
+    config: ProjectConfig,
+) -> None:
+    runner, fast, predictor, _ = _system(config, MetaTTTVariant.A5)
+    optimizer = torch.optim.SGD((*fast.parameters(), *predictor.parameters()), lr=0.05)
+    trainer = TruncatedMetaTTTTrainer(
+        runner=runner,
+        optimizer=optimizer,
+        outer_grad_clip_norm=1.0,
+    )
+    calls = 0
+    original_step = optimizer.step
+
+    def counted_step(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original_step(*args, **kwargs)
+
+    optimizer.step = counted_step  # type: ignore[method-assign]
+    output = trainer.train_step(_truncated_episode(config, support_count=9))
+
+    assert calls == 1
+    assert output.global_step == 1
+    assert output.audit.optimizer_step_applied
+    assert output.episode.audit.backward_count == 2
+    assert output.episode.audit.training_counterfactual_executed is False
 
 
 def test_a4_a5_terms_multi_query_and_repeatability(config: ProjectConfig) -> None:

@@ -25,9 +25,7 @@ class SyntheticA0Predictor:
     model_revision = "fixture-v1"
     state_modules_enabled = False
     ttt_enabled = False
-    prompt_template = (
-        "SYNTHETIC ENGINEERING DRY-RUN: {question} Answer with ONLY one integer."
-    )
+    prompt_template = "SYNTHETIC ENGINEERING DRY-RUN: {question} Answer with ONLY one integer."
     generation_parameters = {"do_sample": False, "max_new_tokens": 8, "synthetic": True}
 
     def __init__(self) -> None:
@@ -58,8 +56,7 @@ def test_committed_synthetic_fold_manifest_is_reproducible_and_video_disjoint() 
         asdict(manifest)
     )
     assert all(
-        not (set(fold.train_video_ids) & set(fold.validation_video_ids))
-        for fold in manifest.folds
+        not (set(fold.train_video_ids) & set(fold.validation_video_ids)) for fold in manifest.folds
     )
 
 
@@ -74,9 +71,7 @@ def test_committed_synthetic_a0_report_covers_metrics_and_failure_case() -> None
         SyntheticA0Predictor(),
     )
 
-    assert _read_json(ARTIFACTS / "synthetic-a0-report.json") == _json_normalize(
-        asdict(report)
-    )
+    assert _read_json(ARTIFACTS / "synthetic-a0-report.json") == _json_normalize(asdict(report))
     assert report.model_id.startswith("synthetic/")
     assert report.state_modules_enabled is False
     assert report.ttt_enabled is False

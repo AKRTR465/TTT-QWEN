@@ -268,6 +268,68 @@ class PreparedVideoFeatures:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class CurrentChunkVisualTokenAudit:
+    """Evidence that one Qwen prefill consumes exactly one current video chunk.
+
+    Token counts are deliberately *not* required to be constant across chunks.  Spatial
+    resolution/aspect ratio and the number of real frames may therefore change the count, while
+    the continuation capability remains a single :class:`PreparedVideoFeatures` object rather
+    than a container of historical chunk features.
+    """
+
+    batch_size: int
+    raw_patch_counts: tuple[int, ...]
+    merged_token_counts: tuple[int, ...]
+    history_feature_set_count: int
+    dynamic_token_count_allowed: bool
+
+    def __post_init__(self) -> None:
+        if self.batch_size <= 0:
+            raise ValueError("current-chunk visual audit requires a non-empty batch")
+        if (
+            len(self.raw_patch_counts) != self.batch_size
+            or len(self.merged_token_counts) != self.batch_size
+        ):
+            raise ValueError("current-chunk visual audit counts must align to the batch")
+        if any(value <= 0 for value in (*self.raw_patch_counts, *self.merged_token_counts)):
+            raise ValueError("current-chunk visual token counts must be positive")
+        if self.history_feature_set_count != 0:
+            raise ValueError("historical chunk visual features may not enter a Qwen prefill")
+        if not self.dynamic_token_count_allowed:
+            raise ValueError("production current-chunk visual counts are intentionally dynamic")
+
+
+def audit_current_chunk_visual_tokens(
+    prepared: PreparedVideoFeatures,
+    pixel_values_videos: Tensor,
+    video_grid_thw: Tensor,
+) -> CurrentChunkVisualTokenAudit:
+    """Validate the one-current-chunk Qwen continuation boundary.
+
+    The strict ``PreparedVideoFeatures`` type is important here: callers cannot pass a list or
+    tuple of per-chunk capabilities and silently concatenate their visual tokens.  The exact
+    geometry must also match the pixels of the current request.  No fixed merged-token target is
+    imposed.
+    """
+
+    if not isinstance(prepared, PreparedVideoFeatures):
+        raise TypeError(
+            "Qwen prefill requires one PreparedVideoFeatures current chunk, not a history container"
+        )
+    prepared.validate_request(pixel_values_videos, video_grid_thw)
+    raw_patch_counts = tuple(
+        int(value) for value in torch.prod(video_grid_thw.detach().to("cpu"), dim=1).tolist()
+    )
+    return CurrentChunkVisualTokenAudit(
+        batch_size=len(prepared.metadata.token_counts),
+        raw_patch_counts=raw_patch_counts,
+        merged_token_counts=prepared.metadata.token_counts,
+        history_feature_set_count=0,
+        dynamic_token_count_allowed=True,
+    )
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class StateEmbeddingPayload:
     """Packed State embeddings to scatter once into one exact Qwen prefill sequence.

@@ -284,7 +284,16 @@ class StateRecord:
             if not bool(torch.isfinite(embedding).all()):
                 raise ValueError("semantic_embedding must be finite")
             norm = torch.linalg.vector_norm(embedding.float())
-            if not torch.allclose(norm, torch.ones_like(norm), atol=5.0e-4, rtol=5.0e-4):
+            norm_tolerance = max(
+                5.0e-4,
+                2.0 * float(torch.finfo(embedding.dtype).eps),
+            )
+            if not torch.allclose(
+                norm,
+                torch.ones_like(norm),
+                atol=norm_tolerance,
+                rtol=0.0,
+            ):
                 raise ValueError("semantic_embedding must have unit L2 norm")
         if (self.timestamp is None) == (self.time_range is None):
             raise ValueError("StateRecord requires exactly one of timestamp or time_range")

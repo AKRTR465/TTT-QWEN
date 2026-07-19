@@ -143,11 +143,15 @@ class O2SoftOutput:
             valid_identity = self.identity[self.valid_mask]
             if valid_identity.numel():
                 norms = torch.linalg.vector_norm(valid_identity.float(), dim=-1)
+                norm_tolerance = max(
+                    5.0e-4,
+                    2.0 * float(torch.finfo(valid_identity.dtype).eps),
+                )
                 if not torch.allclose(
                     norms,
                     torch.ones_like(norms),
-                    atol=5.0e-4,
-                    rtol=5.0e-4,
+                    atol=norm_tolerance,
+                    rtol=0.0,
                 ):
                     raise ValueError("valid O2 identities must have unit L2 norm")
 
@@ -444,11 +448,15 @@ class E2SoftOutput:
             raise ValueError("E2 output requires one next state and an E2 audit per batch row")
         if self.event_logits.device.type != "meta":
             valid_phase = self.phase_probabilities[self.valid_mask]
+            sum_tolerance = max(
+                5.0e-4,
+                2.0 * float(torch.finfo(self.phase_probabilities.dtype).eps),
+            )
             if valid_phase.numel() and not torch.allclose(
                 valid_phase.float().sum(dim=-1),
                 torch.ones(valid_phase.shape[0], device=valid_phase.device),
-                atol=5.0e-4,
-                rtol=5.0e-4,
+                atol=sum_tolerance,
+                rtol=0.0,
             ):
                 raise ValueError("valid E2 phase probabilities must sum to one")
         _assert_e2_state_storage_isolated(self.next_states)
@@ -1112,10 +1120,7 @@ class ObservationHeads(nn.Module):  # type: ignore[misc]
             batch_size,
             "ObservationHeads",
         )
-        if (
-            owners[0] != temporal.cache.video_ids
-            or owners[1] != temporal.cache.trajectory_ids
-        ):
+        if owners[0] != temporal.cache.video_ids or owners[1] != temporal.cache.trajectory_ids:
             raise ValueError("observation owners must exactly match temporal cache owners")
         _validate_query(q_target, spatial.slots, 512, "ObservationHeads")
         if temporal.cache.query_signatures.shape != q_target.shape or not torch.equal(

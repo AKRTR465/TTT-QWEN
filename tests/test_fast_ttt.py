@@ -16,6 +16,7 @@ from ttt_svcbench_qwen.fast_ttt import (
     build_fast_ttt_adapter,
     collect_fast_parameters,
     online_parameter_count,
+    reanchor_fast_state,
     slow_parameter_count,
 )
 from ttt_svcbench_qwen.qwen_adapter import QwenVideoFeatureBoundary
@@ -47,8 +48,7 @@ def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> N
     assert adapter_parameter_count(adapter) == 7_480_064
     assert slow_parameter_count(adapter) == 6_300_416
     assert (
-        sum(parameter.numel() for parameter in adapter.collect_meta_fast_parameters())
-        == 1_179_648
+        sum(parameter.numel() for parameter in adapter.collect_meta_fast_parameters()) == 1_179_648
     )
     assert set(adapter.state_dict()) == {
         "rms_norm.weight",
@@ -253,6 +253,30 @@ def test_parameter_collection_is_stable_exact_and_rejects_boundary_drift() -> No
         adapter.assert_online_parameter_boundary(groups.meta_fast, state)
 
 
+def test_truncated_meta_reanchor_preserves_value_cuts_history_and_restores_w0_path() -> None:
+    adapter = make_adapter()
+    initial = adapter.initialize_fast_state(differentiable=True)
+    support_scale = torch.tensor(0.25, requires_grad=True)
+    old_1 = initial.w_t_1 + support_scale * initial.w_t_1.square()
+    old_2 = initial.w_t_2 + support_scale * initial.w_t_2.square()
+    old_state = replace(initial, w_t_1=old_1, w_t_2=old_2, fast_version=1, update_count=1)
+
+    reanchored, audit = reanchor_fast_state(old_state)
+    query = reanchored.w_t_1.sum() + 2.0 * reanchored.w_t_2.sum()
+    grad_w0 = torch.autograd.grad(query, (adapter.w0_1, adapter.w0_2), retain_graph=True)
+    grad_old_support = torch.autograd.grad(query, support_scale, allow_unused=True)[0]
+
+    assert torch.equal(reanchored.w_t_1.detach(), old_state.w_t_1.detach())
+    assert torch.equal(reanchored.w_t_2.detach(), old_state.w_t_2.detach())
+    assert audit.max_abs_value_drift == (0.0, 0.0)
+    assert audit.old_graph_truncated
+    assert audit.w0_identity_path_restored
+    assert audit.storage_isolated
+    assert torch.equal(grad_w0[0], torch.ones_like(grad_w0[0]))
+    assert torch.equal(grad_w0[1], torch.full_like(grad_w0[1], 2.0))
+    assert grad_old_support is None
+
+
 def test_state_dict_roundtrip_saves_w0_and_never_transient_w_t() -> None:
     source = make_adapter()
     state = source.initialize_fast_state()
@@ -307,9 +331,10 @@ def test_online_binding_rejects_stale_slow_grad_and_differentiable_binding_stays
     online_state = adapter.initialize_fast_state()
     outer_flags = tuple(parameter.requires_grad for parameter in adapter.parameters())
     adapter.p_in.weight.grad = torch.ones_like(adapter.p_in.weight)
-    with pytest.raises(
-        ValueError, match="stale module gradients"
-    ), adapter.use_fast_state(online_state):
+    with (
+        pytest.raises(ValueError, match="stale module gradients"),
+        adapter.use_fast_state(online_state),
+    ):
         pass
     assert tuple(parameter.requires_grad for parameter in adapter.parameters()) == outer_flags
     adapter.zero_grad(set_to_none=True)

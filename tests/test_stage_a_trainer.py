@@ -186,12 +186,13 @@ def test_stage_a_loss_has_no_ttt_and_keeps_a1_a2_objectives_exact() -> None:
         compute_stage_a_losses(StageAVariant.A1, answer=answer, state=state_input)
 
 
-def test_stage_a_optimizer_owns_static_w0_and_state_allowlist_only() -> None:
+def test_stage_a_optimizer_owns_full_qwen_state_and_w0_but_not_predictor() -> None:
     model = _ToyStageAModel()
     trainer = build_trainer(config=load_config(), model=model, forward_step=_ToyForward(model))
     selected = trainer.parameter_audit.trainable_names
     assert any("fast_adapter" in name for name in selected)
-    assert all("predictor" not in name and "qwen_prefill" not in name for name in selected)
+    assert any("qwen_prefill" in name for name in selected)
+    assert all("predictor" not in name for name in selected)
     actual = {
         id(parameter) for group in trainer.optimizer.param_groups for parameter in group["params"]
     }
@@ -211,9 +212,16 @@ def test_stage_a_step_updates_only_allowlist_and_reports_na_as_none() -> None:
     metrics = dict(output.metrics)
     assert metrics["retrieval/precision"] is None
     assert metrics["reader/exact_count_accuracy"] == 1.0
+    changed_names = {
+        name
+        for name, parameter in model.named_parameters()
+        if not torch.equal(before[name], parameter)
+    }
+    assert changed_names
+    assert changed_names <= set(trainer.parameter_audit.trainable_names)
     for name, parameter in model.named_parameters():
-        changed = not torch.equal(before[name], parameter)
-        assert changed == (name in trainer.parameter_audit.trainable_names)
+        if name in trainer.parameter_audit.frozen_names:
+            assert torch.equal(before[name], parameter)
 
 
 def test_stage_a_nonfinite_gradient_skips_without_partial_parameter_update() -> None:
@@ -252,6 +260,22 @@ def test_stage_a_runtime_payload_leak_and_inner_sgd_audit_fail_closed() -> None:
         ).validate_for(StageAVariant.A2)
 
 
+def test_stage_a_audit_allows_label_free_unsupported_route_without_bank_write() -> None:
+    StageAExecutionAudit(
+        row_count=1,
+        observed_chunk_count=1,
+        hard_state_row_count=1,
+        query_router_row_count=1,
+        time_resolver_row_count=1,
+        retrieval_row_count=1,
+        reader_result_count=1,
+        bank_reset_count=1,
+        bank_write_count=0,
+        cache_advance_count=1,
+        fsm_rollout_count=0,
+    ).validate_for(StageAVariant.A2)
+
+
 def test_balanced_stage_a_sampler_is_seeded_and_balances_four_families() -> None:
     tasks = ("o1", "o1", "o1", "o2", "e1", "e1", "e2")
     first = build_balanced_stage_a_indices(tasks, seed=42)
@@ -263,12 +287,16 @@ def test_balanced_stage_a_sampler_is_seeded_and_balances_four_families() -> None
     assert set(counts.values()) == {3}
 
 
-def test_stage_a_checkpoint_roundtrip_is_trainable_only_and_restores_rng(tmp_path: Path) -> None:
+def test_stage_a_checkpoint_roundtrip_is_full_and_restores_outer_state_rng(tmp_path: Path) -> None:
     torch.manual_seed(15)
     random.seed(15)
     config = load_config()
     model = _ToyStageAModel()
     trainer = build_trainer(config=config, model=model, forward_step=_ToyForward(model))
+    trainer.scheduler = torch.optim.lr_scheduler.LambdaLR(
+        trainer.optimizer,
+        lr_lambda=lambda _step: 1.0,
+    )
     trainer.train_step(_batch())
     saved = {
         name: parameter.detach().clone()
@@ -296,6 +324,7 @@ def test_stage_a_checkpoint_roundtrip_is_trainable_only_and_restores_rng(tmp_pat
         checkpoint,
         model=model,
         optimizer=trainer.optimizer,
+        scheduler=trainer.scheduler,
         config=config,
         parameter_audit=trainer.parameter_audit,
         variant=StageAVariant.A2,
@@ -305,14 +334,14 @@ def test_stage_a_checkpoint_roundtrip_is_trainable_only_and_restores_rng(tmp_pat
     assert torch.equal(torch.rand(3), expected_torch)
     assert all(torch.equal(saved[name], dict(model.named_parameters())[name]) for name in saved)
 
-    tensors = load_file(str(checkpoint / "trainable.safetensors"))
-    assert set(tensors) == set(trainer.parameter_audit.trainable_names)
+    tensors = load_file(str(checkpoint / "model.safetensors"))
+    assert set(tensors) == set(model.state_dict())
     manifest = json.loads((checkpoint / "manifest.json").read_text(encoding="utf-8"))
     serialized = json.dumps(manifest, sort_keys=True).lower()
     for forbidden in ("transient_w_t", "state_bank_runtime", "temporal_cache"):
         assert forbidden in serialized
     assert manifest["variant"] == "a2"
-    assert set(manifest["artifacts"]) == {"trainable.safetensors", "training_state.pt"}
+    assert set(manifest["artifacts"]) == {"model.safetensors", "training_state.pt"}
 
 
 def test_training_step_output_rejects_stage_loss_type_mismatch() -> None:

@@ -19,6 +19,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.qwen_adapter import (
+    CurrentChunkVisualTokenAudit,
     MergedVideoMetadata,
     PreparedVideoFeatures,
     Qwen3VLAdapter,
@@ -27,6 +28,7 @@ from ttt_svcbench_qwen.qwen_adapter import (
     StateEmbeddingPayload,
     VideoBatch,
     assert_qwen_checkpoint_config,
+    audit_current_chunk_visual_tokens,
     build_qwen_adapter,
 )
 
@@ -279,6 +281,17 @@ def test_variable_video_mapping_and_deepstack_objects_are_preserved() -> None:
     assert prepared is not None
     assert prepared.main_features == main
     assert all(prepared.deepstack_features[index] is deepstack[index] for index in range(3))
+
+    pixels = torch.zeros(40, 1536)
+    audit = audit_current_chunk_visual_tokens(prepared, pixels, grid)
+    assert isinstance(audit, CurrentChunkVisualTokenAudit)
+    assert audit.raw_patch_counts == (32, 8)
+    assert audit.merged_token_counts == (8, 2)
+    assert audit.history_feature_set_count == 0
+    assert audit.dynamic_token_count_allowed
+
+    with pytest.raises(TypeError, match="history container"):
+        audit_current_chunk_visual_tokens((prepared,), pixels, grid)  # type: ignore[arg-type]
 
 
 def test_visual_output_rejects_invalid_padding_width_and_deepstack_count() -> None:

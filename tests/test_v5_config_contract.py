@@ -539,10 +539,14 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "variant": "a2",
         "inner_sgd_enabled": False,
         "fast_adapter_mode": "static_w0_no_inner_sgd",
-        "qwen_strategy": "frozen_synthetic_engineering_gate",
+        "qwen_strategy": "full_unfreeze_qwen3_vl_8b",
         "qwen_parameter_allowlist": (),
         "trainable_components": (
-            "fast_adapter",
+            "qwen_vit",
+            "qwen_main_merger",
+            "qwen_deepstack_mergers",
+            "qwen_decoder_36",
+            "fast_adapter_w0",
             "query_encoder",
             "spatial_encoder",
             "temporal_encoder",
@@ -550,25 +554,38 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
             "state_bank",
             "resampler",
         ),
+        "predictor_trainable": False,
+        "epochs": 8,
+        "per_device_train_batch_size": 1,
+        "gradient_accumulation_steps": 4,
+        "world_size": 4,
+        "global_batch_size": 16,
+        "loss_terms": ("state", "answer"),
+        "supervision_provenance": "official_weak",
+        "load_best_model_at_end": False,
         "balanced_task_sampling": True,
-        "synthetic_engineering_gate_only": True,
+        "synthetic_engineering_gate_only": False,
         "seed": 42,
         "optimizer": {
             "name": "adamw",
-            "learning_rate": 3.0e-4,
+            "qwen_learning_rate": 1.0e-5,
+            "state_learning_rate": 1.0e-4,
+            "w0_learning_rate": 1.0e-4,
             "weight_decay": 0.01,
             "betas": (0.9, 0.999),
             "epsilon": 1.0e-8,
             "grad_clip_norm": 1.0,
         },
         "checkpoint": {
-            "format": "trainable_safetensors_plus_pt_state_v1",
-            "trainable_only": True,
+            "format": "full_model_optimizer_scheduler_rng_v1",
+            "trainable_only": False,
             "include_optimizer": True,
+            "include_scheduler": True,
             "include_rng": True,
-            "save_full_model": False,
+            "save_full_model": True,
             "save_runtime_state": False,
-            "best_metric": "validation_total_loss",
+            "save_every_epochs": 2,
+            "selection_policy": "final_epoch",
         },
     }
     assert config.stage_b.model_dump() == {
@@ -591,15 +608,23 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "variants": ("a4", "a5"),
         "a4_enabled_ttt_terms": ("pred", "identity"),
         "a5_enabled_ttt_terms": ("pred", "identity", "event"),
-        "support_chunk_schedule": (1, 4, 8),
-        "maximum_support_chunks": 8,
+        "support_chunk_schedule": (),
+        "maximum_support_chunks": None,
         "minimum_query_points": 2,
         "multi_query_enabled": True,
         "detach_overlap_snapshots": True,
         "detach_runtime_between_chunks": True,
         "update_effect": "next_chunk_only",
         "reuse_strategy": "causal_replay_isolated_prefill",
-        "synthetic_engineering_gate_only": True,
+        "direct_from_stage_a": True,
+        "meta_gradient_mode": "truncated_second_order",
+        "truncation_horizon": 8,
+        "reanchor_to_w0": True,
+        "segment_auxiliary_backward": True,
+        "training_counterfactual_enabled": False,
+        "prewarm_support_chunks": 1,
+        "outer_step_scope": "episode",
+        "synthetic_engineering_gate_only": False,
         "seed": 42,
     }
     assert config.inference.model_dump() == {
@@ -615,7 +640,7 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
     }
 
 
-def test_stage_c_a4_and_a5_are_independently_selectable_with_one_term_delta() -> None:
+def test_stage_c_production_path_enters_a5_directly_and_keeps_a4_unreachable() -> None:
     raw_a5 = load_raw_config()
     config_a5 = ProjectConfig.model_validate(raw_a5)
     assert config_a5.stage_c.active_variant.value == "a5"
@@ -623,12 +648,8 @@ def test_stage_c_a4_and_a5_are_independently_selectable_with_one_term_delta() ->
 
     raw_a4 = copy.deepcopy(raw_a5)
     raw_a4["stage_c"]["active_variant"] = "a4"
-    config_a4 = ProjectConfig.model_validate(raw_a4)
-    assert config_a4.stage_c.active_variant.value == "a4"
-    assert config_a4.stage_c.enabled_ttt_terms == ("pred", "identity")
-    assert set(config_a5.stage_c.enabled_ttt_terms) - set(config_a4.stage_c.enabled_ttt_terms) == {
-        "event"
-    }
+    with pytest.raises(ValidationError, match="direct Stage A transition must enter A5"):
+        ProjectConfig.model_validate(raw_a4)
 
 
 def test_v5_parameter_budget_matches_architecture_rounding() -> None:

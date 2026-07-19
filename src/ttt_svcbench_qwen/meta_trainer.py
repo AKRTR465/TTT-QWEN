@@ -11,7 +11,7 @@ cross-video runtime reuse, observe-after-prefill, or carrying differentiable run
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import StrEnum
@@ -27,9 +27,11 @@ from ttt_svcbench_qwen.config import (
 )
 from ttt_svcbench_qwen.data import assert_runtime_payload_safe
 from ttt_svcbench_qwen.fast_ttt import (
+    FastReanchorAudit,
     FastTTTForwardAudit,
     FastWeightsState,
     OptimizerRuntimeState,
+    reanchor_fast_state,
 )
 from ttt_svcbench_qwen.functional_sgd import (
     FunctionalSGDResult,
@@ -71,7 +73,12 @@ from ttt_svcbench_qwen.model import (
 from ttt_svcbench_qwen.observation_heads import ObservationOutputs
 from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput
 from ttt_svcbench_qwen.stage_a_runtime import StageAWriteAudit
-from ttt_svcbench_qwen.stage_a_targets import StageATargetBuilder, TargetProvenance
+from ttt_svcbench_qwen.stage_a_targets import (
+    OfficialWeakStateLossOutput,
+    OfficialWeakTargetBuilder,
+    StageATargetBuilder,
+    TargetProvenance,
+)
 from ttt_svcbench_qwen.state_encoder import TemporalEncoderOutput
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
 from ttt_svcbench_qwen.trainer import (
@@ -80,7 +87,7 @@ from ttt_svcbench_qwen.trainer import (
 )
 
 _SUPPORTED_TERMS = ("pred", "identity", "event")
-_MAX_SUPPORT_CHUNKS = 8
+_LEGACY_FULL_GRAPH_BOUND = 8
 _CI_Z_95 = 1.959963984540054
 
 
@@ -174,16 +181,18 @@ class MetaTTTEpisode:
     support_chunks: tuple[MetaCausalChunk, ...]
     query_points: tuple[MetaTTTQueryPoint, ...]
     seed: int
+    prewarm_chunk: MetaCausalChunk | None = None
 
     def __post_init__(self) -> None:
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("Meta-TTT episode seed must be a non-negative integer")
         support_count = len(self.support_chunks)
-        if support_count < 1 or support_count > _MAX_SUPPORT_CHUNKS:
-            raise ValueError("Meta-TTT episodes require between 1 and 8 Support chunks")
+        if support_count < 1:
+            raise ValueError("Meta-TTT episodes require at least one Support chunk")
         if not self.query_points:
             raise ValueError("Meta-TTT episodes require at least one later Query point")
-        chunks = (*self.support_chunks, *(query.chunk for query in self.query_points))
+        prefix = () if self.prewarm_chunk is None else (self.prewarm_chunk,)
+        chunks = (*prefix, *self.support_chunks, *(query.chunk for query in self.query_points))
         if any(chunk.request.owner != self.owner for chunk in chunks):
             raise ValueError("all Meta-TTT requests must share the episode owner")
         batch_size = len(self.owner.video_ids)
@@ -192,6 +201,8 @@ class MetaTTTEpisode:
         support_ends = tuple(chunk.end_time for chunk in self.support_chunks)
         if any(right <= left for left, right in pairwise(support_ends)):
             raise ValueError("Support chunk end times must advance strictly")
+        if self.prewarm_chunk is not None and self.prewarm_chunk.end_time >= support_ends[0]:
+            raise ValueError("the no-update prewarm chunk must precede every Support chunk")
         query_ends = tuple(query.chunk.end_time for query in self.query_points)
         query_times = tuple(query.query_time for query in self.query_points)
         if query_ends[0] <= support_ends[-1]:
@@ -705,7 +716,7 @@ class CausalOverlapTTTInputBuilder:
 @dataclass(frozen=True, slots=True)
 class MetaQueryLossInput:
     answer: AnswerLossInput
-    state: StateLossInput
+    state: StateLossInput | OfficialWeakStateLossOutput
 
 
 class MetaQueryLossBuilder(Protocol):
@@ -723,6 +734,7 @@ class StageAQueryLossBuilder:
 
     def __init__(self, target_builder: StageATargetBuilder | None = None) -> None:
         self.target_builder = target_builder or StageATargetBuilder()
+        self.official_weak_builder = OfficialWeakTargetBuilder()
 
     def __call__(
         self,
@@ -741,8 +753,8 @@ class StageAQueryLossBuilder:
             output.retrieval, RetrieverOutput
         ):
             raise TypeError("Meta-TTT State loss requires typed Query/Retrieval outputs")
-        if supervision.state is None:
-            raise ValueError("Meta-TTT Query points require explicit State supervision")
+        if supervision.state is None and not supervision.official_weak:
+            raise ValueError("Meta-TTT Query points require explicit or official-weak State labels")
         mapped = map_teacher_forced_targets(
             composed_input=output.composed,
             source_input_ids=answer.base_input_ids,
@@ -766,6 +778,21 @@ class StageAQueryLossBuilder:
             dtype=torch.bool,
             device=device,
         )
+        if supervision.official_weak:
+            state: StateLossInput | OfficialWeakStateLossOutput = self.official_weak_builder(
+                output.observations,
+                output.query,
+                output.retrieval,
+                supervision.official_weak,
+            )
+        else:
+            assert supervision.state is not None
+            state = self.target_builder(
+                output.observations,
+                output.query,
+                output.retrieval,
+                supervision.state,
+            )
         return MetaQueryLossInput(
             answer=AnswerLossInput(
                 logits=output.answer_logits,
@@ -777,12 +804,7 @@ class StageAQueryLossBuilder:
                     valid_mask=reader_valid & count_label_valid,
                 ),
             ),
-            state=self.target_builder(
-                output.observations,
-                output.query,
-                output.retrieval,
-                supervision.state,
-            ),
+            state=state,
         )
 
 
@@ -804,7 +826,7 @@ class QueryMetricSnapshot:
 @dataclass(frozen=True, slots=True)
 class MetaQueryObjective:
     answer: AnswerLossOutput
-    state: StateLossOutput
+    state: StateLossOutput | OfficialWeakStateLossOutput
     outer: OuterLossOutput
     metrics: QueryMetricSnapshot
 
@@ -972,6 +994,163 @@ class MetaTTTTrainingStepOutput:
     def __post_init__(self) -> None:
         if type(self.global_step) is not int or self.global_step < 0:
             raise ValueError("Meta-TTT global_step must be a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
+class TruncatedSegmentAudit:
+    """One bounded second-order graph segment and its local backward boundary."""
+
+    segment_index: int
+    support_start_index: int
+    support_end_index: int
+    support_count: int
+    auxiliary_loss: float
+    backward_applied: bool
+    includes_query_backward: bool
+    reanchored: bool
+    reanchor_audits: tuple[FastReanchorAudit, ...]
+
+    def __post_init__(self) -> None:
+        integers = (
+            self.segment_index,
+            self.support_start_index,
+            self.support_end_index,
+            self.support_count,
+        )
+        if any(type(value) is not int or value < 0 for value in integers):
+            raise ValueError("truncated segment indices/counts must be non-negative integers")
+        if self.support_count <= 0:
+            raise ValueError("a truncated segment must contain at least one Support")
+        if self.support_end_index - self.support_start_index + 1 != self.support_count:
+            raise ValueError("truncated segment Support range does not match its count")
+        if not math.isfinite(self.auxiliary_loss) or self.auxiliary_loss < 0.0:
+            raise ValueError("truncated segment auxiliary loss must be finite and non-negative")
+        flags = (self.backward_applied, self.includes_query_backward, self.reanchored)
+        if any(type(value) is not bool for value in flags):
+            raise TypeError("truncated segment flags must be bool")
+        if not self.backward_applied:
+            raise ValueError("every truncated segment must contribute one backward collective")
+        if self.reanchored != bool(self.reanchor_audits):
+            raise ValueError("segment re-anchor flag and audits disagree")
+
+
+@dataclass(frozen=True, slots=True)
+class TruncatedQueryPointAudit:
+    """Adapted-only Query audit used by the production A5 path."""
+
+    query_index: int
+    task_name: str
+    case_id: str
+    query_time: float
+    observation_end_time: float
+    fast_versions: tuple[int, ...]
+    metrics: QueryMetricSnapshot
+    prefill_count: int
+    observation_immutable: bool
+
+    def __post_init__(self) -> None:
+        if type(self.query_index) is not int or self.query_index < 0:
+            raise ValueError("truncated Query index must be a non-negative integer")
+        if not self.task_name or not self.case_id:
+            raise ValueError("truncated Query task/case identifiers must be non-empty")
+        if self.query_time < self.observation_end_time:
+            raise ValueError("truncated Query audit exposes future observation")
+        if self.prefill_count != 1:
+            raise ValueError("each production Query must execute exactly one prefill")
+        if not self.observation_immutable:
+            raise ValueError("production Query answer mutated its observation")
+
+
+@dataclass(frozen=True, slots=True)
+class TruncatedMetaTTTEpisodeAudit:
+    """Bounded-memory evidence for an otherwise unbounded numeric fast trajectory."""
+
+    variant: MetaTTTVariant
+    active_terms: tuple[str, ...]
+    support_count: int
+    query_count: int
+    prewarm_count: int
+    truncation_horizon: int
+    segment_count: int
+    backward_count: int
+    truncation_count: int
+    maximum_retained_support_graphs: int
+    update_attempt_count: int
+    update_count: int
+    skip_count: int
+    parameter_versions_unchanged_before_outer_step: bool
+    overlap_graph_detached: bool
+    support_supervision_reachable: bool
+    training_counterfactual_executed: bool
+    segments: tuple[TruncatedSegmentAudit, ...]
+    updates: tuple[InnerUpdateAudit, ...]
+    queries: tuple[TruncatedQueryPointAudit, ...]
+
+    def __post_init__(self) -> None:
+        if self.variant is not MetaTTTVariant.A5:
+            raise ValueError("the production truncated path is defined only for A5")
+        if self.prewarm_count != 1:
+            raise ValueError("A5 production episodes require exactly one no-update prewarm")
+        if self.truncation_horizon <= 0:
+            raise ValueError("truncation horizon must be positive")
+        expected_segments = math.ceil(self.support_count / self.truncation_horizon)
+        expected_truncations = self.support_count // self.truncation_horizon
+        if self.segment_count != expected_segments or self.backward_count != expected_segments:
+            raise ValueError("A5 must execute exactly one backward per graph segment")
+        if self.truncation_count != expected_truncations:
+            raise ValueError("A5 truncation count must follow processed Support steps")
+        if self.maximum_retained_support_graphs > self.truncation_horizon:
+            raise ValueError("A5 retained more than K Support graphs")
+        if self.update_attempt_count != self.update_count + self.skip_count:
+            raise ValueError("A5 update attempts must equal accepted plus skipped")
+        if len(self.segments) != self.segment_count:
+            raise ValueError("A5 segment audit count drifted")
+        if len(self.updates) != self.support_count or len(self.queries) != self.query_count:
+            raise ValueError("A5 detailed audit counts drifted")
+        if not self.parameter_versions_unchanged_before_outer_step:
+            raise ValueError("outer parameters changed before the episode-level optimizer step")
+        if not self.overlap_graph_detached:
+            raise ValueError("A5 overlap snapshots retained an autograd graph")
+        if self.support_supervision_reachable:
+            raise ValueError("Support labels became reachable from the A5 inner path")
+        if self.training_counterfactual_executed:
+            raise ValueError("the production A5 path must not execute static-W0 counterfactuals")
+
+
+@dataclass(frozen=True, slots=True)
+class TruncatedMetaTTTEpisodeOutput:
+    """Detached logging values returned after all segment backward calls have completed."""
+
+    total: Tensor
+    query_loss: Tensor
+    support_auxiliary_loss: Tensor
+    final_fast_states: tuple[FastWeightsState, ...]
+    final_optimizer_states: tuple[OptimizerRuntimeState, ...]
+    final_runtime: MetaModelRuntime
+    audit: TruncatedMetaTTTEpisodeAudit
+
+    def __post_init__(self) -> None:
+        values = (self.total, self.query_loss, self.support_auxiliary_loss)
+        if any(value.ndim != 0 or value.dtype != torch.float32 for value in values):
+            raise ValueError("truncated A5 logging losses must be detached FP32 scalars")
+        if any(value.requires_grad or value.grad_fn is not None for value in values):
+            raise ValueError("truncated A5 output must not retain completed autograd graphs")
+        if any(not bool(torch.isfinite(value).item()) for value in values):
+            raise ValueError("truncated A5 logging losses must be finite")
+        expected = self.query_loss + self.support_auxiliary_loss
+        if not torch.allclose(self.total, expected, atol=1.0e-7, rtol=1.0e-7):
+            raise ValueError("truncated A5 total must equal Query plus normalized Support loss")
+
+
+@dataclass(frozen=True, slots=True)
+class TruncatedMetaTTTTrainingStepOutput:
+    episode: TruncatedMetaTTTEpisodeOutput
+    global_step: int
+    audit: MetaOuterStepAudit
+
+    def __post_init__(self) -> None:
+        if type(self.global_step) is not int or self.global_step < 0:
+            raise ValueError("truncated Meta-TTT global_step must be a non-negative integer")
 
 
 class MetaTTTTrainer:
@@ -1272,7 +1451,7 @@ class MetaTTTEpisodeRunner:
             parameter_versions_unchanged_during_inner=versions_before == versions_after,
             overlap_graph_detached=all(update.match.snapshot_detached for update in update_audits),
             retained_support_graph_count=len(support_outputs),
-            graph_bound=_MAX_SUPPORT_CHUNKS,
+            graph_bound=_LEGACY_FULL_GRAPH_BOUND,
             trajectory_reuse_strategy="causal_replay_isolated_prefill",
             support_supervision_reachable=False,
             updates=tuple(update_audits),
@@ -1289,6 +1468,257 @@ class MetaTTTEpisodeRunner:
             audit=audit,
         )
 
+    def run_truncated(
+        self,
+        episode: MetaTTTEpisode,
+        *,
+        backward: Callable[[Tensor], None] | None = None,
+    ) -> TruncatedMetaTTTEpisodeOutput:
+        """Run production A5 with exact second order inside K-step graph segments.
+
+        ``backward`` is injectable so LLaMA-Factory/Accelerate/DeepSpeed can own the
+        distributed backward call.  It is invoked exactly ``ceil(T / K)`` times;
+        this method never executes an Outer optimizer step.
+        """
+
+        self._validate_truncated_episode(episode)
+        backward_fn = backward or _plain_backward
+        self.model.train()
+        self.predictor.train()
+        adapted = self._reset_trajectory(episode.owner, differentiable=True)
+        tracked_parameters = _unique_parameters(
+            (*self.model.parameters(), *self.predictor.parameters())
+        )
+        versions_before = tuple(parameter._version for parameter in tracked_parameters)
+        horizon = self.config.stage_c.truncation_horizon
+        support_count = len(episode.support_chunks)
+        auxiliary_scale = float(self.config.loss.auxiliary_outer_weight) / support_count
+        update_audits: list[InnerUpdateAudit] = []
+        segment_audits: list[TruncatedSegmentAudit] = []
+        segment_outputs: list[TTTLossOutput] = []
+        support_total_detached: Tensor | None = None
+        maximum_retained = 0
+        lifecycle = PrefillLifecycle(episode.owner)
+
+        prewarm = cast(MetaCausalChunk, episode.prewarm_chunk)
+        prewarm_observation, prewarm_fast_audit = self._observe(
+            prewarm,
+            adapted,
+            lifecycle,
+            seed=episode.seed,
+            with_grad=False,
+        )
+        if any(prewarm_fast_audit.fast_versions):
+            raise ValueError("the no-update prewarm must observe the initial W0 generation")
+        adapted.runtime = MetaModelRuntime(
+            prewarm_observation.runtime_state,
+            prewarm_observation.bank_states,
+        )
+        previous_snapshot = DetachedOverlapSnapshot.capture(
+            prewarm_observation,
+            end_time=prewarm.end_time,
+        )
+        del prewarm_observation
+
+        for support_index, chunk in enumerate(episode.support_chunks):
+            observation, fast_audit = self._observe(
+                chunk,
+                adapted,
+                lifecycle,
+                seed=episode.seed + support_index + 1,
+                with_grad=True,
+            )
+            adapted.runtime = MetaModelRuntime(observation.runtime_state, observation.bank_states)
+            built = self.ttt_input_builder(
+                observation,
+                previous=previous_snapshot,
+                current_end_time=chunk.end_time,
+                enabled_terms=self.enabled_terms,
+            )
+            ttt_output = compute_ttt_loss(self.predictor, built.inputs)
+            _validate_variant_loss_terms(ttt_output, self.enabled_terms)
+            before_versions = tuple(state.fast_version for state in adapted.fast_states)
+            results = functional_sgd_steps_from_ttt(
+                ttt_output=ttt_output,
+                fast_states=adapted.fast_states,
+                optimizer_config=self.config.fast_ttt.optimizer,
+                optimizer_states=adapted.optimizer_states,
+            )
+            adapted.fast_states = tuple(result.fast_state for result in results)
+            adapted.optimizer_states = tuple(result.optimizer_state for result in results)
+            after_versions = tuple(state.fast_version for state in adapted.fast_states)
+            update_audits.append(
+                _make_inner_update_audit(
+                    support_index=support_index,
+                    chunk=chunk,
+                    before_versions=before_versions,
+                    observed_fast_audit=fast_audit,
+                    results=results,
+                    ttt_output=ttt_output,
+                    match=built.audit,
+                    runtime=adapted.runtime.runtime_state,
+                    after_versions=after_versions,
+                )
+            )
+            previous_snapshot = built.snapshot
+            segment_outputs.append(ttt_output)
+            maximum_retained = max(maximum_retained, len(segment_outputs))
+            detached_total = ttt_output.total.detach()
+            support_total_detached = (
+                detached_total
+                if support_total_detached is None
+                else support_total_detached + detached_total
+            )
+
+            boundary_reached = len(segment_outputs) == horizon
+            final_support = support_index + 1 == support_count
+            if boundary_reached and not final_support:
+                segment_loss = (
+                    auxiliary_scale
+                    * torch.stack(tuple(output.total for output in segment_outputs)).sum()
+                )
+                backward_fn(segment_loss)
+                reanchor_audits = self._reanchor_trajectory(adapted)
+                segment_audits.append(
+                    TruncatedSegmentAudit(
+                        segment_index=len(segment_audits),
+                        support_start_index=support_index + 1 - len(segment_outputs),
+                        support_end_index=support_index,
+                        support_count=len(segment_outputs),
+                        auxiliary_loss=float(segment_loss.detach().item()),
+                        backward_applied=True,
+                        includes_query_backward=False,
+                        reanchored=True,
+                        reanchor_audits=reanchor_audits,
+                    )
+                )
+                segment_outputs.clear()
+                del segment_loss, results, ttt_output, built, observation
+
+        if not segment_outputs or support_total_detached is None:
+            raise RuntimeError("A5 final graph segment unexpectedly has no Support")
+
+        query_objectives: list[MetaQueryObjective] = []
+        query_audits: list[TruncatedQueryPointAudit] = []
+        for query_index, query in enumerate(episode.query_points):
+            query_lifecycle = PrefillLifecycle(episode.owner)
+            observation, _ = self._observe(
+                query.chunk,
+                adapted,
+                query_lifecycle,
+                seed=episode.seed + 10_000 + query_index,
+                with_grad=True,
+            )
+            adapted.runtime = MetaModelRuntime(observation.runtime_state, observation.bank_states)
+            observation_versions = _tensor_version_signature(observation)
+            output = self._answer(query, observation, query_lifecycle, with_grad=True)
+            immutable = observation_versions == _tensor_version_signature(observation)
+            objective = self._query_objective(query, output, ())
+            query_objectives.append(objective)
+            query_audits.append(
+                TruncatedQueryPointAudit(
+                    query_index=query_index,
+                    task_name=query.task_name,
+                    case_id=query.case_id,
+                    query_time=query.query_time,
+                    observation_end_time=query.chunk.end_time,
+                    fast_versions=tuple(state.fast_version for state in adapted.fast_states),
+                    metrics=objective.metrics,
+                    prefill_count=query_lifecycle.audit().prefill_count,
+                    observation_immutable=immutable,
+                )
+            )
+
+        query_loss = torch.stack(tuple(item.outer.outer for item in query_objectives)).mean()
+        final_segment_loss = (
+            auxiliary_scale * torch.stack(tuple(output.total for output in segment_outputs)).sum()
+        )
+        final_loss = query_loss + final_segment_loss
+        backward_fn(final_loss)
+        final_reanchor_audits = self._reanchor_trajectory(adapted)
+        final_support_index = support_count - 1
+        segment_audits.append(
+            TruncatedSegmentAudit(
+                segment_index=len(segment_audits),
+                support_start_index=final_support_index + 1 - len(segment_outputs),
+                support_end_index=final_support_index,
+                support_count=len(segment_outputs),
+                auxiliary_loss=float(final_segment_loss.detach().item()),
+                backward_applied=True,
+                includes_query_backward=True,
+                reanchored=True,
+                reanchor_audits=final_reanchor_audits,
+            )
+        )
+
+        versions_after = tuple(parameter._version for parameter in tracked_parameters)
+        attempted = sum(len(audit.did_update) for audit in update_audits)
+        updated = sum(sum(audit.did_update) for audit in update_audits)
+        detached_query = query_loss.detach().clone()
+        detached_auxiliary = (auxiliary_scale * support_total_detached).detach().clone()
+        detached_total = (detached_query + detached_auxiliary).detach().clone()
+        audit = TruncatedMetaTTTEpisodeAudit(
+            variant=self.variant,
+            active_terms=self.enabled_terms,
+            support_count=support_count,
+            query_count=len(episode.query_points),
+            prewarm_count=1,
+            truncation_horizon=horizon,
+            segment_count=len(segment_audits),
+            backward_count=len(segment_audits),
+            truncation_count=support_count // horizon,
+            maximum_retained_support_graphs=maximum_retained,
+            update_attempt_count=attempted,
+            update_count=updated,
+            skip_count=attempted - updated,
+            parameter_versions_unchanged_before_outer_step=versions_before == versions_after,
+            overlap_graph_detached=all(item.match.snapshot_detached for item in update_audits),
+            support_supervision_reachable=False,
+            training_counterfactual_executed=False,
+            segments=tuple(segment_audits),
+            updates=tuple(update_audits),
+            queries=tuple(query_audits),
+        )
+        return TruncatedMetaTTTEpisodeOutput(
+            total=detached_total,
+            query_loss=detached_query,
+            support_auxiliary_loss=detached_auxiliary,
+            final_fast_states=adapted.fast_states,
+            final_optimizer_states=adapted.optimizer_states,
+            final_runtime=adapted.runtime,
+            audit=audit,
+        )
+
+    def _validate_truncated_episode(self, episode: MetaTTTEpisode) -> None:
+        stage = self.config.stage_c
+        if self.variant is not MetaTTTVariant.A5 or stage.active_variant is not MetaTTTVariant.A5:
+            raise ValueError("the truncated production entrypoint requires active A5")
+        if not stage.direct_from_stage_a or stage.meta_gradient_mode != "truncated_second_order":
+            raise ValueError("A5 production must transition directly from A2 in truncated mode")
+        if stage.maximum_support_chunks is not None or stage.support_chunk_schedule:
+            raise ValueError("A5 production cannot cap or enumerate Support counts")
+        if episode.prewarm_chunk is None or stage.prewarm_support_chunks != 1:
+            raise ValueError("A5 production requires an explicit S0 no-update prewarm chunk")
+        if len(episode.query_points) < stage.minimum_query_points:
+            raise ValueError("A5 production requires multiple later Query points")
+        if episode.seed != stage.seed:
+            raise ValueError("A5 episode seed must equal the fixed Stage C seed")
+        if self.config.fast_ttt.optimizer.momentum != 0.0:
+            raise ValueError("truncated A5 currently requires stateless momentum=0 Inner SGD")
+        if stage.training_counterfactual_enabled:
+            raise ValueError("static-W0 counterfactuals are validation-only in production A5")
+
+    @staticmethod
+    def _reanchor_trajectory(
+        trajectory: _Trajectory,
+    ) -> tuple[FastReanchorAudit, ...]:
+        pairs = tuple(reanchor_fast_state(state) for state in trajectory.fast_states)
+        trajectory.fast_states = tuple(state for state, _ in pairs)
+        values = tuple(value for state in trajectory.fast_states for value in state.fast_parameters)
+        if len({_storage_key(value) for value in values}) != len(values):
+            raise ValueError("re-anchored batched fast states must remain storage-isolated")
+        return tuple(audit for _, audit in pairs)
+
     def _validate_episode_for_variant(self, episode: MetaTTTEpisode) -> None:
         support_count = len(episode.support_chunks)
         query_count = len(episode.query_points)
@@ -1302,8 +1732,15 @@ class MetaTTTEpisodeRunner:
         else:
             if self.variant not in self.config.stage_c.variants:
                 raise ValueError("Stage C variant is not present in the isolated ablation set")
-            if support_count not in self.config.stage_c.support_chunk_schedule:
-                raise ValueError("Stage C Support count must be one of the audited 1/4/8 schedule")
+            schedule = self.config.stage_c.support_chunk_schedule
+            if schedule and support_count not in schedule:
+                raise ValueError(
+                    "Stage C Support count is outside the configured ablation schedule"
+                )
+            if not schedule and support_count > _LEGACY_FULL_GRAPH_BOUND:
+                raise ValueError(
+                    "unbounded Stage C episodes must use the truncated training entrypoint"
+                )
             if query_count < self.config.stage_c.minimum_query_points:
                 raise ValueError("Stage C requires multiple later Query points")
             if episode.seed != self.config.stage_c.seed:
@@ -1398,11 +1835,124 @@ class MetaTTTEpisodeRunner:
             supervision=query.supervision,
         )
         answer = compute_answer_loss(inputs.answer)
-        state = compute_state_loss(inputs.state)
+        state = (
+            inputs.state
+            if isinstance(inputs.state, OfficialWeakStateLossOutput)
+            else compute_state_loss(inputs.state)
+        )
         outer = compute_outer_loss(
-            OuterLossInput(answer_after=answer, state_after=state, support_ttt=support)
+            OuterLossInput(
+                answer_after=answer,
+                state_after=cast(StateLossOutput, state),
+                support_ttt=support,
+            )
         )
         return MetaQueryObjective(answer, state, outer, _query_metrics(answer, state))
+
+
+class TruncatedMetaTTTTrainer:
+    """Own the sole episode-level AdamW step after segmented A5 backward calls."""
+
+    def __init__(
+        self,
+        *,
+        runner: MetaTTTEpisodeRunner,
+        optimizer: torch.optim.Optimizer,
+        outer_grad_clip_norm: float,
+        backward: Callable[[Tensor], None] | None = None,
+    ) -> None:
+        if not isinstance(runner, MetaTTTEpisodeRunner):
+            raise TypeError("TruncatedMetaTTTTrainer requires MetaTTTEpisodeRunner")
+        if runner.variant is not MetaTTTVariant.A5:
+            raise ValueError("TruncatedMetaTTTTrainer is production A5-only")
+        if not isinstance(optimizer, torch.optim.Optimizer):
+            raise TypeError("TruncatedMetaTTTTrainer requires a torch optimizer")
+        if not math.isfinite(outer_grad_clip_norm) or outer_grad_clip_norm <= 0.0:
+            raise ValueError("Outer gradient clip norm must be positive and finite")
+        self.runner = runner
+        self.optimizer = optimizer
+        self.outer_grad_clip_norm = outer_grad_clip_norm
+        self.backward = backward or _plain_backward
+        self.global_step = 0
+        self._optimizer_parameters = _optimizer_parameters(optimizer)
+        meta_fast = runner.fast_controller.collect_meta_fast_parameters()
+        optimizer_ids = {id(parameter) for parameter in self._optimizer_parameters}
+        if any(id(parameter) not in optimizer_ids for parameter in meta_fast):
+            raise ValueError("A5 Outer optimizer must own both meta-learned W0 matrices")
+
+    def train_step(self, episode: MetaTTTEpisode) -> TruncatedMetaTTTTrainingStepOutput:
+        """Accumulate every segment gradient, clip once, and step AdamW exactly once."""
+
+        self.optimizer.zero_grad(set_to_none=True)
+        meta_fast = self.runner.fast_controller.collect_meta_fast_parameters()
+        before = tuple(parameter.detach().clone() for parameter in meta_fast)
+        output = self.runner.run_truncated(episode, backward=self.backward)
+        transient_ids = {
+            id(value) for state in output.final_fast_states for value in state.fast_parameters
+        }
+        transient_in_optimizer = any(
+            id(parameter) in transient_ids for parameter in self._optimizer_parameters
+        )
+        if transient_in_optimizer:
+            raise ValueError("Outer optimizer captured transient per-video W_t")
+
+        gradients = tuple(parameter.grad for parameter in self._optimizer_parameters)
+        present = tuple(value for value in gradients if value is not None)
+        finite = bool(present) and all(bool(torch.isfinite(value).all()) for value in present)
+        skip_reason: str | None = None
+        gradient_norm: float | None = None
+        meta_norms: tuple[float, float] | None = None
+        if finite:
+            if any(parameter.grad is None for parameter in meta_fast):
+                finite = False
+                skip_reason = "missing_meta_fast_gradient"
+            else:
+                meta_norms = cast(
+                    tuple[float, float],
+                    tuple(
+                        float(cast(Tensor, parameter.grad).detach().float().norm().item())
+                        for parameter in meta_fast
+                    ),
+                )
+                if min(meta_norms) <= 0.0:
+                    finite = False
+                    skip_reason = "zero_meta_fast_gradient"
+        if finite:
+            norm = torch.nn.utils.clip_grad_norm_(
+                self._optimizer_parameters,
+                self.outer_grad_clip_norm,
+                error_if_nonfinite=False,
+            )
+            gradient_norm = float(norm.detach().float().item())
+            if math.isfinite(gradient_norm):
+                self.optimizer.step()
+                self.global_step += 1
+            else:
+                finite = False
+                skip_reason = "nonfinite_clipped_gradient"
+        if not finite:
+            if skip_reason is None:
+                skip_reason = "no_gradient" if not present else "nonfinite_gradient"
+            self.optimizer.zero_grad(set_to_none=True)
+        deltas = cast(
+            tuple[float, float],
+            tuple(
+                float((parameter.detach() - start).float().norm().item())
+                for parameter, start in zip(meta_fast, before, strict=True)
+            ),
+        )
+        return TruncatedMetaTTTTrainingStepOutput(
+            episode=output,
+            global_step=self.global_step,
+            audit=MetaOuterStepAudit(
+                optimizer_step_applied=finite,
+                skip_reason=skip_reason,
+                gradient_norm=gradient_norm,
+                meta_fast_gradient_norms=meta_norms,
+                meta_fast_delta_norms=deltas,
+                transient_fast_in_optimizer=transient_in_optimizer,
+            ),
+        )
 
 
 def enabled_terms_for(
@@ -1774,21 +2324,41 @@ def _pad_probability_width(values: Tensor, width: int) -> Tensor:
     return torch.cat((values, padding), dim=1)
 
 
-def _query_metrics(answer: AnswerLossOutput, state: StateLossOutput) -> QueryMetricSnapshot:
-    return QueryMetricSnapshot(
-        metrics=(
-            ("loss/answer", _term_float(answer.loss)),
-            ("loss/state", float(state.total.detach().item())),
-            ("answer/token_accuracy", _term_float(answer.teacher_forced_token_accuracy)),
-            ("answer/number_token_accuracy", _term_float(answer.number_token_accuracy)),
-            ("answer/exact_match", _term_float(answer.answer_exact_match)),
-            ("reader/exact_count_accuracy", _term_float(answer.reader_exact_count_accuracy)),
+def _query_metrics(
+    answer: AnswerLossOutput,
+    state: StateLossOutput | OfficialWeakStateLossOutput,
+) -> QueryMetricSnapshot:
+    common = (
+        ("loss/answer", _term_float(answer.loss)),
+        ("loss/state", float(state.total.detach().item())),
+        ("answer/token_accuracy", _term_float(answer.teacher_forced_token_accuracy)),
+        ("answer/number_token_accuracy", _term_float(answer.number_token_accuracy)),
+        ("answer/exact_match", _term_float(answer.answer_exact_match)),
+        ("reader/exact_count_accuracy", _term_float(answer.reader_exact_count_accuracy)),
+    )
+    if isinstance(state, OfficialWeakStateLossOutput):
+        state_metrics = (
+            ("state/task", _weak_term_float(state.task)),
+            ("state/operator", _weak_term_float(state.operator)),
+            ("state/retrieval", _weak_term_float(state.retrieval)),
+            ("state/time", _weak_term_float(state.time)),
+        )
+    else:
+        state_metrics = (
             ("state/o1", _term_float(state.o1)),
             ("state/o2", _term_float(state.o2)),
             ("state/e1", _term_float(state.e1)),
             ("state/e2", _term_float(state.e2)),
         )
-    )
+    return QueryMetricSnapshot(metrics=(*common, *state_metrics))
+
+
+def _weak_term_float(term: object) -> float | None:
+    value = getattr(term, "value", None)
+    valid_rows = getattr(term, "valid_rows", None)
+    if not isinstance(value, Tensor) or type(valid_rows) is not int:
+        raise TypeError("official-weak metric source must expose value/valid_rows")
+    return float(value.detach().item()) if valid_rows > 0 else None
 
 
 def _term_float(term: object) -> float | None:
@@ -1843,6 +2413,14 @@ def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> tuple[nn.Paramete
     if not values:
         raise ValueError("Outer optimizer cannot be empty")
     return tuple(values)
+
+
+def _plain_backward(loss: Tensor) -> None:
+    if not isinstance(loss, Tensor) or loss.ndim != 0:
+        raise TypeError("segment backward requires one scalar Tensor")
+    if not loss.requires_grad:
+        raise ValueError("segment loss must remain connected to the Outer graph")
+    loss.backward()
 
 
 class _SeededRNG:

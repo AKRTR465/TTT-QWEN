@@ -94,9 +94,7 @@ class RuntimeModelInput:
             raise ValueError("question must be non-empty")
         if not math.isfinite(self.query_time) or self.query_time < 0.0:
             raise ValueError("query_time must be finite and non-negative")
-        if any(
-            not math.isfinite(value) or value < 0.0 for value in self.explicit_time_values
-        ):
+        if any(not math.isfinite(value) or value < 0.0 for value in self.explicit_time_values):
             raise ValueError("explicit time values must be finite and non-negative")
         assert_runtime_payload_safe(self.as_payload(), layer="Dataset")
 
@@ -337,14 +335,19 @@ def extract_explicit_time_values(question: str) -> tuple[float, ...]:
     for pattern in _SHARED_UNIT_RANGE_PATTERNS:
         for match in pattern.finditer(question):
             unit = match.group("unit").lower()
-            scale = 60.0 if unit in {
-                "minute",
-                "minutes",
-                "min",
-                "mins",
-                "m",
-                "分钟",
-            } else 1.0
+            scale = (
+                60.0
+                if unit
+                in {
+                    "minute",
+                    "minutes",
+                    "min",
+                    "mins",
+                    "m",
+                    "分钟",
+                }
+                else 1.0
+            )
             positioned_values[match.start("start")] = float(match.group("start")) * scale
             positioned_values[match.start("end")] = float(match.group("end")) * scale
     return tuple(value for _, value in sorted(positioned_values.items()))

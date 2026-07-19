@@ -99,18 +99,14 @@ def _typed_encoder_outputs(
     )
     for row in range(batch_size):
         count = int(temporal_mask[row].sum().item())
-        timestamps[row, :count] = torch.arange(
-            count, dtype=torch.float64, device=hidden.device
-        ) / 4.0
-        position_ids[row, :count] = torch.arange(
-            count, dtype=torch.int64, device=hidden.device
+        timestamps[row, :count] = (
+            torch.arange(count, dtype=torch.float64, device=hidden.device) / 4.0
         )
+        position_ids[row, :count] = torch.arange(count, dtype=torch.int64, device=hidden.device)
     spatial = SpatialEncoderOutput(
         slots=slots,
         slot_valid_mask=slot_mask,
-        active_slot_overflow_count=torch.zeros(
-            batch_size, dtype=torch.int64, device=slots.device
-        ),
+        active_slot_overflow_count=torch.zeros(batch_size, dtype=torch.int64, device=slots.device),
     )
     temporal = TemporalEncoderOutput(
         hidden=hidden,
