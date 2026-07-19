@@ -23,7 +23,7 @@ from typing import Protocol, cast
 import torch
 from torch import Tensor
 
-from ttt_svcbench_qwen.config import InnerSGDConfig
+from ttt_svcbench_qwen.config import AuditLevel, InnerSGDConfig
 from ttt_svcbench_qwen.data import (
     RUNTIME_DENYLIST,
     RuntimeQueryInput,
@@ -230,35 +230,77 @@ class InferenceRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeBoundaryStamp:
+    """CPU-copy-free lifecycle identity for the authoritative runtime."""
+
+    video_id: str
+    trajectory_id: str
+    next_chunk_index: int
+    released: bool
+    fast_version: int
+    update_count: int
+    skip_count: int
+    state_bank_version: int
+    identity_bank_version: int
+    component_ids: tuple[int, ...]
+    tensor_versions: tuple[tuple[str, str, str, tuple[int, ...], int | None, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeAuditSnapshot:
+    """Persisted audit work selected by ``AuditLevel``."""
+
+    level: AuditLevel
+    boundary: RuntimeBoundaryStamp | None
+    content_sha256: str | None
+
+    def __post_init__(self) -> None:
+        if self.level is AuditLevel.OFF and (
+            self.boundary is not None or self.content_sha256 is not None
+        ):
+            raise ValueError("off audit snapshots cannot retain runtime state")
+        if self.level is not AuditLevel.OFF and self.boundary is None:
+            raise ValueError("enabled audit snapshots require a boundary stamp")
+        if self.content_sha256 is not None and len(self.content_sha256) != 64:
+            raise ValueError("runtime content hashes must be SHA-256 values")
+        if self.level is not AuditLevel.FULL and self.content_sha256 is not None:
+            raise ValueError("only full audit snapshots may retain a content hash")
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimePristineStamp:
+    """Owner-independent proof that reset produced an empty runtime."""
+
+    fast_shape: tuple[int, ...]
+    fast_dtype: str
+    fast_version: int
+    update_count: int
+    skip_count: int
+    optimizer_attempted_updates: int
+    temporal_width: int
+    state_record_count: int
+    identity_candidate_count: int
+    identity_confirmed_count: int
+    reader_audit_count: int
+    released: bool
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeResetAudit:
     video_id: str
     trajectory_id: str
-    previous_runtime_checksum: str | None
-    previous_release_checksum: str | None
-    reset_runtime_checksum: str
-    pristine_state_checksum: str
-    w0_checksum: str
-    current_fast_checksum: str
-
-    def __post_init__(self) -> None:
-        checksums = (
-            self.reset_runtime_checksum,
-            self.pristine_state_checksum,
-            self.w0_checksum,
-            self.current_fast_checksum,
-        )
-        if any(len(value) != 64 for value in checksums):
-            raise ValueError("runtime reset audit requires SHA-256 checksums")
-        if self.w0_checksum != self.current_fast_checksum:
-            raise ValueError("fresh runtime W_t must equal W0")
+    previous_runtime: RuntimeAuditSnapshot | None
+    previous_release: RuntimeAuditSnapshot | None
+    reset: RuntimeAuditSnapshot
+    pristine: RuntimePristineStamp
 
 
 @dataclass(frozen=True, slots=True)
 class RuntimeReleaseAudit:
     video_id: str
     trajectory_id: str
-    before_checksum: str
-    released_checksum: str
+    before: RuntimeAuditSnapshot
+    released: RuntimeAuditSnapshot
     state_bank_version: int
     identity_bank_version: int
     runtime_state: TrajectoryRuntimeState
@@ -271,8 +313,6 @@ class RuntimeReleaseAudit:
             self.trajectory_id,
         ):
             raise ValueError("release audit runtime owner is inconsistent")
-        if runtime_checksum(self.runtime_state) != self.released_checksum:
-            raise ValueError("release audit checksum does not match released runtime")
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,9 +375,9 @@ class ChunkAudit:
     did_update: bool
     skip_reason: str | None
     valid_term_count: int
-    state_checksum_before: str
-    state_checksum_after_observe: str
-    state_checksum_after_update: str
+    state_before: RuntimeAuditSnapshot
+    state_after_observe: RuntimeAuditSnapshot
+    state_after_update: RuntimeAuditSnapshot
 
     def __post_init__(self) -> None:
         counts = (
@@ -374,19 +414,12 @@ class GenerateAudit:
     retry_of: str | None
     prefill_count: int
     decode_count: int
-    state_checksum_before_prefill: str
-    state_checksum_after_prefill: str
-    decode_state_checksums: tuple[str, ...]
+    state_before: RuntimeAuditSnapshot
+    state_after: RuntimeAuditSnapshot
 
     def __post_init__(self) -> None:
         if self.prefill_count != 1:
             raise ValueError("one inference query must execute exactly one prefill")
-        if self.decode_count != len(self.decode_state_checksums):
-            raise ValueError("decode audit count/checksums must align")
-        if self.state_checksum_before_prefill != self.state_checksum_after_prefill:
-            raise ValueError("query read/composition/prefill cannot mutate runtime state")
-        if any(value != self.state_checksum_after_prefill for value in self.decode_state_checksums):
-            raise ValueError("autoregressive decode cannot mutate runtime state")
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,6 +461,7 @@ class PerVideoRuntimeManager:
         state_bank: StructuredStateBank,
         identity_bank: IdentityBank,
         optimizer_config: InnerSGDConfig,
+        audit_level: AuditLevel = AuditLevel.BOUNDARY,
         hot_cache_enabled: bool = False,
         hot_device: str | torch.device | None = None,
     ) -> None:
@@ -441,17 +475,20 @@ class PerVideoRuntimeManager:
             raise TypeError("runtime manager requires validated InnerSGDConfig")
         if type(hot_cache_enabled) is not bool:
             raise TypeError("hot_cache_enabled must be bool")
+        if not isinstance(audit_level, AuditLevel):
+            raise TypeError("audit_level must be AuditLevel")
         self.fast_adapter = fast_adapter
         self.state_bank = state_bank
         self.identity_bank = identity_bank
         self.optimizer_config = optimizer_config
+        self.audit_level = audit_level
         self.hot_cache_enabled = hot_cache_enabled
         self.hot_device = hot_device
         self._runtime: TrajectoryRuntimeState | None = None
         self._lifecycle: PrefillLifecycle | None = None
         self._reset_audit: RuntimeResetAudit | None = None
         self._chunk_audits: list[ChunkAudit] = []
-        self._query_snapshots: dict[str, str] = {}
+        self._query_snapshots: dict[str, tuple[object, ...]] = {}
         self._lock = RLock()
 
     @property
@@ -488,12 +525,12 @@ class PerVideoRuntimeManager:
         ):
             raise ValueError("runtime reset query_signature must be finite floating [512]")
         with self._lock:
-            previous_checksum = None
-            previous_release_checksum = None
+            previous_snapshot = None
+            previous_release_snapshot = None
             if self._runtime is not None:
-                previous_checksum = runtime_checksum(self._runtime)
+                previous_snapshot = self._snapshot(self._runtime, content=True)
                 prior_release = self._release_locked()
-                previous_release_checksum = prior_release.released_checksum
+                previous_release_snapshot = prior_release.released
 
             owner = RuntimeOwner((video_id,), (trajectory_id,))
             dtype = self.fast_adapter.w0_1.dtype
@@ -519,17 +556,13 @@ class PerVideoRuntimeManager:
                 reader_audit=(),
                 released=False,
             )
-            w0_checksum = _fast_pair_checksum(fast.w0_1, fast.w0_2)
-            current_checksum = _fast_pair_checksum(fast.w_t_1, fast.w_t_2)
             audit = RuntimeResetAudit(
                 video_id=video_id,
                 trajectory_id=trajectory_id,
-                previous_runtime_checksum=previous_checksum,
-                previous_release_checksum=previous_release_checksum,
-                reset_runtime_checksum=runtime_checksum(runtime),
-                pristine_state_checksum=_pristine_state_checksum(runtime),
-                w0_checksum=w0_checksum,
-                current_fast_checksum=current_checksum,
+                previous_runtime=previous_snapshot,
+                previous_release=previous_release_snapshot,
+                reset=self._snapshot(runtime, content=True),
+                pristine=_pristine_state_stamp(runtime),
             )
             self._runtime = runtime
             self._lifecycle = PrefillLifecycle(owner)
@@ -553,8 +586,8 @@ class PerVideoRuntimeManager:
             runtime = self._require_live_runtime()
             fast = _require_fast_state(runtime)
             lifecycle = self._require_ready_lifecycle()
-            before_checksum = runtime_checksum(runtime)
-            before_fast_checksum = _fast_state_checksum(fast)
+            before_snapshot = self._snapshot(runtime)
+            before_fast_stamp = _fast_state_stamp(fast)
             causal = chunk.causal_prefix(query_time)
             if causal is None:
                 audit = ChunkAudit(
@@ -572,9 +605,9 @@ class PerVideoRuntimeManager:
                     did_update=False,
                     skip_reason="no_causal_frames",
                     valid_term_count=0,
-                    state_checksum_before=before_checksum,
-                    state_checksum_after_observe=before_checksum,
-                    state_checksum_after_update=before_checksum,
+                    state_before=before_snapshot,
+                    state_after_observe=before_snapshot,
+                    state_after_update=before_snapshot,
                 )
                 self._chunk_audits.append(audit)
                 return ChunkExecution(None, runtime, audit)
@@ -620,7 +653,7 @@ class PerVideoRuntimeManager:
                 bank_states=(observed.state_bank,),
             )
             observed_fast = _require_fast_state(observed)
-            if _fast_state_checksum(observed_fast) != before_fast_checksum:
+            if _fast_state_stamp(observed_fast) != before_fast_stamp:
                 raise InferenceProtocolError(
                     "observe/hard-write mutated fast weights before the TTT update boundary"
                 )
@@ -631,16 +664,16 @@ class PerVideoRuntimeManager:
                 raise InferenceProtocolError(
                     "observe/hard-write cannot change optimizer or Reader audit state"
                 )
-            after_observe_checksum = runtime_checksum(observed)
-            hard_checksum = _hard_state_checksum(observed)
+            after_observe_snapshot = self._snapshot(observed)
+            hard_stamp = _hard_state_stamp(observed)
             outcome = updater(observation, observed)
             updated = _require_trajectory_runtime(outcome.runtime_state, owner)
-            if _hard_state_checksum(updated) != hard_checksum:
+            if _hard_state_stamp(updated) != hard_stamp:
                 raise InferenceProtocolError(
                     "TTT updater may only change fast/optimizer runtime state"
                 )
             _validate_update_transition(observed, outcome)
-            after_update_checksum = runtime_checksum(updated)
+            after_update_snapshot = self._snapshot(updated, content=True)
             next_observation = replace(
                 observation,
                 runtime_state=BatchRuntimeState((updated,)),
@@ -661,9 +694,9 @@ class PerVideoRuntimeManager:
                 did_update=outcome.did_update,
                 skip_reason=outcome.skip_reason,
                 valid_term_count=outcome.valid_term_count,
-                state_checksum_before=before_checksum,
-                state_checksum_after_observe=after_observe_checksum,
-                state_checksum_after_update=after_update_checksum,
+                state_before=before_snapshot,
+                state_after_observe=after_observe_snapshot,
+                state_after_update=after_update_snapshot,
             )
             self._runtime = updated
             self._chunk_audits.append(audit)
@@ -694,10 +727,11 @@ class PerVideoRuntimeManager:
                 runtime_state=BatchRuntimeState((runtime,)),
                 bank_states=(runtime.state_bank,),
             )
-            causal_checksum = _causal_state_checksum(runtime)
-            self._register_query_attempt(attempt, causal_checksum)
+            causal_stamp = _causal_state_stamp(runtime)
+            self._register_query_attempt(attempt, causal_stamp)
             lifecycle = self._query_lifecycle(owner)
-            before_prefill = runtime_checksum(runtime)
+            before_guard = _runtime_guard_stamp(runtime)
+            before_snapshot = self._snapshot(runtime, content=True)
             prefill = model.answer_query(
                 AnswerQueryRequest(
                     owner=owner,
@@ -713,41 +747,27 @@ class PerVideoRuntimeManager:
                 ),
                 lifecycle,
             )
-            after_prefill = runtime_checksum(runtime)
-            if after_prefill != before_prefill:
-                raise InferenceProtocolError("query read/composition/prefill mutated runtime state")
             if len(prefill.reader) != 1 or not isinstance(prefill.reader[0], ReaderResult):
                 raise InferenceProtocolError("P18 requires one authoritative ReaderResult")
             reader_result = prefill.reader[0]
 
             decode_steps: list[DecodeStepOutput] = []
-            decode_checksums: list[str] = []
             next_inputs = generation_driver.begin(prefill)
-            if runtime_checksum(runtime) != after_prefill:
-                raise InferenceProtocolError("generation begin mutated runtime state")
             while next_inputs is not None:
                 if len(decode_steps) >= max_decode_steps:
                     raise InferenceProtocolError("generation exceeded max_decode_steps")
-                before_decode = runtime_checksum(runtime)
                 decoded = model.decode_step(
                     DecodeStepRequest(owner=owner, model_inputs=next_inputs),
                     lifecycle,
                 )
-                after_decode = runtime_checksum(runtime)
-                if after_decode != before_decode:
-                    raise InferenceProtocolError(
-                        "decode step mutated Bank/FSM/fast/cache runtime state"
-                    )
                 decode_steps.append(decoded)
                 next_inputs = generation_driver.advance(len(decode_steps) - 1, decoded)
-                after_driver = runtime_checksum(runtime)
-                if after_driver != after_prefill:
-                    raise InferenceProtocolError("decode/generation driver mutated runtime state")
-                decode_checksums.append(after_driver)
 
             answer_text = generation_driver.finish(prefill, tuple(decode_steps))
-            if runtime_checksum(runtime) != after_prefill:
-                raise InferenceProtocolError("generation finish mutated runtime state")
+            after_guard = _runtime_guard_stamp(runtime)
+            if after_guard != before_guard:
+                raise InferenceProtocolError("answer prefill/generation mutated runtime state")
+            after_snapshot = self._snapshot(runtime, content=True)
             state_attention = _state_attention(prefill.resampler)
             self._runtime = replace(
                 runtime,
@@ -760,9 +780,8 @@ class PerVideoRuntimeManager:
                 retry_of=attempt.retry_of,
                 prefill_count=lifecycle_audit.prefill_count,
                 decode_count=lifecycle_audit.decode_count,
-                state_checksum_before_prefill=before_prefill,
-                state_checksum_after_prefill=after_prefill,
-                decode_state_checksums=tuple(decode_checksums),
+                state_before=before_snapshot,
+                state_after=after_snapshot,
             )
             result_runtime = self._runtime
             return InferenceResult(
@@ -802,7 +821,7 @@ class PerVideoRuntimeManager:
         runtime = self._require_live_runtime()
         fast = _require_fast_state(runtime)
         temporal_cache = _require_temporal_cache(runtime)
-        before_checksum = runtime_checksum(runtime)
+        before_snapshot = self._snapshot(runtime, content=True)
         released_bank = self.state_bank.release(runtime.state_bank)
         released_identity = self.identity_bank.release(runtime.identity_bank)
         owner = RuntimeOwner((runtime.video_id,), (runtime.trajectory_id,))
@@ -826,8 +845,8 @@ class PerVideoRuntimeManager:
         audit = RuntimeReleaseAudit(
             video_id=runtime.video_id,
             trajectory_id=runtime.trajectory_id,
-            before_checksum=before_checksum,
-            released_checksum=runtime_checksum(released),
+            before=before_snapshot,
+            released=self._snapshot(released, content=True),
             state_bank_version=released_bank.version,
             identity_bank_version=released_identity.version,
             runtime_state=released,
@@ -836,16 +855,38 @@ class PerVideoRuntimeManager:
         self._lifecycle = None
         return audit
 
-    def _register_query_attempt(self, attempt: QueryAttempt, checksum: str) -> None:
+    def _snapshot(
+        self,
+        state: TrajectoryRuntimeState,
+        *,
+        content: bool = False,
+    ) -> RuntimeAuditSnapshot:
+        if self.audit_level is AuditLevel.OFF:
+            return RuntimeAuditSnapshot(AuditLevel.OFF, None, None)
+        return RuntimeAuditSnapshot(
+            level=self.audit_level,
+            boundary=runtime_boundary_stamp(state),
+            content_sha256=(
+                runtime_checksum(state)
+                if content and self.audit_level is AuditLevel.FULL
+                else None
+            ),
+        )
+
+    def _register_query_attempt(
+        self,
+        attempt: QueryAttempt,
+        stamp: tuple[object, ...],
+    ) -> None:
         if attempt.query_id in self._query_snapshots:
             raise InferenceProtocolError("query_id has already been used in this runtime")
         if attempt.kind is QueryAttemptKind.RETRY:
             expected = self._query_snapshots.get(cast(str, attempt.retry_of))
             if expected is None:
                 raise InferenceProtocolError("retry_of does not name a completed query")
-            if expected != checksum:
+            if expected != stamp:
                 raise InferenceProtocolError("retry requires the unchanged causal runtime snapshot")
-        self._query_snapshots[attempt.query_id] = checksum
+        self._query_snapshots[attempt.query_id] = stamp
 
     def _query_lifecycle(self, owner: RuntimeOwner) -> PrefillLifecycle:
         lifecycle = self._lifecycle
@@ -918,7 +959,7 @@ def run_inference(
             audit_fields=result.audit_fields
             + (
                 ("released", True),
-                ("release_checksum", release_audit.released_checksum),
+                ("release_content_sha256", release_audit.released.content_sha256),
             ),
         )
     except Exception:
@@ -927,13 +968,45 @@ def run_inference(
 
 
 def runtime_checksum(state: TrajectoryRuntimeState) -> str:
-    """Hash tensor values plus all typed hard/fast runtime metadata."""
+    """Hash tensor values for explicit full-audit boundaries only."""
 
     if not isinstance(state, TrajectoryRuntimeState):
         raise TypeError("runtime_checksum requires TrajectoryRuntimeState")
     digest = hashlib.sha256()
     _hash_value(digest, state)
     return digest.hexdigest()
+
+
+def runtime_boundary_stamp(state: TrajectoryRuntimeState) -> RuntimeBoundaryStamp:
+    """Describe runtime identity and Tensor versions without reading Tensor contents."""
+
+    if not isinstance(state, TrajectoryRuntimeState):
+        raise TypeError("runtime_boundary_stamp requires TrajectoryRuntimeState")
+    fast = _require_fast_state(state)
+    components = (
+        state.fast_weights,
+        state.optimizer,
+        state.slot_state,
+        state.temporal_cache,
+        state.e1_state,
+        state.e2_state,
+        state.state_bank,
+        state.identity_bank,
+        state.online_overlap_memory,
+    )
+    return RuntimeBoundaryStamp(
+        video_id=state.video_id,
+        trajectory_id=state.trajectory_id,
+        next_chunk_index=state.next_chunk_index,
+        released=state.released,
+        fast_version=fast.fast_version,
+        update_count=fast.update_count,
+        skip_count=fast.skip_count,
+        state_bank_version=state.state_bank.version,
+        identity_bank_version=state.identity_bank.version,
+        component_ids=tuple(0 if value is None else id(value) for value in components),
+        tensor_versions=_boundary_tensor_versions(state),
+    )
 
 
 def assert_inference_runtime_payload(payload: Mapping[str, object]) -> None:
@@ -1079,9 +1152,8 @@ def _validate_update_transition(before: TrajectoryRuntimeState, outcome: TTTUpda
     after_fast = _require_fast_state(after)
     before_optimizer = _require_optimizer_state(before)
     after_optimizer = _require_optimizer_state(after)
-    if _fast_pair_checksum(before_fast.w0_1, before_fast.w0_2) != _fast_pair_checksum(
-        after_fast.w0_1,
-        after_fast.w0_2,
+    if _boundary_tensor_versions((before_fast.w0_1, before_fast.w0_2)) != (
+        _boundary_tensor_versions((after_fast.w0_1, after_fast.w0_2))
     ):
         raise InferenceProtocolError("TTT updater cannot change the meta-learned W0 snapshot")
     optimizer_contract_before = (
@@ -1113,11 +1185,13 @@ def _validate_update_transition(before: TrajectoryRuntimeState, outcome: TTTUpda
         actual = (after_fast.fast_version, after_fast.update_count, after_fast.skip_count)
         if actual != expected or after_optimizer.last_skip_reason is not None:
             raise InferenceProtocolError("accepted TTT update has inconsistent counters")
-        if _fast_pair_checksum(before_fast.w_t_1, before_fast.w_t_2) == _fast_pair_checksum(
-            after_fast.w_t_1,
-            after_fast.w_t_2,
+        after_tensors = (after_fast.w_t_1, after_fast.w_t_2)
+        if any(not bool(torch.isfinite(value).all()) for value in after_tensors):
+            raise InferenceProtocolError("accepted TTT update produced non-finite W_t")
+        if _boundary_tensor_versions((before_fast.w_t_1, before_fast.w_t_2)) == (
+            _boundary_tensor_versions(after_tensors)
         ):
-            raise InferenceProtocolError("accepted TTT update must change W_t values")
+            raise InferenceProtocolError("accepted TTT update must publish new W_t tensors")
     else:
         expected = (
             before_fast.fast_version,
@@ -1127,9 +1201,8 @@ def _validate_update_transition(before: TrajectoryRuntimeState, outcome: TTTUpda
         actual = (after_fast.fast_version, after_fast.update_count, after_fast.skip_count)
         if actual != expected or after_optimizer.last_skip_reason != outcome.skip_reason:
             raise InferenceProtocolError("skipped TTT update has inconsistent counters/reason")
-        if _fast_pair_checksum(before_fast.w_t_1, before_fast.w_t_2) != _fast_pair_checksum(
-            after_fast.w_t_1,
-            after_fast.w_t_2,
+        if _boundary_tensor_versions((before_fast.w_t_1, before_fast.w_t_2)) != (
+            _boundary_tensor_versions((after_fast.w_t_1, after_fast.w_t_2))
         ):
             raise InferenceProtocolError("skipped TTT update cannot change W_t values")
 
@@ -1143,15 +1216,32 @@ def _state_attention(resampler: object | None) -> Tensor | None:
     return value.detach().clone()
 
 
-def _causal_state_checksum(state: TrajectoryRuntimeState) -> str:
-    return runtime_checksum(replace(state, reader_audit=()))
+def _runtime_guard_stamp(state: TrajectoryRuntimeState) -> tuple[object, ...]:
+    stamp = runtime_boundary_stamp(state)
+    return (
+        stamp.video_id,
+        stamp.trajectory_id,
+        stamp.next_chunk_index,
+        stamp.released,
+        stamp.fast_version,
+        stamp.update_count,
+        stamp.skip_count,
+        stamp.state_bank_version,
+        stamp.identity_bank_version,
+        stamp.component_ids,
+        stamp.tensor_versions,
+    )
 
 
-def _hard_state_checksum(state: TrajectoryRuntimeState) -> str:
-    digest = hashlib.sha256()
-    for value in (
+def _causal_state_stamp(state: TrajectoryRuntimeState) -> tuple[object, ...]:
+    return _runtime_guard_stamp(replace(state, reader_audit=()))
+
+
+def _hard_state_stamp(state: TrajectoryRuntimeState) -> tuple[object, ...]:
+    values = (
         state.video_id,
         state.trajectory_id,
+        state.next_chunk_index,
         state.slot_state,
         state.temporal_cache,
         state.e1_state,
@@ -1160,68 +1250,86 @@ def _hard_state_checksum(state: TrajectoryRuntimeState) -> str:
         state.identity_bank,
         state.reader_audit,
         state.released,
-    ):
-        _hash_value(digest, value)
-    return digest.hexdigest()
-
-
-def _fast_state_checksum(state: FastWeightsState) -> str:
-    digest = hashlib.sha256()
-    _hash_value(digest, state)
-    return digest.hexdigest()
-
-
-def _fast_pair_checksum(first: Tensor, second: Tensor) -> str:
-    digest = hashlib.sha256()
-    _hash_tensor_content(digest, first)
-    _hash_tensor_content(digest, second)
-    return digest.hexdigest()
-
-
-def _pristine_state_checksum(state: TrajectoryRuntimeState) -> str:
-    """Owner/query-independent reset fingerprint used across consecutive videos."""
-
-    digest = hashlib.sha256()
-    fast = _require_fast_state(state)
-    temporal_cache = _require_temporal_cache(state)
-    values: tuple[object, ...] = (
-        _fast_pair_checksum(fast.w_t_1, fast.w_t_2),
-        fast.fast_version,
-        fast.update_count,
-        fast.skip_count,
-        state.optimizer,
-        state.slot_state is None,
-        temporal_cache.hidden.shape[1],
-        int(temporal_cache.total_seen[0].item()),
-        state.e1_state is None,
-        state.e2_state is None,
-        len(state.state_bank.records),
-        len(state.state_bank.audit_log),
-        state.state_bank.version,
-        len(state.identity_bank.candidates),
-        len(state.identity_bank.confirmed),
-        len(state.identity_bank.hot_cache),
-        state.identity_bank.version,
-        len(state.reader_audit),
-        state.released,
     )
-    _hash_value(digest, values)
-    return digest.hexdigest()
+    return (
+        tuple(id(value) for value in values[3:9]),
+        state.state_bank.version,
+        state.identity_bank.version,
+        _boundary_tensor_versions(values),
+        values[:3],
+        values[9:],
+    )
+
+
+def _fast_state_stamp(state: FastWeightsState) -> tuple[object, ...]:
+    return (
+        state.fast_version,
+        state.update_count,
+        state.skip_count,
+        state.differentiable,
+        _boundary_tensor_versions(state),
+    )
+
+
+def _pristine_state_stamp(state: TrajectoryRuntimeState) -> RuntimePristineStamp:
+    """Build an owner-independent, content-free reset fingerprint."""
+
+    fast = _require_fast_state(state)
+    optimizer = _require_optimizer_state(state)
+    temporal_cache = _require_temporal_cache(state)
+    return RuntimePristineStamp(
+        fast_shape=tuple(fast.w_t_1.shape),
+        fast_dtype=str(fast.w_t_1.dtype),
+        fast_version=fast.fast_version,
+        update_count=fast.update_count,
+        skip_count=fast.skip_count,
+        optimizer_attempted_updates=optimizer.attempted_update_count,
+        temporal_width=temporal_cache.hidden.shape[1],
+        state_record_count=len(state.state_bank.records),
+        identity_candidate_count=len(state.identity_bank.candidates),
+        identity_confirmed_count=len(state.identity_bank.confirmed),
+        reader_audit_count=len(state.reader_audit),
+        released=state.released,
+    )
+
+
+def _boundary_tensor_versions(
+    value: object,
+) -> tuple[tuple[str, str, str, tuple[int, ...], int | None, int], ...]:
+    found: list[tuple[str, str, str, tuple[int, ...], int | None, int]] = []
+    seen: set[int] = set()
+
+    def visit(item: object, path: str) -> None:
+        if isinstance(item, Tensor):
+            pointer = None if item.device.type == "meta" else item.untyped_storage().data_ptr()
+            found.append(
+                (path, str(item.dtype), str(item.device), tuple(item.shape), pointer, item._version)
+            )
+            return
+        if item is None or isinstance(item, (str, int, float, bool, Path, Enum)):
+            return
+        identity = id(item)
+        if identity in seen:
+            return
+        seen.add(identity)
+        if isinstance(item, Mapping):
+            for key in sorted(item, key=lambda candidate: repr(candidate)):
+                visit(item[key], f"{path}.{key!r}")
+            return
+        if isinstance(item, (tuple, list)):
+            for index, child in enumerate(item):
+                visit(child, f"{path}[{index}]")
+            return
+        if is_dataclass(item) and not isinstance(item, type):
+            for field in fields(item):
+                visit(getattr(item, field.name), f"{path}.{field.name}")
+
+    visit(value, "runtime")
+    return tuple(found)
 
 
 class _Digest(Protocol):
     def update(self, value: bytes) -> object: ...
-
-
-def _hash_tensor_content(digest: _Digest, value: Tensor) -> None:
-    """Hash numerical tensor content while ignoring leaf/gradient metadata."""
-
-    digest.update(str(tuple(value.shape)).encode("ascii"))
-    digest.update(str(value.dtype).encode("ascii"))
-    digest.update(str(value.device).encode("ascii"))
-    if value.device.type != "meta":
-        raw = value.detach().to(device="cpu").contiguous().view(torch.uint8)
-        digest.update(raw.numpy().tobytes())
 
 
 def _hash_value(digest: _Digest, value: object) -> None:

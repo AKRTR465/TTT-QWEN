@@ -1491,8 +1491,6 @@ class ProductionA2LossStep:
         self.graph_anchor_parameters = tuple(
             parameter for parameter in graph_anchor_parameters if parameter.requires_grad
         )
-        if not self.graph_anchor_parameters:
-            raise ValueError("A2 requires trainable Outer parameters for graph parity")
 
     def __call__(self, _model: nn.Module, inputs: Mapping[str, object]) -> Tensor:
         prefetched = inputs.get("prepared_a2")
@@ -1571,16 +1569,17 @@ class ProductionA2LossStep:
         # uses the dynamic-graph ZeRO-1 profile: it performs the reduction after backward in model
         # order.  ZeRO-2 is forbidden for this graph because its per-parameter hooks can construct
         # different bucket boundaries on ranks receiving different operator classes.
-        graph_anchor = (
-            torch.stack(
-                [
-                    parameter.reshape(-1)[0].to(device=total.device, dtype=total.dtype)
-                    for parameter in self.graph_anchor_parameters
-                ]
-            ).sum()
-            * 0.0
-        )
-        total = total + graph_anchor
+        if self.graph_anchor_parameters:
+            graph_anchor = (
+                torch.stack(
+                    [
+                        parameter.reshape(-1)[0].to(device=total.device, dtype=total.dtype)
+                        for parameter in self.graph_anchor_parameters
+                    ]
+                ).sum()
+                * 0.0
+            )
+            total = total + graph_anchor
         if total.ndim != 0 or not total.requires_grad or not bool(torch.isfinite(total).item()):
             raise ValueError("A2 production loss must be one finite differentiable scalar")
         self.progress.emit(call_index, "loss_ready")
@@ -1746,8 +1745,11 @@ def build_runtime(
             preprocess_cache=preprocess_cache,
         )
         predictor.requires_grad_(False)
-        graph_anchor_parameters = tuple(
-            parameter for parameter in outer.parameters() if parameter.requires_grad
+        world_size = int(getattr(backbone.training_args, "world_size", 1))
+        graph_anchor_parameters = (
+            tuple(parameter for parameter in outer.parameters() if parameter.requires_grad)
+            if world_size > 1
+            else ()
         )
         runner = StageAEpisodeRunner(
             model=state_model,

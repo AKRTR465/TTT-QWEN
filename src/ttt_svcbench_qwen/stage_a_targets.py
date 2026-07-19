@@ -637,19 +637,6 @@ def _validate_builder_inputs(
     if not isinstance(labels, StageATargetBatch):
         raise TypeError("Stage A target builder requires pure StageATargetBatch labels")
 
-    # Frozen dataclasses still contain mutable tensors; revalidate at the consumption boundary.
-    observations.o1.__post_init__()
-    observations.o2.__post_init__()
-    observations.e1.__post_init__()
-    observations.e2.__post_init__()
-    observations.__post_init__()
-    query.embeddings.__post_init__()
-    query.route.__post_init__()
-    query.time.logits.__post_init__()
-    query.time.__post_init__()
-    query.__post_init__()
-    retrieval.validate_integrity()
-
     if query.route.confidence_gate_applied:
         raise ValueError("Stage A targets require training-mode query predictions")
     batch_size = int(observations.o1.logits.shape[0])

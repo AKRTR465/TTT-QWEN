@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch import Tensor
 
-from ttt_svcbench_qwen.config import ProjectConfig, load_config
+from ttt_svcbench_qwen.config import AuditLevel, ProjectConfig, load_config
 from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter, FastWeightsState, build_fast_ttt_adapter
 from ttt_svcbench_qwen.identity_bank import IdentityBank, build_identity_bank
 from ttt_svcbench_qwen.inference import (
@@ -23,6 +23,7 @@ from ttt_svcbench_qwen.inference import (
     TTTUpdateOutcome,
     assert_inference_runtime_payload,
     run_inference,
+    runtime_boundary_stamp,
 )
 from ttt_svcbench_qwen.model import (
     BankWriteOutput,
@@ -91,12 +92,16 @@ def dependencies() -> _Dependencies:
     )
 
 
-def _manager(dependencies: _Dependencies) -> PerVideoRuntimeManager:
+def _manager(
+    dependencies: _Dependencies,
+    audit_level: AuditLevel = AuditLevel.BOUNDARY,
+) -> PerVideoRuntimeManager:
     return PerVideoRuntimeManager(
         fast_adapter=dependencies.fast_adapter,
         state_bank=dependencies.state_bank,
         identity_bank=dependencies.identity_bank,
         optimizer_config=dependencies.config.fast_ttt.optimizer,
+        audit_level=audit_level,
         hot_cache_enabled=False,
     )
 
@@ -686,7 +691,7 @@ def _request(*, future_frame: object = "future") -> InferenceRequest:
     )
 
 
-def test_reset_isolates_consecutive_videos_and_matches_pristine_checksum(
+def test_reset_isolates_consecutive_videos_and_matches_pristine_stamp(
     dependencies: _Dependencies,
 ) -> None:
     manager = _manager(dependencies)
@@ -699,10 +704,11 @@ def test_reset_isolates_consecutive_videos_and_matches_pristine_checksum(
     second_state = manager.active_runtime
     assert second_state is not None
 
-    assert first.pristine_state_checksum == second.pristine_state_checksum
-    assert second.previous_runtime_checksum is not None
-    assert second.previous_release_checksum is not None
-    assert second.w0_checksum == second.current_fast_checksum
+    assert first.pristine == second.pristine
+    assert second.previous_runtime is not None
+    assert second.previous_release is not None
+    assert second.reset.boundary is not None
+    assert second.reset.content_sha256 is None
     assert second_state.fast_weights.fast_version == 0
     assert second_state.optimizer.attempted_update_count == 0
     assert second_state.temporal_cache.hidden.shape[1] == 0
@@ -736,13 +742,58 @@ def test_causal_chunks_next_only_updates_and_decode_immutability(
     assert result.chunk_audit[1].skip_reason == "no_valid_term"
     assert result.generate_audit.prefill_count == 1
     assert result.generate_audit.decode_count == 3
-    assert len(set(result.generate_audit.decode_state_checksums)) == 1
+    assert result.generate_audit.state_before == result.generate_audit.state_after
     assert result.reader_result.status is ReaderStatus.OK
     assert result.selected_record_ids == ("record-0",)
     assert result.state_attention is not None
     assert result.runtime_state.released
     assert result.release_audit is not None
     assert manager.active_runtime is None
+
+
+@pytest.mark.parametrize("audit_level", tuple(AuditLevel))
+def test_audit_levels_preserve_runtime_results(
+    dependencies: _Dependencies,
+    audit_level: AuditLevel,
+) -> None:
+    suite = _FakeSuite()
+    result = run_inference(
+        manager=_manager(dependencies, audit_level),
+        model=_model(dependencies, suite),
+        request=_request(),
+        updater=_Updater(skip_calls={1}),
+        generation_driver=_Driver(steps=1),
+    )
+
+    snapshot = result.generate_audit.state_after
+    assert result.answer_text == "answer:(('c',), 1)"
+    assert snapshot.level is audit_level
+    assert (snapshot.boundary is None) is (audit_level is AuditLevel.OFF)
+    assert (snapshot.content_sha256 is not None) is (audit_level is AuditLevel.FULL)
+
+
+def test_boundary_stamp_never_moves_tensor_contents_to_cpu(
+    dependencies: _Dependencies,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(dependencies)
+    manager.reset("video-a", "trajectory-a", torch.zeros(512))
+    runtime = manager.active_runtime
+    assert runtime is not None
+    original_to = Tensor.to
+
+    def reject_cpu(self: Tensor, *args: object, **kwargs: object) -> Tensor:
+        device = kwargs.get("device", args[0] if args else None)
+        if device == "cpu" or device == torch.device("cpu"):
+            raise AssertionError("boundary audit attempted a CPU Tensor copy")
+        return original_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(Tensor, "cpu", lambda _self: pytest.fail("Tensor.cpu was called"))
+    monkeypatch.setattr(Tensor, "to", reject_cpu)
+    stamp = runtime_boundary_stamp(runtime)
+
+    assert stamp.fast_version == 0
+    assert stamp.tensor_versions
 
 
 def test_future_frame_perturbation_does_not_change_answer_or_model_input(
@@ -814,7 +865,7 @@ def test_decode_mutation_fails_closed_and_exception_releases_runtime(
 ) -> None:
     suite = _FakeSuite()
     manager = _manager(dependencies)
-    with pytest.raises(InferenceProtocolError, match="decode/generation driver mutated"):
+    with pytest.raises(InferenceProtocolError, match="prefill/generation mutated"):
         run_inference(
             manager=manager,
             model=_model(dependencies, suite),

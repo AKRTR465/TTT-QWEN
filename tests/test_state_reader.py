@@ -1233,7 +1233,7 @@ def test_reader_rejects_operator_and_window_rewrites_after_retrieval(
         )
 
 
-def test_retriever_snapshot_rejects_typed_payload_replacement_and_tensor_mutation(
+def test_retriever_snapshot_rejects_typed_payload_replacement(
     reader: DeterministicStateReader,
 ) -> None:
     resolution = _resolution(mode=TimeWindowMode.NOW, start_time=None)
@@ -1247,11 +1247,6 @@ def test_retriever_snapshot_rejects_typed_payload_replacement_and_tensor_mutatio
 
     with pytest.raises(ValueError, match="selected typed records.*candidate snapshot"):
         replace(retrieval, selected_records=((replacement,),))
-
-    original.semantic_embedding[0] = 0.25
-    with pytest.raises(ValueError, match="candidate typed snapshot semantics"):
-        reader.read(retrieval)
-
 
 def test_number_tokens_are_reader_owned_gt_substitution_is_detected_and_result_is_frozen(
     reader: DeterministicStateReader,

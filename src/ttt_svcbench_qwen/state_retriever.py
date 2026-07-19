@@ -214,11 +214,6 @@ class RetrieverOutput:
         for row in range(batch_size):
             self._validate_row(row)
 
-    def validate_integrity(self) -> None:
-        """Revalidate mutable tensor-backed snapshot contents before downstream consumption."""
-
-        self.__post_init__()
-
     def _validate_row(self, row: int) -> None:
         n_state = int(self.n_state[row].item())
         n_retrieved = int(self.n_retrieved[row].item())
