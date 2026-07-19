@@ -16,9 +16,10 @@ import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Self, cast
 
 import torch
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from safetensors.torch import load_file
 from torch import nn
 from transformers.modeling_utils import load_sharded_checkpoint
@@ -40,6 +41,32 @@ _FORBIDDEN_CHECKPOINT_TOKENS = (
     "visual_cache",
     "soft_overlap_snapshot",
 )
+
+
+class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
+    """Strict State-TTT extension for production LLaMA-Factory YAML files."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    stage: Literal["a2", "a5"]
+    project_config: str = Field(min_length=1)
+    dataset_manifest: str = Field(min_length=1)
+    visual_cost_index: str | None = Field(default=None, min_length=1)
+    initialize_from_a2_checkpoint: str | None = Field(default=None, min_length=1)
+    support_prefetch_depth: int = Field(gt=0)
+    support_decode_coalesce: bool
+    preprocess_cache_enabled: bool
+    preprocess_cache_root_env: str = Field(min_length=1)
+    preprocess_cache_max_gb: float = Field(gt=0.0)
+    preprocess_cache_dtype: Literal["float32"]
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_stage_checkpoint(self) -> Self:
+        if self.stage == "a2" and self.initialize_from_a2_checkpoint is not None:
+            raise ValueError("A2 must not initialize from an A2 checkpoint")
+        if self.stage == "a5" and self.initialize_from_a2_checkpoint is None:
+            raise ValueError("A5 requires initialize_from_a2_checkpoint")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +103,7 @@ class LlamaFactoryBackboneBundle:
     finetuning_args: object
     generating_args: object
     project_config: ProjectConfig
-    ttt_config: Mapping[str, object]
+    ttt_config: ProductionTTTConfig
     symbols: LlamaFactorySymbols
 
 
@@ -125,15 +152,7 @@ class OuterCheckpointAudit:
             raise ValueError("A2 checkpoint does not exactly match the outer model boundary")
 
 
-class RuntimeFactory(Protocol):
-    def __call__(
-        self,
-        backbone: LlamaFactoryBackboneBundle,
-        config: Mapping[str, object],
-    ) -> object: ...
-
-
-def load_training_yaml(path: str | Path) -> tuple[dict[str, object], dict[str, object]]:
+def load_training_yaml(path: str | Path) -> tuple[dict[str, object], ProductionTTTConfig]:
     """Split native LLaMA-Factory keys from the namespaced ``ttt_qwen`` extension."""
 
     import yaml
@@ -150,7 +169,7 @@ def load_training_yaml(path: str | Path) -> tuple[dict[str, object], dict[str, o
     extension = values.pop("ttt_qwen", None)
     if not isinstance(extension, dict) or not all(isinstance(key, str) for key in extension):
         raise ValueError("training YAML requires a string-keyed ttt_qwen section")
-    return values, cast(dict[str, object], extension)
+    return values, ProductionTTTConfig.model_validate(extension)
 
 
 def import_llamafactory(
@@ -210,10 +229,8 @@ def load_llamafactory_backbone(
     model = symbols.load_model(tokenizer, model_args, finetuning_args, True)
     if not isinstance(model, nn.Module):
         raise TypeError("LLaMA-Factory model loader returned a non-module")
-    configured_project_path = ttt_config.get("project_config")
+    configured_project_path = ttt_config.project_config
     if project_config_path is None:
-        if not isinstance(configured_project_path, str) or not configured_project_path:
-            raise ValueError("ttt_qwen.project_config is required")
         project_config_path = configured_project_path
     config = load_config(project_config_path)
     return LlamaFactoryBackboneBundle(
@@ -346,18 +363,6 @@ def initialize_outer_model_from_a2(
     )
 
 
-def resolve_runtime_factory(specification: str) -> RuntimeFactory:
-    """Resolve ``module:function`` without allowing an implicit remote checkout import."""
-
-    module_name, separator, attribute = specification.partition(":")
-    if not separator or not module_name or not attribute:
-        raise ValueError("runtime_factory must use module:function syntax")
-    value = getattr(importlib.import_module(module_name), attribute, None)
-    if not callable(value):
-        raise TypeError(f"runtime factory is not callable: {specification}")
-    return cast(RuntimeFactory, value)
-
-
 def environment_manifest(bundle: LlamaFactoryBackboneBundle) -> dict[str, object]:
     return {
         "llamafactory_root": str(bundle.symbols.checkout.root),
@@ -365,7 +370,7 @@ def environment_manifest(bundle: LlamaFactoryBackboneBundle) -> dict[str, object
         "llamafactory_dirty": bundle.symbols.checkout.dirty,
         "qwen_model_path": str(getattr(bundle.model_args, "model_name_or_path", "")),
         "project_spec_version": bundle.project_config.spec_version,
-        "ttt_config": json.loads(json.dumps(dict(bundle.ttt_config))),
+        "ttt_config": json.loads(bundle.ttt_config.model_dump_json()),
     }
 
 
@@ -405,6 +410,7 @@ __all__ = [
     "LlamaFactoryCheckoutAudit",
     "LlamaFactorySymbols",
     "OuterCheckpointAudit",
+    "ProductionTTTConfig",
     "audit_outer_checkpoint_boundary",
     "environment_manifest",
     "fully_unfreeze_qwen",
@@ -412,5 +418,4 @@ __all__ = [
     "initialize_outer_model_from_a2",
     "load_llamafactory_backbone",
     "load_training_yaml",
-    "resolve_runtime_factory",
 ]

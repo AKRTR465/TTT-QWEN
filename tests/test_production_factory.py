@@ -24,6 +24,7 @@ from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
     LlamaFactoryCheckoutAudit,
     LlamaFactorySymbols,
+    ProductionTTTConfig,
     audit_outer_checkpoint_boundary,
     fully_unfreeze_qwen,
     initialize_outer_model_from_a2,
@@ -85,9 +86,18 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
     assert "save_total_limit" not in native
     assert native["save_only_model"] is False
     assert native["video_max_pixels"] == 131_072
-    assert extension["checkpoint_selection"] == "final_epoch"
-    assert extension["visual_length_proxy"] == "causal_frame_budget_then_decode_rate"
-    assert "checkpoint_every_epochs" not in extension
+    assert extension.stage == "a2"
+    assert set(extension.model_dump(exclude_none=True)) == {
+        "stage",
+        "project_config",
+        "dataset_manifest",
+        "support_prefetch_depth",
+        "support_decode_coalesce",
+        "preprocess_cache_enabled",
+        "preprocess_cache_root_env",
+        "preprocess_cache_max_gb",
+        "preprocess_cache_dtype",
+    }
 
 
 def test_a2_uses_dynamic_graph_safe_zero1_profile() -> None:
@@ -271,13 +281,42 @@ def test_training_yaml_expands_required_environment_and_keeps_a5_fresh(
 
     assert native["resume_from_checkpoint"] is None
     assert native["output_dir"] == "/tmp/output"
-    assert extension["initialize_from_a2_checkpoint"] == "/tmp/a2-final"
-    assert extension["runtime_factory"] == "ttt_svcbench_qwen.production_runtime:build_runtime"
-    assert extension["support_limit"] is None
+    assert extension.initialize_from_a2_checkpoint == "/tmp/a2-final"
+    assert extension.stage == "a5"
 
     monkeypatch.delenv("A2_CHECKPOINT")
     with pytest.raises(ValueError, match="unresolved environment variables"):
         load_training_yaml(root / "configs/h200/a5_meta_ttt_k8_4gpu.yaml")
+
+
+def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoint(
+    tmp_path: Path,
+) -> None:
+    base = {
+        "stage": "a2",
+        "project_config": "configs/model_state_ttt_8b.yaml",
+        "dataset_manifest": "manifest.json",
+        "support_prefetch_depth": 2,
+        "support_decode_coalesce": True,
+        "preprocess_cache_enabled": True,
+        "preprocess_cache_root_env": "TTT_PREPROCESS_CACHE_ROOT",
+        "preprocess_cache_max_gb": 200.0,
+        "preprocess_cache_dtype": "float32",
+    }
+
+    def write(extension: dict[str, object]) -> Path:
+        path = tmp_path / "training.yaml"
+        lines = ["model_name_or_path: model", "ttt_qwen:"]
+        lines.extend(f"  {key}: {json.dumps(value)}" for key, value in extension.items())
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        load_training_yaml(write({**base, "inner_learning_rate": 1.0e-4}))
+    with pytest.raises(ValueError, match="A2 must not initialize"):
+        load_training_yaml(write({**base, "initialize_from_a2_checkpoint": "checkpoint"}))
+    with pytest.raises(ValueError, match="A5 requires initialize"):
+        load_training_yaml(write({**base, "stage": "a5"}))
 
 
 def test_full_unfreeze_accepts_qwen_module_list(
@@ -454,7 +493,18 @@ def test_central_outer_optimizer_has_exact_stage_groups(
         finetuning_args=object(),
         generating_args=object(),
         project_config=load_config(),
-        ttt_config={"state_w0_predictor_learning_rate": 5.0e-5},
+        ttt_config=ProductionTTTConfig(
+            stage="a5",
+            project_config="configs/model_state_ttt_8b.yaml",
+            dataset_manifest="manifest.json",
+            initialize_from_a2_checkpoint="a2-final",
+            support_prefetch_depth=2,
+            support_decode_coalesce=True,
+            preprocess_cache_enabled=True,
+            preprocess_cache_root_env="TTT_PREPROCESS_CACHE_ROOT",
+            preprocess_cache_max_gb=200.0,
+            preprocess_cache_dtype="float32",
+        ),
         symbols=symbols,
     )
     model = _GroupedOuterToy(qwen, predictor_trainable=predictor_trainable)

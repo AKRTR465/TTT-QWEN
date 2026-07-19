@@ -1,4 +1,5 @@
 spec_version: state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval
+config_schema_version: 2
 
 paths:
   model_root_env: QWEN_MODEL_ROOT
@@ -541,6 +542,10 @@ stage_c:
   outer_step_scope: episode
   synthetic_engineering_gate_only: false
   seed: 42
+  optimizer:
+    state_learning_rate: 5.0e-5
+    w0_learning_rate: 5.0e-5
+    predictor_learning_rate: 5.0e-5
 
 inference:
   reset_per_video: true
@@ -548,7 +553,7 @@ inference:
   prefill_once: true
   decode_state_immutable: true
   release_on_exception: true
-  checksum_runtime_state: true
+  audit_level: boundary
   repeat_query_policy: explicit_new_or_retry
   record_skip_reasons: true
   synthetic_engineering_gate_only: true

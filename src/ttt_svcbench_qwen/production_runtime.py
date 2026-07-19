@@ -80,7 +80,10 @@ from ttt_svcbench_qwen.preprocess_cache import (
     PreprocessFingerprint,
     build_fingerprint,
 )
-from ttt_svcbench_qwen.production_factory import LlamaFactoryBackboneBundle
+from ttt_svcbench_qwen.production_factory import (
+    LlamaFactoryBackboneBundle,
+    ProductionTTTConfig,
+)
 from ttt_svcbench_qwen.query_encoder import (
     Operator,
     QueryEncoder,
@@ -1665,57 +1668,19 @@ class ProductionA5EpisodeAdapter:
         self.materializer.video.end_prefetch()
 
 
-def _config_bool(value: object, *, default: bool, name: str) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str) and value.casefold() in {"true", "1", "yes", "on"}:
-        return True
-    if isinstance(value, str) and value.casefold() in {"false", "0", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be a boolean")
-
-
-def _positive_config_int(value: object, *, default: int, name: str) -> int:
-    if value is None:
-        return default
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
-def _nonnegative_config_float(value: object, *, default: float, name: str) -> float:
-    if value is None:
-        return default
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) <= 0.0:
-        raise ValueError(f"{name} must be a positive number")
-    return float(value)
-
-
 def _build_runtime_preprocess_cache(
     backbone: LlamaFactoryBackboneBundle,
-    config: Mapping[str, object],
+    config: ProductionTTTConfig,
 ) -> PreprocessCache | None:
-    enabled = _config_bool(
-        config.get("preprocess_cache_enabled"), default=True, name="preprocess_cache_enabled"
-    )
-    if not enabled:
+    if not config.preprocess_cache_enabled:
         return None
-    env_name = config.get("preprocess_cache_root_env", "TTT_PREPROCESS_CACHE_ROOT")
-    if not isinstance(env_name, str) or not env_name:
-        raise ValueError("preprocess_cache_root_env must be a non-empty environment-variable name")
+    env_name = config.preprocess_cache_root_env
     root = os.environ.get(env_name)
     if not root:
         # Cache is optional; the direct production decode path remains available when it is unset.
         _loader_trace("cache_disabled", reason=f"missing_env:{env_name}")
         return None
-    max_gb = _nonnegative_config_float(
-        config.get("preprocess_cache_max_gb"), default=200.0, name="preprocess_cache_max_gb"
-    )
-    dtype = config.get("preprocess_cache_dtype", "float32")
-    if dtype != "float32":
-        raise ValueError("preprocess_cache_dtype currently supports only float32")
+    max_gb = config.preprocess_cache_max_gb
     model_id = str(getattr(backbone.model_args, "model_name_or_path", "unknown-model"))
     revision = str(getattr(backbone.model_args, "revision", "unknown-revision"))
     processor_name = (
@@ -1743,7 +1708,7 @@ def _build_runtime_preprocess_cache(
 
 def build_runtime(
     backbone: LlamaFactoryBackboneBundle,
-    config: Mapping[str, object],
+    config: ProductionTTTConfig,
 ) -> object:
     """Built-in ``TTT_RUNTIME_FACTORY`` used by the H200 launch scripts."""
 
@@ -1752,16 +1717,12 @@ def build_runtime(
         ProductionTrainerRuntime,
     )
 
-    stage = ProductionStage(str(config.get("stage")))
+    stage = ProductionStage(config.stage)
     project = backbone.project_config
     minimum_pixels, maximum_pixels = _video_pixel_bounds(backbone)
     preprocess_cache = _build_runtime_preprocess_cache(backbone, config)
-    support_prefetch_depth = _positive_config_int(
-        config.get("support_prefetch_depth"), default=2, name="support_prefetch_depth"
-    )
-    support_decode_coalesce = _config_bool(
-        config.get("support_decode_coalesce"), default=True, name="support_decode_coalesce"
-    )
+    support_prefetch_depth = config.support_prefetch_depth
+    support_decode_coalesce = config.support_decode_coalesce
     fast = build_fast_ttt_adapter(project)
     qwen = Qwen3VLAdapter(
         backbone.model,

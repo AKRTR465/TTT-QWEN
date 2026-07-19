@@ -47,7 +47,6 @@ from ttt_svcbench_qwen.production_factory import (
     fully_unfreeze_qwen,
     initialize_outer_model_from_a2,
     load_llamafactory_backbone,
-    resolve_runtime_factory,
 )
 
 
@@ -336,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     backbone = load_llamafactory_backbone(arguments[0])
     unfreeze_audit = fully_unfreeze_qwen(backbone.model, backbone.project_config)
-    configured_stage = ProductionStage(str(backbone.ttt_config.get("stage")))
+    configured_stage = ProductionStage(backbone.ttt_config.stage)
     if getattr(backbone.training_args, "resume_from_checkpoint", None) is not None:
         raise ValueError(
             "set TTT_RESUME_CHECKPOINT for same-stage resume; YAML resume is forbidden"
@@ -345,17 +344,14 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.get("TTT_RESUME_CHECKPOINT"),
         configured_stage,
     )
-    runtime_spec = backbone.ttt_config.get("runtime_factory")
-    if not isinstance(runtime_spec, str) or not runtime_spec:
-        raise ValueError("ttt_qwen.runtime_factory is required")
-    runtime_raw = resolve_runtime_factory(runtime_spec)(backbone, backbone.ttt_config)
+    from ttt_svcbench_qwen.production_runtime import build_runtime
+
+    runtime_raw = build_runtime(backbone, backbone.ttt_config)
     if not isinstance(runtime_raw, ProductionTrainerRuntime):
-        raise TypeError("runtime_factory must return ProductionTrainerRuntime")
+        raise TypeError("built-in runtime must return ProductionTrainerRuntime")
     if runtime_raw.stage is not configured_stage:
         raise ValueError("runtime factory stage disagrees with ttt_qwen.stage")
-    manifest_path = backbone.ttt_config.get("dataset_manifest")
-    if not isinstance(manifest_path, str) or not manifest_path:
-        raise ValueError("ttt_qwen.dataset_manifest is required")
+    manifest_path = backbone.ttt_config.dataset_manifest
     train_dataset, eval_dataset = load_production_manifest_views(
         manifest_path,
         stage=ManifestStage(configured_stage.value),
@@ -366,14 +362,14 @@ def main(argv: list[str] | None = None) -> int:
         eval_dataset=eval_dataset,
     )
     visual_cost_index: Mapping[str, Sequence[int]] | None = None
-    raw_cost_index = backbone.ttt_config.get("visual_cost_index")
-    if isinstance(raw_cost_index, str) and raw_cost_index:
+    raw_cost_index = backbone.ttt_config.visual_cost_index
+    if raw_cost_index is not None:
         visual_cost_index = load_visual_cost_index(raw_cost_index)
     checkpoint_audit: OuterCheckpointAudit | None = None
     if configured_stage is ProductionStage.A5 and same_stage_resume is None:
-        checkpoint = backbone.ttt_config.get("initialize_from_a2_checkpoint")
-        if not isinstance(checkpoint, str) or not checkpoint:
-            raise ValueError("A5 requires ttt_qwen.initialize_from_a2_checkpoint")
+        checkpoint = backbone.ttt_config.initialize_from_a2_checkpoint
+        if checkpoint is None:
+            raise RuntimeError("validated A5 config lost initialize_from_a2_checkpoint")
         checkpoint_audit = initialize_outer_model_from_a2(runtime_raw.model, checkpoint)
     runtime_raw = replace(
         runtime_raw,
@@ -559,10 +555,10 @@ def make_production_outer_optimizer_factory(
         predictor_lr = state_lr
     else:
         qwen_lr = float(training_args.learning_rate)
-        raw_state_lr = backbone.ttt_config.get("state_w0_predictor_learning_rate")
-        if isinstance(raw_state_lr, bool) or not isinstance(raw_state_lr, (int, float)):
-            raise ValueError("A5 requires numeric state_w0_predictor_learning_rate")
-        state_lr = w0_lr = predictor_lr = float(raw_state_lr)
+        optimizer = backbone.project_config.stage_c.optimizer
+        state_lr = optimizer.state_learning_rate
+        w0_lr = optimizer.w0_learning_rate
+        predictor_lr = optimizer.predictor_learning_rate
 
     def factory(model: nn.Module) -> torch.optim.Optimizer:
         groups: dict[str, list[nn.Parameter]] = {

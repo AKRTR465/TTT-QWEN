@@ -19,6 +19,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SPEC_VERSION = "state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval"
+CONFIG_SCHEMA_VERSION = 2
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -44,6 +45,14 @@ class CalibrationStatus(StrEnum):
     BOOTSTRAP_CALIBRATION_REQUIRED = "bootstrap_calibration_required"
     CALIBRATION_REQUIRED = "calibration_required"
     CALIBRATED = "calibrated"
+
+
+class AuditLevel(StrEnum):
+    """Runtime integrity work retained at each production audit level."""
+
+    OFF = "off"
+    BOUNDARY = "boundary"
+    FULL = "full"
 
 
 class PathsConfig(FrozenModel):
@@ -641,6 +650,14 @@ class StageBTrainingConfig(FrozenModel):
     seed: NonNegativeInt
 
 
+class StageCOptimizerConfig(FrozenModel):
+    """Non-Qwen A5 parameter-group learning rates owned by State-TTT."""
+
+    state_learning_rate: PositiveFloat
+    w0_learning_rate: PositiveFloat
+    predictor_learning_rate: PositiveFloat
+
+
 class StageCTrainingConfig(FrozenModel):
     """Direct A5 contract with unbounded numeric state and bounded meta gradients."""
 
@@ -666,6 +683,7 @@ class StageCTrainingConfig(FrozenModel):
     outer_step_scope: str
     synthetic_engineering_gate_only: bool
     seed: NonNegativeInt
+    optimizer: StageCOptimizerConfig
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
     def validate_incremental_variants(self) -> Self:
@@ -708,7 +726,7 @@ class InferenceRuntimeConfig(FrozenModel):
     prefill_once: bool
     decode_state_immutable: bool
     release_on_exception: bool
-    checksum_runtime_state: bool
+    audit_level: AuditLevel
     repeat_query_policy: str
     record_skip_reasons: bool
     synthetic_engineering_gate_only: bool
@@ -741,6 +759,7 @@ class ProjectConfig(FrozenModel):
     """Complete v5 configuration with cross-component contract validation."""
 
     spec_version: str
+    config_schema_version: int
     paths: PathsConfig
     data: DataConfig
     video_preprocessing: VideoPreprocessingConfig
@@ -770,6 +789,7 @@ class ProjectConfig(FrozenModel):
     def validate_v5_contract(self) -> Self:
         checks: tuple[tuple[str, object, object], ...] = (
             ("spec_version", self.spec_version, SPEC_VERSION),
+            ("config_schema_version", self.config_schema_version, CONFIG_SCHEMA_VERSION),
             ("paths.model_root_env", self.paths.model_root_env, "QWEN_MODEL_ROOT"),
             ("paths.svcbench_root_env", self.paths.svcbench_root_env, "SVCBENCH_ROOT"),
             ("paths.hf_home_env", self.paths.hf_home_env, "HF_HOME"),
@@ -1851,6 +1871,21 @@ class ProjectConfig(FrozenModel):
                 False,
             ),
             ("stage_c.seed", self.stage_c.seed, 42),
+            (
+                "stage_c.optimizer.state_learning_rate",
+                self.stage_c.optimizer.state_learning_rate,
+                5.0e-5,
+            ),
+            (
+                "stage_c.optimizer.w0_learning_rate",
+                self.stage_c.optimizer.w0_learning_rate,
+                5.0e-5,
+            ),
+            (
+                "stage_c.optimizer.predictor_learning_rate",
+                self.stage_c.optimizer.predictor_learning_rate,
+                5.0e-5,
+            ),
             ("inference.reset_per_video", self.inference.reset_per_video, True),
             ("inference.update_effect", self.inference.update_effect, "next_chunk_only"),
             ("inference.prefill_once", self.inference.prefill_once, True),
@@ -1860,11 +1895,7 @@ class ProjectConfig(FrozenModel):
                 True,
             ),
             ("inference.release_on_exception", self.inference.release_on_exception, True),
-            (
-                "inference.checksum_runtime_state",
-                self.inference.checksum_runtime_state,
-                True,
-            ),
+            ("inference.audit_level", self.inference.audit_level, AuditLevel.BOUNDARY),
             (
                 "inference.repeat_query_policy",
                 self.inference.repeat_query_policy,
