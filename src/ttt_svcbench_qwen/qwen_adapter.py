@@ -211,6 +211,68 @@ class QwenVisualOutput:
         return tuple(torch.split(self.packed_main_visual_embeddings(), self.metadata.token_counts))
 
 
+@dataclass(frozen=True, slots=True)
+class RawVisualChunk:
+    """One pre-Adapter Main/DeepStack feature set split from a visual batch."""
+
+    main_feature: Tensor
+    deepstack_features: tuple[Tensor, Tensor, Tensor]
+    metadata: MergedVideoMetadata
+
+    def __post_init__(self) -> None:
+        if len(self.metadata.token_counts) != 1:
+            raise ValueError("RawVisualChunk metadata must describe exactly one chunk")
+        count = self.metadata.token_counts[0]
+        if self.main_feature.ndim != 2 or self.main_feature.shape[0] != count:
+            raise ValueError("RawVisualChunk Main feature must be [N, D]")
+        for feature in self.deepstack_features:
+            if feature.shape != self.main_feature.shape:
+                raise ValueError("RawVisualChunk DeepStack features must align to Main")
+            if (
+                feature.dtype != self.main_feature.dtype
+                or feature.device != self.main_feature.device
+            ):
+                raise ValueError("RawVisualChunk features must share dtype/device")
+
+    def as_batch(self) -> RawVideoFeatureBatch:
+        valid = torch.ones(
+            (1, self.main_feature.shape[0]),
+            dtype=torch.bool,
+            device=self.main_feature.device,
+        )
+        return RawVideoFeatureBatch(
+            QwenVisualOutput(
+                main_visual_embeddings=self.main_feature.unsqueeze(0),
+                deepstack_features=self.deepstack_features,
+                visual_valid_mask=valid,
+                metadata=self.metadata,
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RawVideoFeatureBatch:
+    """Pre-Adapter Main Merger/DeepStack output with exact grid and token offsets."""
+
+    value: QwenVisualOutput
+
+    def split(self) -> tuple[RawVisualChunk, ...]:
+        main = self.value.split_main_visual_embeddings()
+        rows: list[RawVisualChunk] = []
+        for index, feature in enumerate(main):
+            start = self.value.metadata.token_offsets[index]
+            stop = self.value.metadata.token_offsets[index + 1]
+            deepstack = tuple(value[start:stop] for value in self.value.deepstack_features)
+            rows.append(
+                RawVisualChunk(
+                    main_feature=feature,
+                    deepstack_features=cast(tuple[Tensor, Tensor, Tensor], deepstack),
+                    metadata=_single_video_metadata(self.value.metadata, index),
+                )
+            )
+        return tuple(rows)
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class PreparedVideoFeatures:
     """Actual adapted Main features plus untouched DeepStack tensors consumed by Qwen.
@@ -266,6 +328,78 @@ class PreparedVideoFeatures:
             raise ValueError(
                 "precomputed provider packed patch count does not match video_grid_thw"
             )
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class PreparedVisualChunk:
+    """One post-Adapter chunk ready for State modules and a single Qwen continuation."""
+
+    value: QwenVisualOutput
+    prepared_video_features: PreparedVideoFeatures
+    source: object | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.value.metadata.token_counts) != 1:
+            raise ValueError("PreparedVisualChunk must contain exactly one chunk")
+        if self.value.metadata is not self.prepared_video_features.metadata:
+            raise ValueError("PreparedVisualChunk value/prepared metadata must match")
+        if not torch.equal(
+            self.value.packed_main_visual_embeddings(),
+            self.prepared_video_features.main_features[0],
+        ):
+            raise ValueError("PreparedVisualChunk value must expose its prepared Main feature")
+
+
+def _single_video_metadata(
+    metadata: MergedVideoMetadata,
+    index: int,
+) -> MergedVideoMetadata:
+    if index < 0 or index >= len(metadata.token_counts):
+        raise IndexError("visual batch row is out of range")
+    count = metadata.token_counts[index]
+    return MergedVideoMetadata(
+        video_grid_thw=metadata.video_grid_thw[index : index + 1],
+        merged_grid_thw=metadata.merged_grid_thw[index : index + 1],
+        spatial_merge_size=metadata.spatial_merge_size,
+        token_counts=(count,),
+        token_offsets=(0, count),
+    )
+
+
+def _split_prepared_visual_batch(
+    raw: QwenVisualOutput,
+    prepared: PreparedVideoFeatures,
+) -> tuple[PreparedVisualChunk, ...]:
+    rows: list[PreparedVisualChunk] = []
+    for index, main in enumerate(prepared.main_features):
+        start = raw.metadata.token_offsets[index]
+        stop = raw.metadata.token_offsets[index + 1]
+        metadata = _single_video_metadata(raw.metadata, index)
+        deepstack = cast(
+            tuple[Tensor, Tensor, Tensor],
+            tuple(feature[start:stop] for feature in prepared.deepstack_features),
+        )
+        row_prepared = PreparedVideoFeatures(
+            main_features=(main,),
+            deepstack_features=deepstack,
+            metadata=metadata,
+        )
+        rows.append(
+            PreparedVisualChunk(
+                value=QwenVisualOutput(
+                    main_visual_embeddings=main.unsqueeze(0),
+                    deepstack_features=deepstack,
+                    visual_valid_mask=torch.ones(
+                        (1, main.shape[0]),
+                        dtype=torch.bool,
+                        device=main.device,
+                    ),
+                    metadata=metadata,
+                ),
+                prepared_video_features=row_prepared,
+            )
+        )
+    return tuple(rows)
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,40 +540,71 @@ class QwenVideoFeatureBoundary(nn.Module):  # type: ignore[misc]
         deepstack_features: Sequence[Tensor],
         video_grid_thw: Tensor,
     ) -> tuple[Sequence[Tensor], Sequence[Tensor]]:
-        output = self._capture(main_features, deepstack_features, video_grid_thw)
-        self.last_output = output
+        raw = self.capture_raw(main_features, deepstack_features, video_grid_thw)
         if not self.adapter_enabled:
+            self.last_output = raw.value
             self.last_prepared = PreparedVideoFeatures(
                 main_features=tuple(main_features),
-                deepstack_features=output.deepstack_features,
-                metadata=output.metadata,
+                deepstack_features=raw.value.deepstack_features,
+                metadata=raw.value.metadata,
             )
             return main_features, deepstack_features
-        if self.adapter is None:
-            raise RuntimeError("adapter disappeared while adapter_enabled is true")
-        adapted = cast(
-            Tensor,
-            self.adapter(
-                output.main_visual_embeddings,
-                output.visual_valid_mask,
-                output.metadata,
-            ),
+        prepared = self._prepare_output(raw.value)
+        return prepared.main_features, deepstack_features
+
+    def capture_raw(
+        self,
+        main_features: Sequence[Tensor],
+        deepstack_features: Sequence[Tensor],
+        video_grid_thw: Tensor,
+    ) -> RawVideoFeatureBatch:
+        return RawVideoFeatureBatch(
+            self._capture(main_features, deepstack_features, video_grid_thw)
         )
-        if adapted.shape != output.main_visual_embeddings.shape:
-            raise ValueError("video adapter must preserve [B, N_max, 4096] shape")
-        if (
-            adapted.dtype != output.main_visual_embeddings.dtype
-            or adapted.device != output.main_visual_embeddings.device
-        ):
-            raise ValueError("video adapter must preserve Main Merger dtype/device")
-        packed = adapted[output.visual_valid_mask]
-        adapted_splits = tuple(torch.split(packed, output.metadata.token_counts))
+
+    def prepare_raw_batch(
+        self,
+        raw: RawVideoFeatureBatch,
+    ) -> tuple[PreparedVisualChunk, ...]:
+        prepared = self._prepare_output(raw.value)
+        return _split_prepared_visual_batch(raw.value, prepared)
+
+    def prepare_raw_chunk(self, raw: RawVisualChunk) -> PreparedVisualChunk:
+        prepared = self.prepare_raw_batch(raw.as_batch())
+        if len(prepared) != 1:
+            raise RuntimeError("single raw visual chunk produced a non-singleton batch")
+        return prepared[0]
+
+    def _prepare_output(self, output: QwenVisualOutput) -> PreparedVideoFeatures:
+        self.last_output = output
+        if not self.adapter_enabled:
+            main = output.split_main_visual_embeddings()
+        else:
+            if self.adapter is None:
+                raise RuntimeError("adapter disappeared while adapter_enabled is true")
+            adapted = cast(
+                Tensor,
+                self.adapter(
+                    output.main_visual_embeddings,
+                    output.visual_valid_mask,
+                    output.metadata,
+                ),
+            )
+            if adapted.shape != output.main_visual_embeddings.shape:
+                raise ValueError("video adapter must preserve [B, N_max, 4096] shape")
+            if (
+                adapted.dtype != output.main_visual_embeddings.dtype
+                or adapted.device != output.main_visual_embeddings.device
+            ):
+                raise ValueError("video adapter must preserve Main Merger dtype/device")
+            packed = adapted[output.visual_valid_mask]
+            main = tuple(torch.split(packed, output.metadata.token_counts))
         self.last_prepared = PreparedVideoFeatures(
-            main_features=adapted_splits,
+            main_features=main,
             deepstack_features=output.deepstack_features,
             metadata=output.metadata,
         )
-        return adapted_splits, deepstack_features
+        return self.last_prepared
 
     def _capture(
         self,
@@ -603,6 +768,34 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
             except Exception:
                 self._clear_captures()
                 raise
+
+    def encode_video_batch_raw(
+        self,
+        pixel_values_videos: Tensor,
+        video_grid_thw: Tensor,
+    ) -> RawVideoFeatureBatch:
+        """Run HF ViT/Main Merger/DeepStack once without invoking the Fast Adapter."""
+
+        with self._hook_lock:
+            if self._hook_active:
+                raise RuntimeError("raw video encoding cannot run while the forward hook is active")
+            self._clear_captures()
+            main, deepstack = self.feature_owner.get_video_features(
+                pixel_values_videos,
+                video_grid_thw,
+            )
+            return self.video_boundary.capture_raw(main, deepstack, video_grid_thw)
+
+    def prepare_raw_video_batch(
+        self,
+        raw: RawVideoFeatureBatch,
+    ) -> tuple[PreparedVisualChunk, ...]:
+        with self._hook_lock:
+            return self.video_boundary.prepare_raw_batch(raw)
+
+    def prepare_raw_visual_chunk(self, raw: RawVisualChunk) -> PreparedVisualChunk:
+        with self._hook_lock:
+            return self.video_boundary.prepare_raw_chunk(raw)
 
     @contextmanager
     def _patched_video_features(

@@ -108,6 +108,7 @@ from ttt_svcbench_qwen.qwen_adapter import (
     CurrentChunkVisualTokenAudit,
     MergedVideoMetadata,
     PreparedVideoFeatures,
+    PreparedVisualChunk,
     Qwen3VLAdapter,
     QwenVisualOutput,
     StateEmbeddingPayload,
@@ -642,6 +643,19 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
 
     def _visual(self, request: ObservationChunkRequest) -> VisualStageOutput:
         raw = request.video_input
+        if isinstance(raw, PreparedVisualChunk):
+            if not isinstance(raw.source, CurrentChunkMaterialization):
+                raise TypeError("prepared visual chunk lost its materialized source")
+            token_audit = audit_current_chunk_visual_tokens(
+                raw.prepared_video_features,
+                raw.source.pixel_values_videos,
+                raw.source.video_grid_thw,
+            )
+            return VisualStageOutput(
+                value=raw.value,
+                prepared_video_features=raw.prepared_video_features,
+                audit=ProductionVisualAudit(raw.source, token_audit),
+            )
         if isinstance(raw, CurrentChunkSpec):
             chunk = self.materializer(raw)
         elif isinstance(raw, CurrentChunkMaterialization):
@@ -682,6 +696,74 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
             prepared_video_features=prepared,
             audit=ProductionVisualAudit(materialized, token_audit),
         )
+
+    def prepare_support_batch(
+        self,
+        values: Sequence[object],
+        *,
+        batch_size: int,
+    ) -> tuple[PreparedVisualChunk, ...]:
+        """Batch only A2 Support visual work; State/Bank consumers remain sequential."""
+
+        if type(batch_size) is not int or batch_size <= 0:
+            raise ValueError("support visual batch_size must be a positive integer")
+        chunks: list[CurrentChunkMaterialization] = []
+        for value in values:
+            if isinstance(value, CurrentChunkSpec):
+                chunks.append(self.materializer(value))
+            elif isinstance(value, CurrentChunkMaterialization):
+                chunks.append(value)
+            else:
+                raise TypeError("Support visual batch accepts specs/materializations only")
+        device = _module_device(self.qwen)
+        outputs: list[PreparedVisualChunk] = []
+        for start in range(0, len(chunks), batch_size):
+            group = tuple(chunks[start : start + batch_size])
+            h2d_started = time.perf_counter()
+            pixels = torch.cat(
+                tuple(
+                    chunk.pixel_values_videos.to(device=device, non_blocking=True)
+                    for chunk in group
+                )
+            )
+            grid = torch.cat(
+                tuple(chunk.video_grid_thw.to(device=device, non_blocking=True) for chunk in group)
+            )
+            _loader_trace(
+                "pin_memory/H2D",
+                stage="a2_support_batch",
+                chunk_count=len(group),
+                seconds=time.perf_counter() - h2d_started,
+            )
+            with trace_cuda_phase(
+                "vit_forward",
+                stage="a2_support_batch",
+                chunk_count=len(group),
+            ):
+                raw_batch = self.qwen.encode_video_batch_raw(pixels, grid)
+                prepared = self.qwen.prepare_raw_video_batch(raw_batch)
+            if len(prepared) != len(group):
+                raise RuntimeError("visual batch split did not preserve Support count")
+            patch_offset = 0
+            for chunk, row in zip(group, prepared, strict=True):
+                patch_count = chunk.pixel_values_videos.shape[0]
+                row_pixels = pixels[patch_offset : patch_offset + patch_count]
+                patch_offset += patch_count
+                materialized = replace(
+                    chunk,
+                    pixel_values_videos=row_pixels,
+                    video_grid_thw=chunk.video_grid_thw.to(device),
+                    tubelet_timestamps=chunk.tubelet_timestamps.to(device),
+                    tubelet_valid_mask=chunk.tubelet_valid_mask.to(device),
+                    tubelet_position_ids=chunk.tubelet_position_ids.to(device),
+                )
+                audit_current_chunk_visual_tokens(
+                    row.prepared_video_features,
+                    materialized.pixel_values_videos,
+                    materialized.video_grid_thw,
+                )
+                outputs.append(replace(row, source=materialized))
+        return tuple(outputs)
 
     def _prefill(self, request: QwenPrefillRequest) -> QwenPrefillOutput:
         if not isinstance(request.prepared_video_features, PreparedVideoFeatures):
@@ -992,13 +1074,12 @@ class ProductionObservationRuntime(nn.Module):  # type: ignore[misc]
         request: ObservationChunkRequest,
     ) -> ObservationOutputs:
         runtime = _stage_runtime(request)
-        raw_chunk = request.video_input
-        if isinstance(raw_chunk, CurrentChunkSpec):
-            reset = raw_chunk.reset_soft_state
-        elif isinstance(raw_chunk, CurrentChunkMaterialization):
-            reset = raw_chunk.spec.reset_soft_state
-        else:
-            raise TypeError("production Observation runtime requires one current chunk")
+        raw_chunk = _current_chunk_input(request.video_input)
+        reset = (
+            raw_chunk.reset_soft_state
+            if isinstance(raw_chunk, CurrentChunkSpec)
+            else raw_chunk.spec.reset_soft_state
+        )
         empty = (None,) * len(request.owner.video_ids)
         output = self.heads(
             spatial,
@@ -1560,6 +1641,8 @@ class ProductionA2LossStep:
         materializer: ProductionEpisodeMaterializer,
         graph_anchor_parameters: Sequence[nn.Parameter],
         config: ProjectConfig,
+        visual_runtime: ProductionQwenRuntime,
+        support_visual_batch_size: int,
     ):
         self.runner = runner
         self.materializer = materializer
@@ -1571,6 +1654,8 @@ class ProductionA2LossStep:
         )
         self.outer_composer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
+        self.visual_runtime = visual_runtime
+        self.support_visual_batch_size = support_visual_batch_size
 
     def __call__(self, _model: nn.Module, inputs: Mapping[str, object]) -> Tensor:
         prefetched = inputs.get("prepared_a2")
@@ -1588,6 +1673,26 @@ class ProductionA2LossStep:
         if not isinstance(batch.model_inputs, StageAEpisodeInputs):
             raise TypeError("A2 materializer must return StageAEpisodeInputs")
         model_inputs = batch.model_inputs
+        if self.support_visual_batch_size > 1:
+            support_requests = model_inputs.observation_requests[:-1]
+            with torch.no_grad():
+                prepared_supports = self.visual_runtime.prepare_support_batch(
+                    tuple(request.video_input for request in support_requests),
+                    batch_size=self.support_visual_batch_size,
+                )
+            model_inputs = replace(
+                model_inputs,
+                observation_requests=tuple(
+                    replace(request, video_input=prepared)
+                    for request, prepared in zip(
+                        support_requests,
+                        prepared_supports,
+                        strict=True,
+                    )
+                )
+                + (model_inputs.observation_requests[-1],),
+            )
+            batch = replace(batch, model_inputs=model_inputs)
         self.progress.emit(
             call_index,
             "materialized",
@@ -1855,7 +1960,14 @@ def build_runtime(
             data_collator=cast(Any, collator),
             stage_a_loss_step=cast(
                 Any,
-                ProductionA2LossStep(runner, materializer, graph_anchor_parameters, project),
+                ProductionA2LossStep(
+                    runner,
+                    materializer,
+                    graph_anchor_parameters,
+                    project,
+                    qwen_runtime,
+                    config.support_visual_batch_size,
+                ),
             ),
         )
     collator = A5PrefetchCollator(
@@ -2015,6 +2127,19 @@ def _stage_inputs(
     ):
         raise TypeError("production state stages require a typed current visual output")
     return visual.value, visual.audit.chunk, query, _stage_runtime(request)
+
+
+def _current_chunk_input(
+    value: object,
+) -> CurrentChunkSpec | CurrentChunkMaterialization:
+    if isinstance(value, (CurrentChunkSpec, CurrentChunkMaterialization)):
+        return value
+    if isinstance(value, PreparedVisualChunk) and isinstance(
+        value.source,
+        CurrentChunkMaterialization,
+    ):
+        return value.source
+    raise TypeError("production runtime requires one current chunk input")
 
 
 def _stage_runtime(request: ObservationChunkRequest) -> BatchRuntimeState:

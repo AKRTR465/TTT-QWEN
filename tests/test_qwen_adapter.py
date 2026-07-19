@@ -294,6 +294,31 @@ def test_variable_video_mapping_and_deepstack_objects_are_preserved() -> None:
         audit_current_chunk_visual_tokens((prepared,), pixels, grid)  # type: ignore[arg-type]
 
 
+def test_raw_visual_batch_splits_offsets_then_adapts_each_chunk_exactly() -> None:
+    config = load_config()
+    grid = torch.tensor([[2, 4, 4], [1, 2, 4]], dtype=torch.int64)
+    main = (torch.zeros(8, 4096), torch.full((2, 4096), 2.0))
+    deepstack = tuple(
+        torch.arange(10, dtype=torch.float32).unsqueeze(1).expand(-1, 4096) + index
+        for index in range(3)
+    )
+    boundary = QwenVideoFeatureBoundary(config, AddOneAdapter(), adapter_enabled=True)
+
+    raw = boundary.capture_raw(main, deepstack, grid)
+    chunks = raw.split()
+    prepared = boundary.prepare_raw_batch(raw)
+
+    assert len(chunks) == len(prepared) == 2
+    assert chunks[0].metadata.token_offsets == (0, 8)
+    assert chunks[1].metadata.token_offsets == (0, 2)
+    assert torch.equal(chunks[0].deepstack_features[0][:, 0], torch.arange(8.0))
+    assert torch.equal(chunks[1].deepstack_features[0][:, 0], torch.arange(8.0, 10.0))
+    assert torch.equal(prepared[0].value.main_visual_embeddings, torch.ones(1, 8, 4096))
+    assert torch.equal(prepared[1].value.main_visual_embeddings, torch.full((1, 2, 4096), 3.0))
+    assert prepared[0].prepared_video_features.deepstack_features[0].shape == (8, 4096)
+    assert prepared[1].prepared_video_features.deepstack_features[0].shape == (2, 4096)
+
+
 def test_visual_output_rejects_invalid_padding_width_and_deepstack_count() -> None:
     metadata = MergedVideoMetadata(
         video_grid_thw=torch.tensor([[2, 2, 2]], dtype=torch.int64),
