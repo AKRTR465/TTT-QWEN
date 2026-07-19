@@ -17,6 +17,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 from pathlib import Path
 
 import torch
@@ -24,6 +25,21 @@ from safetensors.torch import load_file, save_file
 from torch import Tensor
 
 CACHE_SCHEMA_VERSION = 1
+
+
+class PreprocessCacheMode(StrEnum):
+    DISABLED = "disabled"
+    READ_WRITE = "read_write"
+    READONLY = "readonly"
+
+
+class PreprocessCacheMissPolicy(StrEnum):
+    DECODE = "decode"
+    ERROR = "error"
+
+
+class PreprocessCacheMissError(RuntimeError):
+    """A strict cache run encountered an absent, stale, or corrupt entry."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,19 +142,26 @@ class PreprocessCache:
         *,
         max_bytes: int = 200 * 1024**3,
         memory_entries: int = 2,
-        enabled: bool = True,
+        mode: PreprocessCacheMode | str = PreprocessCacheMode.READ_WRITE,
+        miss_policy: PreprocessCacheMissPolicy | str = PreprocessCacheMissPolicy.DECODE,
         namespace: str | None = None,
     ) -> None:
         if type(max_bytes) is not int or max_bytes <= 0:
             raise ValueError("preprocess cache max_bytes must be a positive integer")
         if type(memory_entries) is not int or memory_entries < 0:
             raise ValueError("preprocess cache memory_entries must be non-negative")
-        if enabled and root is None:
+        self.mode = PreprocessCacheMode(mode)
+        self.miss_policy = PreprocessCacheMissPolicy(miss_policy)
+        if self.mode is not PreprocessCacheMode.DISABLED and root is None:
             raise ValueError("enabled preprocess cache requires a root directory")
+        if (
+            self.mode is PreprocessCacheMode.DISABLED
+            and self.miss_policy is PreprocessCacheMissPolicy.ERROR
+        ):
+            raise ValueError("disabled preprocess cache cannot use miss_policy=error")
         self.root = None if root is None else Path(root).expanduser().resolve()
         self.max_bytes = max_bytes
         self.memory_entries = memory_entries
-        self.enabled = enabled
         if namespace is not None:
             namespace = namespace.strip().replace("\\", "/").strip("/")
             if not namespace or any(part in {".", ".."} for part in namespace.split("/")):
@@ -148,9 +171,19 @@ class PreprocessCache:
         self._memory_sizes: dict[str, int] = {}
         self.hit_count = 0
         self.miss_count = 0
-        self._writes_since_prune = 0
         if self.enabled and self.root is not None:
-            self.root.mkdir(parents=True, exist_ok=True)
+            if self.mode is PreprocessCacheMode.READ_WRITE:
+                self.root.mkdir(parents=True, exist_ok=True)
+            elif not self.root.is_dir():
+                raise FileNotFoundError(f"readonly preprocess cache does not exist: {self.root}")
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode is not PreprocessCacheMode.DISABLED
+
+    @property
+    def writable(self) -> bool:
+        return self.mode is PreprocessCacheMode.READ_WRITE
 
     def get(self, fingerprint: PreprocessFingerprint) -> CachedChunk | None:
         if not self.enabled:
@@ -163,30 +196,28 @@ class PreprocessCache:
             return _clone_cached_chunk(cached)
         path = self._path_for(fingerprint)
         if path is None or not path.is_file():
-            self.miss_count += 1
-            return None
+            return self._miss(fingerprint, "entry_missing")
         try:
             tensors = load_file(str(path), device="cpu")
             embedded_metadata = _read_metadata(tensors)
             sidecar_metadata = _read_sidecar_metadata(path)
             if sidecar_metadata is not None and sidecar_metadata != embedded_metadata:
-                self.miss_count += 1
-                return None
+                return self._miss(fingerprint, "sidecar_mismatch")
             metadata = sidecar_metadata or embedded_metadata
             if metadata != fingerprint.canonical_json():
-                self.miss_count += 1
-                return None
+                return self._miss(fingerprint, "fingerprint_mismatch")
             cached = _cached_chunk_from_tensors(tensors)
-        except Exception:  # corrupt/partially replaced entries are ordinary cache misses
-            self.miss_count += 1
-            return None
-        with suppress(OSError):
-            os.utime(path, None)
+        except PreprocessCacheMissError:
+            raise
+        except Exception:  # corrupt/partially replaced entries follow the configured miss policy
+            return self._miss(fingerprint, "entry_corrupt")
+        if self.mode is PreprocessCacheMode.READ_WRITE:
+            with suppress(OSError):
+                os.utime(path, None)
         try:
             size = path.stat().st_size
         except OSError:
-            self.miss_count += 1
-            return None
+            return self._miss(fingerprint, "entry_stat_failed")
         self._remember(key, cached, size)
         self.hit_count += 1
         return _clone_cached_chunk(cached)
@@ -194,6 +225,8 @@ class PreprocessCache:
     def put(self, fingerprint: PreprocessFingerprint, chunk: CachedChunk) -> None:
         if not self.enabled:
             return
+        if not self.writable:
+            raise PermissionError("readonly preprocess cache forbids put()")
         _validate_cached_chunk(chunk)
         key = fingerprint.digest
         self._remember(key, chunk, _tensor_bytes(chunk))
@@ -231,18 +264,16 @@ class PreprocessCache:
                 temporary.unlink()
             if "metadata_temporary" in locals() and metadata_temporary.exists():
                 metadata_temporary.unlink()
-        self._writes_since_prune += 1
-        if self._writes_since_prune >= 32 or self.disk_size_bytes() > self.max_bytes:
-            self.prune()
-            self._writes_since_prune = 0
 
     def clear_memory(self) -> None:
         self._memory.clear()
         self._memory_sizes.clear()
 
-    def stats(self) -> dict[str, int | bool]:
+    def stats(self) -> dict[str, object]:
         return {
             "enabled": self.enabled,
+            "mode": self.mode.value,
+            "miss_policy": self.miss_policy.value,
             "hit_count": self.hit_count,
             "miss_count": self.miss_count,
             "memory_entries": len(self._memory),
@@ -269,6 +300,8 @@ class PreprocessCache:
         recomputable and writes are atomic.
         """
 
+        if not self.writable:
+            raise PermissionError("cache prune requires read_write mode")
         if self.root is None or not self.root.exists():
             return 0
         entries: list[tuple[float, int, Path]] = []
@@ -296,6 +329,18 @@ class PreprocessCache:
             total -= size
             removed += 1
         return removed
+
+    def _miss(
+        self,
+        fingerprint: PreprocessFingerprint,
+        reason: str,
+    ) -> CachedChunk | None:
+        self.miss_count += 1
+        if self.miss_policy is PreprocessCacheMissPolicy.ERROR:
+            raise PreprocessCacheMissError(
+                f"strict preprocess cache miss for {fingerprint.digest}: {reason}"
+            )
+        return None
 
     def _path_for(self, fingerprint: PreprocessFingerprint) -> Path | None:
         if self.root is None:
@@ -458,6 +503,9 @@ __all__ = [
     "CACHE_SCHEMA_VERSION",
     "CachedChunk",
     "PreprocessCache",
+    "PreprocessCacheMissError",
+    "PreprocessCacheMissPolicy",
+    "PreprocessCacheMode",
     "PreprocessFingerprint",
     "build_fingerprint",
 ]

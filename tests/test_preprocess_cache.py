@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import pytest
 import torch
 
-from ttt_svcbench_qwen.preprocess_cache import CachedChunk, PreprocessCache, build_fingerprint
+from ttt_svcbench_qwen.preprocess_cache import (
+    CachedChunk,
+    PreprocessCache,
+    PreprocessCacheMissError,
+    build_fingerprint,
+)
 
 
 def _fingerprint(video: Path, *, end: float = 1.0):
@@ -84,3 +91,50 @@ def test_cache_prune_removes_oldest_entries(tmp_path: Path) -> None:
     cache.max_bytes = 1
     assert cache.prune() >= 1
     assert cache.disk_size_bytes() == 0
+
+
+def test_readonly_cache_never_writes_or_updates_atime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    fingerprint = _fingerprint(video)
+    root = tmp_path / "cache"
+    PreprocessCache(root, memory_entries=0).put(fingerprint, _chunk())
+    cache = PreprocessCache(root, mode="readonly", memory_entries=0)
+
+    monkeypatch.setattr(os, "utime", lambda *_args, **_kwargs: pytest.fail("atime write"))
+    assert cache.get(fingerprint) is not None
+    with pytest.raises(PermissionError, match="readonly"):
+        cache.put(fingerprint, _chunk())
+    with pytest.raises(PermissionError, match="read_write"):
+        cache.prune()
+
+
+def test_strict_readonly_cache_raises_on_miss(tmp_path: Path) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    root = tmp_path / "cache"
+    root.mkdir()
+    cache = PreprocessCache(root, mode="readonly", miss_policy="error", memory_entries=0)
+
+    with pytest.raises(PreprocessCacheMissError, match="entry_missing"):
+        cache.get(_fingerprint(video))
+
+
+def test_put_does_not_scan_or_prune_cache_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    cache = PreprocessCache(tmp_path / "cache", memory_entries=0)
+    monkeypatch.setattr(
+        cache,
+        "disk_size_bytes",
+        lambda: pytest.fail("hot-path capacity scan"),
+    )
+    monkeypatch.setattr(cache, "prune", lambda: pytest.fail("hot-path prune"))
+
+    cache.put(_fingerprint(video), _chunk())

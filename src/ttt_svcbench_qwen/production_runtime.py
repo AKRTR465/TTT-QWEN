@@ -83,6 +83,8 @@ from ttt_svcbench_qwen.outer_loss_balance import (
 from ttt_svcbench_qwen.preprocess_cache import (
     CachedChunk,
     PreprocessCache,
+    PreprocessCacheMissPolicy,
+    PreprocessCacheMode,
     PreprocessFingerprint,
     build_fingerprint,
 )
@@ -160,7 +162,7 @@ def _loader_trace(event: str, **fields: object) -> None:
     trace_event(event, **fields)
 
 
-def _cache_stats(owner: object) -> dict[str, int | bool]:
+def _cache_stats(owner: object) -> dict[str, object]:
     cache = getattr(owner, "preprocess_cache", None)
     if isinstance(cache, PreprocessCache):
         return cache.stats()
@@ -304,18 +306,27 @@ class PreparedAnswerCPU:
 
 @dataclass(frozen=True, slots=True)
 class PreparedA2Record:
-    """One manifest row plus its prefetched, label-separated Query tensors."""
+    """One manifest row plus its CPU-prepared Query and optional complete Support list."""
 
     record: A2QueryRecord
     answer: PreparedAnswerCPU
+    supports: tuple[CurrentChunkMaterialization, ...] = ()
 
     def __post_init__(self) -> None:
         expected = f"{self.record.query.runtime.query_id}:query"
         if self.answer.spec.chunk_id != expected:
             raise ValueError("prepared A2 answer does not belong to its manifest Query")
+        if self.supports:
+            _, schedule = adaptive_support_schedule(self.record.query.runtime.query_time)
+            if len(self.supports) != len(schedule):
+                raise ValueError("prepared A2 Supports do not match the adaptive schedule")
 
     def pin_memory(self) -> PreparedA2Record:
-        return replace(self, answer=self.answer.pin_memory())
+        return replace(
+            self,
+            answer=self.answer.pin_memory(),
+            supports=tuple(_pin_materialized_chunk(chunk) for chunk in self.supports),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -587,7 +598,7 @@ class VideoChunkMaterializer:
             pixel_values_videos=processed.flatten_for_qwen(),
             video_grid_thw=processed.video_grid_thw,
         )
-        if self.preprocess_cache is not None:
+        if self.preprocess_cache is not None and self.preprocess_cache.writable:
             self.preprocess_cache.put(fingerprint, _cached_from_materialized(materialized))
         return materialized
 
@@ -1124,6 +1135,8 @@ class A2PrefetchCollator:
         minimum_pixels: int,
         maximum_pixels: int,
         preprocess_cache: PreprocessCache | None = None,
+        support_materialization: str = "trainer_prefetch",
+        prepared_episode_max_bytes: int = 2_147_483_648,
     ) -> None:
         _require_latest_qwen_processor(processor, context="A2 prefetch")
         self.processor = processor
@@ -1132,6 +1145,20 @@ class A2PrefetchCollator:
         self.minimum_pixels = minimum_pixels
         self.maximum_pixels = maximum_pixels
         self.preprocess_cache = preprocess_cache
+        if support_materialization not in {"trainer_prefetch", "dataloader_episode"}:
+            raise ValueError("A2 collator received an invalid support materialization mode")
+        if prepared_episode_max_bytes <= 0:
+            raise ValueError("prepared episode byte limit must be positive")
+        self.support_materialization = support_materialization
+        self.prepared_episode_max_bytes = prepared_episode_max_bytes
+        self.video = VideoChunkMaterializer(
+            config,
+            minimum_pixels=minimum_pixels,
+            maximum_pixels=maximum_pixels,
+            preprocess_cache=preprocess_cache,
+            prefetch_depth=1,
+            decode_coalesce=False,
+        )
 
     def __call__(self, records: Sequence[object]) -> dict[str, object]:
         if len(records) != 1 or not isinstance(records[0], A2QueryRecord):
@@ -1156,13 +1183,26 @@ class A2PrefetchCollator:
             preprocess_cache=self.preprocess_cache,
             source_dataset=record.source_dataset,
         )
+        supports: tuple[CurrentChunkMaterialization, ...] = ()
+        if self.support_materialization == "dataloader_episode":
+            self.video.set_source_dataset(record.source_dataset)
+            supports = tuple(
+                self.video(support_spec)
+                for support_spec in _a2_support_chunk_specs(record, video_path)
+            )
+            prepared_bytes = _prepared_a2_record_bytes(answer, supports)
+            if prepared_bytes > self.prepared_episode_max_bytes:
+                raise MemoryError(
+                    f"prepared A2 episode {record.query.runtime.query_id!r} uses "
+                    f"{prepared_bytes} bytes, above limit {self.prepared_episode_max_bytes}"
+                )
         _loader_trace(
             "a2_collate_done",
             query_id=record.query.runtime.query_id,
             seconds=time.perf_counter() - started,
             cache_stats=(self.preprocess_cache.stats() if self.preprocess_cache else {}),
         )
-        return {"prepared_a2": PreparedA2Record(record, answer)}
+        return {"prepared_a2": PreparedA2Record(record, answer, supports)}
 
 
 class A5PrefetchCollator:
@@ -1258,8 +1298,9 @@ class ProductionEpisodeMaterializer:
         if prepared_answer.spec != query_chunk:
             raise ValueError("prefetched A2 Query chunk drifted before runtime assembly")
         answer, labels, materialized_query = self._bind_answer(prepared_answer)
-        requests = tuple(
-            self._request(
+        requests_list: list[ObservationChunkRequest] = []
+        for index, chunk in enumerate(supports):
+            request = self._request(
                 owner,
                 runtime,
                 video_path,
@@ -1268,8 +1309,13 @@ class ProductionEpisodeMaterializer:
                 index,
                 episode_nonce,
             )
-            for index, chunk in enumerate(supports)
-        ) + (
+            if source.supports:
+                prepared_support = source.supports[index]
+                if prepared_support.spec != request.video_input:
+                    raise ValueError("prefetched A2 Support drifted before runtime assembly")
+                request = replace(request, video_input=prepared_support)
+            requests_list.append(request)
+        requests = tuple(requests_list) + (
             ObservationChunkRequest(
                 owner=owner,
                 video_input=materialized_query,
@@ -1670,14 +1716,14 @@ def _build_runtime_preprocess_cache(
     backbone: LlamaFactoryBackboneBundle,
     config: ProductionTTTConfig,
 ) -> PreprocessCache | None:
-    if not config.preprocess_cache_enabled:
+    mode = PreprocessCacheMode(config.preprocess_cache_mode)
+    miss_policy = PreprocessCacheMissPolicy(config.preprocess_cache_miss_policy)
+    if mode is PreprocessCacheMode.DISABLED:
         return None
     env_name = config.preprocess_cache_root_env
     root = os.environ.get(env_name)
     if not root:
-        # Cache is optional; the direct production decode path remains available when it is unset.
-        _loader_trace("cache_disabled", reason=f"missing_env:{env_name}")
-        return None
+        raise ValueError(f"preprocess cache mode {mode.value!r} requires environment {env_name}")
     max_gb = config.preprocess_cache_max_gb
     model_id = str(getattr(backbone.model_args, "model_name_or_path", "unknown-model"))
     revision = str(getattr(backbone.model_args, "revision", "unknown-revision"))
@@ -1699,7 +1745,8 @@ def _build_runtime_preprocess_cache(
         root,
         max_bytes=int(max_gb * 1024**3),
         memory_entries=2,
-        enabled=True,
+        mode=mode,
+        miss_policy=miss_policy,
         namespace=namespace,
     )
 
@@ -1721,6 +1768,10 @@ def build_runtime(
     minimum_pixels, maximum_pixels = _video_pixel_bounds(backbone)
     preprocess_cache = _build_runtime_preprocess_cache(backbone, config)
     support_prefetch_depth = config.support_prefetch_depth
+    if stage is ProductionStage.A5 and config.support_materialization == "segment_double_buffer":
+        support_prefetch_depth = (
+            1 + config.segment_prefetch_depth
+        ) * project.stage_c.truncation_horizon
     support_decode_coalesce = config.support_decode_coalesce
     fast = build_fast_ttt_adapter(project)
     qwen = Qwen3VLAdapter(
@@ -1782,6 +1833,8 @@ def build_runtime(
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
+            support_materialization=config.support_materialization,
+            prepared_episode_max_bytes=config.prepared_episode_max_bytes,
         )
         predictor.requires_grad_(False)
         world_size = int(getattr(backbone.training_args, "world_size", 1))
@@ -2007,6 +2060,24 @@ def _official_weak(query: ProductionQueryRecord) -> OfficialWeakSupervision:
     )
 
 
+def _a2_support_chunk_specs(
+    record: A2QueryRecord,
+    video_path: Path,
+) -> tuple[CurrentChunkSpec, ...]:
+    _, supports = adaptive_support_schedule(record.query.runtime.query_time)
+    return tuple(
+        CurrentChunkSpec(
+            chunk_id=f"{record.query.runtime.query_id}:a2:{index}",
+            video_path=video_path,
+            start_time=chunk.start_time,
+            end_time=chunk.end_time,
+            maximum_frames=chunk.maximum_frames,
+            query_time=record.query.runtime.query_time,
+        )
+        for index, chunk in enumerate(supports)
+    )
+
+
 def _query_chunk_spec(
     chunk_id: str,
     video_path: Path,
@@ -2074,7 +2145,7 @@ def _prepare_answer_cpu(
         )
         pixels, grid = _process_video_once(typed_processor, frames)
         materialized = _build_materialized_query(spec, frames, timestamps, pixels, grid, config)
-        if preprocess_cache is not None:
+        if preprocess_cache is not None and preprocess_cache.writable:
             preprocess_cache.put(fingerprint, _cached_from_materialized(materialized))
 
     prompt_messages = [_user_message(query.runtime.question)]
@@ -2194,6 +2265,44 @@ def _prepared_answer_bytes(answer: PreparedAnswerCPU) -> int:
         answer.materialized_query.video_grid_thw,
     )
     return sum(int(value.numel() * value.element_size()) for value in tensors)
+
+
+def _pin_materialized_chunk(chunk: CurrentChunkMaterialization) -> CurrentChunkMaterialization:
+    """Pin only tensors copied to the accelerator; raw audit frames remain pageable."""
+
+    return replace(
+        chunk,
+        frame_timestamps=chunk.frame_timestamps.pin_memory(),
+        tubelet_timestamps=chunk.tubelet_timestamps.pin_memory(),
+        tubelet_valid_mask=chunk.tubelet_valid_mask.pin_memory(),
+        tubelet_position_ids=chunk.tubelet_position_ids.pin_memory(),
+        pixel_values_videos=chunk.pixel_values_videos.pin_memory(),
+        video_grid_thw=chunk.video_grid_thw.pin_memory(),
+    )
+
+
+def _materialized_chunk_bytes(chunk: CurrentChunkMaterialization) -> int:
+    tensors = (
+        chunk.frames,
+        chunk.frame_timestamps,
+        chunk.tubelet_timestamps,
+        chunk.tubelet_valid_mask,
+        chunk.tubelet_position_ids,
+        chunk.pixel_values_videos,
+        chunk.video_grid_thw,
+    )
+    return sum(int(value.numel() * value.element_size()) for value in tensors)
+
+
+def _prepared_a2_record_bytes(
+    answer: PreparedAnswerCPU,
+    supports: Sequence[CurrentChunkMaterialization],
+) -> int:
+    return (
+        _prepared_answer_bytes(answer)
+        + _materialized_chunk_bytes(answer.materialized_query)
+        + sum(_materialized_chunk_bytes(chunk) for chunk in supports)
+    )
 
 
 def _materialized_from_cached(

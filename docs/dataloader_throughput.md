@@ -25,7 +25,8 @@ processor fingerprint is a miss.
 Use the helper before/after a run:
 
 ```powershell
-python scripts/preprocess_cache.py --root $env:TTT_PREPROCESS_CACHE_ROOT --max-gb 200 --prune
+python scripts/preprocess_cache.py inspect --root $env:TTT_PREPROCESS_CACHE_ROOT --namespace $env:TTT_CACHE_NAMESPACE --max-gb 200
+python scripts/preprocess_cache.py verify --root $env:TTT_PREPROCESS_CACHE_ROOT --namespace $env:TTT_CACHE_NAMESPACE --max-gb 200
 python scripts/summarize_dataloader_trace.py $env:RUNTIME_TRACE_DIR
 ```
 

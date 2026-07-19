@@ -64,7 +64,8 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     prepared_episode_max_bytes: int = Field(default=2_147_483_648, gt=0)
     support_visual_batch_size: int = Field(default=1, gt=0)
     query_encoder_reuse: bool = False
-    preprocess_cache_enabled: bool
+    preprocess_cache_mode: Literal["disabled", "read_write", "readonly"]
+    preprocess_cache_miss_policy: Literal["decode", "error"]
     preprocess_cache_root_env: str = Field(min_length=1)
     preprocess_cache_max_gb: float = Field(gt=0.0)
     preprocess_cache_dtype: Literal["float32"]
@@ -97,6 +98,11 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             raise ValueError("cuda runtime tracing requires runtime_trace_dir")
         if self.visual_cost_mode != "proxy" and self.visual_cost_index is None:
             raise ValueError("strict visual cost modes require visual_cost_index")
+        if (
+            self.preprocess_cache_mode == "disabled"
+            and self.preprocess_cache_miss_policy != "decode"
+        ):
+            raise ValueError("disabled preprocess cache requires miss_policy=decode")
         return self
 
 
