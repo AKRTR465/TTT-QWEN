@@ -1,9 +1,0 @@
-timestamp_utc=2026-07-13T20:50:45.861626+00:00
-environment=UV_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-command=uv run python - (synthetic P3 QwenVideoFeatureBoundary audit)
-exit_code=0
-main_shape_preserved=True
-main_was_adapted=True
-deepstack_identity_preserved=True
-used_runtime_state=True
-transient_w_t_in_boundary_state_dict=False

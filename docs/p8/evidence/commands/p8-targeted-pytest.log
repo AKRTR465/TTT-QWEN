@@ -1,6 +1,0 @@
-timestamp_utc=2026-07-13T23:36:30.2652190Z
-command=.venv/Scripts/pytest.exe -q tests/test_observation_heads.py tests/test_state_encoder.py tests/test_v5_runtime_types.py tests/test_v5_config_contract.py tests/test_v5_module_skeletons.py
-exit_code=0
-result=123 passed in 27.35s
-assets=Meta or small synthetic tensors only
-downloads=none

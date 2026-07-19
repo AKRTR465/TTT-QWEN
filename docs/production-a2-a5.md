@@ -1,7 +1,7 @@
 # A2 → A5 四卡生产训练
 
-本页描述当前生产入口。P15–P18 文档保留的是历史 synthetic/tiny 工程门禁，不再代表正式训练配置。
-正式路径只有 A2 和 A5；A3/A4 仅保留为消融代码，生产 YAML 无法到达。
+本页描述当前生产入口。正式路径只有 A2 和 A5；历史阶段 gate、standalone trainer 与
+synthetic ablation harness 已从主线删除。
 
 ## 已实现的边界
 

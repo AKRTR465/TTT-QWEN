@@ -1,4 +1,0 @@
-timestamp_utc=2026-07-14T05:53:44.0267083Z
-command=.venv/Scripts/python.exe -m pytest -q tests/test_query_tokens.py tests/test_query_encoder.py tests/test_state_bank.py tests/test_identity_bank.py tests/test_state_retriever.py tests/test_state_reader.py tests/test_v5_config_contract.py tests/test_v5_module_skeletons.py tests/test_v5_runtime_types.py
-exit_code=0
-result=285 passed in 59.79s

@@ -1,7 +1,0 @@
-timestamp_utc=2026-07-13T23:36:30.2652190Z
-scope=git ls-files --cached --others --exclude-standard with text extensions
-decoder=System.Text.UTF8Encoding(false,true)
-exit_code=0
-result=UTF-8 strict decode passed: 123 tracked/untracked text files before P8 evidence writeback
-final_timestamp_utc=2026-07-13T23:40:56.5140318Z
-final_result=UTF-8 strict decode passed: 130 tracked/untracked text files

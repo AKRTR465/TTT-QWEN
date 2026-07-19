@@ -382,7 +382,7 @@ def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
     assert identities.unique_count == 0
     assert candidate.observation_count == 1
     assert confirmed.observation_count == 3
-    assert hot.last_accessed == 2.0
+    assert hot.last_accessed_position_id == 2
     assert bank.records[0].payload.current_visible_count == 2
     assert retrieval.n_retrieved.item() == 1
     assert reader.exact_count == 2

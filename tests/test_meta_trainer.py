@@ -29,19 +29,11 @@ from ttt_svcbench_qwen.losses import (
 )
 from ttt_svcbench_qwen.meta_trainer import (
     MetaCausalChunk,
-    MetaGradientReferenceMode,
     MetaQueryLossInput,
     MetaTTTEpisode,
     MetaTTTEpisodeRunner,
     MetaTTTQueryPoint,
-    MetaTTTTrainer,
     StageAQueryLossBuilder,
-    SyntheticAblationRecord,
-    TruncatedMetaTTTTrainer,
-    audit_variant_isolation,
-    compare_synthetic_ablations,
-    render_synthetic_ablation_report,
-    run_meta_gradient_reference,
 )
 from ttt_svcbench_qwen.model import (
     BankWriteOutput,
@@ -816,93 +808,6 @@ def _graph_node_count(value: Tensor) -> int:
     return len(retained_nodes)
 
 
-def test_variant_isolation_and_explicit_first_order_reference(config: ProjectConfig) -> None:
-    audit = audit_variant_isolation(config)
-    assert audit.a4_minus_a3 == ("identity",)
-    assert audit.a5_minus_a4 == ("event",)
-
-    def support(first: Tensor, second: Tensor) -> Tensor:
-        return 0.5 * (first.square() + 3.0 * second.square()).sum()
-
-    def query(first: Tensor, second: Tensor) -> Tensor:
-        return 0.5 * (first + second).square().sum()
-
-    first_order = run_meta_gradient_reference(
-        initial_parameters=(
-            torch.tensor([1.2], dtype=torch.float64, requires_grad=True),
-            torch.tensor([-0.7], dtype=torch.float64, requires_grad=True),
-        ),
-        support_loss=support,
-        query_loss=query,
-        learning_rate=0.1,
-        mode=MetaGradientReferenceMode.FIRST_ORDER,
-    )
-    full = run_meta_gradient_reference(
-        initial_parameters=(
-            torch.tensor([1.2], dtype=torch.float64, requires_grad=True),
-            torch.tensor([-0.7], dtype=torch.float64, requires_grad=True),
-        ),
-        support_loss=support,
-        query_loss=query,
-        learning_rate=0.1,
-        mode=MetaGradientReferenceMode.FULL_SECOND_ORDER,
-    )
-    adapted_sum = (1.0 - 0.1) * 1.2 + (1.0 - 0.3) * -0.7
-    assert torch.allclose(
-        full.meta_gradients[0], torch.tensor([adapted_sum * 0.9], dtype=torch.float64)
-    )
-    assert torch.allclose(
-        full.meta_gradients[1], torch.tensor([adapted_sum * 0.7], dtype=torch.float64)
-    )
-    assert torch.allclose(
-        first_order.meta_gradients[0], torch.tensor([adapted_sum], dtype=torch.float64)
-    )
-    assert torch.allclose(
-        first_order.meta_gradients[1], torch.tensor([adapted_sum], dtype=torch.float64)
-    )
-    assert not torch.equal(first_order.meta_gradients[0], full.meta_gradients[0])
-
-
-def test_a3_runner_and_outer_step_reach_both_meta_fast_matrices(config: ProjectConfig) -> None:
-    runner, fast, predictor, resetter = _system(config, MetaTTTVariant.A3)
-    episode = _episode(config, MetaTTTVariant.A3, support_count=1, query_count=1)
-    optimizer = torch.optim.SGD((*fast.parameters(), *predictor.parameters()), lr=0.05)
-    trainer = MetaTTTTrainer(runner=runner, optimizer=optimizer, outer_grad_clip_norm=1.0)
-    output = trainer.train_step(episode)
-
-    assert output.global_step == 1
-    assert output.audit.optimizer_step_applied
-    assert output.audit.meta_fast_gradient_norms is not None
-    assert min(output.audit.meta_fast_gradient_norms) > 0.0
-    assert min(output.audit.meta_fast_delta_norms) > 0.0
-    assert output.episode.audit.active_terms == ("pred",)
-    assert output.episode.audit.update_count == 1
-    assert output.episode.audit.updates[0].fast_versions_before == (0,)
-    assert output.episode.audit.updates[0].fast_versions_after == (1,)
-    assert output.episode.audit.queries[0].after_fast_versions == (1,)
-    assert output.episode.audit.queries[0].before_fast_versions == (0,)
-    assert resetter.calls == 2
-
-
-def test_invalid_support_skips_update_but_keeps_causal_query(config: ProjectConfig) -> None:
-    runner, _, _, _ = _system(config, MetaTTTVariant.A3)
-    episode = _episode(
-        config,
-        MetaTTTVariant.A3,
-        support_count=1,
-        query_count=1,
-        invalid_first_support=True,
-    )
-    output = runner(episode)
-    update = output.audit.updates[0]
-    assert update.did_update == (False,)
-    assert update.skip_reasons == ("insufficient_time",)
-    assert update.fast_versions_after == (0,)
-    assert output.final_fast_states[0].skip_count == 1
-    assert output.audit.query_count == 1
-    output.total.backward()
-
-
 def test_stage_c_invalid_chunk_skips_then_later_supports_continue(
     config: ProjectConfig,
 ) -> None:
@@ -995,61 +900,6 @@ def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectCon
     assert output.audit.segments[0].reanchored
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
     assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
-
-
-def test_truncated_a5_trainer_steps_outer_optimizer_once_per_episode(
-    config: ProjectConfig,
-) -> None:
-    runner, fast, predictor, _ = _system(config, MetaTTTVariant.A5)
-    optimizer = torch.optim.SGD((*fast.parameters(), *predictor.parameters()), lr=0.05)
-    trainer = TruncatedMetaTTTTrainer(
-        runner=runner,
-        optimizer=optimizer,
-        outer_grad_clip_norm=1.0,
-    )
-    calls = 0
-    original_step = optimizer.step
-
-    def counted_step(*args: object, **kwargs: object) -> object:
-        nonlocal calls
-        calls += 1
-        return original_step(*args, **kwargs)
-
-    optimizer.step = counted_step  # type: ignore[method-assign]
-    output = trainer.train_step(_truncated_episode(config, support_count=9))
-
-    assert calls == 1
-    assert output.global_step == 1
-    assert output.audit.optimizer_step_applied
-    assert output.episode.audit.backward_count == 2
-    assert output.episode.audit.training_counterfactual_executed is False
-
-
-def test_a4_a5_terms_multi_query_and_repeatability(config: ProjectConfig) -> None:
-    a4_runner, _, _, _ = _system(config, MetaTTTVariant.A4)
-    a5_runner, _, _, _ = _system(config, MetaTTTVariant.A5)
-    a4_episode = _episode(config, MetaTTTVariant.A4, support_count=4, query_count=2)
-    a5_episode = _episode(config, MetaTTTVariant.A5, support_count=4, query_count=2)
-    a4 = a4_runner(a4_episode)
-    a5 = a5_runner(a5_episode)
-    repeated = a5_runner(a5_episode)
-
-    assert a4.audit.active_terms == ("pred", "identity")
-    assert a5.audit.active_terms == ("pred", "identity", "event")
-    assert all(sum(update.e1_valid_counts) == 0 for update in a4.audit.updates)
-    assert sum(a5.audit.updates[1].e1_valid_counts) > 0
-    assert len(a5.query_objectives) == 2
-    assert all(query.independent_lifecycles for query in a5.audit.queries)
-    assert all(query.observation_immutable for query in a5.audit.queries)
-    assert torch.equal(a5.total.detach(), repeated.total.detach())
-    assert torch.equal(
-        a5.final_fast_states[0].w_t_1.detach(),
-        repeated.final_fast_states[0].w_t_1.detach(),
-    )
-    assert torch.allclose(
-        a5.total,
-        torch.stack(tuple(query.outer.total for query in a5.query_objectives)).mean(),
-    )
 
 
 def test_eight_support_graph_is_released_and_does_not_grow(config: ProjectConfig) -> None:
@@ -1155,7 +1005,7 @@ def test_support_label_poison_is_rejected_before_any_model_call(
     config: ProjectConfig,
     denied: str,
 ) -> None:
-    runner, fast, _, resetter = _system(config, MetaTTTVariant.A3)
+    runner, fast, _, resetter = _system(config, MetaTTTVariant.A5)
     del runner
     owner = RuntimeOwner(("video-a",), ("trajectory-a",))
     clean = _chunk(owner, chunk_index=0, end_time=1.0, width=2)
@@ -1169,33 +1019,3 @@ def test_support_label_poison_is_rejected_before_any_model_call(
 
 def test_stage_a_query_builder_stays_available_as_production_adapter() -> None:
     assert isinstance(StageAQueryLossBuilder(), StageAQueryLossBuilder)
-
-
-def test_synthetic_ablation_report_has_paired_ci_failures_and_disclaimer() -> None:
-    records = tuple(
-        SyntheticAblationRecord(
-            case_id=f"case-{case}",
-            task_name="count",
-            metric_name="answer/exact_match",
-            variant=variant,
-            value=float(case) + offset,
-            failure_cases=("synthetic-hard-case",) if case == 1 else (),
-        )
-        for case in range(3)
-        for variant, offset in (
-            (MetaTTTVariant.A3, 0.0),
-            (MetaTTTVariant.A4, 0.1),
-            (MetaTTTVariant.A5, 0.15),
-        )
-    )
-    comparisons = compare_synthetic_ablations(records)
-    assert [(item.baseline, item.candidate) for item in comparisons] == [
-        (MetaTTTVariant.A3, MetaTTTVariant.A4),
-        (MetaTTTVariant.A4, MetaTTTVariant.A5),
-    ]
-    assert all(item.sample_count == 3 for item in comparisons)
-    assert all("synthetic-hard-case" in item.failure_cases for item in comparisons)
-    report = render_synthetic_ablation_report(comparisons)
-    assert "Synthetic/tiny engineering evidence only" in report
-    assert "no scientific gain" in report
-    assert "95% CI" in report

@@ -233,13 +233,6 @@ class HotCacheEntry:
         if self.identity_prototype.requires_grad or self.identity_prototype.grad_fn is not None:
             raise ValueError("Hot Cache prototypes must be detached")
 
-    @property
-    def last_accessed(self) -> float:
-        """Compatibility alias retained for the P9 runtime skeleton."""
-
-        return float(self.last_accessed_position_id)
-
-
 @dataclass(frozen=True, slots=True)
 class IdentityBankAuditEntry:
     action: str

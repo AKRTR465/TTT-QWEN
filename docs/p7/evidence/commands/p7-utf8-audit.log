@@ -1,7 +1,0 @@
-timestamp_utc=2026-07-13T22:52:50.3677002Z
-scope=git ls-files --cached --others --exclude-standard with *.py,*.md,*.toml,*.yaml,*.yml,*.json,*.jsonl,*.txt,*.log
-decoder=System.Text.UTF8Encoding(false,true)
-exit_code=0
-candidate_result=UTF-8 strict decode passed: 114 tracked/untracked text files
-final_timestamp_utc=2026-07-13T22:57:43.7360378Z
-final_result=UTF-8 strict decode passed: 122 tracked/untracked text files

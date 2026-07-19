@@ -1,5 +1,0 @@
-command: .\.venv\Scripts\python.exe -m pytest -q tests\test_losses.py tests\test_functional_sgd.py tests\test_p14_gradient_audit.py tests\test_v5_config_contract.py tests\test_v5_module_skeletons.py
-exit_code: 0
-result: 188 passed in 31.04s
-scope: P14 typed loss, row-isolated functional SGD, gradient/delta audit, config drift, and module boundary
-asset_policy: synthetic tensors and in-memory module chains only; no download

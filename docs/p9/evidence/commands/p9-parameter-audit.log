@@ -1,8 +1,0 @@
-timestamp_utc=2026-07-14T00:48:22.4127670Z
-command=build_state_bank(load_config()) plus exact numel/state_dict audit
-exit_code=0
-semantic_projector_parameters=1316864
-new_modules_total_parameters=156715683
-state_dict_keys=7
-runtime_parameters=0
-state_dict=semantic_projector.head_type_embeddings.weight,semantic_projector.input_norm.weight,semantic_projector.input_norm.bias,semantic_projector.hidden_projection.weight,semantic_projector.hidden_projection.bias,semantic_projector.output_projection.weight,semantic_projector.output_projection.bias

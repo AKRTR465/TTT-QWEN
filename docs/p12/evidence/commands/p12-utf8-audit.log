@@ -1,6 +1,0 @@
-timestamp_utc=2026-07-14T05:53:44.0267083Z
-scope=git ls-files --cached --others --exclude-standard with repository text extensions
-decoder=System.Text.UTF8Encoding(false,true)
-exit_code=0
-result=strict UTF-8: 163 files passed
-binary_or_large_asset_downloads=none

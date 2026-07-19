@@ -1276,7 +1276,7 @@ def test_unknown_config_keys_are_rejected() -> None:
         ProjectConfig.model_validate(raw)
 
 
-def test_active_docs_and_tests_no_longer_claim_v3_is_the_current_v5_config() -> None:
+def test_active_docs_and_tests_describe_only_the_v5_mainline() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     decisions = (ROOT / "DECISIONS.md").read_text(encoding="utf-8")
     active_config_and_tests = "\n".join(
@@ -1286,8 +1286,10 @@ def test_active_docs_and_tests_no_longer_claim_v3_is_the_current_v5_config() -> 
         if path.suffix in {".py", ".yaml"}
     )
 
-    assert "P1 已实现并有契约测试" in readme
-    assert "P1 已验证边界" in decisions
+    assert "仓库只维护两条正式主线" in readme
+    assert "仓库只维护" in decisions
+    assert "P0–P18" not in readme
+    assert "standalone trainer" in decisions
     assert not (ROOT / "tests" / "test_v3_architecture_config.py").exists()
     legacy_yaml_value = "bottleneck_dim" + ": 512"
     legacy_test_assertion = 'bottleneck_dim"]' + " == 512"
