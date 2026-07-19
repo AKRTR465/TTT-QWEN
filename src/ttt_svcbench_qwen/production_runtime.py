@@ -76,6 +76,10 @@ from ttt_svcbench_qwen.observation_heads import (
     ObservationOutputs,
     build_observation_heads,
 )
+from ttt_svcbench_qwen.outer_loss_balance import (
+    OfficialWeakBalanceAudit,
+    OfficialWeakOuterLossComposer,
+)
 from ttt_svcbench_qwen.preprocess_cache import (
     CachedChunk,
     PreprocessCache,
@@ -1532,6 +1536,7 @@ class ProductionA2LossStep:
         runner: StageAEpisodeRunner,
         materializer: ProductionEpisodeMaterializer,
         graph_anchor_parameters: Sequence[nn.Parameter],
+        config: ProjectConfig,
     ):
         self.runner = runner
         self.materializer = materializer
@@ -1541,6 +1546,8 @@ class ProductionA2LossStep:
         self.graph_anchor_parameters = tuple(
             parameter for parameter in graph_anchor_parameters if parameter.requires_grad
         )
+        self.outer_composer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
+        self.last_balance_audit: OfficialWeakBalanceAudit | None = None
 
     def __call__(self, _model: nn.Module, inputs: Mapping[str, object]) -> Tensor:
         prefetched = inputs.get("prepared_a2")
@@ -1612,7 +1619,9 @@ class ProductionA2LossStep:
             raw.retrieval,
             batch.supervision.official_weak,
         )
-        total = answer.loss.value + weak.total
+        balanced = self.outer_composer.compose((answer,), (weak,))
+        total = balanced.mean_total
+        self.last_balance_audit = balanced.audit
         # Official task masks and hard routing intentionally produce a sample-dependent graph.
         # Anchor every trainable Outer parameter with an exact zero dependency so every rank has
         # the same non-None gradient set.  Numerical loss and real gradients are unchanged.  A2
@@ -1814,7 +1823,7 @@ def build_runtime(
             data_collator=cast(Any, collator),
             stage_a_loss_step=cast(
                 Any,
-                ProductionA2LossStep(runner, materializer, graph_anchor_parameters),
+                ProductionA2LossStep(runner, materializer, graph_anchor_parameters, project),
             ),
         )
     collator = A5PrefetchCollator(

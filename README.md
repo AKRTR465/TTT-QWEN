@@ -14,6 +14,8 @@
 - 状态路包含 Spatial Slot Encoder、Temporal Encoder、O1/O2/E1/E2 heads、Structured State Bank、Identity Bank、Retriever 和 Deterministic Reader。
 - Reader 负责精确计数及证据，Qwen 负责自然语言答案。
 - A5 使用 `L_pred + 0.5 L_id + 0.5 L_event`，K=8 截断二阶梯度并重锚 W0。
+- A2/A5 Query outer loss 默认保持 `legacy_sum`；实验性的 `instant_equal` 使用当前全局
+  sum/count 对齐四项 official-weak loss，并将辅助组限制为 Answer 的至多 30%。
 
 完整设计见 [ARCHITECTURE.md](./ARCHITECTURE.md)，固定决策见 [DECISIONS.md](./DECISIONS.md)。
 
@@ -44,6 +46,10 @@ bash scripts/h200/launch_qwen3vl8b_ttt_a5_k8_full4.sh
 - 四卡 sampler 保持任务/segment parity，padding 样本 loss 权重为零；
 - checkpoint 保存模型、optimizer、scheduler、RNG，但排除 Wt、Bank、cache 和 FSM runtime；
 - `formal_evaluation_enabled=false`，直至独立校准和正式评估完成。
+
+`loss.official_weak_balance.mode` 默认为 `legacy_sum`。`instant_equal` 是无 EMA、无额外
+checkpoint 状态的实验目标；启用后每个 A2 micro-step 或 A5 episode 使用一次固定长度
+collective，Task、Operator、Retrieval、Time 各占固定四分之一插槽，缺失监督不重分配预算。
 
 ## 在线推理
 

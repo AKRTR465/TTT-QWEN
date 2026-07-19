@@ -19,7 +19,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SPEC_VERSION = "state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval"
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -532,6 +532,29 @@ class PredictorConfig(FrozenModel):
     parameter_count: PositiveInt
 
 
+class OfficialWeakBalanceMode(StrEnum):
+    """Composition policy for labeled official-weak outer losses."""
+
+    LEGACY_SUM = "legacy_sum"
+    INSTANT_EQUAL = "instant_equal"
+
+
+class OfficialWeakBalanceConfig(FrozenModel):
+    """Stateless Answer-dominant composition for the four official-weak terms."""
+
+    mode: OfficialWeakBalanceMode
+    group_weight: Probability
+    scale_min: PositiveFloat
+    scale_max: PositiveFloat
+    epsilon: PositiveFloat
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_scale_bounds(self) -> Self:
+        if self.scale_min > self.scale_max:
+            raise ValueError("official-weak scale_min cannot exceed scale_max")
+        return self
+
+
 class LossConfig(FrozenModel):
     pred_weight: NonNegativeFloat
     identity_weight: NonNegativeFloat
@@ -543,6 +566,7 @@ class LossConfig(FrozenModel):
     auxiliary_outer_weight: NonNegativeFloat
     answer_causal_shift: bool
     answer_ignore_index: int
+    official_weak_balance: OfficialWeakBalanceConfig
 
 
 class StageAVariant(StrEnum):
@@ -1662,6 +1686,26 @@ class ProjectConfig(FrozenModel):
             ("loss.auxiliary_outer_weight", self.loss.auxiliary_outer_weight, 0.1),
             ("loss.answer_causal_shift", self.loss.answer_causal_shift, True),
             ("loss.answer_ignore_index", self.loss.answer_ignore_index, -100),
+            (
+                "loss.official_weak_balance.group_weight",
+                self.loss.official_weak_balance.group_weight,
+                0.3,
+            ),
+            (
+                "loss.official_weak_balance.scale_min",
+                self.loss.official_weak_balance.scale_min,
+                0.1,
+            ),
+            (
+                "loss.official_weak_balance.scale_max",
+                self.loss.official_weak_balance.scale_max,
+                10.0,
+            ),
+            (
+                "loss.official_weak_balance.epsilon",
+                self.loss.official_weak_balance.epsilon,
+                1.0e-8,
+            ),
             ("stage_a.variant", self.stage_a.variant, StageAVariant.A2),
             ("stage_a.inner_sgd_enabled", self.stage_a.inner_sgd_enabled, False),
             (

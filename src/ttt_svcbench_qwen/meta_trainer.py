@@ -22,6 +22,7 @@ from torch import Tensor, nn
 
 from ttt_svcbench_qwen.config import (
     MetaTTTVariant,
+    OfficialWeakBalanceMode,
     ProjectConfig,
 )
 from ttt_svcbench_qwen.data import RuntimeQueryInput
@@ -72,6 +73,10 @@ from ttt_svcbench_qwen.model import (
     StateTTTModelOutput,
 )
 from ttt_svcbench_qwen.observation_heads import ObservationOutputs
+from ttt_svcbench_qwen.outer_loss_balance import (
+    OfficialWeakBalanceAudit,
+    OfficialWeakOuterLossComposer,
+)
 from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput
 from ttt_svcbench_qwen.stage_a_runtime import StageAWriteAudit
 from ttt_svcbench_qwen.stage_a_targets import (
@@ -1072,6 +1077,8 @@ class MetaTTTEpisodeRunner:
         self.enabled_terms = enabled_terms_for(config, variant)
         self.ttt_input_builder = ttt_input_builder or CausalOverlapTTTInputBuilder(config)
         self.query_loss_builder = query_loss_builder or StageAQueryLossBuilder()
+        self.outer_composer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
+        self.last_balance_audit: OfficialWeakBalanceAudit | None = None
         if config.fast_ttt.optimizer.meta_gradient_mode != "full_second_order":
             raise ValueError("the training runner only permits full_second_order inner updates")
 
@@ -1211,6 +1218,11 @@ class MetaTTTEpisodeRunner:
                 )
             )
 
+        query_objectives = list(self._balance_query_objectives(tuple(query_objectives)))
+        query_audits = [
+            replace(audit, after=objective.metrics)
+            for audit, objective in zip(query_audits, query_objectives, strict=True)
+        ]
         total = torch.stack(tuple(query.outer.total for query in query_objectives)).mean()
         versions_after = tuple(parameter._version for parameter in tracked_parameters)
         attempted = sum(len(audit.did_update) for audit in update_audits)
@@ -1405,6 +1417,11 @@ class MetaTTTEpisodeRunner:
                 )
             )
 
+        query_objectives = list(self._balance_query_objectives(tuple(query_objectives)))
+        query_audits = [
+            replace(audit, metrics=objective.metrics)
+            for audit, objective in zip(query_audits, query_objectives, strict=True)
+        ]
         query_loss = torch.stack(tuple(item.outer.outer for item in query_objectives)).mean()
         final_segment_loss = (
             auxiliary_scale * torch.stack(tuple(output.total for output in segment_outputs)).sum()
@@ -1628,6 +1645,49 @@ class MetaTTTEpisodeRunner:
         )
         return MetaQueryObjective(answer, state, outer, _query_metrics(answer, state))
 
+    def _balance_query_objectives(
+        self,
+        objectives: tuple[MetaQueryObjective, ...],
+    ) -> tuple[MetaQueryObjective, ...]:
+        if not objectives:
+            raise ValueError("Meta-TTT requires at least one Query objective")
+        official = tuple(
+            isinstance(objective.state, OfficialWeakStateLossOutput)
+            for objective in objectives
+        )
+        if not any(official):
+            self.last_balance_audit = None
+            return objectives
+        if not all(official):
+            if (
+                self.config.loss.official_weak_balance.mode
+                is OfficialWeakBalanceMode.INSTANT_EQUAL
+            ):
+                raise ValueError("instant_equal cannot mix dense and official-weak Query losses")
+            self.last_balance_audit = None
+            return objectives
+        states = tuple(cast(OfficialWeakStateLossOutput, item.state) for item in objectives)
+        balanced = self.outer_composer.compose(
+            tuple(item.answer for item in objectives),
+            states,
+        )
+        self.last_balance_audit = balanced.audit
+        if balanced.audit is None:
+            return objectives
+        outputs: list[MetaQueryObjective] = []
+        for objective, outer in zip(objectives, balanced.objectives, strict=True):
+            auxiliary = objective.outer.auxiliary_ttt
+            total = outer.outer + objective.outer.auxiliary_weight * auxiliary.value
+            balanced_outer = replace(outer, auxiliary_ttt=auxiliary, total=total)
+            outputs.append(
+                replace(
+                    objective,
+                    outer=balanced_outer,
+                    metrics=_with_balance_metrics(objective.metrics, balanced.audit),
+                )
+            )
+        return tuple(outputs)
+
 
 def enabled_terms_for(
     config: ProjectConfig,
@@ -1792,6 +1852,15 @@ def _query_metrics(
             ("state/e2", _term_float(state.e2)),
         )
     return QueryMetricSnapshot(metrics=(*common, *state_metrics))
+
+
+def _with_balance_metrics(
+    snapshot: QueryMetricSnapshot,
+    audit: OfficialWeakBalanceAudit,
+) -> QueryMetricSnapshot:
+    merged = dict(snapshot.metrics)
+    merged.update(audit.metrics())
+    return QueryMetricSnapshot(metrics=tuple(merged.items()))
 
 
 def _weak_term_float(term: object) -> float | None:

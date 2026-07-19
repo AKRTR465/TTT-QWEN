@@ -34,9 +34,18 @@ def test_v5_yaml_passes_strong_validation_and_serializes_completely() -> None:
     assert serialized["spec_version"] == (
         "state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval"
     )
-    assert serialized["config_schema_version"] == 2
+    assert serialized["config_schema_version"] == 3
     assert serialized["model"]["revision"] == "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
     assert set(serialized) == set(ProjectConfig.model_fields)
+
+
+def test_v5_project_config_accepts_explicit_instant_equal_experiment() -> None:
+    raw = load_raw_config()
+    raw["loss"]["official_weak_balance"]["mode"] = "instant_equal"
+
+    config = ProjectConfig.model_validate(raw)
+
+    assert config.loss.official_weak_balance.mode == "instant_equal"
 
 
 def test_v5_base_and_deepstack_contract() -> None:
@@ -536,6 +545,13 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "auxiliary_outer_weight": 0.1,
         "answer_causal_shift": True,
         "answer_ignore_index": -100,
+        "official_weak_balance": {
+            "mode": "legacy_sum",
+            "group_weight": 0.3,
+            "scale_min": 0.1,
+            "scale_max": 10.0,
+            "epsilon": 1.0e-8,
+        },
     }
     assert config.stage_a.model_dump() == {
         "variant": "a2",

@@ -29,6 +29,7 @@ from ttt_svcbench_qwen.losses import (
 )
 from ttt_svcbench_qwen.meta_trainer import (
     MetaCausalChunk,
+    MetaQueryLossBuilder,
     MetaQueryLossInput,
     MetaTTTEpisode,
     MetaTTTEpisodeRunner,
@@ -61,6 +62,9 @@ from ttt_svcbench_qwen.observation_heads import (
 from ttt_svcbench_qwen.stage_a_runtime import StageAWriteAudit
 from ttt_svcbench_qwen.stage_a_targets import (
     AnswerTargetLabels,
+    OfficialWeakLossAudit,
+    OfficialWeakLossTerm,
+    OfficialWeakStateLossOutput,
     StageATargetBatch,
     TargetProvenance,
 )
@@ -512,6 +516,47 @@ class _TinyQueryLossBuilder:
         )
 
 
+class _TinyOfficialWeakQueryLossBuilder:
+    def __call__(
+        self,
+        output: StateTTTModelOutput,
+        *,
+        answer: StageAEpisodeAnswerInputs,
+        supervision: StageASupervisionBatch,
+    ) -> MetaQueryLossInput:
+        del answer
+        if not isinstance(output.answer_logits, Tensor) or not isinstance(
+            output.observations, ObservationOutputs
+        ):
+            raise TypeError("tiny official-weak Query output has the wrong type")
+        labels = supervision.answer.base_labels.to(output.answer_logits.device)
+        number_mask = torch.zeros_like(labels, dtype=torch.bool)
+        anchor = output.observations.o1.logits.float().square().mean() + 1.0
+        terms = tuple(
+            OfficialWeakLossTerm(value=anchor * factor, valid_rows=1)
+            for factor in (1.0, 2.0, 3.0, 4.0)
+        )
+        state = OfficialWeakStateLossOutput(
+            task=terms[0],
+            operator=terms[1],
+            retrieval=terms[2],
+            time=terms[3],
+            total=torch.stack(tuple(term.value for term in terms)).sum(),
+            audit=OfficialWeakLossAudit(
+                labels_joined_after_forward=True,
+                runtime_payload_reused_for_labels=False,
+                identity_target_fabricated=False,
+                unique_retrieval_id_fabricated=False,
+                future_occurrences_ignored=0,
+                retrieval_bag_sizes=(1,),
+            ),
+        )
+        return MetaQueryLossInput(
+            answer=AnswerLossInput(output.answer_logits, labels, number_mask),
+            state=state,
+        )
+
+
 @pytest.fixture(scope="module")
 def config() -> ProjectConfig:
     return load_config()
@@ -520,6 +565,8 @@ def config() -> ProjectConfig:
 def _system(
     config: ProjectConfig,
     variant: MetaTTTVariant,
+    *,
+    query_loss_builder: MetaQueryLossBuilder | None = None,
 ) -> tuple[MetaTTTEpisodeRunner, _TinyFastController, _TinyPredictor, _RuntimeResetter]:
     fast = _TinyFastController()
     predictor = _TinyPredictor()
@@ -557,7 +604,7 @@ def _system(
         predictor=predictor,
         runtime_resetter=resetter,
         variant=variant,
-        query_loss_builder=_TinyQueryLossBuilder(),
+        query_loss_builder=query_loss_builder or _TinyQueryLossBuilder(),
     )
     return runner, fast, predictor, resetter
 
@@ -896,6 +943,31 @@ def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectCon
     assert output.audit.segments[0].reanchored
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
     assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
+
+
+def test_truncated_a5_instant_equal_composes_all_queries_once(
+    config: ProjectConfig,
+) -> None:
+    raw = config.model_dump(mode="json")
+    raw["loss"]["official_weak_balance"]["mode"] = "instant_equal"
+    instant_config = ProjectConfig.model_validate(raw)
+    runner, _, _, _ = _system(
+        instant_config,
+        MetaTTTVariant.A5,
+        query_loss_builder=_TinyOfficialWeakQueryLossBuilder(),
+    )
+
+    output = runner.run_truncated(
+        _truncated_episode(instant_config, support_count=1, query_count=2)
+    )
+
+    assert runner.last_balance_audit is not None
+    assert runner.last_balance_audit.auxiliary_to_answer_ratio <= 0.3
+    assert len(output.audit.queries) == 2
+    assert all(
+        query.metrics.value("loss/aux_to_answer_ratio") is not None
+        for query in output.audit.queries
+    )
 
 
 def test_eight_support_graph_is_released_and_does_not_grow(config: ProjectConfig) -> None:

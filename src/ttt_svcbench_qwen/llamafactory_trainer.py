@@ -213,6 +213,20 @@ class TTTQwenTrainerMixin:
             int(self.args.world_size),  # type: ignore[attr-defined]
         )
 
+    def log(self, logs: dict[str, float], *args: object, **kwargs: object) -> None:
+        enriched = dict(logs)
+        audit: object | None
+        if self.ttt_runtime.stage is ProductionStage.A2:
+            audit = getattr(self.ttt_runtime.stage_a_loss_step, "last_balance_audit", None)
+        else:
+            audit = getattr(self.ttt_runtime.meta_runner, "last_balance_audit", None)
+        metrics = getattr(audit, "metrics", None)
+        if callable(metrics):
+            for name, value in metrics():
+                if value is not None:
+                    enriched[name] = float(value)
+        super().log(enriched, *args, **kwargs)  # type: ignore[misc]
+
     def compute_loss(
         self,
         model: nn.Module,

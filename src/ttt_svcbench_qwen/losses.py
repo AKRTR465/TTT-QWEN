@@ -1366,15 +1366,29 @@ class OuterLossOutput:
 
 
 def compute_outer_loss(inputs: OuterLossInput) -> OuterLossOutput:
-    auxiliary = _support_ttt_term(
-        inputs.support_ttt,
-        inputs.answer_after.loss.value + inputs.state_after.total,
-    )
-    outer = inputs.answer_after.loss.value + inputs.state_after.total
-    total = outer + _AUXILIARY_OUTER_WEIGHT * auxiliary.value
-    return OuterLossOutput(
+    return compose_outer_loss_terms(
         answer_after=inputs.answer_after.loss.value,
         state_after=inputs.state_after.total,
+        support_ttt=inputs.support_ttt,
+    )
+
+
+def compose_outer_loss_terms(
+    *,
+    answer_after: Tensor,
+    state_after: Tensor,
+    support_ttt: tuple[TTTLossOutput, ...],
+) -> OuterLossOutput:
+    """Compose already-reduced Answer/State terms without changing support-TTT semantics."""
+
+    if answer_after.device != state_after.device:
+        raise ValueError("composed outer Answer and State losses must share one device")
+    auxiliary = _support_ttt_term(support_ttt, answer_after + state_after)
+    outer = answer_after + state_after
+    total = outer + _AUXILIARY_OUTER_WEIGHT * auxiliary.value
+    return OuterLossOutput(
+        answer_after=answer_after,
+        state_after=state_after,
         auxiliary_ttt=auxiliary,
         outer=outer,
         total=total,

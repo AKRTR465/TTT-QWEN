@@ -1,5 +1,5 @@
 spec_version: state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval
-config_schema_version: 2
+config_schema_version: 3
 
 paths:
   model_root_env: QWEN_MODEL_ROOT
@@ -453,6 +453,12 @@ loss:
   auxiliary_outer_weight: 0.1
   answer_causal_shift: true
   answer_ignore_index: -100
+  official_weak_balance:
+    mode: legacy_sum
+    group_weight: 0.3
+    scale_min: 0.1
+    scale_max: 10.0
+    epsilon: 1.0e-8
 
 stage_a:
   variant: a2
