@@ -58,10 +58,20 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     initialize_from_a2_checkpoint: str | None = Field(default=None, min_length=1)
     support_prefetch_depth: int = Field(gt=0)
     support_decode_coalesce: bool
+    support_materialization: Literal[
+        "trainer_prefetch", "dataloader_episode", "segment_double_buffer"
+    ] = "trainer_prefetch"
+    prepared_episode_max_bytes: int = Field(default=2_147_483_648, gt=0)
+    support_visual_batch_size: int = Field(default=1, gt=0)
+    query_encoder_reuse: bool = False
     preprocess_cache_enabled: bool
     preprocess_cache_root_env: str = Field(min_length=1)
     preprocess_cache_max_gb: float = Field(gt=0.0)
     preprocess_cache_dtype: Literal["float32"]
+    visual_cost_mode: Literal["proxy", "exact_tokens", "exact_tokens_then_runtime"] = "proxy"
+    runtime_trace_mode: Literal["off", "cuda"] = "off"
+    runtime_trace_dir: str | None = Field(default=None, min_length=1)
+    segment_prefetch_depth: Literal[0, 1] = 0
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
     def validate_stage_checkpoint(self) -> Self:
@@ -69,6 +79,24 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             raise ValueError("A2 must not initialize from an A2 checkpoint")
         if self.stage == "a5" and self.initialize_from_a2_checkpoint is None:
             raise ValueError("A5 requires initialize_from_a2_checkpoint")
+        allowed_materialization = {
+            "a2": {"trainer_prefetch", "dataloader_episode"},
+            "a5": {"trainer_prefetch", "segment_double_buffer"},
+        }
+        if self.support_materialization not in allowed_materialization[self.stage]:
+            raise ValueError("support_materialization is incompatible with the configured stage")
+        if self.stage == "a2" and self.segment_prefetch_depth != 0:
+            raise ValueError("A2 cannot enable segment prefetch")
+        if (
+            self.stage == "a5"
+            and self.support_materialization == "segment_double_buffer"
+            and self.segment_prefetch_depth != 1
+        ):
+            raise ValueError("A5 segment_double_buffer requires segment_prefetch_depth=1")
+        if self.runtime_trace_mode == "cuda" and self.runtime_trace_dir is None:
+            raise ValueError("cuda runtime tracing requires runtime_trace_dir")
+        if self.visual_cost_mode != "proxy" and self.visual_cost_index is None:
+            raise ValueError("strict visual cost modes require visual_cost_index")
         return self
 
 

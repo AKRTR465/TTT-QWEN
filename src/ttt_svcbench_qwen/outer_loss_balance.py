@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -17,6 +18,7 @@ from ttt_svcbench_qwen.losses import (
     TTTLossOutput,
     compose_outer_loss_terms,
 )
+from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase, trace_event
 from ttt_svcbench_qwen.stage_a_targets import (
     OfficialWeakLossTerm,
     OfficialWeakStateLossOutput,
@@ -175,6 +177,7 @@ class OfficialWeakOuterLossComposer:
                 audit=None,
             )
 
+        pack_started = time.perf_counter()
         answer_sums = tuple(_answer_local_sum(answer) for answer in answer_items)
         answer_counts = tuple(_answer_valid_rows(answer) for answer in answer_items)
         term_items = tuple(
@@ -191,7 +194,14 @@ class OfficialWeakOuterLossComposer:
             *(sum(counts) for counts in term_counts),
         )
         stats = _pack_stats(local_sums, local_counts)
-        reduced, world_size = self._global_sum(stats)
+        trace_event(
+            "outer_loss_balance_pack",
+            seconds=time.perf_counter() - pack_started,
+            query_count=len(answer_items),
+        )
+        with trace_cuda_phase("outer_loss_balance_collective", payload_values=stats.numel()):
+            reduced, world_size = self._global_sum(stats)
+        finalize_started = time.perf_counter()
         global_sums, global_counts = _unpack_stats(reduced)
         if global_counts[0] <= 0:
             raise ValueError("instant_equal requires at least one global valid Answer row")
@@ -299,6 +309,17 @@ class OfficialWeakOuterLossComposer:
             auxiliary_to_answer_ratio=min(float(self.config.group_weight), ratio_value),
             group_guard=float(group_guard.item()),
             group_guard_active=bool((group_guard < 1.0).item()),
+        )
+        trace_event(
+            "outer_loss_balance_finalize",
+            seconds=time.perf_counter() - finalize_started,
+            global_answer_count=global_counts[0],
+            global_task_count=global_counts[1],
+            global_operator_count=global_counts[2],
+            global_retrieval_count=global_counts[3],
+            global_time_count=global_counts[4],
+            group_guard_active=audit.group_guard_active,
+            scale_clamped=tuple(term.scale_clamped for term in audit.terms),
         )
         objective_tuple = tuple(objectives)
         return OfficialWeakBalancedBatch(

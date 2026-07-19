@@ -63,7 +63,15 @@ ttt_qwen:
   dataset_manifest: $SVCBENCH_DATASET_MANIFEST
   support_prefetch_depth: 2
   support_decode_coalesce: true
+  support_materialization: trainer_prefetch
+  prepared_episode_max_bytes: 2147483648
+  support_visual_batch_size: 1
+  query_encoder_reuse: false
   preprocess_cache_enabled: true
   preprocess_cache_root_env: TTT_PREPROCESS_CACHE_ROOT
   preprocess_cache_max_gb: 200
   preprocess_cache_dtype: float32
+  visual_cost_mode: proxy
+  runtime_trace_mode: "off"
+  runtime_trace_dir: null
+  segment_prefetch_depth: 0

@@ -26,14 +26,13 @@ Use the helper before/after a run:
 
 ```powershell
 python scripts/preprocess_cache.py --root $env:TTT_PREPROCESS_CACHE_ROOT --max-gb 200 --prune
-python scripts/summarize_dataloader_trace.py $env:RUN_ROOT/samples/rank_0/dataloader.jsonl
+python scripts/summarize_dataloader_trace.py $env:RUNTIME_TRACE_DIR
 ```
 
-Set `TTT_DATALOADER_TRACE=1` to emit per-rank JSONL events for query preparation, processor,
-cache hit/miss, Support decode, pin-memory/H2D, GPU step, and DataLoader delivery.
-The H200 tmux launcher forwards `TTT_PREPROCESS_CACHE_ROOT`, `TTT_DATALOADER_TRACE`, and
-`TTT_A2_SUPPORT_PREFETCH` into the training process, so these switches also work when launching
-through `scripts/h200/train_a2_a5.sh`.
+Set `ttt_qwen.runtime_trace_mode: cuda` and `ttt_qwen.runtime_trace_dir` in a benchmark profile
+to emit buffered per-rank/process JSONL events for query preparation, processor, cache hit/miss,
+Support decode, pin-memory/H2D, ViT/prefill CUDA events, and instant-equal loss composition.
+Formal training keeps tracing `off`; resolving CUDA events happens only when the run flushes.
 
 ## Cost sidecar
 

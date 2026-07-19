@@ -119,13 +119,20 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
         "stage",
         "project_config",
         "dataset_manifest",
-        "support_prefetch_depth",
-        "support_decode_coalesce",
-        "preprocess_cache_enabled",
+            "support_prefetch_depth",
+            "support_decode_coalesce",
+            "support_materialization",
+            "prepared_episode_max_bytes",
+            "support_visual_batch_size",
+            "query_encoder_reuse",
+            "preprocess_cache_enabled",
         "preprocess_cache_root_env",
         "preprocess_cache_max_gb",
-        "preprocess_cache_dtype",
-    }
+            "preprocess_cache_dtype",
+            "visual_cost_mode",
+            "runtime_trace_mode",
+            "segment_prefetch_depth",
+        }
 
 
 def test_a2_uses_dynamic_graph_safe_zero1_profile() -> None:

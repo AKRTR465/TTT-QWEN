@@ -110,6 +110,11 @@ from ttt_svcbench_qwen.qwen_adapter import (
     StateEmbeddingPayload,
     audit_current_chunk_visual_tokens,
 )
+from ttt_svcbench_qwen.runtime_metrics import (
+    configure_runtime_metrics,
+    trace_cuda_phase,
+    trace_event,
+)
 from ttt_svcbench_qwen.stage_a_runtime import StageABankWriter
 from ttt_svcbench_qwen.stage_a_targets import (
     AnswerTargetLabels,
@@ -150,33 +155,9 @@ _ANSWER_INSTRUCTION = (
 
 
 def _loader_trace(event: str, **fields: object) -> None:
-    """Emit an opt-in rank/worker-local loader timing event."""
+    """Emit one buffered rank/worker-local timing event."""
 
-    if os.environ.get("TTT_DATALOADER_TRACE", "0") != "1":
-        return
-    run_root = os.environ.get("RUN_ROOT")
-    if not run_root:
-        return
-    rank = os.environ.get("RANK", "0")
-    try:
-        from torch.utils.data import get_worker_info
-
-        worker = get_worker_info()
-        worker_id = "main" if worker is None else str(worker.id)
-    except RuntimeError:
-        worker_id = "unknown"
-    path = Path(run_root) / "samples" / f"rank_{rank}" / "dataloader.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "monotonic_seconds": time.monotonic(),
-        "pid": os.getpid(),
-        "rank": int(rank),
-        "worker": worker_id,
-        "event": event,
-        **fields,
-    }
-    with path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    trace_event(event, **fields)
 
 
 def _cache_stats(owner: object) -> dict[str, int | bool]:
@@ -660,9 +641,8 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
         pixels = chunk.pixel_values_videos.to(device=device, non_blocking=True)
         grid = chunk.video_grid_thw.to(device=device, non_blocking=True)
         _loader_trace("pin_memory/H2D", seconds=time.perf_counter() - h2d_started)
-        gpu_started = time.perf_counter()
-        self.qwen.get_video_features(pixels, grid)
-        _loader_trace("gpu_step", stage="visual", seconds=time.perf_counter() - gpu_started)
+        with trace_cuda_phase("vit_forward", stage="visual"):
+            self.qwen.get_video_features(pixels, grid)
         captured = self.qwen.last_visual_output
         prepared = self.qwen.last_prepared_video_features
         if not isinstance(captured, QwenVisualOutput) or not isinstance(
@@ -713,17 +693,16 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
         state_payload = _state_embedding_payload(request, input_ids)
         kwargs = dict(request.qwen_kwargs)
         kwargs.setdefault("use_cache", False)
-        gpu_started = time.perf_counter()
-        output = self.qwen(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values_videos=pixels,
-            video_grid_thw=grid,
-            prepared_video_features=request.prepared_video_features,
-            state_embedding_payload=state_payload,
-            **kwargs,
-        )
-        _loader_trace("gpu_step", stage="prefill", seconds=time.perf_counter() - gpu_started)
+        with trace_cuda_phase("llm_prefill", stage="prefill"):
+            output = self.qwen(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values_videos=pixels,
+                video_grid_thw=grid,
+                prepared_video_features=request.prepared_video_features,
+                state_embedding_payload=state_payload,
+                **kwargs,
+            )
         return cast(QwenPrefillOutput, output)
 
     def _generate(self, request: QwenGenerateRequest) -> QwenGenerateOutput:
@@ -1737,6 +1716,7 @@ def build_runtime(
     )
 
     stage = ProductionStage(config.stage)
+    configure_runtime_metrics(config.runtime_trace_mode, config.runtime_trace_dir)
     project = backbone.project_config
     minimum_pixels, maximum_pixels = _video_pixel_bounds(backbone)
     preprocess_cache = _build_runtime_preprocess_cache(backbone, config)

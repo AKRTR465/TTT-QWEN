@@ -48,6 +48,7 @@ from ttt_svcbench_qwen.production_factory import (
     initialize_outer_model_from_a2,
     load_llamafactory_backbone,
 )
+from ttt_svcbench_qwen.runtime_metrics import flush_runtime_metrics
 
 
 class ProductionStage(StrEnum):
@@ -432,9 +433,12 @@ def main(argv: list[str] | None = None) -> int:
             checkpoint_environment["checkpoint"] = str(checkpoint_audit.checkpoint)
         environment["a2_initialization_audit"] = checkpoint_environment
         _write_json(artifact_root / "environment.json", environment)
-    result = trainer.train(
-        resume_from_checkpoint=None if same_stage_resume is None else str(same_stage_resume)
-    )
+    try:
+        result = trainer.train(
+            resume_from_checkpoint=None if same_stage_resume is None else str(same_stage_resume)
+        )
+    finally:
+        flush_runtime_metrics(resolve_cuda=True)
     if skip_final_checkpoint:
         trainer.accelerator.wait_for_everyone()
         trainer.log_metrics("train", result.metrics)

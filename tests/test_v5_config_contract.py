@@ -546,7 +546,7 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "answer_causal_shift": True,
         "answer_ignore_index": -100,
         "official_weak_balance": {
-            "mode": "legacy_sum",
+            "mode": "instant_equal",
             "group_weight": 0.3,
             "scale_min": 0.1,
             "scale_max": 10.0,
