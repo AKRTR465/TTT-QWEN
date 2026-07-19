@@ -385,9 +385,7 @@ class _BankWriter:
         audit = StageAWriteAudit(
             chunk_index=runtime.next_chunk_index,
             head_types=(HeadType.O2,) * len(request.owner.video_ids),
-            bank_versions_before=tuple(
-                bank.version for bank in runtime.bank_states
-            ),
+            bank_versions_before=tuple(bank.version for bank in runtime.bank_states),
             bank_versions_after=tuple(bank.version for bank in next_banks),
             record_counts_after=(1,) * len(next_banks),
             identity_counts_after=(1,) * len(next_banks),
@@ -522,6 +520,8 @@ class _TinyQueryLossBuilder:
 
 
 class _TinyOfficialWeakQueryLossBuilder:
+    streamed_balance_calibration = True
+
     def __call__(
         self,
         output: StateTTTModelOutput,
@@ -949,7 +949,8 @@ def test_truncated_a5_t17_k8_has_two_numeric_truncations_and_bounded_graphs(
     assert output.audit.truncation_horizon == 8
     assert output.audit.truncation_count == 2
     assert output.audit.segment_count == 3
-    assert output.audit.backward_count == 3
+    assert output.audit.backward_count == 4
+    assert output.audit.query_backward_count == 2
     assert output.audit.maximum_retained_support_graphs == 8
     assert [segment.support_count for segment in output.audit.segments] == [8, 8, 1]
     assert [segment.includes_query_backward for segment in output.audit.segments] == [
@@ -1002,13 +1003,35 @@ def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectCon
     output = runner.run_truncated(_truncated_episode(config, support_count=8))
 
     assert output.audit.segment_count == 1
-    assert output.audit.backward_count == 1
+    assert output.audit.backward_count == 2
+    assert output.audit.query_backward_count == 2
     assert output.audit.truncation_count == 1
     assert output.audit.segments[0].support_count == 8
     assert output.audit.segments[0].includes_query_backward
     assert output.audit.segments[0].reanchored
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
     assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
+
+
+def test_sequential_multi_query_backward_matches_one_shot_mean() -> None:
+    initial = torch.tensor([0.75, -0.25], dtype=torch.float64)
+
+    one_shot = initial.clone().requires_grad_(True)
+    shared_one_shot = torch.sin(one_shot.square())
+    cases = ((1.0, 0.2), (2.0, -0.3), (-0.5, 0.7))
+    losses = tuple((shared_one_shot * scale - target).square().sum() for scale, target in cases)
+    torch.stack(losses).mean().backward()
+    expected = one_shot.grad.detach().clone()
+
+    streamed = initial.clone().requires_grad_(True)
+    shared_streamed = torch.sin(streamed.square())
+    query_count = 3
+    for index, (scale, target) in enumerate(cases):
+        loss = (shared_streamed * scale - target).square().sum() / float(query_count)
+        loss.backward(retain_graph=index + 1 < query_count)
+
+    assert streamed.grad is not None
+    assert torch.allclose(streamed.grad, expected, atol=1.0e-12, rtol=1.0e-12)
 
 
 def test_truncated_a5_instant_equal_composes_all_queries_once(

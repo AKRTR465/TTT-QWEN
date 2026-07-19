@@ -17,6 +17,7 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     ProductionStage,
     ProductionTrainerRuntime,
     SegmentBackwardController,
+    _validate_checkpoint_tree,
     make_production_outer_optimizer_factory,
     resolve_same_stage_resume,
 )
@@ -34,8 +35,11 @@ from ttt_svcbench_qwen.production_factory import (
 from ttt_svcbench_qwen.production_runtime import (
     CurrentChunkSpec,
     ProductionOuterModel,
+    QueryObservationSpec,
     _decode_uniform_interval,
+    _llamafactory_uniform_frame_indices,
     _resize_to_pixel_budget,
+    _uniform_target_times,
     _video_pixel_bounds,
 )
 
@@ -83,8 +87,7 @@ def test_outer_checkpoint_loader_accepts_only_exact_safetensors(tmp_path: Path) 
     assert audit.format == "safetensors"
     assert audit.tensor_count == len(source.state_dict())
     assert all(
-        torch.equal(target.state_dict()[key], value)
-        for key, value in source.state_dict().items()
+        torch.equal(target.state_dict()[key], value) for key, value in source.state_dict().items()
     )
     torch.save(source.state_dict(), tmp_path / "outer.bin")
     with pytest.raises(ValueError, match="safetensors"):
@@ -119,21 +122,52 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
         "stage",
         "project_config",
         "dataset_manifest",
-            "support_prefetch_depth",
-            "support_decode_coalesce",
-            "support_materialization",
-            "prepared_episode_max_bytes",
-            "support_visual_batch_size",
-            "query_encoder_reuse",
-            "preprocess_cache_mode",
-            "preprocess_cache_miss_policy",
+        "support_prefetch_depth",
+        "support_decode_coalesce",
+        "support_materialization",
+        "prepared_episode_max_bytes",
+        "support_visual_batch_size",
+        "query_encoder_reuse",
+        "query_visual_mode",
+        "query_frame_sampling",
+        "query_sample_fps",
+        "query_max_frames",
+        "query_cache_mode",
+        "query_activation_offload",
+        "preprocess_cache_mode",
+        "preprocess_cache_miss_policy",
         "preprocess_cache_root_env",
         "preprocess_cache_max_gb",
-            "preprocess_cache_dtype",
-            "visual_cost_mode",
-            "runtime_trace_mode",
-            "segment_prefetch_depth",
-        }
+        "preprocess_cache_dtype",
+        "visual_cost_mode",
+        "runtime_trace_mode",
+        "segment_prefetch_depth",
+    }
+
+
+def test_fullprefix256_yaml_matches_qwen_visual_budget_and_zero2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[1]
+    monkeypatch.setenv("OUTPUT_DIR", "/tmp/output")
+    monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/dataset_manifest.json")
+    monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
+    monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
+    monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
+
+    native, extension = load_training_yaml(
+        root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml"
+    )
+
+    assert native["video_fps"] == 2.0
+    assert native["video_maxlen"] == 256
+    assert native["cutoff_len"] == 16_384
+    assert native["deepspeed"] == "configs/h200/deepspeed_zero2.json"
+    assert native["save_strategy"] == "epoch"
+    assert native["save_total_limit"] == 1
+    assert extension.query_visual_mode == "causal_prefix"
+    assert extension.query_max_frames == 256
+    assert extension.query_cache_mode == "disabled"
 
 
 def test_a2_uses_dynamic_graph_safe_zero1_profile() -> None:
@@ -241,6 +275,44 @@ def test_long_interval_decoder_seeks_targets_without_retaining_all_frames(
     assert counters["seeks"] == 16
     assert counters["converted"] == 16
     assert counters["decoded"] < 16 * (fps + 3)
+
+
+def test_query_prefix_allows_256_frames_without_relaxing_support_limit(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "video.mp4"
+    path.touch()
+    query = QueryObservationSpec(
+        chunk_id="query",
+        video_path=path,
+        start_time=0.0,
+        end_time=663.0,
+        maximum_frames=256,
+        query_time=663.0,
+        sampling_fps=2.0,
+    )
+
+    targets = _uniform_target_times(query, query.sampling_fps)
+
+    assert len(targets) == 256
+    assert targets[0] == 0.0
+    assert targets[-1] == 663.0
+    assert all(value <= query.query_time for value in targets)
+    with pytest.raises(ValueError, match="Support chunks permit"):
+        CurrentChunkSpec("support", path, 0.0, 8.0, 256, 8.0)
+
+
+def test_query_uniform_indices_match_llamafactory_523f801_reference() -> None:
+    indices = _llamafactory_uniform_frame_indices(
+        total_frames=1_989,
+        duration=663.0,
+        video_fps=2.0,
+        video_maxlen=256,
+    )
+
+    reference = tuple(int(value) for value in np.linspace(0, 1_988, 256).astype(np.int32).tolist())
+    assert indices == reference
+    assert len(indices) == 256
 
 
 def test_short_interval_decoder_streams_once_instead_of_seeking_every_target(
@@ -485,6 +557,23 @@ def test_deepspeed_segment_backward_steps_only_after_all_segments() -> None:
     assert float(parameter.grad) == pytest.approx(24.0)
     with pytest.raises(RuntimeError, match="more than once"):
         controller.finalize()
+
+
+def test_atomic_final_checkpoint_validation_requires_model_and_resume_state(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / ".final-checkpoint.incomplete"
+    resume = checkpoint / "resume_state"
+    resume.mkdir(parents=True)
+    save_file({"weight": torch.ones(1)}, str(checkpoint / "model.safetensors"))
+    (checkpoint / "trainer_state.json").write_text("{}\n", encoding="utf-8")
+    (resume / "random_states_0.pkl").write_bytes(b"state")
+
+    _validate_checkpoint_tree(checkpoint)
+
+    (resume / "random_states_0.pkl").unlink()
+    with pytest.raises(RuntimeError, match="resume state"):
+        _validate_checkpoint_tree(checkpoint)
 
 
 @pytest.mark.parametrize(

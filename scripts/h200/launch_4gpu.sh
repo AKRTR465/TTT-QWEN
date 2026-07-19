@@ -299,9 +299,9 @@ required_native = {
 missing_native = sorted(required_native.difference(native))
 if missing_native:
     raise RuntimeError(f"production YAML is missing LLaMA-Factory keys: {missing_native}")
-stage = ManifestStage(str(extension["stage"]))
+stage = ManifestStage(extension.stage)
 train, validation = load_production_manifest_views(
-    str(extension["dataset_manifest"]),
+    extension.dataset_manifest,
     stage=stage,
 )
 payload = {
@@ -315,7 +315,7 @@ payload = {
     "torch": metadata.version("torch"),
     "transformers": metadata.version("transformers"),
     "deepspeed": metadata.version("deepspeed"),
-    "runtime_factory": extension["runtime_factory"],
+    "runtime_factory": "ttt_svcbench_qwen.production_runtime:build_runtime",
 }
 (run_root / "environment.json").write_text(
     json.dumps(payload, ensure_ascii=False, indent=2) + "\n",

@@ -740,6 +740,34 @@ def test_causal_chunks_next_only_updates_and_generation_immutability(
     assert manager.active_runtime is None
 
 
+def test_fullprefix_query_observation_is_read_only_and_uses_current_fast_state(
+    dependencies: _Dependencies,
+) -> None:
+    suite = _FakeSuite()
+    request = replace(
+        _request(),
+        query_observation=CausalChunk(
+            "query-full-prefix",
+            ("q0", "q1", "q2"),
+            (0.0, 1.0, 2.0),
+            (0, 1, 2),
+        ),
+    )
+    result = run_inference(
+        manager=_manager(dependencies),
+        model=_model(dependencies, suite),
+        request=request,
+        updater=_Updater(skip_calls={1}),
+    )
+
+    assert suite.seen_frames == [("a", "b"), ("c",), ("q0", "q1", "q2")]
+    assert suite.fast_versions == [0, 1, 1]
+    assert len(result.chunk_audit) == 2
+    assert result.release_audit is not None
+    assert result.release_audit.before.boundary is not None
+    assert result.release_audit.before.boundary.state_bank_version == 2
+
+
 @pytest.mark.parametrize("audit_level", tuple(AuditLevel))
 def test_audit_levels_preserve_runtime_results(
     dependencies: _Dependencies,

@@ -10,22 +10,24 @@ synthetic ablation harness 已从主线删除。
 - A5 对 Support 数不设上限，按处理过的 Support 每 `K=8` 步截断。段内
   `create_graph=True`，截断点使用
   `stopgrad(W_t) + W0 - stopgrad(W0)`，保留数值状态并重新建立到 `W0` 的梯度路径。
-- 非末段立即 backward `0.1/T * sum(L_TTT)`；最后一段和所有 Query 一起 backward。
+- 非末段立即 backward `0.1/T * sum(L_TTT)`；多 Query 顺序 backward，最后一个 Query
+  同时 backward 最后一段 Support 辅助损失。
   一个 episode 只由外层 Trainer 裁剪和执行一次 AdamW step。
 - Inner SGD 的唯一参数是 transient `w_t_1/w_t_2`，momentum 固定为 0。Qwen、状态模块、
   `W0` 和 Predictor 只能进入 Outer AdamW。
 - hard Bank/FSM commit 与 soft observation forward 分离；activation checkpoint 重算只能经过
   soft 路径。
-- 每一步只物化一个当前 chunk；视觉帧数与 Token 数可动态变化，历史 chunk 不进入 Qwen
-  上下文，只通过 `W_t`、Bank/FSM 和受限时序状态延续。
+- Support 每一步只物化一个 8/16 帧动态 chunk，处理后不保留历史视觉 Token；Query 单独从
+  `[0, query_time]` 以 2 FPS 采样，超过 256 帧时按 LLaMA-Factory uniform-cap 规则降至
+  256 帧。256 限制帧数而非视觉 Token 数。
 - manifest、采样器、optimizer 参数组、A2→A5 权重初始化和 checkpoint 边界由 TTT-QWEN
   中央控制，不修改相邻的 LLaMA-Factory 工作树。
 
 ## 数据准备
 
-H200 已有的转换集为“每个 Query 一份因果视频”。准备脚本会校验 4576 个 Query 的映射，
-A2 使用对应 Query clip，A5 使用组内最后一个 Query clip，并从每个原始视频的最后 clip 自动
-读取容器时长：
+H200 已有的转换集为“每个 Query 一份因果视频”。准备脚本用它校验 4576 个 Query 的映射，
+实际 A2/A5 runtime 使用原始连续视频：Support 按自适应窗口读取，Query 在原视频上严格裁到
+`query_time`。任何超过原视频容器时长的 Query 写入 `failed.jsonl`：
 
 ```bash
 cd /mnt/shared-storage-user/mineru2-shared/niujunbo/play/projects/ttt_qwen
@@ -34,7 +36,7 @@ export PYTHONPATH="$PWD/src"
 $PWD/.venv-h200/bin/python scripts/prepare_svcbench_episodes.py \
   --annotation /mnt/shared-storage-user/mineru2-shared/niujunbo/play/datasets/qwensft-data/svcbench-part/raw/data__vcbench_data.jsonl \
   --converted-dataset /mnt/shared-storage-user/mineru2-shared/niujunbo/play/datasets/qwensft-data/svcbench-part/svcbench_qwen3vl_sft.json \
-  --video-root /mnt/shared-storage-user/mineru2-shared/niujunbo/play/datasets/qwensft-data/svcbench-part \
+  --video-root /mnt/shared-storage-user/mineru2-shared/niujunbo/play/datasets/SVCBench/videos \
   --dataset-name svcbench-part \
   --dataset-revision h200-20260710 \
   --output-root runs
@@ -71,20 +73,20 @@ factory。中央 bridge 会覆盖 runtime 的 dataset 字段，强制使用 mani
 
 ## 四卡运行
 
-在四卡 worker 内直接运行；首次执行会在项目 `.venv-h200-py312` 建立 Python 3.12 环境，复用
-worker 已有的 CUDA 12.8 PyTorch，并从 PJLAB 镜像安装其余锁定依赖。省略 manifest 时会使用
-远端现有 SVCBench 转换集自动生成：
+在四卡 worker 内直接运行。full-prefix 入口只使用现有
+`.venv-h200-py312-torch28`，不会在线安装依赖。省略 manifest 时会用远端 SVCBench 数据自动
+生成：
 
 ```bash
 cd /mnt/shared-storage-user/mineru2-shared/niujunbo/play/projects/ttt_qwen
-bash scripts/h200/launch_qwen3vl8b_ttt_a2_full4.sh
+bash scripts/h200/train_fullprefix256.sh a2
 ```
 
 A2 成功后，使用最后 epoch 的完整模型权重初始化 A5；不会继承 A2 optimizer、scheduler 或
 Trainer step：
 
 ```bash
-bash scripts/h200/launch_qwen3vl8b_ttt_a5_k8_full4.sh \
+bash scripts/h200/train_fullprefix256.sh a5 \
   /absolute/path/a2_run/checkpoints/final-checkpoint \
   /absolute/path/dataset_manifest.json
 ```
@@ -93,18 +95,26 @@ bash scripts/h200/launch_qwen3vl8b_ttt_a5_k8_full4.sh \
 manifest 严格加载和共享盘 safetensors 往返 smoke，再创建唯一 run 目录并执行四进程训练。
 它不会配置 Mac 的本地代理，也不会写入 dirty 的 LLaMA-Factory checkout。
 
+8-step 对照入口：
+
+```bash
+bash scripts/h200/benchmark_fullprefix256_8step.sh baseline
+bash scripts/h200/benchmark_fullprefix256_8step.sh a2
+bash scripts/h200/benchmark_fullprefix256_8step.sh a5 /absolute/path/a2/checkpoints/final-checkpoint
+```
+
 ## Checkpoint 与续训
 
-- A2 每 2 epoch 保存一个标准 Trainer checkpoint，A5 每 epoch 保存一个；这些
-  `checkpoint-*` 包含模型、optimizer、scheduler、Trainer state 和分布式 RNG，可用于同阶段续训。
+- A2/A5 每个 epoch 写一个标准 Trainer checkpoint，`save_total_limit=1`。训练结束后先在
+  `.final-checkpoint.incomplete` 写入并校验模型、optimizer/scheduler/RNG 和 Trainer state，
+  再原子发布为 `final-checkpoint/`，最后删除 `checkpoint-*`，完成态只保留一个 checkpoint。
 - 同阶段续训必须新建 run，并显式设置
   `TTT_RESUME_CHECKPOINT=/old/run/checkpoints/checkpoint-N`。入口校验 checkpoint 的 stage 与
   `run_config.json` 一致。
 - A2→A5 是阶段切换，只使用 `A2_CHECKPOINT` 中的模型/module 权重，并创建全新的 A5
   optimizer/scheduler/RNG。
-- `final-checkpoint/` 保存最终模型；其 `resume_state/` 还保存 Accelerator 的完整分布式归档状态。
-  原生 Trainer 续训应使用同阶段的标准 `checkpoint-*`，不要把 `resume_state/` 当成
-  `resume_from_checkpoint`。
+- `final-checkpoint/` 保存最终模型，`resume_state/` 保存 Accelerator 完整分布式状态；运行中断
+  时可从尚存的最后一个标准 `checkpoint-*` 新建 run 续训。
 - transient `W_t`、Bank、FSM、视觉/时序 cache 从所有 checkpoint 中排除。
 
 同阶段续训示例：
@@ -128,6 +138,6 @@ bash -n scripts/h200/launch_4gpu.sh
 ```
 
 CPU 测试覆盖 `T=17/K=8`、两次历史截断、数值连续、旧图断开、`W0` 重锚梯度、严格两矩阵
-Inner 参数、manifest 防泄漏、四 rank segment parity、完整 checkpoint 边界与同阶段 resume
-校验。真实单卡 2B、四卡 8B、显存平台、20-episode resume 和正式训练仍必须在 H200 上执行并
-把证据写入各自 run 目录。
+Inner 参数、256 帧 causal Query、LLaMA-Factory 索引一致性、顺序 Query 梯度等价、manifest
+防泄漏、四 rank backward parity 和原子 checkpoint 边界。真实四卡 8B 验收证据写入各自 run
+目录。

@@ -60,6 +60,8 @@ class PreprocessFingerprint:
     temporal_patch_size: int
     spatial_merge_size: int
     transformers_version: str
+    observation_role: str = "support"
+    frame_sampling: str = "uniform"
     cache_schema_version: int = CACHE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -76,9 +78,18 @@ class PreprocessFingerprint:
             raise ValueError("preprocess fingerprint interval is invalid")
         if self.maximum_frames < 2 or self.sample_fps <= 0.0:
             raise ValueError("preprocess fingerprint frame settings are invalid")
+        if self.observation_role not in {"support", "query"} or not self.frame_sampling:
+            raise ValueError("preprocess fingerprint observation role/policy is invalid")
 
     def canonical_json(self) -> str:
-        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        values = asdict(self)
+        # Preserve the digest of the already-warmed Support cache. Query observations always
+        # retain the explicit role/policy fields, so a causal-prefix Query can never reuse a
+        # legacy 16-frame current-chunk entry.
+        if self.observation_role == "support" and self.frame_sampling == "uniform":
+            values.pop("observation_role")
+            values.pop("frame_sampling")
+        return json.dumps(values, sort_keys=True, separators=(",", ":"))
 
     @property
     def digest(self) -> str:
@@ -113,6 +124,8 @@ def build_fingerprint(
     temporal_patch_size: int,
     spatial_merge_size: int,
     transformers_version: str,
+    observation_role: str = "support",
+    frame_sampling: str = "uniform",
 ) -> PreprocessFingerprint:
     stat = video_path.stat()
     return PreprocessFingerprint(
@@ -130,6 +143,8 @@ def build_fingerprint(
         temporal_patch_size=int(temporal_patch_size),
         spatial_merge_size=int(spatial_merge_size),
         transformers_version=str(transformers_version),
+        observation_role=observation_role,
+        frame_sampling=frame_sampling,
     )
 
 
@@ -234,9 +249,7 @@ class PreprocessCache:
         if path is None:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(
-            f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
-        )
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
         tensors = _cached_chunk_tensors(chunk, fingerprint.canonical_json())
         try:
             save_file(
@@ -368,9 +381,7 @@ class PreprocessCache:
 def _cached_chunk_tensors(chunk: CachedChunk, fingerprint_json: str) -> dict[str, Tensor]:
     # safetensors metadata is written separately; storing the JSON as a tiny tensor also lets
     # load_file() validate it without opening a second sidecar file.
-    metadata_tensor = torch.tensor(
-        list(fingerprint_json.encode("utf-8")), dtype=torch.uint8
-    )
+    metadata_tensor = torch.tensor(list(fingerprint_json.encode("utf-8")), dtype=torch.uint8)
     return {
         "frames": chunk.frames.detach().cpu().contiguous(),
         "frame_timestamps": chunk.frame_timestamps.detach().cpu().contiguous(),

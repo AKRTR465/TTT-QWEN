@@ -163,6 +163,7 @@ class InferenceRequest:
     chunks: tuple[CausalChunk, ...]
     answer_inputs: AnswerInputs
     attempt: QueryAttempt
+    query_observation: CausalChunk | None = None
     max_new_tokens: int = 16
 
     def __post_init__(self) -> None:
@@ -193,6 +194,7 @@ class InferenceRequest:
         chunks: tuple[CausalChunk, ...],
         answer_inputs: AnswerInputs,
         attempt: QueryAttempt,
+        query_observation: CausalChunk | None = None,
         max_new_tokens: int = 16,
     ) -> InferenceRequest:
         """Validate one JSON boundary and immediately convert it to a typed Query."""
@@ -217,6 +219,7 @@ class InferenceRequest:
             chunks=chunks,
             answer_inputs=answer_inputs,
             attempt=attempt,
+            query_observation=query_observation,
             max_new_tokens=max_new_tokens,
         )
 
@@ -841,6 +844,55 @@ class PerVideoRuntimeManager:
                 ),
             )
 
+    def observe_query_readonly(
+        self,
+        *,
+        model: StateTTTModel,
+        chunk: CausalChunk,
+        query_input: RuntimeQueryInput,
+        query_time: float,
+    ) -> ObservationChunkOutput:
+        """Observe one Query feature set with current W_t without committing Bank/FSM state."""
+
+        with self._lock:
+            runtime = self._require_live_runtime()
+            fast = _require_fast_state(runtime)
+            causal = chunk.causal_prefix(query_time)
+            if causal is None:
+                raise InferenceProtocolError("Query observation contains no causal frame")
+            owner = RuntimeOwner((runtime.video_id,), (runtime.trajectory_id,))
+            before_guard = _runtime_guard_stamp(runtime)
+            lifecycle = PrefillLifecycle(owner)
+            self.fast_adapter.last_audit = None
+            with self.fast_adapter.use_fast_state(fast):
+                observation = model.observe_chunk(
+                    ObservationChunkRequest(
+                        owner=owner,
+                        video_input=causal if causal.model_input is None else causal.model_input,
+                        query_input=query_input,
+                        runtime_state=BatchRuntimeState((runtime,)),
+                        bank_states=(runtime.state_bank,),
+                        inference=True,
+                    ),
+                    lifecycle,
+                )
+            fast_audit = self.fast_adapter.last_audit
+            if not isinstance(fast_audit, FastTTTForwardAudit) or not fast_audit.used_runtime_state:
+                raise InferenceProtocolError(
+                    "Query observation did not consume the manager-bound FastWeightsState"
+                )
+            if fast_audit.fast_versions != (fast.fast_version,) or fast_audit.update_counts != (
+                fast.update_count,
+            ):
+                raise InferenceProtocolError("Query observation used the wrong fast version")
+            if _runtime_guard_stamp(runtime) != before_guard:
+                raise InferenceProtocolError("read-only Query observation mutated runtime state")
+            return replace(
+                observation,
+                runtime_state=BatchRuntimeState((runtime,)),
+                bank_states=(runtime.state_bank,),
+            )
+
     def release(self) -> RuntimeReleaseAudit | None:
         """Release all trajectory storage; safe and idempotent for exception cleanup."""
 
@@ -899,9 +951,7 @@ class PerVideoRuntimeManager:
             level=self.audit_level,
             boundary=runtime_boundary_stamp(state),
             content_sha256=(
-                runtime_checksum(state)
-                if content and self.audit_level is AuditLevel.FULL
-                else None
+                runtime_checksum(state) if content and self.audit_level is AuditLevel.FULL else None
             ),
         )
 
@@ -970,6 +1020,13 @@ def run_inference(
             )
             if execution.observation is not None:
                 latest_observation = execution.observation
+        if request.query_observation is not None:
+            latest_observation = manager.observe_query_readonly(
+                model=model,
+                chunk=request.query_observation,
+                query_input=request.query_input,
+                query_time=request.query_time,
+            )
         if latest_observation is None:
             raise InferenceProtocolError("no causal frame was available before query_time")
         result = manager.answer_query(
@@ -1445,6 +1502,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default="bfloat16",
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--query-visual-mode",
+        choices=("causal_prefix", "recent_chunk"),
+        default="causal_prefix",
+    )
+    parser.add_argument("--query-sample-fps", type=float, default=2.0)
+    parser.add_argument("--query-max-frames", type=int, default=256)
+    parser.add_argument("--video-max-pixels", type=int, default=131_072)
     return parser
 
 
@@ -1453,6 +1518,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from ttt_svcbench_qwen.production_runtime import (
         CurrentChunkSpec,
+        QueryObservationSpec,
         _expand_qwen_video_placeholders,
         _tokenize_text_only,
         _user_message,
@@ -1483,8 +1549,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if any(not isinstance(value, str) or not value for value in identity.values()):
         raise ValueError("video_id, trajectory_id and query_id must be non-empty strings")
     runtime_payload = {
-        name: payload[name]
-        for name in ("video", "question", "query_time", "explicit_time_values")
+        name: payload[name] for name in ("video", "question", "query_time", "explicit_time_values")
     }
     assert_inference_runtime_payload(runtime_payload)
     video_path = Path(cast(str, payload["video"])).resolve()
@@ -1500,6 +1565,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint=cast(Path, args.checkpoint),
         device=cast(str, args.device),
         dtype=dtype,
+        maximum_pixels=cast(int, args.video_max_pixels),
     )
     query = RuntimeQueryInput(
         video_id=cast(str, payload["video_id"]),
@@ -1533,8 +1599,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         specs.append(spec)
         tubelet_count = spec.maximum_frames // 2
         times = tuple(
-            start + (offset + 1) * (end - start) / tubelet_count
-            for offset in range(tubelet_count)
+            start + (offset + 1) * (end - start) / tubelet_count for offset in range(tubelet_count)
         )
         positions = tuple(range(index * tubelet_count, (index + 1) * tubelet_count))
         chunks.append(
@@ -1552,15 +1617,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         end = min(query.query_time, end + 8.0)
     if not specs:
         raise ValueError("query_time must be greater than zero for video inference")
-    materialized = bundle.video_materializer(specs[-1])
-    latest_times = tuple(
-        float(value) for value in materialized.tubelet_timestamps[0].tolist()
+    visual_mode = cast(str, args.query_visual_mode)
+    query_max_frames = cast(int, args.query_max_frames)
+    if visual_mode == "causal_prefix":
+        query_start_time = 0.0
+        if query_max_frames != 256:
+            raise ValueError("causal_prefix inference requires --query-max-frames 256")
+    else:
+        query_start_time = max(0.0, query.query_time - 8.0)
+        if query_max_frames < 2 or query_max_frames > 16:
+            raise ValueError("recent_chunk inference permits --query-max-frames 2..16")
+    if query_max_frames % 2:
+        raise ValueError("--query-max-frames must be even")
+    query_spec = QueryObservationSpec(
+        chunk_id=f"query-{query.query_id}",
+        video_path=video_path,
+        start_time=query_start_time,
+        end_time=query.query_time,
+        maximum_frames=query_max_frames,
+        query_time=query.query_time,
+        sampling_fps=cast(float, args.query_sample_fps),
     )
-    latest_positions = tuple(
-        int(value) for value in materialized.tubelet_position_ids[0].tolist()
-    )
-    chunks[-1] = CausalChunk(
-        chunk_id=specs[-1].chunk_id,
+    materialized = bundle.video_materializer(query_spec)
+    latest_times = tuple(float(value) for value in materialized.tubelet_timestamps[0].tolist())
+    latest_positions = tuple(int(value) for value in materialized.tubelet_position_ids[0].tolist())
+    query_observation = CausalChunk(
+        chunk_id=query_spec.chunk_id,
         frames=tuple(range(len(latest_times))),
         timestamps=latest_times,
         position_ids=latest_positions,
@@ -1594,6 +1676,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rope_indexer=bundle.qwen_adapter.qwen_model,
         ),
         attempt=QueryAttempt(query.query_id),
+        query_observation=query_observation,
         max_new_tokens=16,
     )
     result = run_inference(
@@ -1620,6 +1703,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "prefill_count": result.generate_audit.prefill_count,
             "decode_count": result.generate_audit.decode_count,
             "chunk_count": len(result.chunk_audit),
+            "query_visual_mode": visual_mode,
+            "prepared_video_feature_count": 1,
+            "history_feature_set_count": 0,
+            "query_frame_count": int(materialized.frames.shape[0]),
+            "query_visual_token_count": int(materialized.pixel_values_videos.shape[0]),
+            "query_video_grid_thw": [
+                int(value) for value in materialized.video_grid_thw[0].tolist()
+            ],
+            "query_timestamp_range": [
+                float(materialized.frame_timestamps[0].item()),
+                float(materialized.frame_timestamps[-1].item()),
+            ],
             "released": result.release_audit is not None,
             "runtime_unchanged_during_generate": (
                 result.generate_audit.state_before == result.generate_audit.state_after

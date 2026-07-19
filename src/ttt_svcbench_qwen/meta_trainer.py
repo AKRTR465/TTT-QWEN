@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 from itertools import pairwise
 from typing import Protocol, cast
@@ -967,6 +967,7 @@ class TruncatedMetaTTTEpisodeAudit:
     truncation_horizon: int
     segment_count: int
     backward_count: int
+    query_backward_count: int
     truncation_count: int
     maximum_retained_support_graphs: int
     update_attempt_count: int
@@ -989,8 +990,13 @@ class TruncatedMetaTTTEpisodeAudit:
             raise ValueError("truncation horizon must be positive")
         expected_segments = math.ceil(self.support_count / self.truncation_horizon)
         expected_truncations = self.support_count // self.truncation_horizon
-        if self.segment_count != expected_segments or self.backward_count != expected_segments:
-            raise ValueError("A5 must execute exactly one backward per graph segment")
+        expected_backwards = expected_segments + self.query_count - 1
+        if self.segment_count != expected_segments:
+            raise ValueError("A5 graph segment count drifted from ceil(T/K)")
+        if self.query_backward_count != self.query_count:
+            raise ValueError("A5 must backward every Query point exactly once")
+        if self.backward_count != expected_backwards:
+            raise ValueError("A5 streamed Query/segment backward count drifted")
         if self.truncation_count != expected_truncations:
             raise ValueError("A5 truncation count must follow processed Support steps")
         if self.maximum_retained_support_graphs > self.truncation_horizon:
@@ -1074,6 +1080,7 @@ class MetaTTTEpisodeRunner:
         query_encoder_reuse: bool = False,
         raw_support_visual_batcher: RawSupportVisualBatcher | None = None,
         support_visual_batch_size: int = 1,
+        query_activation_offload: bool = False,
     ) -> None:
         if not isinstance(config, ProjectConfig):
             raise TypeError("Meta-TTT runner requires validated ProjectConfig")
@@ -1099,6 +1106,9 @@ class MetaTTTEpisodeRunner:
             raise ValueError("support_visual_batch_size must be a positive integer")
         self.raw_support_visual_batcher = raw_support_visual_batcher
         self.support_visual_batch_size = support_visual_batch_size
+        if type(query_activation_offload) is not bool:
+            raise TypeError("query_activation_offload must be bool")
+        self.query_activation_offload = query_activation_offload
         self.outer_composer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
         if config.fast_ttt.optimizer.meta_gradient_mode != "full_second_order":
@@ -1285,13 +1295,14 @@ class MetaTTTEpisodeRunner:
         self,
         episode: MetaTTTEpisode,
         *,
-        backward: Callable[[Tensor], None] | None = None,
+        backward: Callable[[Tensor, bool], None] | None = None,
     ) -> TruncatedMetaTTTEpisodeOutput:
         """Run production A5 with exact second order inside K-step graph segments.
 
         ``backward`` is injectable so LLaMA-Factory/Accelerate/DeepSpeed can own the
-        distributed backward call.  It is invoked exactly ``ceil(T / K)`` times;
-        this method never executes an Outer optimizer step.
+        distributed backward call. It is invoked once per non-final Support segment and once
+        per Query; the final Query includes the final Support auxiliary loss. This method never
+        executes an Outer optimizer step.
         """
 
         self._validate_truncated_episode(episode)
@@ -1414,7 +1425,7 @@ class MetaTTTEpisodeRunner:
                     auxiliary_scale
                     * torch.stack(tuple(output.total for output in segment_outputs)).sum()
                 )
-                backward_fn(segment_loss)
+                backward_fn(segment_loss, False)
                 reanchor_audits = self._reanchor_trajectory(adapted)
                 segment_audits.append(
                     TruncatedSegmentAudit(
@@ -1437,10 +1448,61 @@ class MetaTTTEpisodeRunner:
         if not segment_outputs or support_total_detached is None:
             raise RuntimeError("A5 final graph segment unexpectedly has no Support")
 
-        query_objectives: list[MetaQueryObjective] = []
+        query_runtime_snapshot = adapted.runtime
+        balance_audit: OfficialWeakBalanceAudit | None = None
+        if (
+            self.config.loss.official_weak_balance.mode is OfficialWeakBalanceMode.INSTANT_EQUAL
+            and (
+                all(query.supervision.official_weak for query in episode.query_points)
+                or bool(
+                    getattr(
+                        self.query_loss_builder,
+                        "streamed_balance_calibration",
+                        False,
+                    )
+                )
+            )
+        ):
+            calibration: list[MetaQueryObjective] = []
+            calibration_queries: dict[tuple[int, str, str], PreparedQueryOutput] = {}
+            for query_index, query in enumerate(episode.query_points):
+                adapted.runtime = query_runtime_snapshot
+                lifecycle = PrefillLifecycle(episode.owner)
+                prepared_query: PreparedQueryOutput | None = None
+                if self.query_encoder_reuse:
+                    key = query_reuse_key(query.chunk.request.query_input)
+                    prepared_query = calibration_queries.get(key)
+                    if prepared_query is None:
+                        prepared_query = self._prepare_query(
+                            query.chunk,
+                            adapted,
+                            with_grad=False,
+                        )
+                        calibration_queries[key] = prepared_query
+                observation, _ = self._observe(
+                    query.chunk,
+                    adapted,
+                    lifecycle,
+                    seed=episode.seed + 10_000 + query_index,
+                    with_grad=False,
+                    prepared_query=prepared_query,
+                )
+                output = self._answer(query, observation, lifecycle, with_grad=False)
+                calibration.append(self._query_objective(query, output, ()))
+            self._balance_query_objectives(tuple(calibration))
+            balance_audit = self.last_balance_audit
+            calibration.clear()
+            calibration_queries.clear()
+
+        final_segment_loss = (
+            auxiliary_scale * torch.stack(tuple(output.total for output in segment_outputs)).sum()
+        )
         query_audits: list[TruncatedQueryPointAudit] = []
         prepared_queries: dict[tuple[int, str, str], PreparedQueryOutput] = {}
+        query_loss_detached = final_segment_loss.detach().new_zeros(())
+        query_count = len(episode.query_points)
         for query_index, query in enumerate(episode.query_points):
+            adapted.runtime = query_runtime_snapshot
             query_lifecycle = PrefillLifecycle(episode.owner)
             prepared_query: PreparedQueryOutput | None = None
             if self.query_encoder_reuse:
@@ -1453,20 +1515,40 @@ class MetaTTTEpisodeRunner:
                         with_grad=True,
                     )
                     prepared_queries[key] = prepared_query
-            observation, _ = self._observe(
-                query.chunk,
-                adapted,
-                query_lifecycle,
-                seed=episode.seed + 10_000 + query_index,
-                with_grad=True,
-                prepared_query=prepared_query,
-            )
-            adapted.runtime = _runtime_from_observation(observation, episode.owner)
-            observation_versions = _tensor_version_signature(observation)
-            output = self._answer(query, observation, query_lifecycle, with_grad=True)
+            with self._query_activation_context():
+                observation, _ = self._observe(
+                    query.chunk,
+                    adapted,
+                    query_lifecycle,
+                    seed=episode.seed + 10_000 + query_index,
+                    with_grad=True,
+                    prepared_query=prepared_query,
+                )
+                observation_versions = _tensor_version_signature(observation)
+                output = self._answer(query, observation, query_lifecycle, with_grad=True)
             immutable = observation_versions == _tensor_version_signature(observation)
             objective = self._query_objective(query, output, ())
-            query_objectives.append(objective)
+            if balance_audit is not None:
+                balanced_outer = self.outer_composer.compose_one_from_audit(
+                    objective.answer,
+                    cast(OfficialWeakStateLossOutput, objective.state),
+                    query_count=query_count,
+                    audit=balance_audit,
+                )
+                objective = replace(
+                    objective,
+                    outer=balanced_outer,
+                    metrics=_with_balance_metrics(objective.metrics, balance_audit),
+                )
+            normalized_query_loss = objective.outer.outer / float(query_count)
+            query_loss_detached = query_loss_detached + normalized_query_loss.detach()
+            is_final_query = query_index + 1 == query_count
+            backward_loss = (
+                normalized_query_loss + final_segment_loss
+                if is_final_query
+                else normalized_query_loss
+            )
+            backward_fn(backward_loss, not is_final_query)
             query_audits.append(
                 TruncatedQueryPointAudit(
                     query_index=query_index,
@@ -1480,18 +1562,9 @@ class MetaTTTEpisodeRunner:
                     observation_immutable=immutable,
                 )
             )
+            del backward_loss, normalized_query_loss, objective, output, observation
 
-        query_objectives = list(self._balance_query_objectives(tuple(query_objectives)))
-        query_audits = [
-            replace(audit, metrics=objective.metrics)
-            for audit, objective in zip(query_audits, query_objectives, strict=True)
-        ]
-        query_loss = torch.stack(tuple(item.outer.outer for item in query_objectives)).mean()
-        final_segment_loss = (
-            auxiliary_scale * torch.stack(tuple(output.total for output in segment_outputs)).sum()
-        )
-        final_loss = query_loss + final_segment_loss
-        backward_fn(final_loss)
+        adapted.runtime = query_runtime_snapshot
         active_segment = ()
         final_reanchor_audits = self._reanchor_trajectory(adapted)
         final_support_index = support_count - 1
@@ -1512,7 +1585,7 @@ class MetaTTTEpisodeRunner:
         versions_after = tuple(parameter._version for parameter in tracked_parameters)
         attempted = sum(len(audit.did_update) for audit in update_audits)
         updated = sum(sum(audit.did_update) for audit in update_audits)
-        detached_query = query_loss.detach().clone()
+        detached_query = query_loss_detached.detach().clone()
         detached_auxiliary = (auxiliary_scale * support_total_detached).detach().clone()
         detached_total = (detached_query + detached_auxiliary).detach().clone()
         audit = TruncatedMetaTTTEpisodeAudit(
@@ -1523,7 +1596,8 @@ class MetaTTTEpisodeRunner:
             prewarm_count=1,
             truncation_horizon=horizon,
             segment_count=len(segment_audits),
-            backward_count=len(segment_audits),
+            backward_count=len(segment_audits) + query_count - 1,
+            query_backward_count=query_count,
             truncation_count=support_count // horizon,
             maximum_retained_support_graphs=maximum_retained,
             update_attempt_count=attempted,
@@ -1546,6 +1620,11 @@ class MetaTTTEpisodeRunner:
             final_runtime=adapted.runtime,
             audit=audit,
         )
+
+    def _query_activation_context(self) -> AbstractContextManager[object]:
+        if not self.query_activation_offload or not torch.cuda.is_available():
+            return nullcontext()
+        return torch.autograd.graph.save_on_cpu(pin_memory=True)
 
     def _validate_truncated_episode(self, episode: MetaTTTEpisode) -> None:
         stage = self.config.stage_c
@@ -1760,17 +1839,13 @@ class MetaTTTEpisodeRunner:
         if not objectives:
             raise ValueError("Meta-TTT requires at least one Query objective")
         official = tuple(
-            isinstance(objective.state, OfficialWeakStateLossOutput)
-            for objective in objectives
+            isinstance(objective.state, OfficialWeakStateLossOutput) for objective in objectives
         )
         if not any(official):
             self.last_balance_audit = None
             return objectives
         if not all(official):
-            if (
-                self.config.loss.official_weak_balance.mode
-                is OfficialWeakBalanceMode.INSTANT_EQUAL
-            ):
+            if self.config.loss.official_weak_balance.mode is OfficialWeakBalanceMode.INSTANT_EQUAL:
                 raise ValueError("instant_equal cannot mix dense and official-weak Query losses")
             self.last_balance_audit = None
             return objectives
@@ -2030,12 +2105,12 @@ def _unique_parameters(parameters: Sequence[nn.Parameter]) -> tuple[nn.Parameter
     return tuple(result)
 
 
-def _plain_backward(loss: Tensor) -> None:
+def _plain_backward(loss: Tensor, retain_graph: bool = False) -> None:
     if not isinstance(loss, Tensor) or loss.ndim != 0:
         raise TypeError("segment backward requires one scalar Tensor")
     if not loss.requires_grad:
         raise ValueError("segment loss must remain connected to the Outer graph")
-    loss.backward()
+    loss.backward(retain_graph=retain_graph)
 
 
 class _SeededRNG:

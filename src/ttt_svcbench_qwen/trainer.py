@@ -7,6 +7,7 @@ Forbidden: Inner SGD, transient runtime checkpoints, or label leakage into model
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -213,6 +214,7 @@ class StageAModelForwardOutput:
         if any(tensor.device != self.answer_logits.device for tensor in tensors):
             raise ValueError("Stage A model forward tensors must share one device")
 
+
 @dataclass(frozen=True, slots=True)
 class StageAEpisodeAnswerInputs:
     base_input_ids: Tensor
@@ -267,6 +269,7 @@ class StageAEpisodeRunner:
         variant: StageAVariant,
         metric_builder: StageAEpisodeMetricBuilder,
         query_encoder_reuse: bool = False,
+        query_activation_offload: bool = False,
     ) -> None:
         self.model = model
         self.variant = variant
@@ -274,6 +277,9 @@ class StageAEpisodeRunner:
         if type(query_encoder_reuse) is not bool:
             raise TypeError("query_encoder_reuse must be bool")
         self.query_encoder_reuse = query_encoder_reuse
+        if type(query_activation_offload) is not bool:
+            raise TypeError("query_activation_offload must be bool")
+        self.query_activation_offload = query_activation_offload
 
     def __call__(
         self,
@@ -317,9 +323,7 @@ class StageAEpisodeRunner:
                 template,
                 runtime_state=runtime,
                 bank_states=bank_states,
-                prepared_query=(
-                    prepared_query if is_current_query_chunk else detached_query
-                ),
+                prepared_query=(prepared_query if is_current_query_chunk else detached_query),
             )
             if self.variant is StageAVariant.A2 and not is_current_query_chunk:
                 # A2's loss is defined on the current Query chunk.  Earlier Support chunks
@@ -332,7 +336,8 @@ class StageAEpisodeRunner:
                 with torch.no_grad():
                     observed = self.model.observe_chunk(request, lifecycle)
             else:
-                observed = self.model.observe_chunk(request, lifecycle)
+                with self._query_activation_context():
+                    observed = self.model.observe_chunk(request, lifecycle)
             observations.append(observed)
             runtime = observed.runtime_state
             bank_states = observed.bank_states
@@ -361,10 +366,11 @@ class StageAEpisodeRunner:
             rope_indexer=answer_inputs.rope_indexer,
             qwen_kwargs=answer_inputs.qwen_kwargs,
         )
-        output = self.model.prefill_answer(
-            self.model.prepare_answer(answer_request, lifecycle),
-            lifecycle,
-        )
+        with self._query_activation_context():
+            output = self.model.prefill_answer(
+                self.model.prepare_answer(answer_request, lifecycle),
+                lifecycle,
+            )
         if not isinstance(output.composed, ComposedInput):
             raise TypeError("Stage A episode Composer must return ComposedInput")
         if not isinstance(output.answer_logits, Tensor):
@@ -434,3 +440,8 @@ class StageAEpisodeRunner:
             metrics=metrics,
             failure_cases=failure_cases,
         )
+
+    def _query_activation_context(self):  # type: ignore[no-untyped-def]
+        if not self.query_activation_offload or not torch.cuda.is_available():
+            return nullcontext()
+        return torch.autograd.graph.save_on_cpu(pin_memory=True)

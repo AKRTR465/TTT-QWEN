@@ -64,6 +64,12 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     prepared_episode_max_bytes: int = Field(default=2_147_483_648, gt=0)
     support_visual_batch_size: int = Field(default=1, gt=0)
     query_encoder_reuse: bool = True
+    query_visual_mode: Literal["recent_chunk", "causal_prefix"] = "recent_chunk"
+    query_frame_sampling: Literal["llamafactory_uniform_cap"] = "llamafactory_uniform_cap"
+    query_sample_fps: float = Field(default=2.0, gt=0.0)
+    query_max_frames: int = Field(default=16, ge=2, le=256)
+    query_cache_mode: Literal["disabled", "inherit"] = "inherit"
+    query_activation_offload: bool = False
     preprocess_cache_mode: Literal["disabled", "read_write", "readonly"]
     preprocess_cache_miss_policy: Literal["decode", "error"]
     preprocess_cache_root_env: str = Field(min_length=1)
@@ -103,6 +109,12 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             and self.preprocess_cache_miss_policy != "decode"
         ):
             raise ValueError("disabled preprocess cache requires miss_policy=decode")
+        if self.query_max_frames % 2:
+            raise ValueError("query_max_frames must be even for Qwen temporal patching")
+        if self.query_visual_mode == "recent_chunk" and self.query_max_frames > 16:
+            raise ValueError("recent_chunk Query mode permits at most 16 frames")
+        if self.query_visual_mode == "causal_prefix" and self.query_max_frames != 256:
+            raise ValueError("production causal_prefix Query mode requires query_max_frames=256")
         return self
 
 
@@ -211,12 +223,16 @@ def load_training_yaml(path: str | Path) -> tuple[dict[str, object], ProductionT
         try:
             batch_size = int(visual_batch_override)
         except ValueError as error:
-            raise ValueError(
-                "TTT_SUPPORT_VISUAL_BATCH_SIZE must be a positive integer"
-            ) from error
+            raise ValueError("TTT_SUPPORT_VISUAL_BATCH_SIZE must be a positive integer") from error
         if batch_size <= 0:
             raise ValueError("TTT_SUPPORT_VISUAL_BATCH_SIZE must be a positive integer")
         extension["support_visual_batch_size"] = batch_size
+    offload_override = os.environ.get("TTT_QUERY_ACTIVATION_OFFLOAD")
+    if offload_override is not None:
+        normalized = offload_override.strip().casefold()
+        if normalized not in {"0", "1", "false", "true"}:
+            raise ValueError("TTT_QUERY_ACTIVATION_OFFLOAD must be 0/1/false/true")
+        extension["query_activation_offload"] = normalized in {"1", "true"}
     return values, ProductionTTTConfig.model_validate(extension)
 
 
@@ -372,8 +388,7 @@ def load_outer_checkpoint(
         raw = json.loads(source.read_text(encoding="utf-8"))
         weight_map = raw.get("weight_map") if isinstance(raw, dict) else None
         if not isinstance(weight_map, dict) or not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in weight_map.items()
+            isinstance(key, str) and isinstance(value, str) for key, value in weight_map.items()
         ):
             raise ValueError("sharded safetensors index requires a string weight_map")
         shard_names = set(cast(dict[str, str], weight_map).values())

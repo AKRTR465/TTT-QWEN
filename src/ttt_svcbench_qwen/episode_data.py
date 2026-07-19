@@ -365,11 +365,17 @@ def load_production_manifest_views(
     )
 
 
-def _a2_visual_length_key(record: A2QueryRecord) -> tuple[int, int, int]:
+def _a2_visual_length_key(
+    record: A2QueryRecord,
+    *,
+    query_visual_mode: str = "recent_chunk",
+    query_max_frames: int = 16,
+    query_sample_fps: float = 2.0,
+) -> tuple[int, int, int]:
     """Return a cheap deterministic proxy for visual tokens and decode work.
 
     The first component is the exact configured upper bound on causal frames at 2 FPS across
-    every Support plus the current Query chunk.  Source pixel rate and encoded bitrate then group
+    every Support plus the configured Query observation. Source pixel rate and encoded bitrate group
     videos with similar decode cost; the header probe is cached per unique file.  Missing local
     media is valid for manifest-only tests and simply uses zero tie breakers.
     """
@@ -377,14 +383,19 @@ def _a2_visual_length_key(record: A2QueryRecord) -> tuple[int, int, int]:
     _, supports = adaptive_support_schedule(record.query.runtime.query_time)
 
     def frames(start: float, end: float, maximum: int = 16) -> int:
-        desired = min(maximum, max(2, int(math.floor((end - start) * 2.0)) + 1))
+        desired = min(maximum, max(2, int(math.floor((end - start) * 2.0))))
         return max(2, desired - desired % 2)
 
     frame_budget = sum(
         frames(chunk.start_time, chunk.end_time, chunk.maximum_frames) for chunk in supports
     )
     query_end = record.query.runtime.query_time
-    frame_budget += frames(max(0.0, query_end - 8.0), query_end)
+    query_start = 0.0 if query_visual_mode == "causal_prefix" else max(0.0, query_end - 8.0)
+    query_desired = min(
+        query_max_frames,
+        max(2, int(math.floor((query_end - query_start) * query_sample_fps))),
+    )
+    frame_budget += max(2, query_desired - query_desired % 2)
     file_bytes = 0
     pixel_rate = 0
     encoded_bytes_per_second = 0
@@ -467,6 +478,9 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         seed: int = 42,
         visual_length_fn: Callable[[A2QueryRecord], int] | None = None,
         visual_cost_index: Mapping[str, VisualCostRecord] | None = None,
+        query_visual_mode: str = "recent_chunk",
+        query_max_frames: int = 16,
+        query_sample_fps: float = 2.0,
     ) -> None:
         if dataset.stage is not ManifestStage.A2 or dataset.split is not EpisodeSplit.TRAIN:
             raise ValueError("balanced A2 sampling requires the A2 train dataset")
@@ -478,6 +492,9 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         self.seed = seed
         self.epoch = 0
         self.visual_cost_index = visual_cost_index or {}
+        self.query_visual_mode = query_visual_mode
+        self.query_max_frames = query_max_frames
+        self.query_sample_fps = query_sample_fps
         self.runtime_cost_ema = EpochBoundaryCostEMA(
             {
                 record_id: record.predicted_total_seconds
@@ -530,7 +547,12 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
             ):
                 raise ValueError("A2 visual cost Support count disagrees with manifest")
             return sidecar.sort_key
-        return _a2_visual_length_key(record)
+        return _a2_visual_length_key(
+            record,
+            query_visual_mode=self.query_visual_mode,
+            query_max_frames=self.query_max_frames,
+            query_sample_fps=self.query_sample_fps,
+        )
 
     def set_epoch(self, epoch: int) -> None:
         if type(epoch) is not int or epoch < 0:
@@ -615,6 +637,9 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
         world_size: int,
         seed: int = 42,
         visual_cost_index: Mapping[str, VisualCostRecord] | None = None,
+        query_visual_mode: str = "recent_chunk",
+        query_max_frames: int = 16,
+        query_sample_fps: float = 2.0,
     ) -> None:
         if dataset.stage is not ManifestStage.A5 or dataset.split is not EpisodeSplit.TRAIN:
             raise ValueError("rank-aligned A5 sampling requires the A5 train dataset")
@@ -628,6 +653,9 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
         self.seed = seed
         self.epoch = 0
         self.visual_cost_index = visual_cost_index or {}
+        self.query_visual_mode = query_visual_mode
+        self.query_max_frames = query_max_frames
+        self.query_sample_fps = query_sample_fps
         self.runtime_cost_ema = EpochBoundaryCostEMA(
             {
                 record_id: record.predicted_total_seconds
@@ -644,15 +672,11 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
             raise ValueError("A5 visual cost index does not cover every manifest record")
         for bucket in self._buckets:
             shapes = {
-                _a5_alignment_shape(
-                    _require_a5(dataset[dataset.index_by_id[episode_id]])
-                )
+                _a5_alignment_shape(_require_a5(dataset[dataset.index_by_id[episode_id]]))
                 for episode_id in bucket.episode_ids
             }
             if len(shapes) != 1:
-                raise ValueError(
-                    "A5 manifest bucket mixes exact segment lengths or Query counts"
-                )
+                raise ValueError("A5 manifest bucket mixes exact segment lengths or Query counts")
         self._global_size = sum(len(bucket.episode_ids) for bucket in self._buckets)
 
     def set_epoch(self, epoch: int) -> None:
@@ -728,8 +752,20 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
                 sidecar.total_visual_tokens,
                 sidecar.maximum_visual_tokens,
             )
-        proxy = record.support_count + record.query_count
-        return float(proxy), proxy, record.support_count
+        support_frames = record.prewarm.maximum_frames + sum(
+            chunk.maximum_frames for chunk in record.supports
+        )
+        query_frames = tuple(
+            _query_visual_frame_budget(
+                query.runtime.query_time,
+                mode=self.query_visual_mode,
+                maximum=self.query_max_frames,
+                sample_fps=self.query_sample_fps,
+            )
+            for query in record.queries
+        )
+        proxy = support_frames + sum(query_frames)
+        return float(proxy), proxy, max(query_frames)
 
     def __len__(self) -> int:
         return self._global_size
@@ -741,6 +777,9 @@ def build_production_train_sampler(
     world_size: int,
     *,
     visual_cost_index: Mapping[str, VisualCostRecord] | None = None,
+    query_visual_mode: str = "recent_chunk",
+    query_max_frames: int = 16,
+    query_sample_fps: float = 2.0,
 ) -> Sampler[int]:
     """Shared runtime-factory hook for A2 task balance and A5 segment parity."""
 
@@ -753,6 +792,9 @@ def build_production_train_sampler(
             world_size=world_size,
             seed=dataset.manifest.seed,
             visual_cost_index=visual_cost_index,
+            query_visual_mode=query_visual_mode,
+            query_max_frames=query_max_frames,
+            query_sample_fps=query_sample_fps,
         )
     return RankAlignedA5SegmentSampler(
         dataset,
@@ -760,7 +802,24 @@ def build_production_train_sampler(
         world_size=world_size,
         seed=dataset.manifest.seed,
         visual_cost_index=visual_cost_index,
+        query_visual_mode=query_visual_mode,
+        query_max_frames=query_max_frames,
+        query_sample_fps=query_sample_fps,
     )
+
+
+def _query_visual_frame_budget(
+    query_time: float,
+    *,
+    mode: str,
+    maximum: int,
+    sample_fps: float,
+) -> int:
+    if mode not in {"recent_chunk", "causal_prefix"}:
+        raise ValueError("Query visual mode is invalid")
+    start = 0.0 if mode == "causal_prefix" else max(0.0, query_time - 8.0)
+    desired = min(maximum, max(2, int(math.floor((query_time - start) * sample_fps))))
+    return max(2, desired - desired % 2)
 
 
 def _a5_segment_lengths(record: A5EpisodeRecord) -> tuple[int, ...]:
@@ -1246,9 +1305,7 @@ def _build_segment_buckets(
         list[A5EpisodeRecord],
     ] = defaultdict(list)
     for episode in episodes:
-        grouped[(episode.split, _a5_segment_lengths(episode), episode.query_count)].append(
-            episode
-        )
+        grouped[(episode.split, _a5_segment_lengths(episode), episode.query_count)].append(episode)
     buckets: list[SegmentBucket] = []
     padding_records: list[A5EpisodeRecord] = []
     for key in sorted(grouped, key=lambda item: (item[0].value, item[1], item[2])):

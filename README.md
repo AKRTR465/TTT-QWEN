@@ -35,14 +35,18 @@ uv sync --frozen
 生产配置位于 `configs/h200/`，详细说明见 [docs/production-a2-a5.md](./docs/production-a2-a5.md)。
 
 ```bash
-bash scripts/h200/launch_qwen3vl8b_ttt_a2_full4.sh
-bash scripts/h200/launch_qwen3vl8b_ttt_a5_k8_full4.sh
+bash scripts/h200/train_fullprefix256.sh a2
+bash scripts/h200/train_fullprefix256.sh a5 /absolute/path/a2/checkpoints/final-checkpoint
 ```
 
 固定训练语义：
 
 - A2：Qwen、状态模块和 W0 全量解冻，Predictor 冻结，禁用 Inner SGD；
 - A5：从完整 A2 checkpoint 初始化，Predictor 启用，Support 不设人工上限，K=8 截断二阶；
+- Support 保持 8/16 帧动态块；每个 Query 独立读取 `[0, query_time]` 因果前缀，2 FPS、最多
+  256 帧，动态视觉 Token 数不变；
+- A5 多 Query 逐个 forward/backward，释放各自激活；所有 Query 共用同一 `W_after` 和只读
+  Bank/FSM snapshot；
 - 四卡 sampler 保持任务/segment parity，padding 样本 loss 权重为零；
 - checkpoint 保存模型、optimizer、scheduler、RNG，但排除 Wt、Bank、cache 和 FSM runtime；
 - `formal_evaluation_enabled=false`，直至独立校准和正式评估完成。
@@ -53,7 +57,9 @@ Retrieval、Time 各占固定四分之一插槽，缺失监督不重分配预算
 
 ## 在线推理
 
-`ttt-svcbench-infer` 是正式 JSON 入口，要求 `--run`、`--checkpoint`、`--model-root`、`--device`、`--dtype` 与 `--output`。Qwen generation、在线 updater、严格 safetensors checkpoint 和 per-video runtime 生命周期均由同一 bundle 组装；在真实 8B/H200 证据产生前，不宣称生产性能或科学增益。
+`ttt-svcbench-infer` 是正式 JSON 入口，要求 `--run`、`--checkpoint`、`--model-root`、`--device`、`--dtype` 与 `--output`。默认 Query 视觉模式为完整因果前缀 256 帧；可用
+`--query-visual-mode recent_chunk --query-max-frames 16` 运行兼容消融。Qwen generation、在线
+updater、严格 checkpoint 和 per-video runtime 生命周期均由同一 bundle 组装。
 
 运行时必须保证：
 
