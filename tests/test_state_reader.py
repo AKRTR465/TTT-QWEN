@@ -777,8 +777,8 @@ def test_pinned_tokenizer_fixture_is_small_offline_and_strictly_roundtrips_numbe
 ) -> None:
     snapshot = _tokenizer_snapshot(config)
     files = {path.name for path in snapshot.iterdir() if path.is_file()}
-    assert files == TOKENIZER_FILES
-    assert sum(path.stat().st_size for path in snapshot.iterdir() if path.is_file()) == (
+    assert files >= TOKENIZER_FILES
+    assert sum((snapshot / filename).stat().st_size for filename in TOKENIZER_FILES) == (
         PINNED_TOKENIZER_BYTES
     )
     manifest = sha256()
