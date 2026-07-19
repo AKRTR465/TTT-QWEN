@@ -63,7 +63,7 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     ] = "trainer_prefetch"
     prepared_episode_max_bytes: int = Field(default=2_147_483_648, gt=0)
     support_visual_batch_size: int = Field(default=1, gt=0)
-    query_encoder_reuse: bool = False
+    query_encoder_reuse: bool = True
     preprocess_cache_mode: Literal["disabled", "read_write", "readonly"]
     preprocess_cache_miss_policy: Literal["decode", "error"]
     preprocess_cache_root_env: str = Field(min_length=1)

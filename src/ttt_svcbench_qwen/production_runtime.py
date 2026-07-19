@@ -70,6 +70,7 @@ from ttt_svcbench_qwen.model import (
     RuntimeOwner,
     StateTTTModel,
     VisualStageOutput,
+    query_dropout_seed,
 )
 from ttt_svcbench_qwen.observation_heads import (
     ObservationHeads,
@@ -781,10 +782,7 @@ class ProductionQueryRuntime(nn.Module):  # type: ignore[misc]
             raise RuntimeError("Qwen embedding owner was released")
         embeddings = embed_question_tokens(cast(Any, qwen), tokens, self.query_encoder_config)
         inputs = QueryEncoderInput.from_runtime_queries(embeddings, tokens, (value,))
-        seed_bytes = hashlib.sha256(
-            f"{value.episode_nonce}:{value.query_id}".encode()
-        ).digest()[:8]
-        dropout_seed = int.from_bytes(seed_bytes, "little") % (2**63 - 1)
+        dropout_seed = query_dropout_seed(value)
         cuda_devices: list[int] = []
         if embeddings.device.type == "cuda":
             cuda_devices.append(
@@ -1847,6 +1845,7 @@ def build_runtime(
             model=state_model,
             variant=StageAVariant.A2,
             metric_builder=lambda _output, _supervision: ((), ()),
+            query_encoder_reuse=config.query_encoder_reuse,
         )
         return ProductionTrainerRuntime(
             stage=stage,
@@ -1875,6 +1874,7 @@ def build_runtime(
         predictor=predictor,
         runtime_resetter=lambda owner: _reset_meta_runtime(writer, owner),
         variant=MetaTTTVariant.A5,
+        query_encoder_reuse=config.query_encoder_reuse,
     )
     return ProductionTrainerRuntime(
         stage=stage,

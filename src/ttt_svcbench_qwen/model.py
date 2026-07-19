@@ -14,6 +14,7 @@ state rule.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
@@ -33,7 +34,7 @@ from ttt_svcbench_qwen.observation_heads import (
     E2RuntimeState,
     ObservationOutputs,
 )
-from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput
+from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput, detach_query_encoder_output
 from ttt_svcbench_qwen.state_bank import StateBankRuntimeState, StructuredStateBank
 from ttt_svcbench_qwen.state_encoder import (
     SpatialEncoderOutput,
@@ -453,6 +454,35 @@ class ModelFeatureFlags:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedQueryOutput:
+    """One explicitly scoped Query graph; never stored beyond its caller-owned episode."""
+
+    key: tuple[int, str, str]
+    value: QueryEncoderOutput
+
+    @classmethod
+    def bind(cls, query: RuntimeQueryInput, value: QueryEncoderOutput) -> PreparedQueryOutput:
+        return cls(query_reuse_key(query), value)
+
+    def validate_for(self, query: RuntimeQueryInput) -> None:
+        if self.key != query_reuse_key(query):
+            raise ValueError("prepared Query key does not match the observation request")
+
+    def detached(self) -> PreparedQueryOutput:
+        return PreparedQueryOutput(self.key, detach_query_encoder_output(self.value))
+
+
+def query_reuse_key(query: RuntimeQueryInput) -> tuple[int, str, str]:
+    return (query.episode_nonce, query.query_id, query.question)
+
+
+def query_dropout_seed(query: RuntimeQueryInput) -> int:
+    # Preserve the production dropout contract that predates Query graph reuse.
+    encoded = f"{query.episode_nonce}:{query.query_id}".encode()
+    return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "little") % (2**63 - 1)
+
+
+@dataclass(frozen=True, slots=True)
 class ObservationChunkRequest:
     owner: RuntimeOwner
     video_input: object
@@ -460,12 +490,15 @@ class ObservationChunkRequest:
     runtime_state: BatchRuntimeState
     bank_states: tuple[StateBankRuntimeState, ...]
     inference: bool = True
+    prepared_query: PreparedQueryOutput | None = None
 
     def __post_init__(self) -> None:
         if type(self.inference) is not bool:
             raise TypeError("observation inference flag must be bool")
         if self.bank_states and len(self.bank_states) != len(self.owner.video_ids):
             raise ValueError("bank_states must align to the owner batch")
+        if self.prepared_query is not None:
+            self.prepared_query.validate_for(self.query_input)
 
 
 @dataclass(frozen=True, slots=True)
@@ -946,7 +979,11 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
         visual = self.components.visual_stage(request)
         if not isinstance(visual, VisualStageOutput):
             raise TypeError("visual_stage must return VisualStageOutput")
-        query = self.components.query_encoder(request.query_input, inference=request.inference)
+        query = (
+            request.prepared_query.value
+            if request.prepared_query is not None
+            else self.components.query_encoder(request.query_input, inference=request.inference)
+        )
         adapted = visual
         if self.feature_flags.fast_enabled:
             fast_adapter = self.components.require_fast_adapter()

@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol, Self, cast
 
@@ -393,6 +393,41 @@ class QueryEncoderOutput:
     @property
     def padding_mask(self) -> Tensor:
         return self.embeddings.padding_mask
+
+
+def detach_query_encoder_output(output: QueryEncoderOutput) -> QueryEncoderOutput:
+    """Return a typed detached view without copying Query metadata or Tensor storage."""
+
+    return replace(
+        output,
+        embeddings=replace(
+            output.embeddings,
+            token_states=output.embeddings.token_states.detach(),
+            pooling_weights=output.embeddings.pooling_weights.detach(),
+            q_target=output.embeddings.q_target.detach(),
+            q_operator=output.embeddings.q_operator.detach(),
+            q_time=output.embeddings.q_time.detach(),
+            padding_mask=output.embeddings.padding_mask.detach(),
+        ),
+        route=replace(
+            output.route,
+            logits=output.route.logits.detach(),
+            confidence=output.route.confidence.detach(),
+            raw_indices=output.route.raw_indices.detach(),
+        ),
+        time=replace(
+            output.time,
+            logits=replace(
+                output.time.logits,
+                mode_logits=output.time.logits.mode_logits.detach(),
+                mode_confidence=output.time.logits.mode_confidence.detach(),
+                mode_indices=output.time.logits.mode_indices.detach(),
+                span_start_logits=output.time.logits.span_start_logits.detach(),
+                span_end_logits=output.time.logits.span_end_logits.detach(),
+                padding_mask=output.time.logits.padding_mask.detach(),
+            ),
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)

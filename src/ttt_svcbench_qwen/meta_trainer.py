@@ -68,9 +68,12 @@ from ttt_svcbench_qwen.model import (
     ObservationChunkRequest,
     OnlineOverlapSnapshot,
     PrefillLifecycle,
+    PreparedQueryOutput,
     RuntimeOwner,
     StateTTTModel,
     StateTTTModelOutput,
+    query_dropout_seed,
+    query_reuse_key,
 )
 from ttt_svcbench_qwen.observation_heads import ObservationOutputs
 from ttt_svcbench_qwen.outer_loss_balance import (
@@ -1061,6 +1064,7 @@ class MetaTTTEpisodeRunner:
         variant: MetaTTTVariant,
         ttt_input_builder: CausalOverlapTTTInputBuilder | None = None,
         query_loss_builder: MetaQueryLossBuilder | None = None,
+        query_encoder_reuse: bool = False,
     ) -> None:
         if not isinstance(config, ProjectConfig):
             raise TypeError("Meta-TTT runner requires validated ProjectConfig")
@@ -1077,6 +1081,9 @@ class MetaTTTEpisodeRunner:
         self.enabled_terms = enabled_terms_for(config, variant)
         self.ttt_input_builder = ttt_input_builder or CausalOverlapTTTInputBuilder(config)
         self.query_loss_builder = query_loss_builder or StageAQueryLossBuilder()
+        if type(query_encoder_reuse) is not bool:
+            raise TypeError("query_encoder_reuse must be bool")
+        self.query_encoder_reuse = query_encoder_reuse
         self.outer_composer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
         if config.fast_ttt.optimizer.meta_gradient_mode != "full_second_order":
@@ -1308,13 +1315,19 @@ class MetaTTTEpisodeRunner:
         )
         del prewarm_observation
 
+        segment_query: PreparedQueryOutput | None = None
         for support_index, chunk in enumerate(episode.support_chunks):
+            if self.query_encoder_reuse and support_index % horizon == 0:
+                segment_query = self._prepare_query(chunk, adapted, with_grad=True)
+            elif segment_query is not None:
+                segment_query.validate_for(chunk.request.query_input)
             observation, fast_audit = self._observe(
                 chunk,
                 adapted,
                 lifecycle,
                 seed=episode.seed + support_index + 1,
                 with_grad=True,
+                prepared_query=segment_query,
             )
             adapted.runtime = _runtime_from_observation(observation, episode.owner)
             built = self.ttt_input_builder(
@@ -1381,6 +1394,7 @@ class MetaTTTEpisodeRunner:
                     )
                 )
                 segment_outputs.clear()
+                segment_query = None
                 del segment_loss, results, ttt_output, built, observation
 
         if not segment_outputs or support_total_detached is None:
@@ -1388,14 +1402,27 @@ class MetaTTTEpisodeRunner:
 
         query_objectives: list[MetaQueryObjective] = []
         query_audits: list[TruncatedQueryPointAudit] = []
+        prepared_queries: dict[tuple[int, str, str], PreparedQueryOutput] = {}
         for query_index, query in enumerate(episode.query_points):
             query_lifecycle = PrefillLifecycle(episode.owner)
+            prepared_query: PreparedQueryOutput | None = None
+            if self.query_encoder_reuse:
+                key = query_reuse_key(query.chunk.request.query_input)
+                prepared_query = prepared_queries.get(key)
+                if prepared_query is None:
+                    prepared_query = self._prepare_query(
+                        query.chunk,
+                        adapted,
+                        with_grad=True,
+                    )
+                    prepared_queries[key] = prepared_query
             observation, _ = self._observe(
                 query.chunk,
                 adapted,
                 query_lifecycle,
                 seed=episode.seed + 10_000 + query_index,
                 with_grad=True,
+                prepared_query=prepared_query,
             )
             adapted.runtime = _runtime_from_observation(observation, episode.owner)
             observation_versions = _tensor_version_signature(observation)
@@ -1572,11 +1599,13 @@ class MetaTTTEpisodeRunner:
         *,
         seed: int,
         with_grad: bool,
+        prepared_query: PreparedQueryOutput | None = None,
     ) -> tuple[ObservationChunkOutput, FastTTTForwardAudit]:
         request = replace(
             chunk.request,
             runtime_state=trajectory.runtime,
             bank_states=trajectory.runtime.bank_states,
+            prepared_query=prepared_query,
         )
         with (
             _seeded_rng(seed, trajectory.fast_states),
@@ -1591,6 +1620,26 @@ class MetaTTTEpisodeRunner:
         if audit.fast_versions != expected:
             raise ValueError("Fast Adapter audit version disagrees with the bound trajectory")
         return output, audit
+
+    def _prepare_query(
+        self,
+        chunk: MetaCausalChunk,
+        trajectory: _Trajectory,
+        *,
+        with_grad: bool,
+    ) -> PreparedQueryOutput:
+        query_input = chunk.request.query_input
+        if query_reuse_key(query_input) != query_reuse_key(chunk.query_input):
+            raise ValueError("Meta-TTT chunk Query metadata drifted before reuse")
+        with (
+            _seeded_rng(query_dropout_seed(query_input), trajectory.fast_states),
+            torch.set_grad_enabled(with_grad),
+        ):
+            output = self.model.components.query_encoder(
+                query_input,
+                inference=chunk.request.inference,
+            )
+        return PreparedQueryOutput.bind(query_input, output)
 
     def _answer(
         self,

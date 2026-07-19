@@ -201,9 +201,14 @@ class _VisualStage(nn.Module):
 
 
 class _QueryStage(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
     def forward(self, query_input: object, *, inference: bool) -> object:
         if inference or not isinstance(query_input, RuntimeQueryInput):
             raise ValueError("tiny query stage requires a training RuntimeQueryInput")
+        self.calls += 1
         return SimpleNamespace(q_target=torch.zeros((1, 512)))
 
 
@@ -567,6 +572,7 @@ def _system(
     variant: MetaTTTVariant,
     *,
     query_loss_builder: MetaQueryLossBuilder | None = None,
+    query_encoder_reuse: bool = False,
 ) -> tuple[MetaTTTEpisodeRunner, _TinyFastController, _TinyPredictor, _RuntimeResetter]:
     fast = _TinyFastController()
     predictor = _TinyPredictor()
@@ -605,6 +611,7 @@ def _system(
         runtime_resetter=resetter,
         variant=variant,
         query_loss_builder=query_loss_builder or _TinyQueryLossBuilder(),
+        query_encoder_reuse=query_encoder_reuse,
     )
     return runner, fast, predictor, resetter
 
@@ -683,6 +690,34 @@ def _truncated_episode(
         for index, query in enumerate(base.query_points)
     )
     return replace(base, prewarm_chunk=prewarm, support_chunks=supports, query_points=queries)
+
+
+def _with_shared_query_key(episode: MetaTTTEpisode) -> MetaTTTEpisode:
+    if episode.prewarm_chunk is None:
+        raise ValueError("shared Query helper requires a truncated episode")
+    reference = episode.support_chunks[0].query_input
+    shared = replace(
+        reference,
+        query_id="shared-query",
+        question="shared question",
+        episode_nonce=17,
+    )
+
+    def bind(chunk: MetaCausalChunk) -> MetaCausalChunk:
+        return replace(
+            chunk,
+            request=replace(chunk.request, query_input=shared),
+            query_input=shared,
+        )
+
+    return replace(
+        episode,
+        prewarm_chunk=bind(episode.prewarm_chunk),
+        support_chunks=tuple(bind(chunk) for chunk in episode.support_chunks),
+        query_points=tuple(
+            replace(query, chunk=bind(query.chunk)) for query in episode.query_points
+        ),
+    )
 
 
 def _chunk(
@@ -968,6 +1003,48 @@ def test_truncated_a5_instant_equal_composes_all_queries_once(
         query.metrics.value("loss/aux_to_answer_ratio") is not None
         for query in output.audit.queries
     )
+
+
+def test_truncated_a5_reuses_one_query_graph_per_segment_and_final_key(
+    config: ProjectConfig,
+) -> None:
+    serial, serial_fast, _, _ = _system(config, MetaTTTVariant.A5)
+    reused, reused_fast, _, _ = _system(
+        config,
+        MetaTTTVariant.A5,
+        query_encoder_reuse=True,
+    )
+    episode = _with_shared_query_key(_truncated_episode(config, support_count=17))
+
+    serial_output = serial.run_truncated(episode)
+    reused_output = reused.run_truncated(episode)
+
+    serial_query = serial.model.components.query_encoder
+    reused_query = reused.model.components.query_encoder
+    assert isinstance(serial_query, _QueryStage)
+    assert isinstance(reused_query, _QueryStage)
+    assert serial_query.calls == 20  # prewarm + 17 Supports + 2 final Queries
+    assert reused_query.calls == 5  # prewarm + three K segments + one final key
+    assert torch.equal(serial_output.total, reused_output.total)
+    assert torch.equal(serial_output.query_loss, reused_output.query_loss)
+    assert torch.equal(serial_fast.w0_1.grad, reused_fast.w0_1.grad)
+    assert torch.equal(serial_fast.w0_2.grad, reused_fast.w0_2.grad)
+
+
+def test_truncated_a5_does_not_reuse_different_final_query_ids(
+    config: ProjectConfig,
+) -> None:
+    runner, _, _, _ = _system(
+        config,
+        MetaTTTVariant.A5,
+        query_encoder_reuse=True,
+    )
+    episode = _truncated_episode(config, support_count=1, query_count=2)
+    runner.run_truncated(episode)
+
+    query = runner.model.components.query_encoder
+    assert isinstance(query, _QueryStage)
+    assert query.calls == 4  # prewarm + one segment + two distinct final keys
 
 
 def test_eight_support_graph_is_released_and_does_not_grow(config: ProjectConfig) -> None:

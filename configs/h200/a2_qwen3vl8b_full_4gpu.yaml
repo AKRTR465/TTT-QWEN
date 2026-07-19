@@ -66,7 +66,7 @@ ttt_qwen:
   support_materialization: dataloader_episode
   prepared_episode_max_bytes: 2147483648
   support_visual_batch_size: 1
-  query_encoder_reuse: false
+  query_encoder_reuse: true
   preprocess_cache_mode: readonly
   preprocess_cache_miss_policy: error
   preprocess_cache_root_env: TTT_PREPROCESS_CACHE_ROOT

@@ -22,6 +22,7 @@ from ttt_svcbench_qwen.model import (
     ObservationChunkOutput,
     ObservationChunkRequest,
     PrefillLifecycle,
+    PreparedQueryOutput,
     RuntimeOwner,
     StateTTTModel,
     StateTTTModelOutput,
@@ -265,10 +266,14 @@ class StageAEpisodeRunner:
         model: StateTTTModel,
         variant: StageAVariant,
         metric_builder: StageAEpisodeMetricBuilder,
+        query_encoder_reuse: bool = False,
     ) -> None:
         self.model = model
         self.variant = variant
         self.metric_builder = metric_builder
+        if type(query_encoder_reuse) is not bool:
+            raise TypeError("query_encoder_reuse must be bool")
+        self.query_encoder_reuse = query_encoder_reuse
 
     def __call__(
         self,
@@ -294,9 +299,28 @@ class StageAEpisodeRunner:
         runtime = initial
         bank_states = initial.state_bank_states
         bank_write_count = fsm_rollout_count = cache_advance_count = 0
+        prepared_query: PreparedQueryOutput | None = None
+        detached_query: PreparedQueryOutput | None = None
+        if self.variant is StageAVariant.A2 and self.query_encoder_reuse:
+            final_request = episode.observation_requests[-1]
+            prepared_query = PreparedQueryOutput.bind(
+                final_request.query_input,
+                self.model.components.query_encoder(
+                    final_request.query_input,
+                    inference=final_request.inference,
+                ),
+            )
+            detached_query = prepared_query.detached()
         for chunk_index, template in enumerate(episode.observation_requests):
-            request = replace(template, runtime_state=runtime, bank_states=bank_states)
             is_current_query_chunk = chunk_index + 1 == len(episode.observation_requests)
+            request = replace(
+                template,
+                runtime_state=runtime,
+                bank_states=bank_states,
+                prepared_query=(
+                    prepared_query if is_current_query_chunk else detached_query
+                ),
+            )
             if self.variant is StageAVariant.A2 and not is_current_query_chunk:
                 # A2's loss is defined on the current Query chunk.  Earlier Support chunks
                 # only causally commit detached Bank/FSM/temporal state, so retaining their
