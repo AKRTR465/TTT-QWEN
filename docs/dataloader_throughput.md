@@ -7,6 +7,16 @@ The production path requires the current Qwen3-VL processor interface (`video_pr
 tokenizer, and chat template); older processor/collator compatibility paths are intentionally not
 supported.
 
+## Full-prefix A2 path
+
+The formal 256-frame A2 profile keeps `query_cache_mode: disabled`. Query target times still
+come from the LLaMA-Factory uniform sampler, but `grouped_seek` opens the container once and uses
+at most 16 forward decode groups; non-seekable media falls back to one sequential scan. Workers
+release raw RGB after Qwen processing and return a compact payload containing timestamps, tubelet
+metadata, patches/grid, labels, and preparation telemetry. A2 consumes the GA=4 sequence lazily,
+so each microbatch is fetched immediately before its forward/backward; the optimizer boundary is
+unchanged. A5 continues to use the upstream Trainer path.
+
 ## Launch settings
 
 The H200 A2/A5 profiles use two persistent workers, prefetch factor two, pinned memory, and
@@ -37,7 +47,16 @@ Formal training keeps tracing `off`; resolving CUDA events happens only when the
 
 ## Cost sidecar
 
-`scripts/build_visual_cost_index.py` writes an advisory `visual_cost_index.json`.  Set
-`ttt_qwen.visual_cost_index` to that file to let the A2 sampler use its exact/estimated visual
-cost before falling back to the existing deterministic header proxy.  Task/support buckets,
-seed, rank alignment, and episode ownership are unchanged.
+`scripts/build_visual_cost_index.py` writes strict schema-3 metadata only; it never stores Query
+frames, patches, features, or visual-token tensors. Formal full-prefix A2 requires a runtime-trace
+derived index through `VISUAL_COST_INDEX`; schema-2, missing, estimated-only, or fingerprint-mismatched
+records fail closed. For an explicit calibration smoke run, set `TTT_VISUAL_COST_PREFLIGHT=1` and
+`TTT_SMOKE_MAX_STEPS`; then rebuild the index from the emitted trace before formal training.
+Task/support buckets, rank alignment, and epoch-boundary rank-0 EMA broadcast remain unchanged.
+
+Use `scripts/select_dataloader_profile.py` to choose between 2 workers/prefetch 2 and 4/1 from
+measured trials. Use `scripts/select_visual_batch_size.py` for Support visual batches 1, 2, 4, 8;
+it enforces no OOM, at least 12 GiB free memory, state/loss parity, and at least 5% adjacent P50
+improvement. The checked-in batch remains 1 until a four-H200 run selects a larger value. The GPU
+utilization, GA-wait, step-time, and memory targets are therefore hardware acceptance gates, not
+claims established by local tests.
