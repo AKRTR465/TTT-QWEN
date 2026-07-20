@@ -233,6 +233,8 @@ class QueryObservationSpec:
     history_chunk_ids: tuple[str, ...] = ()
     sampling_fps: float = 2.0
     sampling_policy: str = "llamafactory_uniform_cap"
+    decode_strategy: str = "legacy_seek"
+    decode_max_groups: int = 16
 
     def __post_init__(self) -> None:
         if not self.chunk_id or not self.video_path.is_file():
@@ -252,6 +254,10 @@ class QueryObservationSpec:
             raise ValueError("Query sampling_fps must be finite and positive")
         if self.sampling_policy != "llamafactory_uniform_cap":
             raise ValueError("unsupported Query frame sampling policy")
+        if self.decode_strategy not in {"legacy_seek", "grouped_seek"}:
+            raise ValueError("unsupported Query decode strategy")
+        if self.decode_max_groups < 1 or self.decode_max_groups > 16:
+            raise ValueError("Query decode_max_groups must be within [1, 16]")
         if self.history_chunk_ids:
             raise ValueError("a Query observation cannot carry historical feature sets")
 
@@ -2545,6 +2551,8 @@ def _query_chunk_spec(
         reset_soft_state=reset_soft_state,
         sampling_fps=config.query_sample_fps,
         sampling_policy=config.query_frame_sampling,
+        decode_strategy=config.query_decode_strategy,
+        decode_max_groups=config.query_decode_max_groups,
     )
 
 
@@ -2591,6 +2599,8 @@ def _prepare_answer_cpu(
             "query_decode",
             query_id=query.runtime.query_id,
             frame_count=len(frames),
+            strategy=spec.decode_strategy,
+            max_groups=spec.decode_max_groups,
             seconds=time.perf_counter() - decode_started,
         )
         frames = _resize_to_pixel_budget(
@@ -2985,6 +2995,15 @@ def _decode_uniform_interval(
     # still bounded by the current chunk's dynamic frame cap.
     if spec.end_time - spec.start_time <= 16.0 + 1.0e-6:
         frames, timestamps = _decode_targets_streaming(spec, target_times)
+    elif isinstance(spec, QueryObservationSpec) and spec.decode_strategy == "grouped_seek":
+        try:
+            frames, timestamps = _decode_query_targets_grouped(
+                spec,
+                target_times,
+                max_groups=spec.decode_max_groups,
+            )
+        except _TargetSeekUnavailable:
+            frames, timestamps = _decode_targets_streaming(spec, target_times)
     else:
         try:
             frames, timestamps = _decode_targets_with_seek(spec, target_times)
@@ -3196,6 +3215,143 @@ def _finalize_decoded_frames(
 
 class _TargetSeekUnavailable(RuntimeError):
     """Signal that a media container cannot service timestamp-targeted decoding."""
+
+
+def _decode_query_targets_grouped(
+    spec: QueryObservationSpec,
+    target_times: Sequence[float],
+    *,
+    max_groups: int,
+) -> tuple[list[Tensor], list[float]]:
+    """Decode a Query with at most ``max_groups`` backward keyframe seeks.
+
+    Groups contain contiguous target timestamps. Within each group a single forward scan applies
+    the same nearest-frame rule as the legacy per-target decoder: compare the closest frame before
+    and after the target, prefer the earlier frame on a tie, and never reuse a timestamp selected
+    by an earlier target. Only selected frames are converted to RGB.
+    """
+
+    if max_groups < 1 or max_groups > 16:
+        raise ValueError("grouped Query decoding requires max_groups within [1, 16]")
+    groups = _balanced_target_groups(target_times, max_groups=max_groups)
+    if not groups:
+        return [], []
+    started = time.perf_counter()
+    frames: list[Tensor] = []
+    timestamps: list[float] = []
+    seek_count = 0
+    try:
+        with av.open(str(spec.video_path)) as container:
+            stream = container.streams.video[0]
+            if stream.time_base is None:
+                raise _TargetSeekUnavailable("video stream exposes no seek time base")
+            time_base = float(stream.time_base)
+            if not math.isfinite(time_base) or time_base <= 0.0:
+                raise _TargetSeekUnavailable("video stream exposes an invalid seek time base")
+            minimum_timestamp: float | None = None
+            for group in groups:
+                offset = int(max(0.0, group[0] - 1.0e-6) / time_base)
+                container.seek(offset, stream=stream, backward=True, any_frame=False)
+                seek_count += 1
+                selected = _decode_nearest_target_group(
+                    container,
+                    stream,
+                    targets=group,
+                    start_time=spec.start_time,
+                    end_time=spec.end_time,
+                    minimum_timestamp=minimum_timestamp,
+                )
+                for frame, timestamp in selected:
+                    frames.append(_rgb_frame_tensor(frame))
+                    timestamps.append(timestamp)
+                    minimum_timestamp = timestamp
+    except _TargetSeekUnavailable:
+        raise
+    except (OSError, ValueError, TypeError, IndexError, av.error.FFmpegError) as error:
+        raise _TargetSeekUnavailable(str(error)) from error
+    _loader_trace(
+        "query_decode_grouped",
+        target_count=len(target_times),
+        group_count=len(groups),
+        seek_count=seek_count,
+        seconds=time.perf_counter() - started,
+    )
+    return frames, timestamps
+
+
+def _balanced_target_groups(
+    target_times: Sequence[float], *, max_groups: int
+) -> tuple[tuple[float, ...], ...]:
+    if max_groups <= 0:
+        raise ValueError("target group count must be positive")
+    targets = tuple(float(value) for value in target_times)
+    if not targets:
+        return ()
+    group_count = min(max_groups, len(targets))
+    base_size, extra = divmod(len(targets), group_count)
+    groups: list[tuple[float, ...]] = []
+    start = 0
+    for group_index in range(group_count):
+        size = base_size + int(group_index < extra)
+        groups.append(targets[start : start + size])
+        start += size
+    return tuple(groups)
+
+
+def _decode_nearest_target_group(
+    container: Any,
+    stream: Any,
+    *,
+    targets: Sequence[float],
+    start_time: float,
+    end_time: float,
+    minimum_timestamp: float | None,
+) -> list[tuple[Any, float]]:
+    selected: list[tuple[Any, float]] = []
+    target_index = 0
+    before: tuple[Any, float] | None = None
+    decoded = container.decode(stream)
+    try:
+        for frame in decoded:
+            timestamp = _av_timestamp(frame)
+            if timestamp < start_time - 1.0e-9:
+                continue
+            if timestamp > end_time + 1.0e-9:
+                break
+            if minimum_timestamp is not None and timestamp <= minimum_timestamp + 1.0e-9:
+                continue
+            current = (frame, timestamp)
+            while target_index < len(targets):
+                target = targets[target_index]
+                if timestamp < target - 1.0e-9:
+                    before = current
+                    break
+                candidates = (current,) if before is None else (before, current)
+                candidate = min(
+                    candidates,
+                    key=lambda item: (abs(item[1] - target), item[1]),
+                )
+                selected.append(candidate)
+                minimum_timestamp = candidate[1]
+                target_index += 1
+                if timestamp > candidate[1] + 1.0e-9:
+                    before = current
+                    continue
+                before = None
+                break
+            if target_index >= len(targets):
+                break
+    finally:
+        close = getattr(decoded, "close", None)
+        if callable(close):
+            close()
+    if (
+        target_index < len(targets)
+        and before is not None
+        and (minimum_timestamp is None or before[1] > minimum_timestamp + 1.0e-9)
+    ):
+        selected.append(before)
+    return selected
 
 
 def _decode_targets_with_seek(

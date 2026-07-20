@@ -68,6 +68,8 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     query_frame_sampling: Literal["llamafactory_uniform_cap"] = "llamafactory_uniform_cap"
     query_sample_fps: float = Field(default=2.0, gt=0.0)
     query_max_frames: int = Field(default=16, ge=2, le=256)
+    query_decode_strategy: Literal["legacy_seek", "grouped_seek"] = "legacy_seek"
+    query_decode_max_groups: int = Field(default=16, ge=1, le=16)
     query_cache_mode: Literal["disabled", "inherit"] = "inherit"
     query_activation_offload: bool = False
     preprocess_cache_mode: Literal["disabled", "read_write", "readonly"]

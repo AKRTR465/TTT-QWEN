@@ -70,6 +70,8 @@ ttt_qwen:
   query_frame_sampling: llamafactory_uniform_cap
   query_sample_fps: 2.0
   query_max_frames: 256
+  query_decode_strategy: grouped_seek
+  query_decode_max_groups: 16
   query_cache_mode: disabled
   query_activation_offload: false
   preprocess_cache_mode: readonly

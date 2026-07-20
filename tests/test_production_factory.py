@@ -37,9 +37,12 @@ from ttt_svcbench_qwen.production_runtime import (
     CurrentChunkSpec,
     ProductionOuterModel,
     QueryObservationSpec,
+    _decode_query_targets_grouped,
+    _decode_targets_with_seek,
     _decode_uniform_interval,
     _llamafactory_uniform_frame_indices,
     _resize_to_pixel_budget,
+    _TargetSeekUnavailable,
     _uniform_target_times,
     _video_pixel_bounds,
 )
@@ -133,6 +136,8 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
         "query_frame_sampling",
         "query_sample_fps",
         "query_max_frames",
+        "query_decode_strategy",
+        "query_decode_max_groups",
         "query_cache_mode",
         "query_activation_offload",
         "preprocess_cache_mode",
@@ -168,6 +173,8 @@ def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
     assert native["save_total_limit"] == 1
     assert extension.query_visual_mode == "causal_prefix"
     assert extension.query_max_frames == 256
+    assert extension.query_decode_strategy == "grouped_seek"
+    assert extension.query_decode_max_groups == 16
     assert extension.query_cache_mode == "disabled"
 
 
@@ -341,6 +348,129 @@ def test_query_uniform_indices_match_llamafactory_523f801_reference() -> None:
     reference = tuple(int(value) for value in np.linspace(0, 1_988, 256).astype(np.int32).tolist())
     assert indices == reference
     assert len(indices) == 256
+
+
+def test_grouped_query_decode_matches_legacy_frames_with_at_most_sixteen_seeks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "long-query.mp4"
+    path.touch()
+    fps = 12
+    total_frames = 664 * fps
+    counters = {"seeks": 0}
+
+    class _Frame:
+        def __init__(self, index: int) -> None:
+            self.index = index
+            self.time = index / fps
+
+        def to_ndarray(self, *, format: str) -> np.ndarray:
+            assert format == "rgb24"
+            value = np.zeros((2, 2, 3), dtype=np.uint8)
+            value[0, 0] = (self.index & 255, (self.index >> 8) & 255, 0)
+            return value
+
+    stream = SimpleNamespace(time_base=Fraction(1, fps))
+
+    class _Container:
+        def __init__(self) -> None:
+            self.streams = SimpleNamespace(video=[stream])
+            self.cursor = 0
+
+        def __enter__(self) -> _Container:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def seek(self, offset: int, **_kwargs: object) -> None:
+            counters["seeks"] += 1
+            self.cursor = max(0, offset - offset % fps)
+
+        def decode(self, _stream: object) -> Iterator[_Frame]:
+            for index in range(self.cursor, total_frames):
+                yield _Frame(index)
+
+    monkeypatch.setattr("ttt_svcbench_qwen.production_runtime.av.open", lambda _path: _Container())
+    query = QueryObservationSpec(
+        chunk_id="query",
+        video_path=path,
+        start_time=0.0,
+        end_time=663.0,
+        maximum_frames=256,
+        query_time=663.0,
+        sampling_fps=2.0,
+        decode_strategy="grouped_seek",
+        decode_max_groups=16,
+    )
+    targets = _uniform_target_times(query, query.sampling_fps)
+
+    legacy_frames, legacy_timestamps = _decode_targets_with_seek(query, targets)
+    legacy_seek_count = counters["seeks"]
+    counters["seeks"] = 0
+    grouped_frames, grouped_timestamps = _decode_query_targets_grouped(
+        query, targets, max_groups=16
+    )
+
+    assert legacy_seek_count == 256
+    assert counters["seeks"] == 16
+    assert grouped_timestamps == legacy_timestamps
+    assert len(grouped_frames) == len(legacy_frames) == 256
+    assert all(
+        torch.equal(grouped, legacy)
+        for grouped, legacy in zip(grouped_frames, legacy_frames, strict=True)
+    )
+
+
+def test_grouped_query_decode_falls_back_to_one_streaming_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "nonseekable.mp4"
+    path.touch()
+    query = QueryObservationSpec(
+        "query",
+        path,
+        0.0,
+        32.0,
+        64,
+        32.0,
+        decode_strategy="grouped_seek",
+    )
+    calls: list[str] = []
+    targets = [float(index) * 32.0 / 63.0 for index in range(64)]
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.production_runtime._llamafactory_query_target_times",
+        lambda _spec, _fps: targets,
+    )
+
+    def unavailable(*_args: object, **_kwargs: object) -> tuple[list[torch.Tensor], list[float]]:
+        calls.append("grouped")
+        raise _TargetSeekUnavailable("no timestamp index")
+
+    def streaming(
+        _spec: object, values: list[float]
+    ) -> tuple[list[torch.Tensor], list[float]]:
+        calls.append("streaming")
+        return [torch.zeros((3, 2, 2), dtype=torch.uint8) for _ in values], values
+
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.production_runtime._decode_query_targets_grouped", unavailable
+    )
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.production_runtime._decode_targets_streaming", streaming
+    )
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.production_runtime._decode_targets_with_seek",
+        lambda *_args, **_kwargs: pytest.fail("legacy per-target seek must not run"),
+    )
+
+    frames, timestamps = _decode_uniform_interval(query, query.sampling_fps)
+
+    assert calls == ["grouped", "streaming"]
+    assert frames.shape[0] == 64
+    assert timestamps.shape == (64,)
 
 
 def test_short_interval_decoder_streams_once_instead_of_seeking_every_target(
