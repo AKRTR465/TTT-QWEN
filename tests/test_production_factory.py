@@ -169,6 +169,10 @@ def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
     assert native["video_maxlen"] == 256
     assert native["cutoff_len"] == 16_384
     assert native["deepspeed"] == "configs/h200/deepspeed_zero1_dynamic_graph.json"
+    assert native["per_device_train_batch_size"] == 1
+    assert native["gradient_accumulation_steps"] == 4
+    assert native["dataloader_num_workers"] == 2
+    assert native["dataloader_prefetch_factor"] == 2
     assert native["save_strategy"] == "epoch"
     assert native["save_total_limit"] == 1
     assert extension.query_visual_mode == "causal_prefix"
@@ -178,7 +182,7 @@ def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
     assert extension.query_cache_mode == "disabled"
 
 
-def test_a2_eager_ga_fetch_records_each_wait_and_group(
+def test_a2_lazy_ga_fetch_pulls_each_microbatch_only_when_consumed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[tuple[str, dict[str, object]]] = []
@@ -187,14 +191,26 @@ def test_a2_eager_ga_fetch_records_each_wait_and_group(
         lambda event, **fields: events.append((event, fields)),
     )
     owner = SimpleNamespace(ttt_runtime=SimpleNamespace(stage=ProductionStage.A2))
-    source = iter({"prepared_a2": index} for index in range(4))
+    pulled: list[int] = []
+
+    def source():
+        for index in range(4):
+            pulled.append(index)
+            yield {"prepared_a2": index}
 
     batches, num_items = TTTQwenTrainerMixin.get_batch_samples(
-        owner, source, 4, torch.device("cpu")
+        owner, iter(source()), 4, torch.device("cpu")
     )
 
-    assert batches == [{"prepared_a2": index} for index in range(4)]
     assert num_items is None
+    assert len(batches) == 4
+    assert pulled == []
+    iterator = iter(batches)
+    assert next(iterator) == {"prepared_a2": 0}
+    assert pulled == [0]
+    assert [name for name, _ in events] == ["a2_ga_microbatch_fetch"]
+    assert list(iterator) == [{"prepared_a2": index} for index in range(1, 4)]
+    assert pulled == [0, 1, 2, 3]
     assert [name for name, _ in events] == [
         "a2_ga_microbatch_fetch",
         "a2_ga_microbatch_fetch",
@@ -203,6 +219,20 @@ def test_a2_eager_ga_fetch_records_each_wait_and_group(
         "a2_ga_group_fetch",
     ]
     assert events[-1][1]["fetched_batches"] == 4
+
+
+def test_a2_lazy_ga_fails_closed_on_transformers_version_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.llamafactory_trainer.transformers.__version__", "4.58.0"
+    )
+    owner = SimpleNamespace(ttt_runtime=SimpleNamespace(stage=ProductionStage.A2))
+
+    with pytest.raises(RuntimeError, match="pinned to Transformers 4.57.1"):
+        TTTQwenTrainerMixin.get_batch_samples(
+            owner, iter(({"prepared_a2": 0},)), 1, torch.device("cpu")
+        )
 
 
 def test_a2_uses_dynamic_graph_safe_zero1_profile() -> None:

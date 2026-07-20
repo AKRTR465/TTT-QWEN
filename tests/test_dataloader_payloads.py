@@ -8,8 +8,11 @@ import pytest
 import torch
 
 from ttt_svcbench_qwen.production_runtime import (
+    CurrentChunkMaterialization,
     CurrentChunkSpec,
+    PreparedVisualCPU,
     VideoChunkMaterializer,
+    _compact_materialized_chunk,
     _decode_coalesced_intervals,
     _decode_uniform_interval,
 )
@@ -29,6 +32,29 @@ def _specs(tmp_path: Path, count: int = 4) -> tuple[CurrentChunkSpec, ...]:
         )
         for index in range(count)
     )
+
+
+def test_compact_worker_payload_drops_raw_rgb_frames(tmp_path: Path) -> None:
+    spec = _specs(tmp_path, 1)[0]
+    materialized = CurrentChunkMaterialization(
+        spec=spec,
+        frames=torch.zeros((2, 3, 64, 64), dtype=torch.uint8),
+        frame_timestamps=torch.tensor([0.0, 0.5], dtype=torch.float64),
+        tubelet_timestamps=torch.tensor([[0.5]], dtype=torch.float64),
+        tubelet_valid_mask=torch.ones((1, 1), dtype=torch.bool),
+        tubelet_position_ids=torch.zeros((1, 1), dtype=torch.int64),
+        pixel_values_videos=torch.zeros((16, 1536), dtype=torch.float32),
+        video_grid_thw=torch.tensor([[1, 4, 4]], dtype=torch.int64),
+    )
+
+    compact = _compact_materialized_chunk(materialized)
+
+    assert isinstance(compact, PreparedVisualCPU)
+    assert not hasattr(compact, "frames")
+    assert compact.frame_count == 2
+    assert compact.patch_count == 16
+    assert torch.equal(compact.pixel_values_videos, materialized.pixel_values_videos)
+    assert torch.equal(compact.video_grid_thw, materialized.video_grid_thw)
 
 
 def test_bounded_prefetch_preserves_order_and_depth(tmp_path: Path) -> None:

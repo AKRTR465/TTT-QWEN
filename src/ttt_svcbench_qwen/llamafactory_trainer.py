@@ -14,11 +14,11 @@ import os
 import shutil
 import sys
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, cast, overload
 
 # ``python -m`` executes this file as ``__main__``.  The dynamically loaded production runtime
 # imports the canonical package name, so register the running module under that name before the
@@ -207,6 +207,67 @@ class ProductionTrainerRuntime:
                 raise ValueError("A5 runtime cannot expose the A2 loss hook")
 
 
+class _LazyGradientAccumulationGroup(Sequence[object]):
+    """Pull one A2 microbatch only when the pinned Trainer loop is ready to execute it."""
+
+    def __init__(self, iterator: Iterator[object], expected_count: int) -> None:
+        if expected_count <= 0:
+            raise ValueError("lazy GA group requires a positive batch count")
+        self.iterator = iterator
+        self.expected_count = expected_count
+        self._cache: list[object] = []
+        self._started = time.perf_counter()
+
+    def __len__(self) -> int:
+        return self.expected_count
+
+    @overload
+    def __getitem__(self, index: int) -> object: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[object]: ...
+
+    def __getitem__(self, index: int | slice) -> object | list[object]:
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(self.expected_count))]
+        normalized = index + self.expected_count if index < 0 else index
+        if normalized < 0 or normalized >= self.expected_count:
+            raise IndexError(index)
+        while len(self._cache) <= normalized:
+            self._pull_next()
+        return self._cache[normalized]
+
+    def __iter__(self) -> Iterator[object]:
+        for index in range(self.expected_count):
+            yield self[index]
+
+    def _pull_next(self) -> None:
+        microbatch_index = len(self._cache)
+        wait_started = time.perf_counter()
+        try:
+            batch = next(self.iterator)
+        except StopIteration as error:
+            raise RuntimeError(
+                "A2 DataLoader ended before the declared gradient-accumulation group"
+            ) from error
+        self._cache.append(batch)
+        trace_event(
+            "a2_ga_microbatch_fetch",
+            seconds=time.perf_counter() - wait_started,
+            microbatch_index=microbatch_index,
+            requested_batches=self.expected_count,
+            lazy=True,
+        )
+        if len(self._cache) == self.expected_count:
+            trace_event(
+                "a2_ga_group_fetch",
+                seconds=time.perf_counter() - self._started,
+                requested_batches=self.expected_count,
+                fetched_batches=len(self._cache),
+                lazy=True,
+            )
+
+
 class TTTQwenTrainerMixin:
     """Mixin dynamically combined with remote ``CustomSeq2SeqTrainer``."""
 
@@ -243,42 +304,26 @@ class TTTQwenTrainerMixin:
         epoch_iterator: Iterator[object],
         num_batches: int,
         device: torch.device,
-    ) -> tuple[list[object], Tensor | int | None]:
-        """Measure the eager GA fetch boundary used by Transformers 4.57.1.
+    ) -> tuple[Sequence[object], Tensor | int | None]:
+        """Return a lazy A2 GA group for the pinned Transformers 4.57.1 loop.
 
         A2 batches deliberately carry no conventional ``labels`` entry: the typed loss hook
-        owns all supervision. Returning ``None`` for ``num_items_in_batch`` therefore preserves
-        the upstream loss-scaling contract while exposing how long each blocking ``next()`` call
-        takes. A5 retains the exact upstream implementation.
+        owns all supervision. Returning ``None`` for ``num_items_in_batch`` preserves upstream
+        loss scaling. The outer loop observes the declared group length but each ``next()`` runs
+        only immediately before its corresponding forward/backward. A5 stays on the upstream path.
         """
 
         if self.ttt_runtime.stage is not ProductionStage.A2:
             return cast(
-                tuple[list[object], Tensor | int | None],
+                tuple[Sequence[object], Tensor | int | None],
                 super().get_batch_samples(epoch_iterator, num_batches, device),  # type: ignore[misc]
             )
-        group_started = time.perf_counter()
-        batch_samples: list[object] = []
-        for microbatch_index in range(num_batches):
-            wait_started = time.perf_counter()
-            try:
-                batch = next(epoch_iterator)
-            except StopIteration:
-                break
-            batch_samples.append(batch)
-            trace_event(
-                "a2_ga_microbatch_fetch",
-                seconds=time.perf_counter() - wait_started,
-                microbatch_index=microbatch_index,
-                requested_batches=num_batches,
+        if transformers.__version__ != "4.57.1":
+            raise RuntimeError(
+                "lazy A2 gradient accumulation is pinned to Transformers 4.57.1; "
+                f"found {transformers.__version__}"
             )
-        trace_event(
-            "a2_ga_group_fetch",
-            seconds=time.perf_counter() - group_started,
-            requested_batches=num_batches,
-            fetched_batches=len(batch_samples),
-        )
-        return batch_samples, None
+        return _LazyGradientAccumulationGroup(epoch_iterator, num_batches), None
 
     def log(self, logs: dict[str, float], *args: object, **kwargs: object) -> None:
         enriched = dict(logs)
