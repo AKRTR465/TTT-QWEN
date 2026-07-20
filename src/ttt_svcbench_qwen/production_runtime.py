@@ -170,6 +170,11 @@ def _loader_trace(event: str, **fields: object) -> None:
     trace_event(event, **fields)
 
 
+def _a2_record_id_from_chunk(chunk_id: str) -> str | None:
+    marker = ":a2:"
+    return chunk_id.rsplit(marker, 1)[0] if marker in chunk_id else None
+
+
 def _cache_stats(owner: object) -> dict[str, object]:
     cache = getattr(owner, "preprocess_cache", None)
     if isinstance(cache, PreprocessCache):
@@ -395,6 +400,7 @@ class QueryPreparationTelemetry:
     total_seconds: float
     frame_count: int
     patch_count: int
+    visual_token_count: int
 
     def __post_init__(self) -> None:
         times = (self.decode_seconds, self.processor_seconds, self.total_seconds)
@@ -402,7 +408,7 @@ class QueryPreparationTelemetry:
             raise ValueError("Query preparation times must be finite and non-negative")
         if self.total_seconds + 1.0e-9 < self.decode_seconds + self.processor_seconds:
             raise ValueError("Query total preparation time cannot omit decode/processor time")
-        if self.frame_count <= 0 or self.patch_count <= 0:
+        if self.frame_count <= 0 or self.patch_count <= 0 or self.visual_token_count <= 0:
             raise ValueError("Query preparation counts must be positive")
 
 
@@ -713,12 +719,15 @@ class VideoChunkMaterializer:
         cache = self._cache_for(spec)
         if cache is not None:
             cache_started = time.perf_counter()
+            cache_bytes = cache.payload_size(fingerprint)
             cached = cache.get(fingerprint)
             if spec.observation_role == "support":
                 _loader_trace(
                     "support_cache_read",
                     chunk_id=spec.chunk_id,
+                    record_id=_a2_record_id_from_chunk(spec.chunk_id),
                     hit=cached is not None,
+                    cache_bytes=cache_bytes,
                     seconds=time.perf_counter() - cache_started,
                 )
             if cached is not None:
@@ -765,11 +774,16 @@ class VideoChunkMaterializer:
         for spec in specs:
             fingerprint = self._fingerprint(spec)
             cache_started = time.perf_counter()
+            cache_bytes = (
+                self.preprocess_cache.payload_size(fingerprint) if self.preprocess_cache else 0
+            )
             cached = self.preprocess_cache.get(fingerprint) if self.preprocess_cache else None
             _loader_trace(
                 "support_cache_read",
                 chunk_id=spec.chunk_id,
+                record_id=_a2_record_id_from_chunk(spec.chunk_id),
                 hit=cached is not None,
+                cache_bytes=cache_bytes,
                 seconds=time.perf_counter() - cache_started,
             )
             if cached is not None:
@@ -1680,6 +1694,11 @@ class A2PrefetchCollator:
             seconds=collate_seconds,
             prepared_bytes=prepared_bytes,
             support_payload_bytes=support_payload_bytes,
+            query_frame_count=answer.preparation.frame_count,
+            query_patch_count=answer.preparation.patch_count,
+            query_visual_token_count=answer.preparation.visual_token_count,
+            query_decode_seconds=answer.preparation.decode_seconds,
+            query_processor_seconds=answer.preparation.processor_seconds,
             cache_stats=(self.preprocess_cache.stats() if self.preprocess_cache else {}),
         )
         return {
@@ -2796,10 +2815,20 @@ def _prepare_answer_cpu(
         count_provenance=(TargetProvenance.OFFICIAL_WEAK,),
     )
     total_seconds = time.perf_counter() - started
+    spatial_merge_area = config.video_preprocessing.spatial_merge_size**2
+    patch_count = int(materialized.pixel_values_videos.shape[0])
+    if patch_count % spatial_merge_area:
+        raise ValueError("Query patch count is not divisible by the spatial merge area")
+    visual_token_count = patch_count // spatial_merge_area
     _loader_trace(
         "query_prepare_done",
         query_id=query.runtime.query_id,
         seconds=total_seconds,
+        frame_count=int(materialized.frame_timestamps.shape[0]),
+        patch_count=patch_count,
+        visual_token_count=visual_token_count,
+        decode_seconds=decode_seconds,
+        processor_seconds=processor_seconds,
         cache_stats=(preprocess_cache.stats() if preprocess_cache else {}),
     )
     prepared_visual = _compact_materialized_chunk(materialized)
@@ -2815,6 +2844,7 @@ def _prepare_answer_cpu(
             total_seconds=total_seconds,
             frame_count=prepared_visual.frame_count,
             patch_count=prepared_visual.patch_count,
+            visual_token_count=visual_token_count,
         ),
     )
 

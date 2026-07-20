@@ -442,18 +442,40 @@ class TTTQwenTrainerMixin:
         inputs: Mapping[str, object],
         seconds: float,
     ) -> None:
-        sampler = getattr(self, "_ttt_train_sampler", None)
-        observe = getattr(sampler, "observe_runtime_cost", None)
-        if not callable(observe):
-            return
         prepared = inputs.get(
             "prepared_a2" if self.ttt_runtime.stage is ProductionStage.A2 else "prepared_a5"
         )
         record = getattr(prepared, "record", None)
+        preparation_seconds = 0.0
+        record_id: str | None = None
         if isinstance(record, A2QueryRecord):
-            observe(record.query.runtime.query_id, seconds)
+            record_id = record.query.runtime.query_id
+            telemetry = getattr(prepared, "preparation", None)
+            raw_seconds = getattr(telemetry, "collate_seconds", 0.0)
+            if isinstance(raw_seconds, (int, float)):
+                preparation_seconds = float(raw_seconds)
         elif isinstance(record, A5EpisodeRecord):
-            observe(record.episode_id, seconds)
+            record_id = record.episode_id
+            answers = getattr(prepared, "query_answers", ())
+            for answer in (answers if isinstance(answers, tuple) else ()):
+                telemetry = getattr(answer, "preparation", None)
+                raw_seconds = getattr(telemetry, "total_seconds", 0.0)
+                if isinstance(raw_seconds, (int, float)):
+                    preparation_seconds += float(raw_seconds)
+        if record_id is None:
+            return
+        total_seconds = preparation_seconds + seconds
+        trace_event(
+            "runtime_cost_observation",
+            record_id=record_id,
+            preparation_seconds=preparation_seconds,
+            training_seconds=seconds,
+            seconds=total_seconds,
+        )
+        sampler = getattr(self, "_ttt_train_sampler", None)
+        observe = getattr(sampler, "observe_runtime_cost", None)
+        if callable(observe):
+            observe(record_id, total_seconds)
 
     def _assert_rank_episode_parity(
         self,
@@ -581,10 +603,15 @@ def main(argv: list[str] | None = None) -> int:
                 if torch.cuda.is_available()
                 else "cpu"
             ),
+            query_decode_strategy=backbone.ttt_config.query_decode_strategy,
+            query_decode_max_groups=backbone.ttt_config.query_decode_max_groups,
         )
         visual_cost_index = load_visual_cost_index(
             raw_cost_index,
             expected_fingerprint=expected_fingerprint,
+            require_runtime_measurements=(
+                backbone.ttt_config.visual_cost_mode == "exact_tokens_then_runtime"
+            ),
         )
     checkpoint_audit: OuterCheckpointAudit | None = None
     if configured_stage is ProductionStage.A5 and same_stage_resume is None:

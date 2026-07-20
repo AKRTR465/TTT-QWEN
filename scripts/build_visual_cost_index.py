@@ -1,7 +1,7 @@
-"""Build a strict schema-2 A2/A5 visual and runtime cost index.
+"""Build a strict schema-3 A2/A5 visual and runtime cost index.
 
-The default timing coefficients are zero, so this command can create a token-only preflight
-index. H200 calibration should pass measured coefficients or replace rows from a trace summary.
+Pass ``--runtime-trace --require-measured-runtime`` for the formal A2 profile. The output contains
+only media metadata, counts and timings; decoded Query frames or processor tensors are never saved.
 """
 
 from __future__ import annotations
@@ -10,9 +10,13 @@ import argparse
 import hashlib
 import json
 import math
-from dataclasses import asdict
+import os
+import statistics
+from collections import defaultdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import av
 import transformers
 
 from ttt_svcbench_qwen.config import load_config
@@ -28,6 +32,104 @@ from ttt_svcbench_qwen.visual_cost import (
     VisualCostRecord,
     make_visual_cost_fingerprint,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeMeasurement:
+    query_frame_count: int
+    query_visual_tokens: int
+    decode_seconds: float
+    processor_seconds: float
+    preparation_seconds: float
+    training_seconds: float
+    support_cache_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class MediaProbe:
+    codec: str = "unknown"
+    width: int = 0
+    height: int = 0
+    keyframe_interval_seconds: float | None = None
+
+
+def _load_runtime_measurements(path: Path) -> dict[str, RuntimeMeasurement]:
+    paths = (path,) if path.is_file() else tuple(sorted(path.rglob("runtime_*.jsonl")))
+    if not paths:
+        raise ValueError("runtime trace contains no JSONL files")
+    values: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    support_sizes: dict[str, dict[str, int]] = defaultdict(dict)
+    for source in paths:
+        for line in source.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            event = row.get("event")
+            if event == "a2_collate_done" and isinstance(row.get("query_id"), str):
+                record_id = str(row["query_id"])
+                _append_numeric(values[record_id], row, "query_frame_count")
+                _append_numeric(values[record_id], row, "query_visual_token_count")
+                _append_numeric(values[record_id], row, "query_decode_seconds")
+                _append_numeric(values[record_id], row, "query_processor_seconds")
+                _append_numeric(
+                    values[record_id], row, "seconds", destination="preparation_seconds"
+                )
+            elif event == "runtime_cost_observation" and isinstance(
+                row.get("record_id"), str
+            ):
+                record_id = str(row["record_id"])
+                _append_numeric(values[record_id], row, "training_seconds")
+            elif (
+                event == "support_cache_read"
+                and isinstance(row.get("record_id"), str)
+                and isinstance(row.get("chunk_id"), str)
+                and isinstance(row.get("cache_bytes"), (int, float))
+            ):
+                record_id = str(row["record_id"])
+                chunk_id = str(row["chunk_id"])
+                support_sizes[record_id][chunk_id] = max(
+                    support_sizes[record_id].get(chunk_id, 0), int(row["cache_bytes"])
+                )
+    result: dict[str, RuntimeMeasurement] = {}
+    required = (
+        "query_frame_count",
+        "query_visual_token_count",
+        "query_decode_seconds",
+        "query_processor_seconds",
+        "preparation_seconds",
+        "training_seconds",
+    )
+    for record_id, fields in values.items():
+        if any(not fields.get(name) for name in required):
+            continue
+        result[record_id] = RuntimeMeasurement(
+            query_frame_count=max(1, round(statistics.fmean(fields["query_frame_count"]))),
+            query_visual_tokens=max(
+                1, round(statistics.fmean(fields["query_visual_token_count"]))
+            ),
+            decode_seconds=statistics.fmean(fields["query_decode_seconds"]),
+            processor_seconds=statistics.fmean(fields["query_processor_seconds"]),
+            preparation_seconds=statistics.fmean(fields["preparation_seconds"]),
+            training_seconds=statistics.fmean(fields["training_seconds"]),
+            support_cache_bytes=sum(support_sizes.get(record_id, {}).values()),
+        )
+    return result
+
+
+def _append_numeric(
+    fields: dict[str, list[float]],
+    row: dict[object, object],
+    field: str,
+    *,
+    destination: str | None = None,
+) -> None:
+    key = field if destination is None else destination
+    value = row.get(field)
+    if isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) >= 0.0:
+        fields[key].append(float(value))
 
 
 def main() -> int:
@@ -55,6 +157,15 @@ def main() -> int:
     )
     parser.add_argument("--query-max-frames", type=int, default=256)
     parser.add_argument("--query-sample-fps", type=float, default=2.0)
+    parser.add_argument(
+        "--query-decode-strategy",
+        choices=("legacy_seek", "grouped_seek"),
+        default="grouped_seek",
+    )
+    parser.add_argument("--query-decode-max-groups", type=int, default=16)
+    parser.add_argument("--runtime-trace", type=Path, default=None)
+    parser.add_argument("--require-measured-runtime", action="store_true")
+    parser.add_argument("--video-root", type=Path, default=None)
     parser.add_argument("--decode-seconds-per-chunk", type=float, default=0.0)
     parser.add_argument("--processor-seconds-per-chunk", type=float, default=0.0)
     parser.add_argument("--vit-seconds-per-token", type=float, default=0.0)
@@ -80,12 +191,29 @@ def main() -> int:
         loss_scale_max=balance.scale_max,
         loss_epsilon=balance.epsilon,
         gpu_model=args.gpu_model,
+        query_decode_strategy=args.query_decode_strategy,
+        query_decode_max_groups=args.query_decode_max_groups,
     )
-    train, validation = load_production_manifest_views(
+    train, _validation = load_production_manifest_views(
         args.manifest,
         stage=ManifestStage(args.stage),
     )
-    records = tuple(train.records) + tuple(validation.records)
+    records = tuple(train.records)
+    measurements = (
+        {} if args.runtime_trace is None else _load_runtime_measurements(args.runtime_trace)
+    )
+    if args.require_measured_runtime:
+        missing = {
+            _record_id(record) for record in records if _record_id(record) not in measurements
+        }
+        if missing:
+            raise ValueError(
+                "runtime trace does not cover every manifest record: "
+                + ", ".join(sorted(missing)[:8])
+            )
+    video_root = args.video_root
+    if video_root is None and os.environ.get("SVCBENCH_VIDEO_ROOT"):
+        video_root = Path(os.environ["SVCBENCH_VIDEO_ROOT"])
     rows = [
         _cost_record(
             record,
@@ -97,6 +225,8 @@ def main() -> int:
             query_visual_mode=args.query_visual_mode,
             query_max_frames=args.query_max_frames,
             query_sample_fps=args.query_sample_fps,
+            measurement=measurements.get(_record_id(record)),
+            media=_probe_media(record, video_root),
         )
         for record in records
     ]
@@ -117,6 +247,60 @@ def main() -> int:
     return 0
 
 
+def _record_id(record: object) -> str:
+    if isinstance(record, A2QueryRecord):
+        return record.query.runtime.query_id
+    if isinstance(record, A5EpisodeRecord):
+        return record.episode_id
+    raise TypeError("visual cost builder received an unknown manifest record")
+
+
+def _probe_media(record: object, video_root: Path | None) -> MediaProbe:
+    if video_root is None or not isinstance(record, (A2QueryRecord, A5EpisodeRecord)):
+        return MediaProbe()
+    root = video_root.resolve()
+    candidates = (
+        (root / record.relative_video_path).resolve(),
+        (root / record.source_dataset / record.relative_video_path).resolve(),
+    )
+    path = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.is_relative_to(root) and candidate.is_file()
+        ),
+        None,
+    )
+    if path is None:
+        return MediaProbe()
+    try:
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            codec = str(getattr(stream.codec_context, "name", None) or "unknown")
+            keyframes: list[float] = []
+            if stream.time_base is not None:
+                for packet in container.demux(stream):
+                    if packet.is_keyframe and packet.pts is not None:
+                        keyframes.append(float(packet.pts * stream.time_base))
+                        if len(keyframes) >= 33:
+                            break
+            intervals = [
+                right - left
+                for left, right in zip(keyframes, keyframes[1:], strict=False)
+                if right > left
+            ]
+            return MediaProbe(
+                codec=codec,
+                width=max(0, int(stream.width or 0)),
+                height=max(0, int(stream.height or 0)),
+                keyframe_interval_seconds=(
+                    None if not intervals else float(statistics.median(intervals))
+                ),
+            )
+    except (OSError, ValueError, TypeError, IndexError, av.error.FFmpegError):
+        return MediaProbe()
+
+
 def _cost_record(
     record: object,
     *,
@@ -128,6 +312,8 @@ def _cost_record(
     query_visual_mode: str,
     query_max_frames: int,
     query_sample_fps: float,
+    measurement: RuntimeMeasurement | None = None,
+    media: MediaProbe | None = None,
 ) -> VisualCostRecord:
     coefficients = (
         decode_per_chunk,
@@ -184,13 +370,37 @@ def _cost_record(
         _frame_budget(*interval, sample_fps)
         for interval, sample_fps in zip(intervals, interval_fps, strict=True)
     )
+    query_frame_count = sum(visual_tokens[-query_count:])
+    query_visual_tokens = query_frame_count
+    if measurement is not None:
+        query_frame_count = measurement.query_frame_count
+        query_visual_tokens = measurement.query_visual_tokens
+        visual_tokens = (*visual_tokens[:-query_count], query_visual_tokens)
     chunk_count = len(visual_tokens)
     total_tokens = sum(visual_tokens)
-    decode_seconds = decode_per_chunk * chunk_count
-    processor_seconds = processor_per_chunk * chunk_count
-    vit_seconds = vit_per_token * total_tokens
-    query_seconds = query_per_query * query_count
-    predicted = decode_seconds + processor_seconds + vit_seconds + query_seconds + loss_collective
+    if measurement is None:
+        decode_seconds = decode_per_chunk * chunk_count
+        processor_seconds = processor_per_chunk * chunk_count
+        preparation_seconds = decode_seconds + processor_seconds
+        training_seconds = (
+            vit_per_token * total_tokens + query_per_query * query_count + loss_collective
+        )
+        vit_seconds = vit_per_token * total_tokens
+        query_seconds = query_per_query * query_count
+        support_cache_bytes = 0
+        measurement_source = "estimated"
+    else:
+        decode_seconds = measurement.decode_seconds
+        processor_seconds = measurement.processor_seconds
+        preparation_seconds = measurement.preparation_seconds
+        training_seconds = measurement.training_seconds
+        vit_seconds = 0.0
+        query_seconds = 0.0
+        loss_collective = 0.0
+        support_cache_bytes = measurement.support_cache_bytes
+        measurement_source = "runtime_trace"
+    predicted = preparation_seconds + training_seconds
+    media = MediaProbe() if media is None else media
     return VisualCostRecord(
         record_id=record_id,
         support_count=support_count,
@@ -199,12 +409,22 @@ def _cost_record(
         visual_tokens=visual_tokens,
         total_visual_tokens=total_tokens,
         maximum_visual_tokens=max(visual_tokens),
+        query_frame_count=query_frame_count,
+        query_visual_tokens=query_visual_tokens,
+        source_codec=media.codec,
+        source_width=media.width,
+        source_height=media.height,
+        keyframe_interval_seconds=media.keyframe_interval_seconds,
+        support_cache_bytes=support_cache_bytes,
         decode_seconds=decode_seconds,
         processor_seconds=processor_seconds,
+        preparation_seconds=preparation_seconds,
+        training_seconds=training_seconds,
         vit_seconds=vit_seconds,
         query_seconds=query_seconds,
         loss_collective_seconds=loss_collective,
         predicted_total_seconds=predicted,
+        measurement_source=measurement_source,
     )
 
 

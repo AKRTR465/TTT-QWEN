@@ -235,6 +235,17 @@ def load_training_yaml(path: str | Path) -> tuple[dict[str, object], ProductionT
         if normalized not in {"0", "1", "false", "true"}:
             raise ValueError("TTT_QUERY_ACTIVATION_OFFLOAD must be 0/1/false/true")
         extension["query_activation_offload"] = normalized in {"1", "true"}
+    if os.environ.get("TTT_DATALOADER_TRACE") == "1":
+        run_root = os.environ.get("RUN_ROOT")
+        if not run_root:
+            raise ValueError("TTT_DATALOADER_TRACE=1 requires RUN_ROOT")
+        extension["runtime_trace_mode"] = "cuda"
+        extension["runtime_trace_dir"] = str(Path(run_root) / "runtime_trace")
+    if os.environ.get("TTT_VISUAL_COST_PREFLIGHT") == "1":
+        if os.environ.get("TTT_SMOKE_MAX_STEPS") is None:
+            raise ValueError("visual-cost preflight is allowed only for an explicit smoke run")
+        extension["visual_cost_mode"] = "proxy"
+        extension.pop("visual_cost_index", None)
     return values, ProductionTTTConfig.model_validate(extension)
 
 

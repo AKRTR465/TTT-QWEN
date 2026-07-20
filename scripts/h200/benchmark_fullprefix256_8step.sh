@@ -28,6 +28,7 @@ SESSION="${SESSION:-${MODE}_fullprefix256_8step_${RUN_ID}}"
 RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/runs/$RUN_ID}"
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs/$RUN_ID}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/experiment.log}"
+VISUAL_COST_INDEX="${VISUAL_COST_INDEX:-$PROJECT_ROOT/artifacts/a2_fullprefix256_visual_cost_index.json}"
 
 if [[ "$(id -un)" != "$EXPECTED_USER" ]]; then
   echo "refusing to benchmark as $(id -un); expected $EXPECTED_USER" >&2
@@ -40,7 +41,7 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
     env RUN_IN_TMUX=1 TTT_PROJECT_ROOT="$PROJECT_ROOT" TTT_H200_VENV="$VENV"
     MODEL="$MODEL" DATASET_DIR="$DATASET_DIR" DATASET_NAME="$DATASET_NAME"
     RUN_ID="$RUN_ID" SESSION="$SESSION" RUN_ROOT="$RUN_ROOT"
-    LOG_DIR="$LOG_DIR" LOG_FILE="$LOG_FILE"
+    LOG_DIR="$LOG_DIR" LOG_FILE="$LOG_FILE" VISUAL_COST_INDEX="$VISUAL_COST_INDEX"
     bash "$PROJECT_ROOT/scripts/h200/benchmark_fullprefix256_8step.sh" "$MODE"
   )
   command+=("$@")

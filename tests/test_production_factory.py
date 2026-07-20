@@ -160,6 +160,7 @@ def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
     monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
     monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
     monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
+    monkeypatch.setenv("VISUAL_COST_INDEX", "/tmp/visual_cost_index.json")
 
     native, extension = load_training_yaml(
         root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml"
@@ -180,6 +181,76 @@ def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
     assert extension.query_decode_strategy == "grouped_seek"
     assert extension.query_decode_max_groups == 16
     assert extension.query_cache_mode == "disabled"
+    assert extension.visual_cost_mode == "exact_tokens_then_runtime"
+    assert extension.visual_cost_index == "/tmp/visual_cost_index.json"
+
+
+def test_fullprefix256_trace_override_requires_run_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[1]
+    for key, value in {
+        "OUTPUT_DIR": "/tmp/output",
+        "SVCBENCH_DATASET_MANIFEST": "/tmp/dataset_manifest.json",
+        "MODEL": "/tmp/qwen3vl8b",
+        "DATASET_DIR": "/tmp/svcbench",
+        "DATASET_NAME": "svcbench_qwen3vl_sft",
+        "VISUAL_COST_INDEX": "/tmp/visual_cost_index.json",
+        "TTT_DATALOADER_TRACE": "1",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("RUN_ROOT", raising=False)
+
+    with pytest.raises(ValueError, match="requires RUN_ROOT"):
+        load_training_yaml(root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml")
+
+
+def test_fullprefix256_trace_and_cost_preflight_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[1]
+    for key, value in {
+        "OUTPUT_DIR": "/tmp/output",
+        "SVCBENCH_DATASET_MANIFEST": "/tmp/dataset_manifest.json",
+        "MODEL": "/tmp/qwen3vl8b",
+        "DATASET_DIR": "/tmp/svcbench",
+        "DATASET_NAME": "svcbench_qwen3vl_sft",
+        "VISUAL_COST_INDEX": "/tmp/visual_cost_index.json",
+        "TTT_DATALOADER_TRACE": "1",
+        "RUN_ROOT": "/tmp/run",
+        "TTT_VISUAL_COST_PREFLIGHT": "1",
+        "TTT_SMOKE_MAX_STEPS": "1",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    _, extension = load_training_yaml(
+        root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml"
+    )
+
+    assert extension.runtime_trace_mode == "cuda"
+    assert Path(extension.runtime_trace_dir or "") == Path("/tmp/run/runtime_trace")
+    assert extension.visual_cost_mode == "proxy"
+    assert extension.visual_cost_index is None
+
+
+def test_fullprefix256_cost_preflight_requires_explicit_smoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[1]
+    for key, value in {
+        "OUTPUT_DIR": "/tmp/output",
+        "SVCBENCH_DATASET_MANIFEST": "/tmp/dataset_manifest.json",
+        "MODEL": "/tmp/qwen3vl8b",
+        "DATASET_DIR": "/tmp/svcbench",
+        "DATASET_NAME": "svcbench_qwen3vl_sft",
+        "VISUAL_COST_INDEX": "/tmp/visual_cost_index.json",
+        "TTT_VISUAL_COST_PREFLIGHT": "1",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("TTT_SMOKE_MAX_STEPS", raising=False)
+
+    with pytest.raises(ValueError, match="explicit smoke run"):
+        load_training_yaml(root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml")
 
 
 def test_a2_lazy_ga_fetch_pulls_each_microbatch_only_when_consumed(
@@ -233,6 +304,50 @@ def test_a2_lazy_ga_fails_closed_on_transformers_version_drift(
         TTTQwenTrainerMixin.get_batch_samples(
             owner, iter(({"prepared_a2": 0},)), 1, torch.device("cpu")
         )
+
+
+def test_a2_runtime_cost_observation_includes_collate_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeA2Record:
+        query = SimpleNamespace(runtime=SimpleNamespace(query_id="query-1"))
+
+    observations: list[tuple[str, float]] = []
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.llamafactory_trainer.A2QueryRecord", _FakeA2Record
+    )
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.llamafactory_trainer.trace_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    owner = SimpleNamespace(
+        ttt_runtime=SimpleNamespace(stage=ProductionStage.A2),
+        _ttt_train_sampler=SimpleNamespace(
+            observe_runtime_cost=lambda record_id, seconds: observations.append(
+                (record_id, seconds)
+            )
+        ),
+    )
+    prepared = SimpleNamespace(
+        record=_FakeA2Record(),
+        preparation=SimpleNamespace(collate_seconds=7.5),
+    )
+
+    TTTQwenTrainerMixin._observe_runtime_cost(owner, {"prepared_a2": prepared}, 2.5)
+
+    assert observations == [("query-1", 10.0)]
+    assert events == [
+        (
+            "runtime_cost_observation",
+            {
+                "record_id": "query-1",
+                "preparation_seconds": 7.5,
+                "training_seconds": 2.5,
+                "seconds": 10.0,
+            },
+        )
+    ]
 
 
 def test_a2_uses_dynamic_graph_safe_zero1_profile() -> None:

@@ -1,4 +1,4 @@
-"""Strict schema-2 visual/runtime cost index used for rank-aligned sampling."""
+"""Strict schema-3 measured visual/runtime cost index for rank-aligned sampling."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch.distributed as dist
 
-VISUAL_COST_SCHEMA_VERSION = 2
+VISUAL_COST_SCHEMA_VERSION = 3
 FINGERPRINT_FIELDS = frozenset(
     {
         "manifest_sha256",
@@ -29,6 +29,8 @@ FINGERPRINT_FIELDS = frozenset(
         "loss_scale_max",
         "loss_epsilon",
         "gpu_model",
+        "query_decode_strategy",
+        "query_decode_max_groups",
     }
 )
 
@@ -50,6 +52,8 @@ def make_visual_cost_fingerprint(
     loss_scale_max: float,
     loss_epsilon: float,
     gpu_model: str,
+    query_decode_strategy: str,
+    query_decode_max_groups: int,
 ) -> dict[str, object]:
     return validate_visual_cost_fingerprint(locals())
 
@@ -63,12 +67,22 @@ class VisualCostRecord:
     visual_tokens: tuple[int, ...]
     total_visual_tokens: int
     maximum_visual_tokens: int
+    query_frame_count: int
+    query_visual_tokens: int
+    source_codec: str
+    source_width: int
+    source_height: int
+    keyframe_interval_seconds: float | None
+    support_cache_bytes: int
     decode_seconds: float
     processor_seconds: float
+    preparation_seconds: float
+    training_seconds: float
     vit_seconds: float
     query_seconds: float
     loss_collective_seconds: float
     predicted_total_seconds: float
+    measurement_source: str
 
     def __post_init__(self) -> None:
         if not self.record_id:
@@ -85,9 +99,22 @@ class VisualCostRecord:
             raise ValueError("visual cost total tokens must sum per-chunk tokens")
         if self.maximum_visual_tokens != max(self.visual_tokens):
             raise ValueError("visual cost maximum tokens must match per-chunk tokens")
+        if self.query_frame_count <= 0 or self.query_visual_tokens <= 0:
+            raise ValueError("visual cost Query frame/token counts must be positive")
+        if not self.source_codec:
+            raise ValueError("visual cost source codec must be non-empty")
+        if self.source_width < 0 or self.source_height < 0 or self.support_cache_bytes < 0:
+            raise ValueError("visual cost media/cache sizes must be non-negative")
+        if self.keyframe_interval_seconds is not None and (
+            not math.isfinite(self.keyframe_interval_seconds)
+            or self.keyframe_interval_seconds < 0.0
+        ):
+            raise ValueError("visual cost keyframe interval must be finite and non-negative")
         times = (
             self.decode_seconds,
             self.processor_seconds,
+            self.preparation_seconds,
+            self.training_seconds,
             self.vit_seconds,
             self.query_seconds,
             self.loss_collective_seconds,
@@ -95,6 +122,8 @@ class VisualCostRecord:
         )
         if any(not math.isfinite(value) or value < 0.0 for value in times):
             raise ValueError("visual cost times must be finite and non-negative")
+        if self.measurement_source not in {"estimated", "runtime_trace"}:
+            raise ValueError("visual cost measurement_source is invalid")
 
     @property
     def sort_key(self) -> tuple[float, int, int]:
@@ -171,7 +200,7 @@ class EpochBoundaryCostEMA:
 
 def validate_visual_cost_fingerprint(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping) or set(value) != FINGERPRINT_FIELDS:
-        raise ValueError("visual cost fingerprint fields do not match schema 2")
+        raise ValueError("visual cost fingerprint fields do not match schema 3")
     result = {str(key): item for key, item in value.items()}
     string_fields = (
         "manifest_sha256",
@@ -182,17 +211,27 @@ def validate_visual_cost_fingerprint(value: object) -> dict[str, object]:
         "cache_mode",
         "loss_mode",
         "gpu_model",
+        "query_decode_strategy",
     )
     for field in string_fields:
         item = result[field]
         if not isinstance(item, str) or not item:
             raise ValueError(f"visual cost fingerprint {field} must be non-empty")
-    for field in ("minimum_pixels", "maximum_pixels", "visual_batch_size"):
+    for field in (
+        "minimum_pixels",
+        "maximum_pixels",
+        "visual_batch_size",
+        "query_decode_max_groups",
+    ):
         item = result[field]
         if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
             raise ValueError(f"visual cost fingerprint {field} must be positive")
     if int(result["minimum_pixels"]) > int(result["maximum_pixels"]):
         raise ValueError("visual cost fingerprint pixel bounds are invalid")
+    if result["query_decode_strategy"] not in {"legacy_seek", "grouped_seek"}:
+        raise ValueError("visual cost fingerprint Query decode strategy is invalid")
+    if int(result["query_decode_max_groups"]) > 16:
+        raise ValueError("visual cost fingerprint Query decode group cap exceeds 16")
     for field in ("loss_group_weight", "loss_scale_min", "loss_scale_max", "loss_epsilon"):
         item = result[field]
         if isinstance(item, bool) or not isinstance(item, (int, float)):
@@ -206,6 +245,7 @@ def load_visual_cost_index(
     path: str | Path,
     *,
     expected_fingerprint: Mapping[str, object] | None = None,
+    require_runtime_measurements: bool = False,
 ) -> dict[str, VisualCostRecord]:
     source = Path(path)
     raw = json.loads(source.read_text(encoding="utf-8"))
@@ -214,9 +254,9 @@ def load_visual_cost_index(
         "fingerprint",
         "records",
     }:
-        raise ValueError("visual cost index must use strict schema 2")
+        raise ValueError("visual cost index must use strict schema 3")
     if raw["schema_version"] != VISUAL_COST_SCHEMA_VERSION:
-        raise ValueError("visual cost index schema_version must be 2")
+        raise ValueError("visual cost index schema_version must be 3")
     fingerprint = validate_visual_cost_fingerprint(raw["fingerprint"])
     if expected_fingerprint is not None:
         expected = validate_visual_cost_fingerprint(expected_fingerprint)
@@ -235,6 +275,10 @@ def load_visual_cost_index(
         record = _parse_visual_cost_record(value)
         if record.record_id in result:
             raise ValueError(f"duplicate visual cost record: {record.record_id}")
+        if require_runtime_measurements and record.measurement_source != "runtime_trace":
+            raise ValueError(
+                f"visual cost record lacks runtime measurement: {record.record_id}"
+            )
         result[record.record_id] = record
     if not result:
         raise ValueError("visual cost index must contain at least one record")
@@ -244,7 +288,7 @@ def load_visual_cost_index(
 def _parse_visual_cost_record(value: object) -> VisualCostRecord:
     fields = set(VisualCostRecord.__dataclass_fields__)
     if not isinstance(value, Mapping) or set(value) != fields:
-        raise ValueError("visual cost record fields do not match schema 2")
+        raise ValueError("visual cost record fields do not match schema 3")
     record_id = value["record_id"]
     if not isinstance(record_id, str):
         raise ValueError("visual cost record_id must be a string")
@@ -259,8 +303,25 @@ def _parse_visual_cost_record(value: object) -> VisualCostRecord:
             maximum_visual_tokens=_integer(
                 value["maximum_visual_tokens"], "maximum_visual_tokens"
             ),
+            query_frame_count=_integer(value["query_frame_count"], "query_frame_count"),
+            query_visual_tokens=_integer(
+                value["query_visual_tokens"], "query_visual_tokens"
+            ),
+            source_codec=_string(value["source_codec"], "source_codec"),
+            source_width=_integer(value["source_width"], "source_width"),
+            source_height=_integer(value["source_height"], "source_height"),
+            keyframe_interval_seconds=_optional_number(
+                value["keyframe_interval_seconds"], "keyframe_interval_seconds"
+            ),
+            support_cache_bytes=_integer(
+                value["support_cache_bytes"], "support_cache_bytes"
+            ),
             decode_seconds=_number(value["decode_seconds"], "decode_seconds"),
             processor_seconds=_number(value["processor_seconds"], "processor_seconds"),
+            preparation_seconds=_number(
+                value["preparation_seconds"], "preparation_seconds"
+            ),
+            training_seconds=_number(value["training_seconds"], "training_seconds"),
             vit_seconds=_number(value["vit_seconds"], "vit_seconds"),
             query_seconds=_number(value["query_seconds"], "query_seconds"),
             loss_collective_seconds=_number(
@@ -268,6 +329,9 @@ def _parse_visual_cost_record(value: object) -> VisualCostRecord:
             ),
             predicted_total_seconds=_number(
                 value["predicted_total_seconds"], "predicted_total_seconds"
+            ),
+            measurement_source=_string(
+                value["measurement_source"], "measurement_source"
             ),
         )
     except KeyError as error:  # pragma: no cover - exact field set above
@@ -284,6 +348,16 @@ def _number(value: object, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"visual cost {field} must be numeric")
     return float(value)
+
+
+def _optional_number(value: object, field: str) -> float | None:
+    return None if value is None else _number(value, field)
+
+
+def _string(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"visual cost {field} must be a non-empty string")
+    return value
 
 
 def _integer_tuple(value: object, field: str) -> tuple[int, ...]:

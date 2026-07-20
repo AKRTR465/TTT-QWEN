@@ -53,6 +53,9 @@ def test_cache_roundtrip_and_stable_key(tmp_path: Path) -> None:
     assert first.digest == second.digest
     cache = PreprocessCache(tmp_path / "cache", memory_entries=0, namespace="model-a")
     cache.put(first, _chunk())
+    path = cache._path_for(first)
+    assert path is not None
+    assert cache.payload_size(first) == path.stat().st_size
     loaded = cache.get(second)
     assert loaded is not None
     assert torch.equal(loaded.frames, _chunk().frames)

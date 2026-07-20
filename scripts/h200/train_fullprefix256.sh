@@ -12,6 +12,12 @@ PROJECT_ROOT="${TTT_PROJECT_ROOT:-/mnt/shared-storage-user/mineru2-shared/niujun
 if [[ "$STAGE" == "a2" ]]; then
   YAML="${YAML:-$PROJECT_ROOT/configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml}"
   TASK_NAME="qwen3vl8b_ttt_a2_fullprefix256_4h200"
+  DEFAULT_VISUAL_COST_INDEX="$PROJECT_ROOT/artifacts/a2_fullprefix256_visual_cost_index.json"
+  export VISUAL_COST_INDEX="${VISUAL_COST_INDEX:-$DEFAULT_VISUAL_COST_INDEX}"
+  if [[ ! -f "$VISUAL_COST_INDEX" && "${TTT_VISUAL_COST_PREFLIGHT:-0}" != "1" ]]; then
+    echo "measured schema-3 visual cost index not found: $VISUAL_COST_INDEX" >&2
+    exit 1
+  fi
 else
   YAML="${YAML:-$PROJECT_ROOT/configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml}"
   TASK_NAME="qwen3vl8b_ttt_a5_k8_fullprefix256_4h200"

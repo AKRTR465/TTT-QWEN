@@ -200,6 +200,21 @@ class PreprocessCache:
     def writable(self) -> bool:
         return self.mode is PreprocessCacheMode.READ_WRITE
 
+    def payload_size(self, fingerprint: PreprocessFingerprint) -> int:
+        """Return the bytes read for one cached tensor payload, or zero when absent."""
+
+        key = fingerprint.digest
+        memory_size = self._memory_sizes.get(key)
+        if memory_size is not None:
+            return int(memory_size)
+        path = self._path_for(fingerprint)
+        if path is None:
+            return 0
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+
     def get(self, fingerprint: PreprocessFingerprint) -> CachedChunk | None:
         if not self.enabled:
             return None
