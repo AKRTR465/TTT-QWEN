@@ -1468,24 +1468,24 @@ class MetaTTTEpisodeRunner:
             for query_index, query in enumerate(episode.query_points):
                 adapted.runtime = query_runtime_snapshot
                 lifecycle = PrefillLifecycle(episode.owner)
-                prepared_query: PreparedQueryOutput | None = None
+                calibration_prepared_query: PreparedQueryOutput | None = None
                 if self.query_encoder_reuse:
                     key = query_reuse_key(query.chunk.request.query_input)
-                    prepared_query = calibration_queries.get(key)
-                    if prepared_query is None:
-                        prepared_query = self._prepare_query(
+                    calibration_prepared_query = calibration_queries.get(key)
+                    if calibration_prepared_query is None:
+                        calibration_prepared_query = self._prepare_query(
                             query.chunk,
                             adapted,
                             with_grad=False,
                         )
-                        calibration_queries[key] = prepared_query
+                        calibration_queries[key] = calibration_prepared_query
                 observation, _ = self._observe(
                     query.chunk,
                     adapted,
                     lifecycle,
                     seed=episode.seed + 10_000 + query_index,
                     with_grad=False,
-                    prepared_query=prepared_query,
+                    prepared_query=calibration_prepared_query,
                 )
                 output = self._answer(query, observation, lifecycle, with_grad=False)
                 calibration.append(self._query_objective(query, output, ()))
@@ -1624,7 +1624,10 @@ class MetaTTTEpisodeRunner:
     def _query_activation_context(self) -> AbstractContextManager[object]:
         if not self.query_activation_offload or not torch.cuda.is_available():
             return nullcontext()
-        return torch.autograd.graph.save_on_cpu(pin_memory=True)
+        return cast(
+            AbstractContextManager[object],
+            torch.autograd.graph.save_on_cpu(pin_memory=True),
+        )
 
     def _validate_truncated_episode(self, episode: MetaTTTEpisode) -> None:
         stage = self.config.stage_c
@@ -2026,6 +2029,7 @@ def _query_metrics(
             ("state/operator", _weak_term_float(state.operator)),
             ("state/retrieval", _weak_term_float(state.retrieval)),
             ("state/time", _weak_term_float(state.time)),
+            *state.audit.metrics(),
         )
     else:
         state_metrics = (

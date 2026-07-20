@@ -410,6 +410,23 @@ class _Retriever:
         versions = tuple(state.version for state in states)
         return SimpleNamespace(audit=versions, versions=versions)
 
+    def retrieve_query_history(
+        self,
+        state_bank: object,
+        states: Sequence[object],
+        query: object,
+        *,
+        video_ids: Sequence[str],
+        trajectory_ids: Sequence[str],
+    ) -> object:
+        return self.retrieve_query(
+            state_bank,
+            states,
+            query,
+            video_ids=video_ids,
+            trajectory_ids=trajectory_ids,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class _ReaderResult:
@@ -428,11 +445,40 @@ class _Reader:
         self.calls.append(results)
         return results
 
+    def read_bank(
+        self,
+        _state_bank: object,
+        states: Sequence[object],
+        _query: object,
+        *,
+        video_ids: Sequence[str],
+        trajectory_ids: Sequence[str],
+    ) -> Sequence[object]:
+        if len(states) != len(video_ids) or len(states) != len(trajectory_ids):
+            raise ValueError("tiny Reader ownership mismatch")
+        results = tuple(_ReaderResult(int(state.version)) for state in states)
+        self.calls.append(results)
+        return results
+
     def audit_results(
         self,
         _retrieval: object,
         results: Sequence[object],
     ) -> Sequence[object]:
+        return results
+
+    def audit_bank_results(
+        self,
+        _state_bank: object,
+        _states: Sequence[object],
+        _query: object,
+        results: Sequence[object],
+        *,
+        video_ids: Sequence[str],
+        trajectory_ids: Sequence[str],
+    ) -> Sequence[object]:
+        if len(video_ids) != len(trajectory_ids):
+            raise ValueError("tiny Reader ownership mismatch")
         return results
 
     def audit_number_tokens(self, result: object) -> int | None:

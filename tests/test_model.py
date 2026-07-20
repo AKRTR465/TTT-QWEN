@@ -130,9 +130,41 @@ class SpySuite:
         assert tuple(trajectory_ids) == ("trajectory-a",)
         return self.retrieval
 
+    def retrieve_query_history(
+        self,
+        state_bank: object,
+        states: Any,
+        query: object,
+        *,
+        video_ids: Any,
+        trajectory_ids: Any,
+    ) -> object:
+        self.events.append("retriever.history")
+        assert state_bank == "state-bank-component"
+        assert tuple(states) == ("bank-0",)
+        assert tuple(video_ids) == ("video-a",)
+        assert tuple(trajectory_ids) == ("trajectory-a",)
+        return self.retrieval
+
     def read(self, retrieval: object) -> tuple[object, ...]:
         self.events.append("reader.read")
         assert retrieval is self.retrieval
+        return self.reader_results
+
+    def read_bank(
+        self,
+        state_bank: object,
+        states: Any,
+        query: object,
+        *,
+        video_ids: Any,
+        trajectory_ids: Any,
+    ) -> tuple[object, ...]:
+        self.events.append("reader.bank")
+        assert state_bank == "state-bank-component"
+        assert tuple(states) == ("bank-1",)
+        assert tuple(video_ids) == ("video-a",)
+        assert tuple(trajectory_ids) == ("trajectory-a",)
         return self.reader_results
 
     def audit_results(
@@ -142,6 +174,24 @@ class SpySuite:
     ) -> tuple[object, ...]:
         self.events.append("reader.audit")
         assert retrieval is self.retrieval
+        assert tuple(results) == self.reader_results
+        return self.reader_results if self.audit_replacement is None else self.audit_replacement
+
+    def audit_bank_results(
+        self,
+        state_bank: object,
+        states: Any,
+        query: object,
+        results: Any,
+        *,
+        video_ids: Any,
+        trajectory_ids: Any,
+    ) -> tuple[object, ...]:
+        self.events.append("reader.audit")
+        assert state_bank == "state-bank-component"
+        assert tuple(states) == ("bank-1",)
+        assert tuple(video_ids) == ("video-a",)
+        assert tuple(trajectory_ids) == ("trajectory-a",)
         assert tuple(results) == self.reader_results
         return self.reader_results if self.audit_replacement is None else self.audit_replacement
 
@@ -383,8 +433,8 @@ def test_answer_query_audits_same_retrieval_before_resampler_and_native_prefill(
     output = run_answer(model, make_answer_request(owner, observation), lifecycle)
 
     assert suite.events == [
-        "retriever",
-        "reader.read",
+        "retriever.history",
+        "reader.bank",
         "reader.audit",
         "reader.number",
         "resampler",
@@ -472,7 +522,11 @@ def test_reader_rewrite_blocks_resampler_composer_and_marks_lifecycle_failed(
     with pytest.raises(ValueError, match="unchanged authoritative"):
         model.prepare_answer(make_answer_request(owner, observation), lifecycle)
 
-    assert suite.events == ["retriever", "reader.read", "reader.audit"]
+    assert suite.events == [
+        "retriever.history",
+        "reader.bank",
+        "reader.audit",
+    ]
     assert lifecycle.audit().phase is LifecyclePhase.READY
 
 

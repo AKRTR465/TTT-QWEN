@@ -569,6 +569,7 @@ class ObservationChunkOutput:
     observations: ObservationOutputs | None
     runtime_state: BatchRuntimeState
     bank_states: tuple[StateBankRuntimeState, ...]
+    retrieval_bank_states: tuple[StateBankRuntimeState, ...]
     state_audit: object | None
     soft_intermediates: SoftIntermediates
     lifecycle: LifecycleAudit
@@ -798,14 +799,45 @@ class RetrieverStage(Protocol):
         trajectory_ids: Sequence[str],
     ) -> RetrieverOutput: ...
 
+    def retrieve_query_history(
+        self,
+        state_bank: StructuredStateBank,
+        states: Sequence[StateBankRuntimeState],
+        query: QueryEncoderOutput,
+        *,
+        video_ids: Sequence[str],
+        trajectory_ids: Sequence[str],
+    ) -> RetrieverOutput: ...
+
 
 class ReaderStage(Protocol):
     def read(self, retrieval: RetrieverOutput) -> Sequence[ReaderResult]: ...
+
+    def read_bank(
+        self,
+        state_bank: StructuredStateBank,
+        states: Sequence[StateBankRuntimeState],
+        query: QueryEncoderOutput,
+        *,
+        video_ids: Sequence[str],
+        trajectory_ids: Sequence[str],
+    ) -> Sequence[ReaderResult]: ...
 
     def audit_results(
         self,
         retrieval: RetrieverOutput,
         results: Sequence[ReaderResult],
+    ) -> Sequence[ReaderResult]: ...
+
+    def audit_bank_results(
+        self,
+        state_bank: StructuredStateBank,
+        states: Sequence[StateBankRuntimeState],
+        query: QueryEncoderOutput,
+        results: Sequence[ReaderResult],
+        *,
+        video_ids: Sequence[str],
+        trajectory_ids: Sequence[str],
     ) -> Sequence[ReaderResult]: ...
 
     def audit_number_tokens(self, result: ReaderResult) -> int | None: ...
@@ -1029,6 +1061,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             soft.commit_guard.claim(request.owner)
             runtime_state = request.runtime_state
             bank_states = request.bank_states
+            retrieval_bank_states = tuple(request.bank_states)
             bank_audit: object | None = None
             soft_write: object | None = None
             if self.feature_flags.bank_enabled:
@@ -1062,6 +1095,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
                 observations=soft.observations,
                 runtime_state=runtime_state,
                 bank_states=bank_states,
+                retrieval_bank_states=retrieval_bank_states,
                 state_audit=bank_audit,
                 soft_intermediates=SoftIntermediates(
                     adapted_visual=soft.visual.value,
@@ -1091,18 +1125,35 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
         resampler_output: StateResamplerOutput | None = None
         if self.feature_flags.reader_enabled or self.feature_flags.state_tokens_enabled:
             retriever = self.components.require_retriever()
-            retrieval = retriever.retrieve_query(
+            retrieval = retriever.retrieve_query_history(
                 self.components.require_state_bank(),
-                observation.bank_states,
+                observation.retrieval_bank_states,
                 observation.query,
                 video_ids=request.owner.video_ids,
                 trajectory_ids=request.owner.trajectory_ids,
             )
         if self.feature_flags.reader_enabled:
             reader = self.components.require_reader()
-            assert retrieval is not None
-            computed = tuple(reader.read(retrieval))
-            reader_results = tuple(reader.audit_results(retrieval, computed))
+            state_bank = self.components.require_state_bank()
+            computed = tuple(
+                reader.read_bank(
+                    state_bank,
+                    observation.bank_states,
+                    observation.query,
+                    video_ids=request.owner.video_ids,
+                    trajectory_ids=request.owner.trajectory_ids,
+                )
+            )
+            reader_results = tuple(
+                reader.audit_bank_results(
+                    state_bank,
+                    observation.bank_states,
+                    observation.query,
+                    computed,
+                    video_ids=request.owner.video_ids,
+                    trajectory_ids=request.owner.trajectory_ids,
+                )
+            )
             if reader_results != computed:
                 raise ValueError("Reader audit must return the unchanged authoritative results")
             for result in reader_results:
@@ -1112,7 +1163,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             resampler_output = self.components.require_resampler()(
                 observation.query.q_target, retrieval
             )
-            _validate_answer_provenance(retrieval, reader_results, resampler_output)
+            _validate_answer_provenance(retrieval, resampler_output)
         state_tokens = None if resampler_output is None else resampler_output.state_tokens
         state_valid = (
             None if resampler_output is None else resampler_output.state_token_valid_mask
@@ -1281,19 +1332,14 @@ def assert_training_number_agreement(
 
 def _validate_answer_provenance(
     retrieval: RetrieverOutput,
-    reader_results: tuple[ReaderResult, ...],
     resampler: StateResamplerOutput,
 ) -> None:
-    """Check IDs/status provenance only; arithmetic remains wholly Reader-owned."""
+    """Check semantic Retriever/Resampler provenance; Reader owns aggregate state."""
 
     retrieval_ids = retrieval.selected_record_ids
     resampler_ids = resampler.selected_record_ids
     if retrieval_ids != resampler_ids:
         raise ValueError("Resampler must consume the same Retriever selected-record snapshot")
-    if reader_results:
-        reader_ids = tuple(result.selected_record_ids for result in reader_results)
-        if reader_ids != retrieval_ids:
-            raise ValueError("Reader results must preserve Retriever selected-record IDs")
     if retrieval.status != resampler.retrieval_status:
         raise ValueError("Resampler must preserve Retriever row statuses")
 

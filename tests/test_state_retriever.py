@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -292,6 +293,65 @@ def test_operator_partitions_head_before_similarity_for_all_routes(
     assert unsupported.n_retrieved.tolist() == [0]
     assert unsupported.audit[0].head_partition_excluded_count == 4
 
+
+def test_query_history_reprojects_detached_sources_and_backpropagates_to_projector() -> None:
+    torch.manual_seed(20260720)
+    config = load_config()
+    bank = build_state_bank(config)
+    retriever = build_state_retriever(config)
+    state = bank.reset("video-gradient", "trajectory-gradient")
+    support_sources = (
+        torch.randn(768, requires_grad=True),
+        torch.randn(768, requires_grad=True),
+    )
+    for index, source in enumerate(support_sources):
+        state = bank.append_retrieval_history(
+            state,
+            head_type=HeadType.O1,
+            operator=Operator.O1_SNAP,
+            semantic_source=source,
+            timestamp=float(index + 1),
+            time_range=None,
+        )
+    q_target = torch.randn((1, SEMANTIC_DIM), requires_grad=True)
+    query = SimpleNamespace(
+        q_target=q_target,
+        hard_operators=(Operator.O1_SNAP,),
+        time=SimpleNamespace(resolutions=(_resolution(query_time=3.0),)),
+    )
+
+    output = retriever.retrieve_query_history(
+        bank,
+        (state,),
+        query,
+        video_ids=("video-gradient",),
+        trajectory_ids=("trajectory-gradient",),
+    )
+    candidate_mask = (
+        output.present_mask
+        & output.record_valid_mask
+        & output.retrieval_eligible_mask
+        & output.causal_mask
+    )
+    assert candidate_mask.tolist() == [[True, True]]
+    assert output.state_embeddings.grad_fn is not None
+    loss = torch.logsumexp(output.scores[0, candidate_mask[0]], dim=0) - output.scores[0, 0]
+    assert float(loss.detach().item()) > 0.0
+    loss.backward()
+
+    assert q_target.grad is not None and float(q_target.grad.abs().sum().item()) > 0.0
+    projector_grads = tuple(
+        parameter.grad for parameter in bank.semantic_projector.parameters()
+    )
+    assert any(
+        gradient is not None and float(gradient.abs().sum().item()) > 0.0
+        for gradient in projector_grads
+    )
+    assert all(source.grad is None for source in support_sources)
+    assert all(
+        not record.semantic_source.requires_grad and record.semantic_source.grad_fn is None
+        for record in state.retrieval_history
+    )
 
 def test_normalized_cosine_scores_every_record_in_partition(
     components: tuple[StructuredStateBank, EmbeddingStateRetriever],

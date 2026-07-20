@@ -28,6 +28,7 @@ from ttt_svcbench_qwen.query_encoder import (
     OPERATOR_TO_EVENT_KIND,
     OPERATOR_TO_HEAD_TYPE,
     Operator,
+    QueryEncoderOutput,
     TimeResolution,
     TimeResolutionStatus,
     TimeWindow,
@@ -39,9 +40,14 @@ from ttt_svcbench_qwen.state_bank import (
     E2EventKind,
     E2Payload,
     O1Payload,
+    StateBankRuntimeState,
     StateRecord,
+    StructuredStateBank,
+    clone_state_record,
 )
 from ttt_svcbench_qwen.state_retriever import (
+    RetrievalFilterAudit,
+    RetrievalReason,
     RetrievalStatus,
     RetrieverOutput,
 )
@@ -627,6 +633,26 @@ class DeterministicStateReader:
             for row in range(batch_size)
         )
 
+    def read_bank(
+        self,
+        state_bank: StructuredStateBank,
+        states: Sequence[StateBankRuntimeState],
+        query: QueryEncoderOutput,
+        *,
+        video_ids: Sequence[str],
+        trajectory_ids: Sequence[str],
+    ) -> tuple[ReaderResult, ...]:
+        """Read the post-write aggregate/Confirmed Bank without semantic retrieval."""
+
+        snapshot = _reader_bank_snapshot(
+            state_bank,
+            states,
+            query,
+            video_ids=video_ids,
+            trajectory_ids=trajectory_ids,
+        )
+        return self.read(snapshot)
+
     def __call__(
         self,
         retrieval: RetrieverOutput,
@@ -648,6 +674,30 @@ class DeterministicStateReader:
             raise ValueError(
                 "Reader results do not match authoritative retrieved-record arithmetic"
             )
+        return normalized
+
+    def audit_bank_results(
+        self,
+        state_bank: StructuredStateBank,
+        states: Sequence[StateBankRuntimeState],
+        query: QueryEncoderOutput,
+        results: Sequence[ReaderResult],
+        *,
+        video_ids: Sequence[str],
+        trajectory_ids: Sequence[str],
+    ) -> tuple[ReaderResult, ...]:
+        """Recompute direct Bank arithmetic and reject any caller rewrite."""
+
+        normalized = tuple(results)
+        expected = self.read_bank(
+            state_bank,
+            states,
+            query,
+            video_ids=video_ids,
+            trajectory_ids=trajectory_ids,
+        )
+        if normalized != expected:
+            raise ValueError("Reader results do not match authoritative Bank arithmetic")
         return normalized
 
     def audit_number_tokens(self, result: ReaderResult) -> int | None:
@@ -749,11 +799,20 @@ class DeterministicStateReader:
                 selected_ids,
                 common_audit + (("reader_reason", "unsupported_operator"),),
             )
+        if any(not isinstance(record, StateRecord) for record in records):
+            return self._no_count_result(
+                ReaderStatus.INVALID,
+                operator,
+                resolution.window,
+                selected_ids,
+                common_audit + (("reader_reason", "retrieval_history_reached_reader"),),
+            )
+        typed_records = cast(tuple[StateRecord, ...], records)
         try:
             computation = _read_exact_count(
                 operator,
                 resolution.window,
-                records,
+                typed_records,
             )
         except _ReaderStateError as error:
             return self._no_count_result(
@@ -819,6 +878,186 @@ class DeterministicStateReader:
             time_window=window,
             audit_fields=audit,
         )
+
+
+def _reader_bank_snapshot(
+    state_bank: StructuredStateBank,
+    states: Sequence[StateBankRuntimeState],
+    query: QueryEncoderOutput,
+    *,
+    video_ids: Sequence[str],
+    trajectory_ids: Sequence[str],
+) -> RetrieverOutput:
+    """Build a typed Reader-only snapshot with no cosine or time prefiltering."""
+
+    batch_size = len(query.hard_operators)
+    normalized_states = tuple(states)
+    normalized_video_ids = tuple(video_ids)
+    normalized_trajectory_ids = tuple(trajectory_ids)
+    if (
+        len(normalized_states) != batch_size
+        or len(normalized_video_ids) != batch_size
+        or len(normalized_trajectory_ids) != batch_size
+    ):
+        raise ValueError("Reader Bank inputs must align to the Query batch")
+    heads = tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in query.hard_operators)
+    view = state_bank.view(normalized_states, heads)
+    scores = torch.zeros(
+        view.present_mask.shape,
+        dtype=torch.float32,
+        device=view.embeddings.device,
+    )
+    selected_mask = torch.zeros_like(view.present_mask)
+    statuses: list[RetrievalStatus] = []
+    reasons: list[RetrievalReason] = []
+    audits: list[RetrievalFilterAudit] = []
+    selected_ids: list[tuple[str, ...]] = []
+    selected_scores: list[tuple[float, ...]] = []
+    selected_records: list[tuple[StateRecord, ...]] = []
+    n_retrieved = torch.zeros(batch_size, dtype=torch.int64, device=view.embeddings.device)
+
+    for row, (operator, resolution) in enumerate(
+        zip(query.hard_operators, query.time.resolutions, strict=True)
+    ):
+        n_state = int(view.n_state[row].item())
+        owner_count = int(view.owner_record_counts[row].item())
+        head_excluded = owner_count - n_state
+        owner_matches = (
+            view.video_ids[row] == normalized_video_ids[row]
+            and view.trajectory_ids[row] == normalized_trajectory_ids[row]
+        )
+        rejected_status: RetrievalStatus | None = None
+        rejected_reason: RetrievalReason | None = None
+        query_rejected = owner_mismatch = 0
+        if not owner_matches:
+            rejected_status = RetrievalStatus.INVALID
+            rejected_reason = RetrievalReason.OWNER_MISMATCH
+            owner_mismatch = n_state
+        elif resolution.status is TimeResolutionStatus.INVALID:
+            rejected_status = RetrievalStatus.INVALID
+            rejected_reason = RetrievalReason.INVALID_TIME
+            query_rejected = n_state
+        elif resolution.status is TimeResolutionStatus.UNSUPPORTED:
+            rejected_status = RetrievalStatus.UNSUPPORTED
+            rejected_reason = RetrievalReason.UNSUPPORTED_TIME
+            query_rejected = n_state
+        elif operator is Operator.UNSUPPORTED or heads[row] is None:
+            rejected_status = RetrievalStatus.UNSUPPORTED
+            rejected_reason = RetrievalReason.UNSUPPORTED_OPERATOR
+            query_rejected = n_state
+
+        if rejected_status is not None and rejected_reason is not None:
+            statuses.append(rejected_status)
+            reasons.append(rejected_reason)
+            audits.append(
+                RetrievalFilterAudit(
+                    n_state=n_state,
+                    head_partition_excluded_count=head_excluded,
+                    query_rejected_count=query_rejected,
+                    owner_mismatch_count=owner_mismatch,
+                    invalid_count=0,
+                    retrieval_ineligible_count=0,
+                    future_count=0,
+                    outside_window_count=0,
+                    below_similarity_count=0,
+                    selected_count=0,
+                )
+            )
+            selected_ids.append(())
+            selected_scores.append(())
+            selected_records.append(())
+            continue
+
+        invalid = ineligible = 0
+        selected_columns: list[int] = []
+        for column in range(n_state):
+            record = view.cloned_records[row][column]
+            if record is None:
+                raise ValueError("present Reader Bank columns require typed records")
+            if not record.valid:
+                invalid += 1
+            elif not bool(view.retrieval_eligible_mask[row, column]):
+                ineligible += 1
+            else:
+                selected_columns.append(column)
+                selected_mask[row, column] = True
+        selected_columns.sort(
+            key=lambda column: str(view.record_ids[row][column])
+        )
+        row_ids = tuple(
+            str(view.record_ids[row][column]) for column in selected_columns
+        )
+        row_records = tuple(
+            clone_state_record(view.cloned_records[row][column])
+            for column in selected_columns
+            if view.cloned_records[row][column] is not None
+        )
+        if len(row_records) != len(selected_columns):
+            raise ValueError("Reader Bank record metadata lost alignment")
+        selected_count = len(selected_columns)
+        n_retrieved[row] = selected_count
+        selected_ids.append(row_ids)
+        selected_scores.append((0.0,) * selected_count)
+        selected_records.append(row_records)
+        if selected_count:
+            statuses.append(RetrievalStatus.OK)
+            reasons.append(RetrievalReason.MATCHED)
+        else:
+            statuses.append(RetrievalStatus.EMPTY)
+            if n_state == 0:
+                reason = (
+                    RetrievalReason.EMPTY_BANK
+                    if owner_count == 0
+                    else RetrievalReason.EMPTY_HEAD_PARTITION
+                )
+            elif invalid == n_state:
+                reason = RetrievalReason.ALL_INVALID
+            elif invalid + ineligible == n_state and ineligible:
+                reason = RetrievalReason.ALL_RETRIEVAL_INELIGIBLE
+            else:
+                reason = RetrievalReason.NO_MATCH
+            reasons.append(reason)
+        audits.append(
+            RetrievalFilterAudit(
+                n_state=n_state,
+                head_partition_excluded_count=head_excluded,
+                query_rejected_count=0,
+                owner_mismatch_count=0,
+                invalid_count=invalid,
+                retrieval_ineligible_count=ineligible,
+                future_count=0,
+                outside_window_count=0,
+                below_similarity_count=0,
+                selected_count=selected_count,
+            )
+        )
+
+    return RetrieverOutput(
+        selected_record_ids=tuple(selected_ids),
+        selected_scores=tuple(selected_scores),
+        selected_records=tuple(selected_records),
+        candidate_record_ids=view.record_ids,
+        candidate_records=view.cloned_records,
+        state_embeddings=view.embeddings,
+        scores=scores,
+        present_mask=view.present_mask,
+        record_valid_mask=view.record_valid_mask,
+        retrieval_eligible_mask=view.retrieval_eligible_mask,
+        causal_mask=view.present_mask.clone(),
+        selected_mask=selected_mask,
+        status=tuple(statuses),
+        reason=tuple(reasons),
+        hard_operators=query.hard_operators,
+        time_resolutions=query.time.resolutions,
+        n_state=view.n_state,
+        n_retrieved=n_retrieved,
+        audit=tuple(audits),
+        video_ids=normalized_video_ids,
+        trajectory_ids=normalized_trajectory_ids,
+        bank_video_ids=view.video_ids,
+        bank_trajectory_ids=view.trajectory_ids,
+        bank_versions=view.bank_versions,
+    )
 
 
 _CANONICAL_SIGNED_INTEGER = re.compile(r"-?(?:0|[1-9][0-9]*)\Z")

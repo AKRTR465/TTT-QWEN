@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
@@ -260,7 +261,23 @@ class _FakeSuite:
             audit=("retrieval", self.status.value),
         )
 
+    def retrieve_query_history(self, *_args: object, **_kwargs: object) -> object:
+        return self.retrieve_query(*_args, **_kwargs)
+
     def read(self, _retrieval: object) -> tuple[ReaderResult, ...]:
+        return (_reader_result(self.status),)
+
+    def read_bank(
+        self,
+        _state_bank: object,
+        _states: object,
+        _query: object,
+        *,
+        video_ids: object,
+        trajectory_ids: object,
+    ) -> tuple[ReaderResult, ...]:
+        assert tuple(cast(Sequence[str], video_ids)) == ("video-a",)
+        assert tuple(cast(Sequence[str], trajectory_ids)) == ("trajectory-a",)
         return (_reader_result(self.status),)
 
     @staticmethod
@@ -268,6 +285,20 @@ class _FakeSuite:
         _retrieval: object,
         results: tuple[ReaderResult, ...],
     ) -> tuple[ReaderResult, ...]:
+        return results
+
+    @staticmethod
+    def audit_bank_results(
+        _state_bank: object,
+        _states: object,
+        _query: object,
+        results: tuple[ReaderResult, ...],
+        *,
+        video_ids: object,
+        trajectory_ids: object,
+    ) -> tuple[ReaderResult, ...]:
+        assert tuple(cast(Sequence[str], video_ids)) == ("video-a",)
+        assert tuple(cast(Sequence[str], trajectory_ids)) == ("trajectory-a",)
         return results
 
     @staticmethod

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pytest
 import torch
@@ -37,6 +37,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     E2TargetLabels,
     O1TargetLabels,
     O2TargetLabels,
+    OfficialWeakStateLossOutput,
     OfficialWeakSupervision,
     OfficialWeakTargetBuilder,
     QueryTargetLabels,
@@ -44,6 +45,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     StageATargetBatch,
     StageATargetBuilder,
     TargetProvenance,
+    _record_matches_causal_occurrence,
 )
 from ttt_svcbench_qwen.state_bank import HeadType, O1Payload, StateRecord
 from ttt_svcbench_qwen.state_retriever import (
@@ -290,6 +292,9 @@ def _typed_predictions(
         state_embeddings=state_embeddings,
         scores=retrieval_scores,
         present_mask=present_mask,
+        record_valid_mask=present_mask.clone(),
+        retrieval_eligible_mask=present_mask.clone(),
+        causal_mask=present_mask.clone(),
         selected_mask=selected_mask,
         status=(RetrievalStatus.OK,) * batch_size,
         reason=(RetrievalReason.MATCHED,) * batch_size,
@@ -694,9 +699,11 @@ def test_official_weak_post_forward_loss_uses_masks_bags_and_no_identity_pseudol
     assert output.task.valid_rows == 4
     assert output.operator.valid_rows == 4
     assert output.time.valid_rows == 4
-    assert output.retrieval.valid_rows == 4
+    assert output.retrieval.valid_rows == 1
     assert output.audit.future_occurrences_ignored == 1
-    assert output.audit.retrieval_bag_sizes == (1, 1, 1, 1)
+    assert output.audit.retrieval_bag_sizes == (1, 0, 0, 0)
+    assert output.audit.retrieval_wrong_operator_rows == 3
+    assert output.audit.retrieval_valid_bag_rows == 1
     assert not output.audit.identity_target_fabricated
     assert not output.audit.unique_retrieval_id_fabricated
     assert torch.equal(
@@ -722,3 +729,93 @@ def test_official_weak_post_forward_loss_uses_masks_bags_and_no_identity_pseudol
         assert leaves[name].grad is not None, name
         assert float(leaves[name].grad.norm()) > 0.0, name
     assert leaves["o2_identity"].grad is None
+
+
+def test_official_retrieval_requires_aligned_mixed_bag_and_ignores_selection_mask() -> None:
+    observations, query, retrieval, _ = _typed_predictions(1)
+
+    def build(
+        points: tuple[float, ...],
+        *,
+        operator: Operator = Operator.O1_SNAP,
+        candidate_retrieval: RetrieverOutput = retrieval,
+    ) -> OfficialWeakStateLossOutput:
+        label = OfficialWeakSupervision(
+            query_id="weak-retrieval-structure",
+            operator=operator,
+            time_mode=TimeWindowMode.NOW,
+            count=1,
+            query_time=10.0,
+            occurrence_points=points,
+            occurrence_intervals=(),
+        )
+        return OfficialWeakTargetBuilder().build(
+            observations,
+            query,
+            candidate_retrieval,
+            (label,),
+        )
+
+    valid = build((1.0,))
+    expected = torch.logsumexp(retrieval.scores[0], dim=0) - retrieval.scores[0, 0]
+    assert valid.retrieval.valid_rows == 1
+    assert valid.audit.retrieval_valid_bag_rows == 1
+    assert valid.audit.retrieval_candidate_counts == (2,)
+    assert valid.audit.retrieval_positive_counts == (1,)
+    assert valid.audit.retrieval_negative_counts == (1,)
+    assert float(valid.retrieval.value.detach().item()) > 0.0
+    assert torch.allclose(valid.retrieval.value, expected)
+    assert retrieval.selected_mask.tolist() == [[True, False]]
+    assert dict(valid.audit.metrics()) == {
+        "retrieval/wrong_operator_rows": 0.0,
+        "retrieval/no_candidate_rows": 0.0,
+        "retrieval/no_positive_rows": 0.0,
+        "retrieval/all_positive_rows": 0.0,
+        "retrieval/valid_bag_rows": 1.0,
+        "retrieval/candidate_count": 2.0,
+        "retrieval/positive_count": 1.0,
+        "retrieval/negative_count": 1.0,
+    }
+
+    no_positive = build((9.0,))
+    assert no_positive.retrieval.valid_rows == 0
+    assert no_positive.audit.retrieval_no_positive_rows == 1
+
+    all_positive = build((1.0, 2.0))
+    assert all_positive.retrieval.valid_rows == 0
+    assert all_positive.audit.retrieval_all_positive_rows == 1
+
+    no_candidate = build(
+        (1.0,),
+        candidate_retrieval=replace(
+            retrieval,
+            causal_mask=torch.zeros_like(retrieval.causal_mask),
+        ),
+    )
+    assert no_candidate.retrieval.valid_rows == 0
+    assert no_candidate.audit.retrieval_no_candidate_rows == 1
+
+    wrong_operator = build((1.0,), operator=Operator.O2_UNIQUE)
+    assert wrong_operator.retrieval.valid_rows == 0
+    assert wrong_operator.audit.retrieval_wrong_operator_rows == 1
+
+
+def test_e2_retrieval_uses_interval_overlap_without_special_negative_generation() -> None:
+    record = type(
+        "SyntheticHistoryRecord",
+        (),
+        {"timestamp": None, "time_range": (0.0, 2.0)},
+    )()
+    overlap = OfficialWeakSupervision(
+        query_id="weak-e2-overlap",
+        operator=Operator.E2_EPISODE,
+        time_mode=TimeWindowMode.HISTORY,
+        count=1,
+        query_time=3.0,
+        occurrence_points=(),
+        occurrence_intervals=((1.5, 3.0),),
+    )
+    disjoint = replace(overlap, occurrence_intervals=((2.1, 3.0),))
+
+    assert _record_matches_causal_occurrence(record, overlap)
+    assert not _record_matches_causal_occurrence(record, disjoint)

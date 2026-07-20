@@ -14,7 +14,9 @@ import torch
 from torch import Tensor
 
 from ttt_svcbench_qwen.identity_bank import (
+    ConfirmedIdentity,
     IdentityBank,
+    IdentityDecisionStatus,
     IdentityObservationDecision,
 )
 from ttt_svcbench_qwen.model import (
@@ -39,6 +41,8 @@ from ttt_svcbench_qwen.state_bank import (
     E1EventKind,
     E2EventKind,
     HeadType,
+    StateBankRuntimeState,
+    StateRecord,
     StructuredStateBank,
 )
 from ttt_svcbench_qwen.state_encoder import (
@@ -50,7 +54,7 @@ from ttt_svcbench_qwen.state_encoder import (
 
 @dataclass(frozen=True, slots=True)
 class StageASoftWriteOutput:
-    """Semantic Projector outputs retained only for outer-loss gradients."""
+    """Projected write semantics plus raw sources for detached retrieval history."""
 
     o1_semantics: Tensor
     o1_present_mask: Tensor
@@ -60,11 +64,15 @@ class StageASoftWriteOutput:
     e1_present_mask: Tensor
     e2_semantics: Tensor
     e2_present_mask: Tensor
+    o1_sources: Tensor
+    o2_sources: Tensor
+    e1_sources: Tensor
+    e2_sources: Tensor
     source_policy: tuple[tuple[str, str], ...] = (
         ("o1", "valid_slot_mean_v1"),
         ("o2", "per_valid_slot_v1"),
-        ("e1", "per_valid_tubelet_v1"),
-        ("e2", "per_valid_tubelet_v1"),
+        ("e1", "valid_tubelet_mean_v1"),
+        ("e2", "valid_tubelet_mean_v1"),
     )
 
     def __post_init__(self) -> None:
@@ -83,6 +91,15 @@ class StageASoftWriteOutput:
                 raise ValueError(f"{name} soft semantics must be [B, N, 512]")
             if mask.shape != values.shape[:2]:
                 raise ValueError(f"{name} semantic mask must be [B, N]")
+        source_shapes = (
+            (self.o1_sources, (batch_size, 768), "O1"),
+            (self.o2_sources, (*self.o2_present_mask.shape, 768), "O2"),
+            (self.e1_sources, (batch_size, 768), "E1"),
+            (self.e2_sources, (batch_size, 768), "E2"),
+        )
+        for source, expected, name in source_shapes:
+            if source.shape != expected or not torch.is_floating_point(source):
+                raise ValueError(f"{name} retrieval sources must be floating {expected}")
         tensors = (
             self.o1_semantics,
             self.o1_present_mask,
@@ -92,6 +109,10 @@ class StageASoftWriteOutput:
             self.e1_present_mask,
             self.e2_semantics,
             self.e2_present_mask,
+            self.o1_sources,
+            self.o2_sources,
+            self.e1_sources,
+            self.e2_sources,
         )
         reference = self.o1_semantics
         if any(tensor.device != reference.device for tensor in tensors):
@@ -104,7 +125,17 @@ class StageASoftWriteOutput:
         ):
             if mask.dtype is not torch.bool:
                 raise TypeError("Stage A semantic masks must be bool")
-        if not all(torch.is_floating_point(tensor) for tensor in tensors[::2]):
+        float_values = (
+            self.o1_semantics,
+            self.o2_semantics,
+            self.e1_semantics,
+            self.e2_semantics,
+            self.o1_sources,
+            self.o2_sources,
+            self.e1_sources,
+            self.e2_sources,
+        )
+        if not all(torch.is_floating_point(tensor) for tensor in float_values):
             raise TypeError("Stage A semantic values must be floating")
         if reference.device.type != "meta":
             for values, mask in (
@@ -131,6 +162,17 @@ class StageASoftWriteOutput:
                         rtol=0.0,
                     ):
                         raise ValueError("valid Stage A semantics must have unit norm")
+            source_masks = (
+                (self.o1_sources, self.o1_present_mask),
+                (self.o2_sources, self.o2_present_mask),
+                (self.e1_sources, self.e1_present_mask.any(dim=1)),
+                (self.e2_sources, self.e2_present_mask.any(dim=1)),
+            )
+            for source, mask in source_masks:
+                if not bool(torch.isfinite(source).all()):
+                    raise ValueError("Stage A retrieval sources must be finite")
+                if bool(torch.any(source[~mask] != 0.0)):
+                    raise ValueError("invalid Stage A retrieval sources must be zero")
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +312,14 @@ class StageABankWriter:
                     set_baseline=operator is Operator.O1_DELTA and not has_o1,
                     slot_overflow_count=int(spatial.active_slot_overflow_count[row].item()),
                 )
+                next_banks[row] = self.state_bank.append_retrieval_history(
+                    next_banks[row],
+                    head_type=head,
+                    operator=operator,
+                    semantic_source=soft.o1_sources[row],
+                    timestamp=None,
+                    time_range=_time_range(observations.o1.timestamps[row], mask),
+                )
             elif head is HeadType.O2:
                 result = self.identity_bank.update_row(
                     next_identities[row],
@@ -283,6 +333,23 @@ class StageABankWriter:
                 next_identities[row] = result.identity_state
                 next_banks[row] = result.state_bank_state
                 identity_decisions[row] = result.decisions
+                for decision in result.decisions:
+                    if decision.status is not IdentityDecisionStatus.PROMOTED:
+                        continue
+                    if decision.identity_id is None:
+                        raise ValueError("promoted O2 decision requires an identity ID")
+                    confirmed = _confirmed_record(next_banks[row], decision.identity_id)
+                    payload = cast(ConfirmedIdentity, confirmed.payload)
+                    point = payload.first_seen == payload.last_seen
+                    next_banks[row] = self.state_bank.append_retrieval_history(
+                        next_banks[row],
+                        head_type=head,
+                        operator=operator,
+                        semantic_source=soft.o2_sources[row, decision.slot_index],
+                        timestamp=payload.first_seen if point else None,
+                        time_range=None if point else (payload.first_seen, payload.last_seen),
+                        lifecycle_id=payload.identity_id,
+                    )
             elif head is HeadType.E1:
                 event_kind = OPERATOR_TO_EVENT_KIND[operator]
                 if not isinstance(event_kind, E1EventKind):
@@ -294,6 +361,16 @@ class StageABankWriter:
                     event_kind=event_kind,
                     row=row,
                 )
+                mask = observations.e1.valid_mask[row]
+                if bool(mask.any().item()):
+                    next_banks[row] = self.state_bank.append_retrieval_history(
+                        next_banks[row],
+                        head_type=head,
+                        operator=operator,
+                        semantic_source=soft.e1_sources[row],
+                        timestamp=None,
+                        time_range=_time_range(observations.e1.timestamps[row], mask),
+                    )
             elif head is HeadType.E2:
                 event_kind = OPERATOR_TO_EVENT_KIND[operator]
                 if not isinstance(event_kind, E2EventKind):
@@ -305,6 +382,16 @@ class StageABankWriter:
                     event_kind=event_kind,
                     row=row,
                 )
+                mask = observations.e2.valid_mask[row]
+                if bool(mask.any().item()):
+                    next_banks[row] = self.state_bank.append_retrieval_history(
+                        next_banks[row],
+                        head_type=head,
+                        operator=operator,
+                        semantic_source=soft.e2_sources[row],
+                        timestamp=None,
+                        time_range=_time_range(observations.e2.timestamps[row], mask),
+                    )
             else:
                 skipped.append(row)
 
@@ -363,12 +450,20 @@ class StageABankWriter:
             dim=1
         ) / slot_count.to(dtype=spatial.slots.dtype)
         o1_present = slot_mask.any(dim=1)
+        o1_source = torch.where(o1_present.unsqueeze(-1), o1_source, 0.0)
+        o2_source = torch.where(slot_mask.unsqueeze(-1), spatial.slots, 0.0)
         o1 = self.state_bank.project(o1_source, HeadType.O1)
         o1 = torch.where(o1_present.unsqueeze(-1), o1, 0.0)
 
         o2 = self.state_bank.project(spatial.slots, HeadType.O2)
         o2 = torch.where(slot_mask.unsqueeze(-1), o2, 0.0)
         time_mask = temporal.valid_mask
+        time_count = time_mask.sum(dim=1, keepdim=True).clamp_min(1)
+        time_source = (
+            temporal.hidden * time_mask.unsqueeze(-1).to(dtype=temporal.hidden.dtype)
+        ).sum(dim=1) / time_count.to(dtype=temporal.hidden.dtype)
+        time_present = time_mask.any(dim=1)
+        time_source = torch.where(time_present.unsqueeze(-1), time_source, 0.0)
         e1 = self.state_bank.project(temporal.hidden, HeadType.E1)
         e2 = self.state_bank.project(temporal.hidden, HeadType.E2)
         e1 = torch.where(time_mask.unsqueeze(-1), e1, 0.0)
@@ -390,4 +485,28 @@ class StageABankWriter:
             e1_present_mask=time_mask.clone(),
             e2_semantics=e2,
             e2_present_mask=time_mask.clone(),
+            o1_sources=o1_source.detach(),
+            o2_sources=o2_source.detach(),
+            e1_sources=time_source.detach(),
+            e2_sources=time_source.detach(),
         )
+
+
+def _time_range(timestamps: Tensor, mask: Tensor) -> tuple[float, float]:
+    selected = timestamps[mask]
+    if not selected.numel():
+        raise ValueError("retrieval history requires at least one valid timestamp")
+    return float(selected.min().item()), float(selected.max().item())
+
+
+def _confirmed_record(state: StateBankRuntimeState, identity_id: str) -> StateRecord:
+    matches = [
+        record
+        for record in state.records
+        if isinstance(record.payload, ConfirmedIdentity)
+        and record.payload.identity_id == identity_id
+        and record.valid
+    ]
+    if len(matches) != 1:
+        raise ValueError("promoted identity must map to one valid Confirmed StateRecord")
+    return matches[0]

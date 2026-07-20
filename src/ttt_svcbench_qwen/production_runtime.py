@@ -123,11 +123,16 @@ from ttt_svcbench_qwen.runtime_metrics import (
 from ttt_svcbench_qwen.stage_a_runtime import StageABankWriter
 from ttt_svcbench_qwen.stage_a_targets import (
     AnswerTargetLabels,
+    OfficialWeakLossAudit,
     OfficialWeakSupervision,
     OfficialWeakTargetBuilder,
     TargetProvenance,
 )
-from ttt_svcbench_qwen.state_bank import StructuredStateBank, build_state_bank
+from ttt_svcbench_qwen.state_bank import (
+    StateBankRuntimeState,
+    StructuredStateBank,
+    build_state_bank,
+)
 from ttt_svcbench_qwen.state_encoder import (
     SpatialEncoderOutput,
     SpatialObjectEncoder,
@@ -462,7 +467,10 @@ class ProductionVisualAudit:
 
     @property
     def video_grid_thw(self) -> tuple[int, int, int]:
-        return tuple(int(value) for value in self.chunk.video_grid_thw[0].tolist())
+        values = tuple(int(value) for value in self.chunk.video_grid_thw[0].tolist())
+        if len(values) != 3:
+            raise ValueError("video_grid_thw must contain exactly three dimensions")
+        return values
 
 
 def _identity_chunk(value: object) -> CurrentChunkMaterialization:
@@ -1324,12 +1332,48 @@ class ProductionReaderRuntime:
     def read(self, retrieval: RetrieverOutput) -> Sequence[ReaderResult]:
         return self.reader.read(retrieval)
 
+    def read_bank(
+        self,
+        state_bank: StructuredStateBank,
+        states: Sequence[StateBankRuntimeState],
+        query: QueryEncoderOutput,
+        *,
+        video_ids: Sequence[str],
+        trajectory_ids: Sequence[str],
+    ) -> Sequence[ReaderResult]:
+        return self.reader.read_bank(
+            state_bank,
+            states,
+            query,
+            video_ids=video_ids,
+            trajectory_ids=trajectory_ids,
+        )
+
     def audit_results(
         self,
         retrieval: RetrieverOutput,
         results: Sequence[ReaderResult],
     ) -> Sequence[ReaderResult]:
         return self.reader.audit_results(retrieval, results)
+
+    def audit_bank_results(
+        self,
+        state_bank: StructuredStateBank,
+        states: Sequence[StateBankRuntimeState],
+        query: QueryEncoderOutput,
+        results: Sequence[ReaderResult],
+        *,
+        video_ids: Sequence[str],
+        trajectory_ids: Sequence[str],
+    ) -> Sequence[ReaderResult]:
+        return self.reader.audit_bank_results(
+            state_bank,
+            states,
+            query,
+            results,
+            video_ids=video_ids,
+            trajectory_ids=trajectory_ids,
+        )
 
     def audit_number_tokens(self, result: ReaderResult) -> int | None:
         return self.reader.audit_number_tokens(result)
@@ -1889,6 +1933,7 @@ class ProductionA2LossStep:
         )
         self.outer_composer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
+        self.last_weak_audit: OfficialWeakLossAudit | None = None
         self.visual_runtime = visual_runtime
         self.support_visual_batch_size = support_visual_batch_size
         self._backward_started_at: float | None = None
@@ -1981,6 +2026,7 @@ class ProductionA2LossStep:
             raw.retrieval,
             batch.supervision.official_weak,
         )
+        self.last_weak_audit = weak.audit
         balanced = self.outer_composer.compose((answer,), (weak,))
         total = balanced.mean_total
         self.last_balance_audit = balanced.audit

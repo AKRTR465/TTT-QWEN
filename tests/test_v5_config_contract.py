@@ -27,14 +27,14 @@ def load_raw_config() -> dict[str, Any]:
     return raw
 
 
-def test_v5_yaml_passes_strong_validation_and_serializes_completely() -> None:
+def test_v6_yaml_passes_strong_validation_and_serializes_completely() -> None:
     config = load_config(CONFIG_PATH)
     serialized = json.loads(config.model_dump_json())
 
     assert serialized["spec_version"] == (
-        "state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval"
+        "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history"
     )
-    assert serialized["config_schema_version"] == 3
+    assert serialized["config_schema_version"] == 4
     assert serialized["model"]["revision"] == "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
     assert set(serialized) == set(ProjectConfig.model_fields)
 
@@ -46,6 +46,17 @@ def test_v5_project_config_accepts_explicit_instant_equal_experiment() -> None:
     config = ProjectConfig.model_validate(raw)
 
     assert config.loss.official_weak_balance.mode == "instant_equal"
+
+
+def test_v6_retrieval_history_source_dim_is_frozen_to_projector_input() -> None:
+    raw = load_raw_config()
+    raw["state_bank"]["retrieval_history_source_dim"] = 512
+
+    with pytest.raises(
+        ValueError,
+        match="state_bank.retrieval_history_source_dim must be 768",
+    ):
+        ProjectConfig.model_validate(raw)
 
 
 def test_v5_base_and_deepstack_contract() -> None:
@@ -322,6 +333,8 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "semantic_dim": 512,
         "identity_dim": 256,
         "event_history_capacity": 512,
+        "retrieval_history_capacity_per_head": 512,
+        "retrieval_history_source_dim": 768,
         "isolation_keys": ("video_id", "trajectory_id", "head_type"),
         "hard_updates_no_grad": True,
         "detach_before_write": True,

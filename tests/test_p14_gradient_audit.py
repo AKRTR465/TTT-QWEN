@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 from torch import Tensor, nn
@@ -12,6 +14,7 @@ from ttt_svcbench_qwen.functional_sgd import (
     initialize_optimizer_state,
     snapshot_gradient_delta_group,
 )
+from ttt_svcbench_qwen.llamafactory_trainer import _semantic_projector_gradient_norm
 from ttt_svcbench_qwen.losses import O1StateTarget, StateLossInput, compute_state_loss
 from ttt_svcbench_qwen.observation_heads import O1CurrentCountDecoder
 from ttt_svcbench_qwen.state_bank import SemanticProjector
@@ -19,6 +22,21 @@ from ttt_svcbench_qwen.state_bank import SemanticProjector
 
 def _storage_pointer(value: Tensor) -> int:
     return int(value.untyped_storage().data_ptr())
+
+
+def test_semantic_projector_training_log_captures_post_backward_gradient_norm() -> None:
+    projector = SemanticProjector(load_config().state_bank.semantic_projector)
+    wrapper = nn.Module()
+    wrapper.add_module("semantic_projector", projector)
+    parameter_count = 0
+    for parameter in projector.parameters():
+        parameter.grad = torch.ones_like(parameter)
+        parameter_count += parameter.numel()
+
+    assert _semantic_projector_gradient_norm(wrapper) == pytest.approx(
+        math.sqrt(parameter_count)
+    )
+    assert _semantic_projector_gradient_norm(nn.Linear(2, 2)) is None
 
 
 def test_actual_fast_bridge_observation_chain_has_exact_inner_update_boundary() -> None:

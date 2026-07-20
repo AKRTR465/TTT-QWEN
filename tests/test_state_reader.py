@@ -325,6 +325,8 @@ def _retrieval(
     embeddings = torch.zeros(batch_size, max_records, SEMANTIC_DIM, dtype=torch.float32)
     scores = torch.zeros(batch_size, max_records, dtype=torch.float32)
     present_mask = torch.zeros(batch_size, max_records, dtype=torch.bool)
+    record_valid_mask = torch.zeros_like(present_mask)
+    retrieval_eligible_mask = torch.zeros_like(present_mask)
     selected_mask = torch.zeros_like(present_mask)
     candidate_ids: list[tuple[str | None, ...]] = []
     candidate_snapshots: list[tuple[StateRecord | None, ...]] = []
@@ -351,6 +353,10 @@ def _retrieval(
             embeddings[row_index, column] = record.semantic_embedding
             scores[row_index, column] = 0.8 if record.record_id in selected_id_set else 0.1
             present_mask[row_index, column] = True
+            record_valid_mask[row_index, column] = record.valid
+            retrieval_eligible_mask[row_index, column] = record.valid and not isinstance(
+                record.payload, CandidateIdentity
+            )
             selected_mask[row_index, column] = record.record_id in selected_id_set
         ids_on_candidate_axis = tuple(record.record_id for record in candidates)
         candidate_ids.append(ids_on_candidate_axis + (None,) * (max_records - len(candidates)))
@@ -398,6 +404,9 @@ def _retrieval(
         state_embeddings=embeddings,
         scores=scores,
         present_mask=present_mask,
+        record_valid_mask=record_valid_mask,
+        retrieval_eligible_mask=retrieval_eligible_mask,
+        causal_mask=present_mask.clone(),
         selected_mask=selected_mask,
         status=normalized_statuses,
         reason=normalized_reasons,

@@ -890,6 +890,14 @@ class OfficialWeakLossAudit:
     unique_retrieval_id_fabricated: bool
     future_occurrences_ignored: int
     retrieval_bag_sizes: tuple[int, ...]
+    retrieval_candidate_counts: tuple[int, ...] = ()
+    retrieval_positive_counts: tuple[int, ...] = ()
+    retrieval_negative_counts: tuple[int, ...] = ()
+    retrieval_wrong_operator_rows: int = 0
+    retrieval_no_candidate_rows: int = 0
+    retrieval_no_positive_rows: int = 0
+    retrieval_all_positive_rows: int = 0
+    retrieval_valid_bag_rows: int = 0
 
     def __post_init__(self) -> None:
         if not self.labels_joined_after_forward:
@@ -904,6 +912,39 @@ class OfficialWeakLossAudit:
             value < 0 for value in self.retrieval_bag_sizes
         ):
             raise ValueError("official weak audit counts must be non-negative")
+        counts = (
+            self.retrieval_wrong_operator_rows,
+            self.retrieval_no_candidate_rows,
+            self.retrieval_no_positive_rows,
+            self.retrieval_all_positive_rows,
+            self.retrieval_valid_bag_rows,
+        )
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise ValueError("official weak retrieval audit row counts must be non-negative")
+        aligned = (
+            self.retrieval_candidate_counts,
+            self.retrieval_positive_counts,
+            self.retrieval_negative_counts,
+        )
+        if any(any(value < 0 for value in values) for values in aligned):
+            raise ValueError("official weak retrieval candidate counts must be non-negative")
+        non_empty_lengths = {len(values) for values in aligned if values}
+        if len(non_empty_lengths) > 1:
+            raise ValueError("official weak retrieval count vectors must align")
+
+    def metrics(self) -> tuple[tuple[str, float], ...]:
+        """Expose bag-validity counts to A2/A5 training logs."""
+
+        return (
+            ("retrieval/wrong_operator_rows", float(self.retrieval_wrong_operator_rows)),
+            ("retrieval/no_candidate_rows", float(self.retrieval_no_candidate_rows)),
+            ("retrieval/no_positive_rows", float(self.retrieval_no_positive_rows)),
+            ("retrieval/all_positive_rows", float(self.retrieval_all_positive_rows)),
+            ("retrieval/valid_bag_rows", float(self.retrieval_valid_bag_rows)),
+            ("retrieval/candidate_count", float(sum(self.retrieval_candidate_counts))),
+            ("retrieval/positive_count", float(sum(self.retrieval_positive_counts))),
+            ("retrieval/negative_count", float(sum(self.retrieval_negative_counts))),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -978,6 +1019,16 @@ class OfficialWeakTargetBuilder:
         time_losses: list[Tensor] = []
         future_ignored = 0
         bag_sizes: list[int] = []
+        candidate_counts: list[int] = []
+        positive_counts: list[int] = []
+        negative_counts: list[int] = []
+        retrieval_status_counts = {
+            "wrong_operator": 0,
+            "no_candidate": 0,
+            "no_positive": 0,
+            "all_positive": 0,
+            "valid_bag": 0,
+        }
 
         for row, label in enumerate(labels):
             operator_index = OPERATORS.index(label.operator)
@@ -1024,8 +1075,15 @@ class OfficialWeakTargetBuilder:
             time_losses.append(row_time)
 
             task_losses.append(_official_weak_task_loss(observations, row, label))
-            retrieval_loss, bag_size = _official_weak_retrieval_loss(retrieval, row, label)
+            retrieval_loss, positives, candidates, negatives, retrieval_status = (
+                _official_weak_retrieval_loss(retrieval, row, label)
+            )
+            bag_size = positives
             bag_sizes.append(bag_size)
+            candidate_counts.append(candidates)
+            positive_counts.append(positives)
+            negative_counts.append(negatives)
+            retrieval_status_counts[retrieval_status] += 1
             if retrieval_loss is not None:
                 retrieval_losses.append(retrieval_loss)
             future_ignored += sum(point > label.query_time for point in label.occurrence_points)
@@ -1052,6 +1110,14 @@ class OfficialWeakTargetBuilder:
                 unique_retrieval_id_fabricated=False,
                 future_occurrences_ignored=future_ignored,
                 retrieval_bag_sizes=tuple(bag_sizes),
+                retrieval_candidate_counts=tuple(candidate_counts),
+                retrieval_positive_counts=tuple(positive_counts),
+                retrieval_negative_counts=tuple(negative_counts),
+                retrieval_wrong_operator_rows=retrieval_status_counts["wrong_operator"],
+                retrieval_no_candidate_rows=retrieval_status_counts["no_candidate"],
+                retrieval_no_positive_rows=retrieval_status_counts["no_positive"],
+                retrieval_all_positive_rows=retrieval_status_counts["all_positive"],
+                retrieval_valid_bag_rows=retrieval_status_counts["valid_bag"],
             ),
         )
 
@@ -1129,29 +1195,39 @@ def _official_weak_retrieval_loss(
     retrieval: RetrieverOutput,
     row: int,
     label: OfficialWeakSupervision,
-) -> tuple[Tensor | None, int]:
-    present_columns = torch.nonzero(retrieval.present_mask[row], as_tuple=False).flatten()
-    if not present_columns.numel():
-        return None, 0
+) -> tuple[Tensor | None, int, int, int, str]:
+    if retrieval.hard_operators[row] is not label.operator:
+        return None, 0, 0, 0, "wrong_operator"
+    candidate_mask = (
+        retrieval.present_mask[row]
+        & retrieval.record_valid_mask[row]
+        & retrieval.retrieval_eligible_mask[row]
+        & retrieval.causal_mask[row]
+    )
+    present_columns = torch.nonzero(candidate_mask, as_tuple=False).flatten()
+    candidate_count = int(present_columns.numel())
+    if not candidate_count:
+        return None, 0, 0, 0, "no_candidate"
     positive_columns: list[int] = []
     for column_tensor in present_columns:
         column = int(column_tensor.item())
         record = retrieval.candidate_records[row][column]
         if record is None:
             raise ValueError("present Retriever candidate is missing its typed record")
-        if _record_end_time(record) > label.query_time + 1.0e-6:
-            raise ValueError("official weak retrieval candidate contains future state")
         if _record_matches_causal_occurrence(record, label):
             positive_columns.append(column)
     if not positive_columns:
-        return None, 0
+        return None, 0, candidate_count, candidate_count, "no_positive"
+    negative_count = candidate_count - len(positive_columns)
+    if negative_count == 0:
+        return None, len(positive_columns), candidate_count, 0, "all_positive"
     all_logits = retrieval.scores[row].index_select(0, present_columns).float()
     positive_index = torch.tensor(
         positive_columns, dtype=torch.int64, device=retrieval.scores.device
     )
     positive_logits = retrieval.scores[row].index_select(0, positive_index).float()
     loss = torch.logsumexp(all_logits, dim=0) - torch.logsumexp(positive_logits, dim=0)
-    return loss, len(positive_columns)
+    return loss, len(positive_columns), candidate_count, negative_count, "valid_bag"
 
 
 def _record_matches_causal_occurrence(
@@ -1175,18 +1251,8 @@ def _record_matches_causal_occurrence(
         return False
     record_start, record_end = (float(value) for value in time_range)
     return any(record_start <= point <= record_end for point in points) or any(
-        record_start <= start and record_end >= end for start, end in intervals
+        record_start <= end and start <= record_end for start, end in intervals
     )
-
-
-def _record_end_time(record: object) -> float:
-    timestamp = getattr(record, "timestamp", None)
-    if timestamp is not None:
-        return float(timestamp)
-    time_range = getattr(record, "time_range", None)
-    if time_range is None:
-        raise ValueError("Retriever candidate record has no temporal metadata")
-    return float(time_range[1])
 
 
 def _nearest_timestamp_index(timestamps: Tensor, target: float) -> int | None:

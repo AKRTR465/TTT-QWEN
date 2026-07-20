@@ -214,6 +214,7 @@ class TTTQwenTrainerMixin:
     ) -> None:
         self.ttt_runtime = ttt_runtime
         self.last_meta_output: TruncatedMetaTTTEpisodeOutput | None = None
+        self.last_semantic_projector_grad_norm: float | None = None
         super().__init__(*args, **kwargs)
 
     def create_optimizer(self, *args: object, **kwargs: object) -> torch.optim.Optimizer:
@@ -245,6 +246,21 @@ class TTTQwenTrainerMixin:
             for name, value in metrics():
                 if value is not None:
                     enriched[name] = float(value)
+        if self.ttt_runtime.stage is ProductionStage.A2:
+            weak_audit = getattr(self.ttt_runtime.stage_a_loss_step, "last_weak_audit", None)
+            weak_metrics = getattr(weak_audit, "metrics", None)
+            if callable(weak_metrics):
+                for name, value in weak_metrics():
+                    enriched[name] = float(value)
+        elif self.last_meta_output is not None:
+            retrieval_metrics: dict[str, float] = {}
+            for query in self.last_meta_output.audit.queries:
+                for name, value in query.metrics.metrics:
+                    if name.startswith("retrieval/") and value is not None:
+                        retrieval_metrics[name] = retrieval_metrics.get(name, 0.0) + value
+            enriched.update(retrieval_metrics)
+        if self.last_semantic_projector_grad_norm is not None:
+            enriched["grad/semantic_projector"] = self.last_semantic_projector_grad_norm
         super().log(enriched, *args, **kwargs)  # type: ignore[misc]
 
     def compute_loss(
@@ -280,6 +296,7 @@ class TTTQwenTrainerMixin:
             marker = getattr(self.ttt_runtime.stage_a_loss_step, "mark_backward_returned", None)
             if callable(marker):
                 marker()
+            self.last_semantic_projector_grad_norm = _semantic_projector_gradient_norm(model)
             self._observe_runtime_cost(inputs, time.perf_counter() - step_started)
             return result
         if int(self.args.gradient_accumulation_steps) != 1:  # type: ignore[attr-defined]
@@ -324,6 +341,7 @@ class TTTQwenTrainerMixin:
         if output.audit.backward_count != expected_backwards:
             raise RuntimeError("A5 streamed backward collective count drifted from its bucket")
         backward_controller.finalize()
+        self.last_semantic_projector_grad_norm = _semantic_projector_gradient_norm(model)
         self.last_meta_output = output
         self._observe_runtime_cost(inputs, time.perf_counter() - step_started)
         return (output.total * loss_weight).detach().to(self.args.device)  # type: ignore[attr-defined]
@@ -797,6 +815,26 @@ def make_production_outer_optimizer_factory(
         return optimizer
 
     return factory
+
+
+def _semantic_projector_gradient_norm(model: nn.Module) -> float | None:
+    """Capture the post-backward Projector norm before the optimizer clears gradients."""
+
+    squared_norm: Tensor | None = None
+    matched = False
+    for name, parameter in model.named_parameters():
+        if "semantic_projector" not in name:
+            continue
+        matched = True
+        if parameter.grad is None:
+            continue
+        value = parameter.grad.detach().float().square().sum()
+        squared_norm = value if squared_norm is None else squared_norm + value
+    if not matched:
+        return None
+    if squared_norm is None:
+        return 0.0
+    return math.sqrt(float(squared_norm.item()))
 
 
 def _write_json(path: Path, value: object) -> None:

@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from ttt_svcbench_qwen.config import load_config
-from ttt_svcbench_qwen.identity_bank import build_identity_bank
+from ttt_svcbench_qwen.identity_bank import IdentityDecisionStatus, build_identity_bank
 from ttt_svcbench_qwen.model import BatchRuntimeState, ObservationChunkRequest, RuntimeOwner
 from ttt_svcbench_qwen.observation_heads import (
     E1RuntimeState,
@@ -336,6 +336,15 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
     )
 
     soft = result.soft_write
+    assert all(
+        not source.requires_grad and source.grad_fn is None
+        for source in (
+            soft.o1_sources,
+            soft.o2_sources,
+            soft.e1_sources,
+            soft.e2_sources,
+        )
+    )
     soft_loss = (
         soft.o1_semantics.square().sum()
         + soft.o2_semantics.square().sum()
@@ -351,24 +360,124 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
         float(value.abs().sum().item()) > 0.0 for value in projector_grads if value is not None
     )
 
-    retrieval_targets = torch.stack(
-        tuple(state.records[0].semantic_embedding for state in result.bank_states)
-    )
-    retrieval_query = replace(
-        query,
-        embeddings=replace(query.embeddings, q_target=retrieval_targets),
-    )
-    retrieval = build_state_retriever(load_config()).retrieve_query(
+    retriever = build_state_retriever(load_config())
+    pre_write_retrieval = retriever.retrieve_query_history(
         state_bank,
-        result.bank_states,
-        retrieval_query,
+        runtime.state_bank_states,
+        query,
         video_ids=owner.video_ids,
         trajectory_ids=owner.trajectory_ids,
     )
-    reader_results = DeterministicStateReader(_NumberTokenizer()).read(retrieval)
+    assert pre_write_retrieval.n_state.tolist() == [0, 0, 0, 0]
+    history_retrieval = retriever.retrieve_query_history(
+        state_bank,
+        result.bank_states,
+        query,
+        video_ids=owner.video_ids,
+        trajectory_ids=owner.trajectory_ids,
+    )
+    assert history_retrieval.n_state.tolist() == [1, 0, 1, 1]
+    assert all(
+        not record.semantic_source.requires_grad and record.semantic_source.grad_fn is None
+        for state in result.bank_states
+        for record in state.retrieval_history
+    )
+    reader_results = DeterministicStateReader(_NumberTokenizer()).read_bank(
+        state_bank,
+        result.bank_states,
+        query,
+        video_ids=owner.video_ids,
+        trajectory_ids=owner.trajectory_ids,
+    )
     assert len(reader_results) == 4
     assert all(isinstance(value, ReaderResult) for value in reader_results)
-    assert tuple(value.operator for value in reader_results) == retrieval_query.hard_operators
+    assert tuple(value.operator for value in reader_results) == query.hard_operators
+
+
+def test_o2_history_is_written_only_when_candidates_promote() -> None:
+    torch.manual_seed(20260720)
+    owner = RuntimeOwner(
+        ("video-o1", "video-o2", "video-e1", "video-e2"),
+        ("trajectory-o1", "trajectory-o2", "trajectory-e1", "trajectory-e2"),
+    )
+    query = _query(owner)
+    slots = torch.randn((4, 2, 768))
+    hidden = torch.randn((4, 3, 768))
+    spatial = _spatial(owner, slots)
+    temporal = TemporalEncoderOutput(
+        hidden=hidden,
+        timestamps=torch.arange(3, dtype=torch.float64).expand(4, -1).clone(),
+        position_ids=torch.arange(3, dtype=torch.int64).expand(4, -1).clone(),
+        valid_mask=torch.ones((4, 3), dtype=torch.bool),
+        cache=_cache(owner, hidden, query.q_target),
+    )
+    observations = _observations(owner, spatial, temporal, query.q_target)
+    state_bank = build_state_bank(load_config())
+    writer = StageABankWriter(state_bank, build_identity_bank(load_config()))
+    runtime = writer.reset(owner)
+    request = ObservationChunkRequest(
+        owner=owner,
+        video_input="synthetic",
+        query_input="synthetic",
+        runtime_state=runtime,
+        bank_states=runtime.state_bank_states,
+        inference=False,
+    )
+    first = writer(observations, spatial, temporal, query, request)
+    assert first.bank_states[1].retrieval_history == ()
+    assert all(
+        decision.status is IdentityDecisionStatus.CANDIDATE_CREATED
+        for decision in first.audit.identity_decisions[1]
+    )
+
+    second_observations = replace(
+        observations,
+        o1=replace(
+            observations.o1,
+            timestamps=observations.o1.timestamps + 3.0,
+            position_ids=observations.o1.position_ids + 3,
+        ),
+        o2=replace(
+            observations.o2,
+            timestamps=observations.o2.timestamps + 3.0,
+            position_ids=observations.o2.position_ids + 3,
+        ),
+        e1=replace(
+            observations.e1,
+            timestamps=observations.e1.timestamps + 3.0,
+            position_ids=observations.e1.position_ids + 3,
+        ),
+        e2=replace(
+            observations.e2,
+            timestamps=observations.e2.timestamps + 3.0,
+            position_ids=observations.e2.position_ids + 3,
+        ),
+    )
+    second = writer(
+        second_observations,
+        spatial,
+        temporal,
+        query,
+        replace(
+            request,
+            runtime_state=first.runtime_state,
+            bank_states=first.bank_states,
+        ),
+    )
+
+    assert all(
+        decision.status is IdentityDecisionStatus.PROMOTED
+        for decision in second.audit.identity_decisions[1]
+    )
+    o2_history = second.bank_states[1].retrieval_history
+    assert len(o2_history) == 2
+    assert all(record.head_type is HeadType.O2 for record in o2_history)
+    assert all(record.lifecycle_id is not None for record in o2_history)
+    assert all(record.retrieval_eligible for record in o2_history)
+    assert [len(second.bank_states[index].records) for index in (0, 2, 3)] == [1, 1, 1]
+    assert [
+        len(second.bank_states[index].retrieval_history) for index in (0, 2, 3)
+    ] == [2, 2, 2]
 
 
 def test_stage_a_runtime_has_no_fast_or_optimizer_state() -> None:

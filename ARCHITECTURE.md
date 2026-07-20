@@ -1,7 +1,7 @@
-# Qwen3-VL-8B State-TTT v5 架构
+# Qwen3-VL-8B State-TTT v6 架构
 
-> 规范版本：state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval
-> 修订日期：2026-07-19
+> 规范版本：state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history
+> 修订日期：2026-07-20
 > 状态：A2/A5 TRAINING MAINLINE IMPLEMENTED；ONLINE INFERENCE WIRED
 
 ## 1. 固定目标
@@ -32,9 +32,9 @@ video chunk
 
 question + query_time
   -> Query Encoder + operator/time routing
-  -> Retriever
-  -> Deterministic Reader
-  -> 16-token State Resampler
+  -> pre-write Retrieval History -> Semantic Projector -> Retriever
+  -> Retriever -> 16-token State Resampler
+  -> post-write aggregate/Confirmed Bank -> Deterministic Reader
   -> Qwen answer prefill/generation
 ```
 
@@ -61,13 +61,14 @@ hard path 在提交前 detach；Identity Bank 只依据模型输出和因果 ove
 
 ### 3.4 Query、Retriever 与 Reader
 
-Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由与时间窗口。Retriever 按 typed records 与时间窗口筛选。Reader 是唯一精确计数所有者，输出状态、选中 record IDs、算术结果和审计字段。
+Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由与时间窗口。Semantic Retriever 只读取当前 Query 写入前的 append-only retrieval history，并在 Query graph 中用现有 SemanticProjector 将 detached 768D source 重投影为 512D key；因此 retrieval loss 可同时更新 q_target 与 Projector，但不会回传到历史 Support encoder。Reader 不经过 semantic threshold 或 retrieval history，直接读取当前 Query 写入后的 aggregate/Confirmed Bank，并作为唯一精确计数所有者输出状态、record IDs、算术结果和审计字段。
 
 ## 4. 训练主线
 
 ### A2
 
 - 全量解冻 Qwen、状态模块与 W0；
+- v5 及更早训练因 aggregate 单记录拓扑而视为 legacy retrieval-off 消融；v6 新训练不恢复旧 optimizer、scheduler、RNG 或 runtime state；
 - Predictor 冻结、Inner SGD 不可达；
 - Query outer loss 默认使用 `instant_equal`：以全局有效数归一四个 official-weak 项，
   固定等权后将辅助组限制为 Answer 的至多 30%，且不维护 EMA/checkpoint 状态；

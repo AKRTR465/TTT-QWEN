@@ -5,8 +5,8 @@ from ttt_svcbench_qwen.inference import main as inference_main
 from ttt_svcbench_qwen.llamafactory_trainer import main as training_main
 from ttt_svcbench_qwen.production_runtime import build_runtime
 
-V5_ARCHITECTURE_SNAPSHOT = {
-    "spec_version": "state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval",
+V6_ARCHITECTURE_SNAPSHOT = {
+    "spec_version": "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history",
     "base_model": "Qwen/Qwen3-VL-8B-Instruct",
     "vision": {
         "output_size": 4096,
@@ -44,7 +44,7 @@ V5_ARCHITECTURE_SNAPSHOT = {
 }
 
 
-def test_v5_architecture_snapshot_is_unchanged() -> None:
+def test_v6_architecture_snapshot_is_unchanged() -> None:
     config = load_config()
     actual = {
         "spec_version": config.spec_version,
@@ -98,7 +98,7 @@ def test_v5_architecture_snapshot_is_unchanged() -> None:
             "auxiliary_outer_weight": config.loss.auxiliary_outer_weight,
         },
     }
-    assert actual == V5_ARCHITECTURE_SNAPSHOT
+    assert actual == V6_ARCHITECTURE_SNAPSHOT
 
 
 def test_production_entrypoints_remain_importable() -> None:

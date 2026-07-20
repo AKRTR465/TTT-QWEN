@@ -5,13 +5,14 @@
 - A2 全量状态模型训练，再初始化 A5 Meta-TTT；
 - 按视频隔离、按 chunk 因果更新的在线推理。
 
-当前规范版本为 `state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval`。配置、运行时和测试均以 v5 为准；历史阶段 gate 与 synthetic 报告不再随源码分发。
+当前规范版本为 `state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history`。配置、运行时和测试均以 v6 为准；历史阶段 gate 与 synthetic 报告不再随源码分发。
 
 ## 架构摘要
 
 - Fast Adapter 位于 Qwen Main Visual Merger 与 video `masked_scatter` 之间；DeepStack 保持原始路径。
 - 在线状态仅更新两块 768x768 fast matrix，更新顺序固定为“当前 chunk 使用 Wt，更新后的 Wt+1 从下一 chunk 生效”。
 - 状态路包含 Spatial Slot Encoder、Temporal Encoder、O1/O2/E1/E2 heads、Structured State Bank、Identity Bank、Retriever 和 Deterministic Reader。
+- State Bank 同时维护写后 aggregate/Confirmed 状态和 append-only retrieval history；Query 从写前 history 重投影 768D source，Reader 直接读取写后状态。
 - Reader 负责精确计数及证据，Qwen 负责自然语言答案。
 - A5 使用 `L_pred + 0.5 L_id + 0.5 L_event`，K=8 截断二阶梯度并重锚 W0。
 - A2/A5 正式训练默认使用 `instant_equal`：按当前全局 sum/count 对齐四项

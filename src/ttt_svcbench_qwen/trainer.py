@@ -7,9 +7,9 @@ Forbidden: Inner SGD, transient runtime checkpoints, or label leakage into model
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Protocol, cast
 
 import torch
 from torch import Tensor
@@ -441,7 +441,10 @@ class StageAEpisodeRunner:
             failure_cases=failure_cases,
         )
 
-    def _query_activation_context(self):  # type: ignore[no-untyped-def]
+    def _query_activation_context(self) -> AbstractContextManager[object]:
         if not self.query_activation_offload or not torch.cuda.is_available():
             return nullcontext()
-        return torch.autograd.graph.save_on_cpu(pin_memory=True)
+        return cast(
+            AbstractContextManager[object],
+            torch.autograd.graph.save_on_cpu(pin_memory=True),
+        )

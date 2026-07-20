@@ -18,8 +18,8 @@ import transformers
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION = "state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval"
-CONFIG_SCHEMA_VERSION = 3
+SPEC_VERSION = "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history"
+CONFIG_SCHEMA_VERSION = 4
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -385,6 +385,8 @@ class StateBankConfig(FrozenModel):
     confirmed_store: ConfirmedStoreConfig
     candidate_store: CandidateStoreConfig
     event_history_capacity: PositiveInt
+    retrieval_history_capacity_per_head: PositiveInt
+    retrieval_history_source_dim: PositiveInt
     isolation_keys: tuple[str, ...]
     hard_updates_no_grad: bool
     detach_before_write: bool
@@ -1274,6 +1276,16 @@ class ProjectConfig(FrozenModel):
                 ),
             ),
             ("state_bank.event_history_capacity", self.state_bank.event_history_capacity, 512),
+            (
+                "state_bank.retrieval_history_capacity_per_head",
+                self.state_bank.retrieval_history_capacity_per_head,
+                512,
+            ),
+            (
+                "state_bank.retrieval_history_source_dim",
+                self.state_bank.retrieval_history_source_dim,
+                768,
+            ),
             ("state_bank.hard_updates_no_grad", self.state_bank.hard_updates_no_grad, True),
             ("state_bank.detach_before_write", self.state_bank.detach_before_write, True),
             (
@@ -2307,6 +2319,10 @@ class ProjectConfig(FrozenModel):
             raise ValueError("semantic projector head_type_count must match head_types")
         if projector.output_dim != self.state_bank.semantic_dim:
             raise ValueError("semantic projector output must match state_bank.semantic_dim")
+        if projector.input_dim != self.state_bank.retrieval_history_source_dim:
+            raise ValueError(
+                "semantic projector input must match retrieval history source dimension"
+            )
         projector_parameter_count = (
             projector.head_type_count * projector.input_dim
             + 2 * projector.input_dim

@@ -1,5 +1,5 @@
-spec_version: state_ttt_qwen3vl8b_high_capacity_sgd_v5_embedding_retrieval
-config_schema_version: 3
+spec_version: state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history
+config_schema_version: 4
 
 paths:
   model_root_env: QWEN_MODEL_ROOT
@@ -290,6 +290,8 @@ state_bank:
     overflow_policy: expire_then_low_confidence_then_reject
     prune_order: [expired, low_confidence, confidence_asc, last_position_id_asc, candidate_id_asc, reject_new]
   event_history_capacity: 512
+  retrieval_history_capacity_per_head: 512
+  retrieval_history_source_dim: 768
   isolation_keys: [video_id, trajectory_id, head_type]
   hard_updates_no_grad: true
   detach_before_write: true
