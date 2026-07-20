@@ -610,7 +610,15 @@ class VideoChunkMaterializer:
         fingerprint = self._fingerprint(spec)
         cache = self._cache_for(spec)
         if cache is not None:
+            cache_started = time.perf_counter()
             cached = cache.get(fingerprint)
+            if spec.observation_role == "support":
+                _loader_trace(
+                    "support_cache_read",
+                    chunk_id=spec.chunk_id,
+                    hit=cached is not None,
+                    seconds=time.perf_counter() - cache_started,
+                )
             if cached is not None:
                 _loader_trace(
                     f"{spec.observation_role}_cache_hit",
@@ -654,7 +662,14 @@ class VideoChunkMaterializer:
         misses: list[tuple[SupportChunkSpec, PreprocessFingerprint]] = []
         for spec in specs:
             fingerprint = self._fingerprint(spec)
+            cache_started = time.perf_counter()
             cached = self.preprocess_cache.get(fingerprint) if self.preprocess_cache else None
+            _loader_trace(
+                "support_cache_read",
+                chunk_id=spec.chunk_id,
+                hit=cached is not None,
+                seconds=time.perf_counter() - cache_started,
+            )
             if cached is not None:
                 results[spec.chunk_id] = self._from_cached(spec, cached)
                 _loader_trace("support_cache_hit", chunk_id=spec.chunk_id)
@@ -1538,16 +1553,17 @@ class A2PrefetchCollator:
                 self.video(support_spec)
                 for support_spec in _a2_support_chunk_specs(record, video_path)
             )
-            prepared_bytes = _prepared_a2_record_bytes(answer, supports)
-            if prepared_bytes > self.prepared_episode_max_bytes:
-                raise MemoryError(
-                    f"prepared A2 episode {record.query.runtime.query_id!r} uses "
-                    f"{prepared_bytes} bytes, above limit {self.prepared_episode_max_bytes}"
-                )
+        prepared_bytes = _prepared_a2_record_bytes(answer, supports)
+        if prepared_bytes > self.prepared_episode_max_bytes:
+            raise MemoryError(
+                f"prepared A2 episode {record.query.runtime.query_id!r} uses "
+                f"{prepared_bytes} bytes, above limit {self.prepared_episode_max_bytes}"
+            )
         _loader_trace(
             "a2_collate_done",
             query_id=record.query.runtime.query_id,
             seconds=time.perf_counter() - started,
+            prepared_bytes=prepared_bytes,
             cache_stats=(self.preprocess_cache.stats() if self.preprocess_cache else {}),
         )
         return {"prepared_a2": PreparedA2Record(record, answer, supports)}
@@ -1948,6 +1964,7 @@ class ProductionA2LossStep:
         )
         source = prefetched
         record = prefetched.record
+        _loader_trace("forward_arrival", query_id=record.query.runtime.query_id)
         call_index = self.progress.begin(record)
         self._active_progress_call = call_index
         batch = self.materializer.a2(source)
@@ -2568,7 +2585,14 @@ def _prepare_answer_cpu(
         _loader_trace("query_cache_hit", query_id=query.runtime.query_id)
     else:
         _loader_trace("query_cache_miss", query_id=query.runtime.query_id)
+        decode_started = time.perf_counter()
         frames, timestamps = _decode_uniform_interval(spec, spec.sampling_fps)
+        _loader_trace(
+            "query_decode",
+            query_id=query.runtime.query_id,
+            frame_count=len(frames),
+            seconds=time.perf_counter() - decode_started,
+        )
         frames = _resize_to_pixel_budget(
             frames,
             minimum_pixels=minimum_pixels,

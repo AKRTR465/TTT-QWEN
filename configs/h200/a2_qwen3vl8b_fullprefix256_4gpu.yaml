@@ -12,7 +12,9 @@ finetuning_type: full
 freeze_vision_tower: false
 freeze_multi_modal_projector: false
 freeze_language_model: false
-deepspeed: configs/h200/deepspeed_zero2.json
+# A2 has a sample-dependent official-weak graph. Reduce the fully anchored
+# gradient set after backward instead of constructing ZeRO-2 hook buckets.
+deepspeed: configs/h200/deepspeed_zero1_dynamic_graph.json
 
 dataset_dir: $DATASET_DIR
 dataset: $DATASET_NAME

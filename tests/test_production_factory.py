@@ -17,6 +17,7 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     ProductionStage,
     ProductionTrainerRuntime,
     SegmentBackwardController,
+    TTTQwenTrainerMixin,
     _validate_checkpoint_tree,
     make_production_outer_optimizer_factory,
     resolve_same_stage_resume,
@@ -145,7 +146,7 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
     }
 
 
-def test_fullprefix256_yaml_matches_qwen_visual_budget_and_zero2(
+def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = Path(__file__).parents[1]
@@ -162,12 +163,39 @@ def test_fullprefix256_yaml_matches_qwen_visual_budget_and_zero2(
     assert native["video_fps"] == 2.0
     assert native["video_maxlen"] == 256
     assert native["cutoff_len"] == 16_384
-    assert native["deepspeed"] == "configs/h200/deepspeed_zero2.json"
+    assert native["deepspeed"] == "configs/h200/deepspeed_zero1_dynamic_graph.json"
     assert native["save_strategy"] == "epoch"
     assert native["save_total_limit"] == 1
     assert extension.query_visual_mode == "causal_prefix"
     assert extension.query_max_frames == 256
     assert extension.query_cache_mode == "disabled"
+
+
+def test_a2_eager_ga_fetch_records_each_wait_and_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.llamafactory_trainer.trace_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    owner = SimpleNamespace(ttt_runtime=SimpleNamespace(stage=ProductionStage.A2))
+    source = iter({"prepared_a2": index} for index in range(4))
+
+    batches, num_items = TTTQwenTrainerMixin.get_batch_samples(
+        owner, source, 4, torch.device("cpu")
+    )
+
+    assert batches == [{"prepared_a2": index} for index in range(4)]
+    assert num_items is None
+    assert [name for name, _ in events] == [
+        "a2_ga_microbatch_fetch",
+        "a2_ga_microbatch_fetch",
+        "a2_ga_microbatch_fetch",
+        "a2_ga_microbatch_fetch",
+        "a2_ga_group_fetch",
+    ]
+    assert events[-1][1]["fetched_batches"] == 4
 
 
 def test_a2_uses_dynamic_graph_safe_zero1_profile() -> None:

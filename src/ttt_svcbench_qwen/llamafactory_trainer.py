@@ -14,7 +14,7 @@ import os
 import shutil
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -53,7 +53,11 @@ from ttt_svcbench_qwen.production_factory import (
     initialize_outer_model_from_a2,
     load_llamafactory_backbone,
 )
-from ttt_svcbench_qwen.runtime_metrics import flush_runtime_metrics, trace_cuda_phase
+from ttt_svcbench_qwen.runtime_metrics import (
+    flush_runtime_metrics,
+    trace_cuda_phase,
+    trace_event,
+)
 from ttt_svcbench_qwen.visual_cost import (
     VisualCostRecord,
     make_visual_cost_fingerprint,
@@ -233,6 +237,48 @@ class TTTQwenTrainerMixin:
         )
         self._ttt_train_sampler = sampler
         return sampler
+
+    def get_batch_samples(
+        self,
+        epoch_iterator: Iterator[object],
+        num_batches: int,
+        device: torch.device,
+    ) -> tuple[list[object], Tensor | int | None]:
+        """Measure the eager GA fetch boundary used by Transformers 4.57.1.
+
+        A2 batches deliberately carry no conventional ``labels`` entry: the typed loss hook
+        owns all supervision. Returning ``None`` for ``num_items_in_batch`` therefore preserves
+        the upstream loss-scaling contract while exposing how long each blocking ``next()`` call
+        takes. A5 retains the exact upstream implementation.
+        """
+
+        if self.ttt_runtime.stage is not ProductionStage.A2:
+            return cast(
+                tuple[list[object], Tensor | int | None],
+                super().get_batch_samples(epoch_iterator, num_batches, device),  # type: ignore[misc]
+            )
+        group_started = time.perf_counter()
+        batch_samples: list[object] = []
+        for microbatch_index in range(num_batches):
+            wait_started = time.perf_counter()
+            try:
+                batch = next(epoch_iterator)
+            except StopIteration:
+                break
+            batch_samples.append(batch)
+            trace_event(
+                "a2_ga_microbatch_fetch",
+                seconds=time.perf_counter() - wait_started,
+                microbatch_index=microbatch_index,
+                requested_batches=num_batches,
+            )
+        trace_event(
+            "a2_ga_group_fetch",
+            seconds=time.perf_counter() - group_started,
+            requested_batches=num_batches,
+            fetched_batches=len(batch_samples),
+        )
+        return batch_samples, None
 
     def log(self, logs: dict[str, float], *args: object, **kwargs: object) -> None:
         enriched = dict(logs)
