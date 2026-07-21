@@ -45,6 +45,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     StageATargetBatch,
     StageATargetBuilder,
     TargetProvenance,
+    _official_weak_task_loss,
     _record_matches_causal_occurrence,
 )
 from ttt_svcbench_qwen.state_bank import HeadType, O1Payload, StateRecord
@@ -775,6 +776,7 @@ def test_official_retrieval_requires_aligned_mixed_bag_and_ignores_selection_mas
         "retrieval/candidate_count": 2.0,
         "retrieval/positive_count": 1.0,
         "retrieval/negative_count": 1.0,
+        "task/annotation_count_mismatch": 0.0,
     }
 
     no_positive = build((9.0,))
@@ -799,6 +801,82 @@ def test_official_retrieval_requires_aligned_mixed_bag_and_ignores_selection_mas
     assert wrong_operator.retrieval.valid_rows == 0
     assert wrong_operator.audit.retrieval_wrong_operator_rows == 1
 
+
+@pytest.mark.parametrize(
+    ("operator", "head_name", "target_count"),
+    (
+        (Operator.O2_UNIQUE, "o2", 47),
+        (Operator.E1_ACTION, "e1", 140),
+        (Operator.E2_EPISODE, "e2", 140),
+    ),
+)
+def test_unbounded_count_predictions_train_beyond_local_axis(
+    operator: Operator,
+    head_name: str,
+    target_count: int,
+) -> None:
+    observations, query, retrieval, _ = _typed_predictions(1)
+    prediction = torch.tensor([0.5], requires_grad=True)
+    selected = getattr(observations, head_name)
+    observations = replace(
+        observations,
+        **{head_name: replace(selected, count_prediction=prediction)},
+    )
+    label = OfficialWeakSupervision(
+        query_id=f"unbounded-{head_name}",
+        operator=operator,
+        time_mode=TimeWindowMode.HISTORY,
+        count=target_count,
+        query_time=10.0,
+        occurrence_points=(),
+        occurrence_intervals=(),
+    )
+
+    output = OfficialWeakTargetBuilder().build(observations, query, retrieval, (label,))
+    output.task.value.backward()
+
+    assert torch.isfinite(output.task.value)
+    assert prediction.grad is not None
+    assert torch.isfinite(prediction.grad).all()
+    assert prediction.grad.abs().item() > 0.0
+
+
+def test_historical_occurrences_outside_state_tail_do_not_create_dense_targets() -> None:
+    observations, _, _, _ = _typed_predictions(1)
+    tail_times = torch.tensor([[8.0, 9.0, 10.0]], dtype=torch.float64)
+    observations = replace(
+        observations,
+        e1=replace(observations.e1, timestamps=tail_times),
+        e2=replace(observations.e2, timestamps=tail_times),
+    )
+    e1_empty = OfficialWeakSupervision(
+        query_id="e1-empty-tail",
+        operator=Operator.E1_ACTION,
+        time_mode=TimeWindowMode.HISTORY,
+        count=0,
+        query_time=10.0,
+        occurrence_points=(),
+        occurrence_intervals=(),
+    )
+    e1_historical = replace(e1_empty, occurrence_points=(1.0, 2.0, 3.0))
+    e2_empty = replace(
+        e1_empty,
+        query_id="e2-empty-tail",
+        operator=Operator.E2_EPISODE,
+    )
+    e2_historical = replace(
+        e2_empty,
+        occurrence_intervals=((1.0, 2.0), (3.0, 4.0)),
+    )
+
+    assert torch.allclose(
+        _official_weak_task_loss(observations, 0, e1_empty),
+        _official_weak_task_loss(observations, 0, e1_historical),
+    )
+    assert torch.allclose(
+        _official_weak_task_loss(observations, 0, e2_empty),
+        _official_weak_task_loss(observations, 0, e2_historical),
+    )
 
 def test_e2_retrieval_uses_interval_overlap_without_special_negative_generation() -> None:
     record = type(

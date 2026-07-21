@@ -8,7 +8,7 @@ Forbidden: hard thresholds, integer accumulation, Bank/FSM mutation, or input de
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar
 
 import torch
@@ -105,6 +105,10 @@ class O1SoftOutput:
     def confidence_probability(self) -> Tensor:
         return self.probabilities[..., 5]
 
+    @property
+    def count_prediction(self) -> Tensor:
+        return self.soft_count
+
 
 @dataclass(frozen=True, slots=True)
 class O2SoftOutput:
@@ -116,6 +120,7 @@ class O2SoftOutput:
     valid_mask: Tensor
     timestamps: Tensor
     position_ids: Tensor
+    count_prediction: Tensor = field(default_factory=lambda: torch.empty(0))
 
     def __post_init__(self) -> None:
         _require_float_shape(self.identity, 256, "O2 identity")
@@ -130,6 +135,13 @@ class O2SoftOutput:
         )
         if self.identity.shape[:2] != self.score_logits.shape[:2]:
             raise ValueError("O2 identity and score must share batch and slot dimensions")
+        if self.count_prediction.numel() == 0:
+            object.__setattr__(
+                self,
+                "count_prediction",
+                (self.score_probabilities[..., 0] * self.valid_mask).sum(dim=1),
+            )
+        _validate_count_prediction(self.count_prediction, self.score_logits, "O2")
         if (
             self.identity.dtype != self.score_logits.dtype
             or self.identity.device != self.score_logits.device
@@ -160,6 +172,10 @@ class O2SoftOutput:
         """Compatibility alias for raw novelty/match-confidence logits."""
 
         return self.score_logits
+
+    @property
+    def diagnostic_local_novelty_sum(self) -> Tensor:
+        return (self.score_probabilities[..., 0] * self.valid_mask).sum(dim=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +300,7 @@ class E1SoftOutput:
     position_ids: Tensor
     next_states: tuple[E1RuntimeState, ...]
     audit: StreamReplayAudit
+    count_prediction: Tensor = field(default_factory=lambda: torch.empty(0))
 
     def __post_init__(self) -> None:
         _validate_soft_axis_output(
@@ -297,7 +314,18 @@ class E1SoftOutput:
         )
         if len(self.next_states) != self.logits.shape[0] or self.audit.head != "e1":
             raise ValueError("E1 output requires one next state and an E1 audit per batch row")
+        if self.count_prediction.numel() == 0:
+            object.__setattr__(
+                self,
+                "count_prediction",
+                (self.probabilities[..., 1] * self.valid_mask).sum(dim=1),
+            )
+        _validate_count_prediction(self.count_prediction, self.logits, "E1")
         _assert_e1_state_storage_isolated(self.next_states)
+
+    @property
+    def diagnostic_local_completion_sum(self) -> Tensor:
+        return (self.probabilities[..., 1] * self.valid_mask).sum(dim=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +450,7 @@ class E2SoftOutput:
     position_ids: Tensor
     next_states: tuple[E2RuntimeState, ...]
     audit: StreamReplayAudit
+    count_prediction: Tensor = field(default_factory=lambda: torch.empty(0))
 
     def __post_init__(self) -> None:
         _validate_soft_axis_output(
@@ -446,6 +475,13 @@ class E2SoftOutput:
             raise ValueError("E2 event and phase logits must have identical shapes")
         if len(self.next_states) != self.event_logits.shape[0] or self.audit.head != "e2":
             raise ValueError("E2 output requires one next state and an E2 audit per batch row")
+        if self.count_prediction.numel() == 0:
+            object.__setattr__(
+                self,
+                "count_prediction",
+                (self.event_probabilities[..., 3] * self.valid_mask).sum(dim=1),
+            )
+        _validate_count_prediction(self.count_prediction, self.event_logits, "E2")
         if self.event_logits.device.type != "meta":
             valid_phase = self.phase_probabilities[self.valid_mask]
             sum_tolerance = max(
@@ -460,6 +496,10 @@ class E2SoftOutput:
             ):
                 raise ValueError("valid E2 phase probabilities must sum to one")
         _assert_e2_state_storage_isolated(self.next_states)
+
+    @property
+    def diagnostic_local_completion_sum(self) -> Tensor:
+        return (self.event_probabilities[..., 3] * self.valid_mask).sum(dim=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,6 +526,22 @@ class ObservationOutputs:
             raise ValueError("E1/E2 outputs must share tubelet mask and metadata")
         if self.o1.logits.shape[0] != self.e1.logits.shape[0]:
             raise ValueError("all observation heads must share one batch size")
+
+
+class CumulativeCountHead(nn.Module):  # type: ignore[misc]
+    """Unbounded positive cumulative count independent of the local sequence length."""
+
+    def __init__(self, input_dim: int, *, layer_norm_eps: float) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(input_dim, eps=layer_norm_eps)
+        self.hidden = nn.Linear(input_dim, 256, bias=True)
+        self.output = nn.Linear(256, 1, bias=True)
+
+    def forward(self, features: Tensor) -> Tensor:
+        if features.ndim != 2:
+            raise ValueError("cumulative count features must be [B, D]")
+        logits = self.output(F.silu(self.hidden(self.norm(features)))).squeeze(-1)
+        return F.softplus(logits.float()).to(dtype=logits.dtype)
 
 
 class O1CurrentCountDecoder(nn.Module):  # type: ignore[misc]
@@ -551,6 +607,10 @@ class O2IdentityDecoder(nn.Module):  # type: ignore[misc]
         self.trunk_2 = nn.Linear(config.hidden_dims[0], config.hidden_dims[1], bias=True)
         self.identity_projection = nn.Linear(config.hidden_dims[1], config.identity_dim, bias=True)
         self.score_projection = nn.Linear(config.hidden_dims[1], config.score_dim, bias=True)
+        self.count_head = CumulativeCountHead(
+            config.hidden_dims[1] + 512,
+            layer_norm_eps=config.layer_norm_eps,
+        )
 
     def forward(
         self,
@@ -558,6 +618,8 @@ class O2IdentityDecoder(nn.Module):  # type: ignore[misc]
         slot_valid_mask: Tensor,
         observation_timestamps: Tensor,
         observation_position_ids: Tensor,
+        *,
+        q_target: Tensor | None = None,
     ) -> O2SoftOutput:
         safe_slots, expanded_timestamps, expanded_positions = _validate_spatial_head_inputs(
             self,
@@ -569,6 +631,12 @@ class O2IdentityDecoder(nn.Module):  # type: ignore[misc]
         )
         hidden = F.silu(self.trunk_1(self.slot_norm(safe_slots)))
         hidden = F.silu(self.trunk_2(hidden))
+        if q_target is None:
+            q_target = hidden.new_zeros((hidden.shape[0], 512))
+        _validate_query(q_target, hidden, 512, "O2")
+        valid_weights = slot_valid_mask.unsqueeze(-1).to(dtype=hidden.dtype)
+        pooled = (hidden * valid_weights).sum(dim=1) / valid_weights.sum(dim=1).clamp_min(1.0)
+        count_prediction = self.count_head(torch.cat((pooled, q_target), dim=-1))
         raw_identity = self.identity_projection(hidden)
         raw_fp32 = raw_identity.float()
         norms = torch.linalg.vector_norm(raw_fp32, dim=-1, keepdim=True)
@@ -596,6 +664,7 @@ class O2IdentityDecoder(nn.Module):  # type: ignore[misc]
             valid_mask=slot_valid_mask.clone(),
             timestamps=expanded_timestamps,
             position_ids=expanded_positions,
+            count_prediction=count_prediction,
         )
 
 
@@ -651,6 +720,10 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
             for dilation in config.dilations
         )
         self.output_projection = nn.Linear(config.channels, config.output_dim, bias=True)
+        self.count_head = CumulativeCountHead(
+            config.channels,
+            layer_norm_eps=config.layer_norm_eps,
+        )
 
     def forward(
         self,
@@ -686,6 +759,7 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
         valid_counts: list[int] = []
         overlap_counts: list[int] = []
         state_lengths: list[int] = []
+        count_features: list[Tensor] = []
         for row in range(hidden.shape[0]):
             state = states[row] or self._empty_state(
                 owners[0][row],
@@ -700,6 +774,7 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
                 next_states.append(next_state)
                 overlap_counts.append(0)
                 state_lengths.append(int(next_state.projected_history.shape[0]))
+                count_features.append(projected[row].new_zeros((self.config.channels,)))
                 continue
             current_positions = position_ids[row, :count]
             current_timestamps = normalized_timestamps[row, :count]
@@ -727,6 +802,7 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
             next_states.append(next_state)
             overlap_counts.append(overlap_count)
             state_lengths.append(int(next_state.projected_history.shape[0]))
+            count_features.append(encoded[0, -1])
         logits = torch.cat(output_rows, dim=0)
         logits = torch.where(valid_mask.unsqueeze(-1), logits, 0.0)
         probabilities = torch.sigmoid(logits.float()).to(dtype=logits.dtype)
@@ -745,6 +821,7 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
             position_ids=position_ids.clone(),
             next_states=tuple(next_states),
             audit=audit,
+            count_prediction=self.count_head(torch.stack(count_features, dim=0)),
         )
 
     def reset_state(
@@ -862,6 +939,10 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
         )
         self.event_projection = nn.Linear(config.hidden_dim, config.event_output_dim, bias=True)
         self.phase_projection = nn.Linear(config.hidden_dim, config.phase_output_dim, bias=True)
+        self.count_head = CumulativeCountHead(
+            config.hidden_dim,
+            layer_norm_eps=config.layer_norm_eps,
+        )
 
     def forward(
         self,
@@ -897,6 +978,7 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
         valid_counts: list[int] = []
         overlap_counts: list[int] = []
         state_lengths: list[int] = []
+        count_features: list[Tensor] = []
         for row in range(hidden.shape[0]):
             state = states[row] or self._empty_state(
                 owners[0][row],
@@ -912,6 +994,7 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
                 next_states.append(next_state)
                 overlap_counts.append(0)
                 state_lengths.append(int(next_state.checkpoint_hidden.shape[0]))
+                count_features.append(state.hidden[-1])
                 continue
             current_positions = position_ids[row, :count]
             current_timestamps = normalized_timestamps[row, :count]
@@ -950,6 +1033,7 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
             next_states.append(next_state)
             overlap_counts.append(overlap)
             state_lengths.append(int(next_state.checkpoint_hidden.shape[0]))
+            count_features.append(recurrent_hidden[-1, 0])
         event_logits = torch.cat(event_rows, dim=0)
         phase_logits = torch.cat(phase_rows, dim=0)
         event_logits = torch.where(valid_mask.unsqueeze(-1), event_logits, 0.0)
@@ -976,6 +1060,7 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
             position_ids=position_ids.clone(),
             next_states=tuple(next_states),
             audit=audit,
+            count_prediction=self.count_head(torch.stack(count_features, dim=0)),
         )
 
     def reset_state(
@@ -1158,6 +1243,7 @@ class ObservationHeads(nn.Module):  # type: ignore[misc]
             effective_slot_mask,
             observation_timestamps,
             observation_position_ids,
+            q_target=q_target,
         )
         e1 = self.e1(
             temporal.hidden,
@@ -1406,6 +1492,20 @@ def _validate_module_dtype_device(module: nn.Module, inputs: Tensor, name: str) 
     for parameter in module.parameters():
         if parameter.dtype != inputs.dtype or parameter.device != inputs.device:
             raise ValueError(f"{name} module and inputs must share dtype/device")
+
+
+def _validate_count_prediction(prediction: Tensor, reference: Tensor, name: str) -> None:
+    if (
+        prediction.shape != (reference.shape[0],)
+        or not torch.is_floating_point(prediction)
+        or prediction.dtype != reference.dtype
+        or prediction.device != reference.device
+    ):
+        raise ValueError(f"{name} count_prediction must match logits as floating [B]")
+    if prediction.device.type != "meta" and (
+        not bool(torch.isfinite(prediction).all()) or bool(torch.any(prediction < 0.0))
+    ):
+        raise ValueError(f"{name} count_prediction must be finite and non-negative")
 
 
 def _validate_query(query: Tensor, reference: Tensor, query_dim: int, name: str) -> None:
@@ -1692,7 +1792,7 @@ def _validate_o2_config(config: O2Config) -> None:
         "identity_normalization": "l2_fp32_unit_basis_fallback",
         "normalization_eps": 1.0e-8,
         "score_names": O2SoftOutput.SCORE_NAMES,
-        "parameter_count": 2_103_042,
+        "parameter_count": 2_499_843,
     }
     _validate_config_fields(config, expected, "O2")
 
@@ -1719,7 +1819,7 @@ def _validate_e1_config(config: E1Config) -> None:
         "state_owner_keys": ("video_id", "trajectory_id", "query_signature"),
         "detach_runtime_default": True,
         "output_names": E1SoftOutput.LOGIT_NAMES,
-        "parameter_count": 9_584_643,
+        "parameter_count": 9_717_252,
     }
     _validate_config_fields(config, expected, "E1")
 
@@ -1743,12 +1843,12 @@ def _validate_e2_config(config: E2Config) -> None:
         "detach_runtime_default": True,
         "event_names": E2SoftOutput.EVENT_NAMES,
         "phase_names": E2SoftOutput.PHASE_NAMES,
-        "parameter_count": 7_094_792,
+        "parameter_count": 7_293_449,
     }
     _validate_config_fields(config, expected, "E2")
 
 
 def _validate_config_fields(config: object, expected: dict[str, object], name: str) -> None:
-    for field, required in expected.items():
-        if getattr(config, field) != required:
-            raise ValueError(f"P8 requires {name} {field}={required!r}")
+    for field_name, required in expected.items():
+        if getattr(config, field_name) != required:
+            raise ValueError(f"P8 requires {name} {field_name}={required!r}")

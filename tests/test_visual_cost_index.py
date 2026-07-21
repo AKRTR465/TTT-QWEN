@@ -32,6 +32,11 @@ def _fingerprint() -> dict[str, object]:
         gpu_model="NVIDIA H200",
         query_decode_strategy="grouped_seek",
         query_decode_max_groups=16,
+        state_query_visual_mode="recent_chunk",
+        state_query_max_frames=16,
+        answer_query_visual_mode="causal_prefix",
+        answer_query_max_frames=256,
+        query_sample_fps=2.0,
     )
 
 
@@ -63,13 +68,13 @@ def _record() -> dict[str, object]:
     }
 
 
-def test_visual_cost_schema3_loads_measured_records_and_fingerprint(tmp_path: Path) -> None:
+def test_visual_cost_schema4_loads_measured_records_and_fingerprint(tmp_path: Path) -> None:
     path = tmp_path / "visual_cost_index.json"
     fingerprint = _fingerprint()
     path.write_text(
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "fingerprint": fingerprint,
                 "records": [_record()],
             }
@@ -89,14 +94,14 @@ def test_visual_cost_schema3_loads_measured_records_and_fingerprint(tmp_path: Pa
         load_visual_cost_index(path, expected_fingerprint=changed)
 
 
-def test_visual_cost_schema3_rejects_bad_or_incomplete_rows(tmp_path: Path) -> None:
+def test_visual_cost_schema4_rejects_bad_or_incomplete_rows(tmp_path: Path) -> None:
     path = tmp_path / "visual_cost_index.json"
     bad = _record()
     bad["total_visual_tokens"] = 95
     path.write_text(
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "fingerprint": _fingerprint(),
                 "records": [bad],
             }
@@ -108,7 +113,7 @@ def test_visual_cost_schema3_rejects_bad_or_incomplete_rows(tmp_path: Path) -> N
         load_visual_cost_index(path)
 
 
-def test_visual_cost_schema3_rejects_legacy_schema_and_estimates_in_runtime_mode(
+def test_visual_cost_schema4_rejects_legacy_schema_and_estimates_in_runtime_mode(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "visual_cost_index.json"
@@ -117,7 +122,7 @@ def test_visual_cost_schema3_rejects_legacy_schema_and_estimates_in_runtime_mode
     path.write_text(
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "fingerprint": _fingerprint(),
                 "records": [row],
             }
@@ -128,9 +133,9 @@ def test_visual_cost_schema3_rejects_legacy_schema_and_estimates_in_runtime_mode
         load_visual_cost_index(path, require_runtime_measurements=True)
 
     legacy = json.loads(path.read_text(encoding="utf-8"))
-    legacy["schema_version"] = 2
+    legacy["schema_version"] = 3
     path.write_text(json.dumps(legacy), encoding="utf-8")
-    with pytest.raises(ValueError, match="schema_version must be 3"):
+    with pytest.raises(ValueError, match="schema_version must be 4"):
         load_visual_cost_index(path)
 
 
@@ -148,7 +153,7 @@ def test_runtime_cost_ema_only_changes_at_epoch_boundary() -> None:
     assert ema.value("record", 0.0) == pytest.approx(2.12)
 
 
-def test_schema3_runtime_trace_extracts_end_to_end_record_cost(tmp_path: Path) -> None:
+def test_schema4_runtime_trace_extracts_end_to_end_record_cost(tmp_path: Path) -> None:
     trace = tmp_path / "runtime_rank0.jsonl"
     rows = (
         {
@@ -156,6 +161,8 @@ def test_schema3_runtime_trace_extracts_end_to_end_record_cost(tmp_path: Path) -
             "query_id": "q1",
             "query_frame_count": 256,
             "query_visual_token_count": 2048,
+            "state_query_frame_count": 16,
+            "state_query_visual_token_count": 128,
             "query_decode_seconds": 4.0,
             "query_processor_seconds": 2.0,
             "seconds": 9.0,
@@ -182,8 +189,8 @@ def test_schema3_runtime_trace_extracts_end_to_end_record_cost(tmp_path: Path) -
 
     measured = _load_runtime_measurements(trace)["q1"]
 
-    assert measured.query_frame_count == 256
-    assert measured.query_visual_tokens == 2048
+    assert measured.query_frame_count == 272
+    assert measured.query_visual_tokens == 2176
     assert measured.decode_seconds == 4.0
     assert measured.processor_seconds == 2.0
     assert measured.preparation_seconds == 9.0

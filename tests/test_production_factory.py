@@ -22,6 +22,7 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     make_production_outer_optimizer_factory,
     resolve_same_stage_resume,
 )
+from ttt_svcbench_qwen.outer_loss_balance import OfficialWeakOuterLossComposer
 from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
     LlamaFactoryCheckoutAudit,
@@ -41,6 +42,7 @@ from ttt_svcbench_qwen.production_runtime import (
     _decode_targets_with_seek,
     _decode_uniform_interval,
     _llamafactory_uniform_frame_indices,
+    _query_chunk_spec,
     _resize_to_pixel_budget,
     _TargetSeekUnavailable,
     _uniform_target_times,
@@ -101,6 +103,19 @@ def test_outer_checkpoint_loader_accepts_only_exact_safetensors(tmp_path: Path) 
     save_file(bad, tmp_path / "bad.safetensors")
     with pytest.raises(ValueError, match="exactly match"):
         load_outer_checkpoint(target, tmp_path / "bad.safetensors")
+
+
+def test_production_outer_checkpoint_owns_ema_balance_state() -> None:
+    config = load_config()
+    qwen = nn.Linear(2, 2)
+    balancer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
+    outer = ProductionOuterModel(nn.Linear(2, 2), nn.Linear(2, 2), qwen, balancer)
+
+    keys = set(audit_outer_checkpoint_boundary(outer))
+
+    assert "official_weak_balancer.ema_values" in keys
+    assert "official_weak_balancer.ema_valid" in keys
+    assert "official_weak_balancer.ema_update_counts" in keys
 
 
 def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
@@ -178,11 +193,116 @@ def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
     assert native["save_total_limit"] == 1
     assert extension.query_visual_mode == "causal_prefix"
     assert extension.query_max_frames == 256
+    assert extension.resolved_state_query_visual_mode == "recent_chunk"
+    assert extension.resolved_state_query_max_frames == 16
+    assert extension.resolved_answer_query_visual_mode == "causal_prefix"
+    assert extension.resolved_answer_query_max_frames == 256
+    assert extension.split_query_visuals
     assert extension.query_decode_strategy == "grouped_seek"
     assert extension.query_decode_max_groups == 16
     assert extension.query_cache_mode == "disabled"
     assert extension.visual_cost_mode == "exact_tokens_then_runtime"
     assert extension.visual_cost_index == "/tmp/visual_cost_index.json"
+
+
+def test_semantic_repair_train_split_recipe_saves_only_epochs_two_and_four(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[1]
+    for key, value in {
+        "OUTPUT_DIR": "/tmp/output",
+        "RUN_ROOT": "/tmp/run",
+        "SVCBENCH_DATASET_MANIFEST": "/tmp/dataset_manifest.json",
+        "MODEL": "/tmp/qwen3vl8b",
+        "DATASET_DIR": "/tmp/svcbench",
+        "DATASET_NAME": "svcbench_qwen3vl_sft",
+        "VISUAL_COST_INDEX": "/tmp/state16_answer256_schema4.json",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    native, extension = load_training_yaml(
+        root / "configs/h200/a2_qwen3vl8b_trainsplit_costbalanced_4epoch_4gpu.yaml"
+    )
+
+    assert native["num_train_epochs"] == 4.0
+    assert native["save_strategy"] == "steps"
+    assert native["save_steps"] == 0.5
+    assert native["save_total_limit"] == 2
+    assert native["resume_from_checkpoint"] is None
+    assert extension.stage == "a2"
+    assert extension.resolved_state_query_visual_mode == "recent_chunk"
+    assert extension.resolved_state_query_max_frames == 16
+    assert extension.resolved_answer_query_visual_mode == "causal_prefix"
+    assert extension.resolved_answer_query_max_frames == 256
+    assert extension.query_cache_mode == "disabled"
+    assert extension.preprocess_cache_mode == "readonly"
+
+
+def test_split_query_visual_config_is_complete_and_legacy_falls_back() -> None:
+    fields = {
+        "stage": "a2",
+        "project_config": "configs/model_state_ttt_8b.yaml",
+        "dataset_manifest": "manifest.json",
+        "support_prefetch_depth": 2,
+        "support_decode_coalesce": True,
+        "preprocess_cache_mode": "read_write",
+        "preprocess_cache_miss_policy": "decode",
+        "preprocess_cache_root_env": "TTT_PREPROCESS_CACHE_ROOT",
+        "preprocess_cache_max_gb": 200.0,
+        "preprocess_cache_dtype": "float32",
+    }
+    legacy = ProductionTTTConfig(**fields)
+    assert legacy.resolved_state_query_visual_mode == "recent_chunk"
+    assert legacy.resolved_answer_query_max_frames == 16
+    assert not legacy.split_query_visuals
+
+    with pytest.raises(ValueError, match="requires all four fields"):
+        ProductionTTTConfig(**fields, state_query_visual_mode="recent_chunk")
+
+
+def test_split_query_specs_bound_state_to_16_and_answer_to_256(tmp_path: Path) -> None:
+    video = tmp_path / "video.mp4"
+    video.touch()
+    config = ProductionTTTConfig(
+        stage="a2",
+        project_config="configs/model_state_ttt_8b.yaml",
+        dataset_manifest="manifest.json",
+        support_prefetch_depth=2,
+        support_decode_coalesce=True,
+        query_visual_mode="causal_prefix",
+        query_max_frames=256,
+        state_query_visual_mode="recent_chunk",
+        state_query_max_frames=16,
+        answer_query_visual_mode="causal_prefix",
+        answer_query_max_frames=256,
+        preprocess_cache_mode="read_write",
+        preprocess_cache_miss_policy="decode",
+        preprocess_cache_root_env="TTT_PREPROCESS_CACHE_ROOT",
+        preprocess_cache_max_gb=200.0,
+        preprocess_cache_dtype="float32",
+    )
+    state = _query_chunk_spec(
+        "q:state_query",
+        video,
+        20.0,
+        reset_soft_state=False,
+        config=config,
+        role="state_query",
+    )
+    answer = _query_chunk_spec(
+        "q:answer_query",
+        video,
+        20.0,
+        reset_soft_state=False,
+        config=config,
+        role="answer_query",
+    )
+
+    assert (state.start_time, state.end_time, state.maximum_frames) == (12.0, 20.0, 16)
+    assert state.observation_role == "state_query"
+    assert (answer.start_time, answer.end_time, answer.maximum_frames) == (0.0, 20.0, 256)
+    assert answer.observation_role == "answer_query"
+    assert not state.history_chunk_ids and not answer.history_chunk_ids
 
 
 def test_fullprefix256_trace_override_requires_run_root(

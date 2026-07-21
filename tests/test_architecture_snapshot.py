@@ -23,9 +23,9 @@ V6_ARCHITECTURE_SNAPSHOT = {
     },
     "observation_heads": {
         "o1": 2_632_710,
-        "o2": 2_103_042,
-        "e1": 9_584_643,
-        "e2": 7_094_792,
+        "o2": 2_499_843,
+        "e1": 9_717_252,
+        "e2": 7_293_449,
     },
     "query_and_reader": {
         "query_layers": 4,

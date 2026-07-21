@@ -27,11 +27,11 @@ from ttt_svcbench_qwen.state_encoder import (
 
 EXACT_HEAD_COUNTS = {
     "o1": 2_632_710,
-    "o2": 2_103_042,
-    "e1": 9_584_643,
-    "e2": 7_094_792,
+    "o2": 2_499_843,
+    "e1": 9_717_252,
+    "e2": 7_293_449,
 }
-EXACT_TOTAL = 21_415_187
+EXACT_TOTAL = 22_143_254
 HIDDEN_DIM = 768
 QUERY_DIM = 512
 

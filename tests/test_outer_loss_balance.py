@@ -116,6 +116,7 @@ def test_instant_equal_assigns_four_fixed_slots_and_keeps_scales_detached() -> N
     answer_value = torch.tensor(4.0, requires_grad=True)
     auxiliaries = tuple(torch.tensor(2.0, requires_grad=True) for _ in range(4))
     composer = OfficialWeakOuterLossComposer(_config(OfficialWeakBalanceMode.INSTANT_EQUAL))
+    assert composer.state_dict() == {}
 
     output = composer.compose((_answer(answer_value),), (_state(*auxiliaries),))
 
@@ -235,3 +236,36 @@ def test_config_rejects_inverted_scale_bounds() -> None:
             scale_max=0.1,
             epsilon=1.0e-8,
         )
+
+
+def test_ema_answer_reference_persists_and_missing_term_keeps_history() -> None:
+    config = OfficialWeakBalanceConfig(
+        mode=OfficialWeakBalanceMode.EMA_ANSWER_REF,
+        group_weight=0.3,
+        scale_min=0.001,
+        scale_max=20.0,
+        epsilon=1.0e-8,
+        ema_beta=0.5,
+    )
+    composer = OfficialWeakOuterLossComposer(config)
+    values = tuple(torch.tensor(2.0, requires_grad=True) for _ in range(4))
+    first = composer.compose((_answer(torch.tensor(4.0, requires_grad=True)),), (_state(*values),))
+    assert first.audit is not None
+    assert first.audit.ema_means == pytest.approx((4.0, 2.0, 2.0, 2.0, 2.0))
+    assert first.audit.ema_update_counts == (1, 1, 1, 1, 1)
+
+    second_values = tuple(torch.tensor(8.0, requires_grad=True) for _ in range(4))
+    second = composer.compose(
+        (_answer(torch.tensor(2.0, requires_grad=True)),),
+        (_state(*second_values, valid=(True, True, False, True)),),
+    )
+    assert second.audit is not None
+    assert second.audit.ema_means == pytest.approx((3.0, 5.0, 5.0, 2.0, 5.0))
+    assert second.audit.ema_update_counts == (2, 2, 2, 1, 2)
+    assert second.audit.terms[2].global_valid_count == 0
+    assert second.audit.terms[2].scale == pytest.approx(1.5)
+
+    restored = OfficialWeakOuterLossComposer(config)
+    restored.load_state_dict(composer.state_dict(), strict=True)
+    assert torch.equal(restored.ema_values, composer.ema_values)
+    assert torch.equal(restored.ema_update_counts, composer.ema_update_counts)

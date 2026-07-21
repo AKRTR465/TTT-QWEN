@@ -898,6 +898,7 @@ class OfficialWeakLossAudit:
     retrieval_no_positive_rows: int = 0
     retrieval_all_positive_rows: int = 0
     retrieval_valid_bag_rows: int = 0
+    annotation_count_mismatch: int = 0
 
     def __post_init__(self) -> None:
         if not self.labels_joined_after_forward:
@@ -918,6 +919,7 @@ class OfficialWeakLossAudit:
             self.retrieval_no_positive_rows,
             self.retrieval_all_positive_rows,
             self.retrieval_valid_bag_rows,
+            self.annotation_count_mismatch,
         )
         if any(type(value) is not int or value < 0 for value in counts):
             raise ValueError("official weak retrieval audit row counts must be non-negative")
@@ -944,6 +946,7 @@ class OfficialWeakLossAudit:
             ("retrieval/candidate_count", float(sum(self.retrieval_candidate_counts))),
             ("retrieval/positive_count", float(sum(self.retrieval_positive_counts))),
             ("retrieval/negative_count", float(sum(self.retrieval_negative_counts))),
+            ("task/annotation_count_mismatch", float(self.annotation_count_mismatch)),
         )
 
 
@@ -1003,9 +1006,12 @@ class OfficialWeakTargetBuilder:
             observations.o1.logits.float().sum()
             + observations.o2.identity.float().sum()
             + observations.o2.score_logits.float().sum()
+            + observations.o2.count_prediction.float().sum()
             + observations.e1.logits.float().sum()
+            + observations.e1.count_prediction.float().sum()
             + observations.e2.event_logits.float().sum()
             + observations.e2.phase_logits.float().sum()
+            + observations.e2.count_prediction.float().sum()
             + query.route.logits.float().sum()
             + query.time.logits.mode_logits.float().sum()
             + query.time.logits.span_start_logits.float().sum()
@@ -1029,6 +1035,7 @@ class OfficialWeakTargetBuilder:
             "all_positive": 0,
             "valid_bag": 0,
         }
+        annotation_count_mismatch = 0
 
         for row, label in enumerate(labels):
             operator_index = OPERATORS.index(label.operator)
@@ -1075,6 +1082,7 @@ class OfficialWeakTargetBuilder:
             time_losses.append(row_time)
 
             task_losses.append(_official_weak_task_loss(observations, row, label))
+            annotation_count_mismatch += int(_official_count_mismatch(label))
             retrieval_loss, positives, candidates, negatives, retrieval_status = (
                 _official_weak_retrieval_loss(retrieval, row, label)
             )
@@ -1118,6 +1126,7 @@ class OfficialWeakTargetBuilder:
                 retrieval_no_positive_rows=retrieval_status_counts["no_positive"],
                 retrieval_all_positive_rows=retrieval_status_counts["all_positive"],
                 retrieval_valid_bag_rows=retrieval_status_counts["valid_bag"],
+                annotation_count_mismatch=annotation_count_mismatch,
             ),
         )
 
@@ -1131,34 +1140,33 @@ def _official_weak_task_loss(
         float(label.count), dtype=torch.float32, device=observations.o1.logits.device
     )
     if label.operator in (Operator.O1_SNAP, Operator.O1_DELTA):
-        prediction = observations.o1.soft_count[row].float()
-        return F.mse_loss(prediction, target_count)
+        return _robust_count_loss(observations.o1.count_prediction[row], target_count)
     if label.operator in (Operator.O2_UNIQUE, Operator.O2_GAIN):
-        valid = observations.o2.valid_mask[row]
-        novelty = observations.o2.score_probabilities[row, :, 0].float()
-        prediction = novelty[valid].sum()
-        return F.mse_loss(prediction, target_count)
+        return _robust_count_loss(observations.o2.count_prediction[row], target_count)
     if label.operator in (Operator.E1_ACTION, Operator.E1_TRANSIT):
         valid = observations.e1.valid_mask[row]
+        count_loss = _robust_count_loss(observations.e1.count_prediction[row], target_count)
         if not bool(valid.any().item()):
-            return observations.e1.logits[row].float().sum() * 0.0
+            dense = observations.e1.logits[row].float().sum() * 0.0
+            return (dense + count_loss) / 2.0
         logits = observations.e1.logits[row][valid].float()
         timestamps = observations.e1.timestamps[row][valid]
         targets = torch.zeros_like(logits)
-        causal_points = tuple(
-            point for point in label.occurrence_points if point <= label.query_time
-        )
-        for point in causal_points:
-            index = _nearest_timestamp_index(timestamps, point)
+        for point in label.occurrence_points:
+            if point > label.query_time:
+                continue
+            index = _voronoi_timestamp_index(timestamps, point)
             if index is not None:
                 targets[index] = 1.0
         dense = F.binary_cross_entropy_with_logits(logits, targets)
-        predicted_count = torch.sigmoid(logits[:, 1]).sum()
-        return dense + F.mse_loss(predicted_count, target_count)
+        return (dense + count_loss) / 2.0
     if label.operator in (Operator.E2_PERIODIC, Operator.E2_EPISODE):
         valid = observations.e2.valid_mask[row]
+        count_loss = _robust_count_loss(observations.e2.count_prediction[row], target_count)
         if not bool(valid.any().item()):
-            return observations.e2.event_logits[row].float().sum() * 0.0
+            dense_zero = observations.e2.event_logits[row].float().sum() * 0.0
+            phase_zero = observations.e2.phase_logits[row].float().sum() * 0.0
+            return (dense_zero + phase_zero + count_loss) / 3.0
         event_logits = observations.e2.event_logits[row][valid].float()
         phase_logits = observations.e2.phase_logits[row][valid].float()
         timestamps = observations.e2.timestamps[row][valid]
@@ -1170,15 +1178,18 @@ def _official_weak_task_loss(
             if start > label.query_time:
                 continue
             causal_end = min(end, label.query_time)
+            tail_start, tail_end = _voronoi_timestamp_bounds(timestamps)
+            if causal_end < tail_start or start > tail_end:
+                continue
             active = (timestamps >= start) & (timestamps <= causal_end)
             event_targets[active, 1] = 1.0
             phase_targets[active] = 1
-            start_index = _nearest_timestamp_index(timestamps, start)
+            start_index = _voronoi_timestamp_index(timestamps, start)
             if start_index is not None:
                 event_targets[start_index, 0] = 1.0
                 phase_targets[start_index] = 1
             if end <= label.query_time:
-                end_index = _nearest_timestamp_index(timestamps, end)
+                end_index = _voronoi_timestamp_index(timestamps, end)
                 if end_index is not None:
                     event_targets[end_index, 2:] = 1.0
                     phase_targets[end_index] = 3
@@ -1186,8 +1197,7 @@ def _official_weak_task_loss(
                     phase_targets[completed] = 3
         dense = F.binary_cross_entropy_with_logits(event_logits, event_targets)
         phase = F.cross_entropy(phase_logits, phase_targets)
-        predicted_count = torch.sigmoid(event_logits[:, 3]).sum()
-        return dense + phase + F.mse_loss(predicted_count, target_count)
+        return (dense + phase + count_loss) / 3.0
     raise ValueError(f"unsupported official weak operator: {label.operator}")
 
 
@@ -1255,10 +1265,47 @@ def _record_matches_causal_occurrence(
     )
 
 
-def _nearest_timestamp_index(timestamps: Tensor, target: float) -> int | None:
+def _robust_count_loss(prediction: Tensor, target: Tensor) -> Tensor:
+    return F.smooth_l1_loss(
+        torch.log1p(prediction.float()),
+        torch.log1p(target.float()),
+        beta=0.25,
+    )
+
+
+def _voronoi_timestamp_index(timestamps: Tensor, target: float) -> int | None:
     if not timestamps.numel():
         return None
-    return int(torch.argmin(torch.abs(timestamps.float() - target)).item())
+    values = timestamps.float()
+    lower, upper = _voronoi_timestamp_bounds(values)
+    if target < lower or target > upper:
+        return None
+    if values.numel() == 1:
+        return 0
+    midpoints = (values[:-1] + values[1:]) / 2.0
+    return int(torch.searchsorted(midpoints, target, right=False).item())
+
+
+def _voronoi_timestamp_bounds(timestamps: Tensor) -> tuple[float, float]:
+    if not timestamps.numel():
+        raise ValueError("Voronoi timestamp bounds require at least one timestamp")
+    values = timestamps.float()
+    if values.numel() == 1:
+        value = float(values[0].item())
+        return value, value
+    lower = values[0] - (values[1] - values[0]) / 2.0
+    upper = values[-1] + (values[-1] - values[-2]) / 2.0
+    return max(0.0, float(lower.item())), float(upper.item())
+
+
+def _official_count_mismatch(label: OfficialWeakSupervision) -> bool:
+    if label.operator in (Operator.E1_ACTION, Operator.E1_TRANSIT):
+        derived = sum(point <= label.query_time for point in label.occurrence_points)
+        return derived != label.count
+    if label.operator in (Operator.E2_PERIODIC, Operator.E2_EPISODE):
+        derived = sum(end <= label.query_time for _, end in label.occurrence_intervals)
+        return derived != label.count
+    return False
 
 
 def _official_weak_term(losses: Sequence[Tensor], anchor: Tensor) -> OfficialWeakLossTerm:

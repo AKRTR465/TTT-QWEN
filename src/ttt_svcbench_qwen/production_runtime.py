@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import av
 import torch
@@ -240,6 +240,7 @@ class QueryObservationSpec:
     sampling_policy: str = "llamafactory_uniform_cap"
     decode_strategy: str = "legacy_seek"
     decode_max_groups: int = 16
+    query_role: Literal["query", "state_query", "answer_query"] = "query"
 
     def __post_init__(self) -> None:
         if not self.chunk_id or not self.video_path.is_file():
@@ -265,10 +266,12 @@ class QueryObservationSpec:
             raise ValueError("Query decode_max_groups must be within [1, 16]")
         if self.history_chunk_ids:
             raise ValueError("a Query observation cannot carry historical feature sets")
+        if self.query_role not in {"query", "state_query", "answer_query"}:
+            raise ValueError("unsupported Query observation role")
 
     @property
     def observation_role(self) -> str:
-        return "query"
+        return self.query_role
 
     @property
     def sample_fps(self) -> float:
@@ -496,11 +499,17 @@ class PreparedA2Record:
     answer: PreparedAnswerCPU
     preparation: A2PreparationTelemetry
     supports: tuple[PreparedVisualCPU, ...] = ()
+    state_query: PreparedVisualCPU | None = None
 
     def __post_init__(self) -> None:
-        expected = f"{self.record.query.runtime.query_id}:query"
-        if self.answer.spec.chunk_id != expected:
+        legacy = f"{self.record.query.runtime.query_id}:query"
+        expected = f"{self.record.query.runtime.query_id}:answer_query"
+        if self.answer.spec.chunk_id not in {legacy, expected}:
             raise ValueError("prepared A2 answer does not belong to its manifest Query")
+        if self.state_query is not None:
+            state_expected = f"{self.record.query.runtime.query_id}:state_query"
+            if self.state_query.spec.chunk_id != state_expected:
+                raise ValueError("prepared A2 State Query does not belong to its manifest Query")
         if self.supports:
             _, schedule = adaptive_support_schedule(self.record.query.runtime.query_time)
             if len(self.supports) != len(schedule):
@@ -511,6 +520,7 @@ class PreparedA2Record:
             self,
             answer=self.answer.pin_memory(),
             supports=tuple(chunk.pin_memory() for chunk in self.supports),
+            state_query=(self.state_query.pin_memory() if self.state_query is not None else None),
         )
 
 
@@ -520,19 +530,28 @@ class PreparedA5Record:
 
     record: A5EpisodeRecord
     query_answers: tuple[PreparedAnswerCPU, ...]
+    state_queries: tuple[PreparedVisualCPU, ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.query_answers) != len(self.record.queries):
             raise ValueError("prepared A5 answers must align to every Query point")
+        if self.state_queries and len(self.state_queries) != len(self.record.queries):
+            raise ValueError("prepared A5 State Queries must align to every Query point")
         for index, prepared in enumerate(self.query_answers):
             expected_prefix = f"{self.record.episode_id}:q{index}"
-            if prepared.spec.chunk_id != expected_prefix:
+            expected_answer = f"{expected_prefix}:answer_query"
+            if prepared.spec.chunk_id not in {expected_prefix, expected_answer}:
                 raise ValueError("prepared A5 answer does not belong to its Query point")
+            if self.state_queries:
+                expected_state = f"{expected_prefix}:state_query"
+                if self.state_queries[index].spec.chunk_id != expected_state:
+                    raise ValueError("prepared A5 State Query does not belong to its Query point")
 
     def pin_memory(self) -> PreparedA5Record:
         return replace(
             self,
             query_answers=tuple(answer.pin_memory() for answer in self.query_answers),
+            state_queries=tuple(query.pin_memory() for query in self.state_queries),
         )
 
 
@@ -1548,10 +1567,13 @@ class ProductionOuterModel(nn.Module):  # type: ignore[misc]
         state_model: StateTTTModel,
         predictor: TemporalPredictor,
         qwen_model: nn.Module,
+        official_weak_balancer: OfficialWeakOuterLossComposer | None = None,
     ) -> None:
         super().__init__()
         self.state_model = state_model
         self.predictor = predictor
+        if official_weak_balancer is not None:
+            self.official_weak_balancer = official_weak_balancer
         # Qwen is already registered below ``state_model``.  Keep only a weak reference here so
         # Hugging Face lifecycle methods can be forwarded without duplicating checkpoint keys.
         self._qwen_model_ref = weakref.ref(qwen_model)
@@ -1643,16 +1665,27 @@ class A2PrefetchCollator:
         started = time.perf_counter()
         record = records[0]
         video_path = _resolve_video_path(record.source_dataset, record.relative_video_path)
-        spec = _query_chunk_spec(
-            f"{record.query.runtime.query_id}:query",
+        self.video.set_source_dataset(record.source_dataset)
+        state_spec = _query_chunk_spec(
+            f"{record.query.runtime.query_id}:state_query",
             video_path,
             record.query.runtime.query_time,
             reset_soft_state=False,
             config=self.ttt_config,
+            role="state_query",
         )
+        answer_spec = _query_chunk_spec(
+            f"{record.query.runtime.query_id}:answer_query",
+            video_path,
+            record.query.runtime.query_time,
+            reset_soft_state=False,
+            config=self.ttt_config,
+            role="answer_query",
+        )
+        state_query = _compact_materialized_chunk(self.video(state_spec))
         answer = _prepare_answer_cpu(
             record.query,
-            spec,
+            answer_spec,
             processor=self.processor,
             tokenizer=self.tokenizer,
             config=self.config,
@@ -1666,14 +1699,13 @@ class A2PrefetchCollator:
         supports: tuple[PreparedVisualCPU, ...] = ()
         support_prepare_seconds = 0.0
         if self.support_materialization == "dataloader_episode":
-            self.video.set_source_dataset(record.source_dataset)
             support_started = time.perf_counter()
             supports = tuple(
                 _compact_materialized_chunk(self.video(support_spec))
                 for support_spec in _a2_support_chunk_specs(record, video_path)
             )
             support_prepare_seconds = time.perf_counter() - support_started
-        prepared_bytes = _prepared_a2_record_bytes(answer, supports)
+        prepared_bytes = _prepared_a2_record_bytes(answer, supports, state_query)
         if prepared_bytes > self.prepared_episode_max_bytes:
             raise MemoryError(
                 f"prepared A2 episode {record.query.runtime.query_id!r} uses "
@@ -1697,6 +1729,10 @@ class A2PrefetchCollator:
             query_frame_count=answer.preparation.frame_count,
             query_patch_count=answer.preparation.patch_count,
             query_visual_token_count=answer.preparation.visual_token_count,
+            state_query_frame_count=state_query.frame_count,
+            state_query_visual_token_count=(
+                state_query.patch_count // self.config.video_preprocessing.spatial_merge_size**2
+            ),
             query_decode_seconds=answer.preparation.decode_seconds,
             query_processor_seconds=answer.preparation.processor_seconds,
             cache_stats=(self.preprocess_cache.stats() if self.preprocess_cache else {}),
@@ -1707,6 +1743,7 @@ class A2PrefetchCollator:
                 answer=answer,
                 preparation=preparation,
                 supports=supports,
+                state_query=state_query,
             )
         }
 
@@ -1733,6 +1770,15 @@ class A5PrefetchCollator:
         self.minimum_pixels = minimum_pixels
         self.maximum_pixels = maximum_pixels
         self.preprocess_cache = preprocess_cache
+        self.video = VideoChunkMaterializer(
+            config,
+            minimum_pixels=minimum_pixels,
+            maximum_pixels=maximum_pixels,
+            preprocess_cache=preprocess_cache,
+            cache_query_visuals=ttt_config.query_cache_mode == "inherit",
+            prefetch_depth=1,
+            decode_coalesce=False,
+        )
 
     def __call__(self, records: Sequence[object]) -> dict[str, object]:
         if len(records) != 1 or not isinstance(records[0], A5EpisodeRecord):
@@ -1741,19 +1787,31 @@ class A5PrefetchCollator:
         record = records[0]
         video_path = _resolve_video_path(record.source_dataset, record.relative_video_path)
         answers: list[PreparedAnswerCPU] = []
+        state_queries: list[PreparedVisualCPU] = []
+        self.video.set_source_dataset(record.source_dataset)
         primary = record.queries[0].runtime
         for index, query in enumerate(record.queries):
-            spec = _query_chunk_spec(
-                f"{record.episode_id}:q{index}",
+            state_spec = _query_chunk_spec(
+                f"{record.episode_id}:q{index}:state_query",
                 video_path,
                 query.runtime.query_time,
                 reset_soft_state=index > 0 and query.runtime.question != primary.question,
                 config=self.ttt_config,
+                role="state_query",
             )
+            answer_spec = _query_chunk_spec(
+                f"{record.episode_id}:q{index}:answer_query",
+                video_path,
+                query.runtime.query_time,
+                reset_soft_state=index > 0 and query.runtime.question != primary.question,
+                config=self.ttt_config,
+                role="answer_query",
+            )
+            state_queries.append(_compact_materialized_chunk(self.video(state_spec)))
             answers.append(
                 _prepare_answer_cpu(
                     query,
-                    spec,
+                    answer_spec,
                     processor=self.processor,
                     tokenizer=self.tokenizer,
                     config=self.config,
@@ -1774,7 +1832,7 @@ class A5PrefetchCollator:
             seconds=time.perf_counter() - started,
             cache_stats=(self.preprocess_cache.stats() if self.preprocess_cache else {}),
         )
-        return {"prepared_a5": PreparedA5Record(record, tuple(answers))}
+        return {"prepared_a5": PreparedA5Record(record, tuple(answers), tuple(state_queries))}
 
 
 class ProductionEpisodeMaterializer:
@@ -1802,17 +1860,32 @@ class ProductionEpisodeMaterializer:
         owner = RuntimeOwner((record.video_id,), (record.trajectory_id,))
         runtime = self.writer.reset(owner)
         _, supports = adaptive_support_schedule(record.query.runtime.query_time)
-        query_chunk = _query_chunk_spec(
-            f"{record.query.runtime.query_id}:query",
+        state_chunk = _query_chunk_spec(
+            f"{record.query.runtime.query_id}:state_query",
             video_path,
             record.query.runtime.query_time,
             reset_soft_state=False,
             config=self.ttt_config,
+            role="state_query",
+        )
+        answer_chunk = _query_chunk_spec(
+            f"{record.query.runtime.query_id}:answer_query",
+            video_path,
+            record.query.runtime.query_time,
+            reset_soft_state=False,
+            config=self.ttt_config,
+            role="answer_query",
         )
         prepared_answer = source.answer
-        if prepared_answer.spec != query_chunk:
-            raise ValueError("prefetched A2 Query chunk drifted before runtime assembly")
-        answer, labels, materialized_query = self._bind_answer(prepared_answer)
+        if prepared_answer.spec != answer_chunk:
+            raise ValueError("prefetched A2 Answer Query drifted before runtime assembly")
+        answer, labels, _ = self._bind_answer(prepared_answer)
+        materialized_state = source.state_query
+        if materialized_state is None:
+            # Legacy prepared payloads used one visual for both roles.
+            materialized_state = prepared_answer.materialized_query
+        elif materialized_state.spec != state_chunk:
+            raise ValueError("prefetched A2 State Query drifted before runtime assembly")
         requests_list: list[ObservationChunkRequest] = []
         for index, chunk in enumerate(supports):
             request = self._request(
@@ -1833,7 +1906,7 @@ class ProductionEpisodeMaterializer:
         requests = tuple(requests_list) + (
             ObservationChunkRequest(
                 owner=owner,
-                video_input=materialized_query,
+                video_input=materialized_state,
                 query_input=_bind_runtime_query(record.query.runtime, video_path, episode_nonce),
                 runtime_state=runtime,
                 bank_states=runtime.state_bank_states,
@@ -1884,17 +1957,33 @@ class ProductionEpisodeMaterializer:
         )
         queries: list[MetaTTTQueryPoint] = []
         for index, query in enumerate(record.queries):
-            spec = _query_chunk_spec(
-                f"{record.episode_id}:q{index}",
+            state_spec = _query_chunk_spec(
+                f"{record.episode_id}:q{index}:state_query",
                 video_path,
                 query.runtime.query_time,
                 reset_soft_state=index > 0 and query.runtime.question != primary.question,
                 config=self.ttt_config,
+                role="state_query",
+            )
+            answer_spec = _query_chunk_spec(
+                f"{record.episode_id}:q{index}:answer_query",
+                video_path,
+                query.runtime.query_time,
+                reset_soft_state=index > 0 and query.runtime.question != primary.question,
+                config=self.ttt_config,
+                role="answer_query",
             )
             prepared_answer = prepared.query_answers[index]
-            if prepared_answer.spec != spec:
-                raise ValueError("prefetched A5 Query chunk drifted before runtime assembly")
-            answer, labels, materialized = self._bind_answer(prepared_answer)
+            if prepared_answer.spec != answer_spec:
+                raise ValueError("prefetched A5 Answer Query drifted before runtime assembly")
+            answer, labels, _ = self._bind_answer(prepared_answer)
+            materialized = (
+                prepared.state_queries[index]
+                if prepared.state_queries
+                else prepared_answer.materialized_query
+            )
+            if prepared.state_queries and materialized.spec != state_spec:
+                raise ValueError("prefetched A5 State Query drifted before runtime assembly")
             request = ObservationChunkRequest(
                 owner=owner,
                 video_input=materialized,
@@ -1907,8 +1996,8 @@ class ProductionEpisodeMaterializer:
                 MetaTTTQueryPoint(
                     chunk=MetaCausalChunk(
                         request,
-                        spec.start_time,
-                        spec.end_time,
+                        state_spec.start_time,
+                        state_spec.end_time,
                         _bind_runtime_query(query.runtime, video_path, episode_nonce),
                     ),
                     query_time=query.runtime.query_time,
@@ -2080,6 +2169,7 @@ class ProductionA2LossStep:
         config: ProjectConfig,
         visual_runtime: ProductionQwenRuntime,
         support_visual_batch_size: int,
+        outer_composer: OfficialWeakOuterLossComposer,
     ):
         self.runner = runner
         self.materializer = materializer
@@ -2089,7 +2179,7 @@ class ProductionA2LossStep:
         self.graph_anchor_parameters = tuple(
             parameter for parameter in graph_anchor_parameters if parameter.requires_grad
         )
-        self.outer_composer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
+        self.outer_composer = outer_composer
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
         self.last_weak_audit: OfficialWeakLossAudit | None = None
         self.visual_runtime = visual_runtime
@@ -2381,7 +2471,13 @@ def build_runtime(
         ModelFeatureFlags(),
     )
     predictor = build_temporal_predictor(project.predictor)
-    outer = ProductionOuterModel(state_model, predictor, backbone.model)
+    official_weak_balancer = OfficialWeakOuterLossComposer(project.loss.official_weak_balance)
+    outer = ProductionOuterModel(
+        state_model,
+        predictor,
+        backbone.model,
+        official_weak_balancer,
+    )
     materializer = ProductionEpisodeMaterializer(backbone, writer, chunk_materializer)
     if stage is ProductionStage.A2:
         collator: object = A2PrefetchCollator(
@@ -2424,6 +2520,7 @@ def build_runtime(
                     project,
                     qwen_runtime,
                     config.support_visual_batch_size,
+                    official_weak_balancer,
                 ),
             ),
         )
@@ -2448,6 +2545,7 @@ def build_runtime(
         raw_support_visual_batcher=qwen_runtime.prepare_raw_support_batch,
         support_visual_batch_size=config.support_visual_batch_size,
         query_activation_offload=config.query_activation_offload,
+        outer_composer=official_weak_balancer,
     )
     return ProductionTrainerRuntime(
         stage=stage,
@@ -2551,7 +2649,12 @@ def build_inference_runtime_bundle(
         ModelFeatureFlags(),
     )
     predictor = build_temporal_predictor(config.predictor)
-    outer = ProductionOuterModel(state_model, predictor, qwen_model)
+    outer = ProductionOuterModel(
+        state_model,
+        predictor,
+        qwen_model,
+        OfficialWeakOuterLossComposer(config.loss.official_weak_balance),
+    )
     load_outer_checkpoint(outer, checkpoint)
     outer.eval()
     manager = PerVideoRuntimeManager(
@@ -2689,9 +2792,19 @@ def _query_chunk_spec(
     *,
     reset_soft_state: bool,
     config: ProductionTTTConfig,
+    role: Literal["query", "state_query", "answer_query"] = "query",
 ) -> QueryObservationSpec:
+    if role == "state_query":
+        mode = config.resolved_state_query_visual_mode
+        maximum_frames = config.resolved_state_query_max_frames
+    elif role == "answer_query":
+        mode = config.resolved_answer_query_visual_mode
+        maximum_frames = config.resolved_answer_query_max_frames
+    else:
+        mode = config.query_visual_mode
+        maximum_frames = config.query_max_frames
     end = query_time
-    start = 0.0 if config.query_visual_mode == "causal_prefix" else max(0.0, end - 8.0)
+    start = 0.0 if mode == "causal_prefix" else max(0.0, end - 8.0)
     if end <= start:
         raise ValueError("Query point is too early to materialize a causal observation")
     return QueryObservationSpec(
@@ -2699,13 +2812,14 @@ def _query_chunk_spec(
         video_path=video_path,
         start_time=start,
         end_time=end,
-        maximum_frames=config.query_max_frames,
+        maximum_frames=maximum_frames,
         query_time=query_time,
         reset_soft_state=reset_soft_state,
         sampling_fps=config.query_sample_fps,
         sampling_policy=config.query_frame_sampling,
         decode_strategy=config.query_decode_strategy,
         decode_max_groups=config.query_decode_max_groups,
+        query_role=role,
     )
 
 
@@ -2934,8 +3048,10 @@ def _prepared_answer_bytes(answer: PreparedAnswerCPU) -> int:
 def _prepared_a2_record_bytes(
     answer: PreparedAnswerCPU,
     supports: Sequence[PreparedVisualCPU],
+    state_query: PreparedVisualCPU | None = None,
 ) -> int:
-    return _prepared_answer_bytes(answer) + sum(
+    state_bytes = 0 if state_query is None else _prepared_visual_bytes(state_query)
+    return _prepared_answer_bytes(answer) + state_bytes + sum(
         _prepared_visual_bytes(chunk) for chunk in supports
     )
 

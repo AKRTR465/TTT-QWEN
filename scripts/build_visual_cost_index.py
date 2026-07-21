@@ -1,4 +1,4 @@
-"""Build a strict schema-3 A2/A5 visual and runtime cost index.
+"""Build a strict schema-4 A2/A5 visual and runtime cost index.
 
 Pass ``--runtime-trace --require-measured-runtime`` for the formal A2 profile. The output contains
 only media metadata, counts and timings; decoded Query frames or processor tensors are never saved.
@@ -70,8 +70,23 @@ def _load_runtime_measurements(path: Path) -> dict[str, RuntimeMeasurement]:
             event = row.get("event")
             if event == "a2_collate_done" and isinstance(row.get("query_id"), str):
                 record_id = str(row["query_id"])
-                _append_numeric(values[record_id], row, "query_frame_count")
-                _append_numeric(values[record_id], row, "query_visual_token_count")
+                for answer_field, state_field, destination in (
+                    ("query_frame_count", "state_query_frame_count", "query_frame_count"),
+                    (
+                        "query_visual_token_count",
+                        "state_query_visual_token_count",
+                        "query_visual_token_count",
+                    ),
+                ):
+                    answer_value = row.get(answer_field)
+                    state_value = row.get(state_field, 0.0)
+                    if all(
+                        isinstance(value, (int, float)) and math.isfinite(float(value))
+                        for value in (answer_value, state_value)
+                    ):
+                        values[record_id][destination].append(
+                            float(answer_value) + float(state_value)
+                        )
                 _append_numeric(values[record_id], row, "query_decode_seconds")
                 _append_numeric(values[record_id], row, "query_processor_seconds")
                 _append_numeric(
@@ -156,6 +171,18 @@ def main() -> int:
         default="causal_prefix",
     )
     parser.add_argument("--query-max-frames", type=int, default=256)
+    parser.add_argument(
+        "--state-query-visual-mode",
+        choices=("recent_chunk", "causal_prefix"),
+        default="recent_chunk",
+    )
+    parser.add_argument("--state-query-max-frames", type=int, default=16)
+    parser.add_argument(
+        "--answer-query-visual-mode",
+        choices=("recent_chunk", "causal_prefix"),
+        default="causal_prefix",
+    )
+    parser.add_argument("--answer-query-max-frames", type=int, default=256)
     parser.add_argument("--query-sample-fps", type=float, default=2.0)
     parser.add_argument(
         "--query-decode-strategy",
@@ -193,6 +220,11 @@ def main() -> int:
         gpu_model=args.gpu_model,
         query_decode_strategy=args.query_decode_strategy,
         query_decode_max_groups=args.query_decode_max_groups,
+        state_query_visual_mode=args.state_query_visual_mode,
+        state_query_max_frames=args.state_query_max_frames,
+        answer_query_visual_mode=args.answer_query_visual_mode,
+        answer_query_max_frames=args.answer_query_max_frames,
+        query_sample_fps=args.query_sample_fps,
     )
     train, _validation = load_production_manifest_views(
         args.manifest,
@@ -225,6 +257,10 @@ def main() -> int:
             query_visual_mode=args.query_visual_mode,
             query_max_frames=args.query_max_frames,
             query_sample_fps=args.query_sample_fps,
+            state_query_visual_mode=args.state_query_visual_mode,
+            state_query_max_frames=args.state_query_max_frames,
+            answer_query_visual_mode=args.answer_query_visual_mode,
+            answer_query_max_frames=args.answer_query_max_frames,
             measurement=measurements.get(_record_id(record)),
             media=_probe_media(record, video_root),
         )
@@ -312,6 +348,10 @@ def _cost_record(
     query_visual_mode: str,
     query_max_frames: int,
     query_sample_fps: float,
+    state_query_visual_mode: str | None = None,
+    state_query_max_frames: int | None = None,
+    answer_query_visual_mode: str | None = None,
+    answer_query_max_frames: int | None = None,
     measurement: RuntimeMeasurement | None = None,
     media: MediaProbe | None = None,
 ) -> VisualCostRecord:
@@ -331,17 +371,51 @@ def _cost_record(
     if not math.isfinite(query_sample_fps) or query_sample_fps <= 0.0:
         raise ValueError("visual cost Query FPS must be positive")
 
-    def query_interval(query_time: float) -> tuple[float, float, int, float]:
-        start = 0.0 if query_visual_mode == "causal_prefix" else max(0.0, query_time - 8.0)
-        return start, query_time, query_max_frames, query_sample_fps
+    split_query = state_query_visual_mode is not None or answer_query_visual_mode is not None
+    if split_query and None in {
+        state_query_visual_mode,
+        state_query_max_frames,
+        answer_query_visual_mode,
+        answer_query_max_frames,
+    }:
+        raise ValueError("split visual-cost Query configuration requires both roles")
+    if split_query:
+        for role, mode, maximum in (
+            ("State", str(state_query_visual_mode), int(state_query_max_frames)),
+            ("Answer", str(answer_query_visual_mode), int(answer_query_max_frames)),
+        ):
+            if mode not in {"recent_chunk", "causal_prefix"}:
+                raise ValueError(f"visual cost {role} Query mode is invalid")
+            if maximum < 2 or maximum > 256 or maximum % 2:
+                raise ValueError(f"visual cost {role} Query frame cap is invalid")
+            if mode == "recent_chunk" and maximum > 16:
+                raise ValueError(f"visual cost {role} recent Query exceeds 16 frames")
+            if mode == "causal_prefix" and maximum != 256:
+                raise ValueError(f"visual cost {role} prefix Query requires 256 frames")
+
+    def query_intervals(query_time: float) -> tuple[tuple[float, float, int, float], ...]:
+        roles = ((query_visual_mode, query_max_frames),)
+        if split_query:
+            roles = (
+                (str(state_query_visual_mode), int(state_query_max_frames)),
+                (str(answer_query_visual_mode), int(answer_query_max_frames)),
+            )
+        result: list[tuple[float, float, int, float]] = []
+        for mode, maximum in roles:
+            start = 0.0 if mode == "causal_prefix" else max(0.0, query_time - 8.0)
+            result.append((start, query_time, maximum, query_sample_fps))
+        return tuple(result)
 
     if isinstance(record, A2QueryRecord):
         _, supports = adaptive_support_schedule(record.query.runtime.query_time)
         intervals = tuple(
             (chunk.start_time, chunk.end_time, chunk.maximum_frames) for chunk in supports
         )
-        interval_fps = tuple(2.0 for _ in intervals) + (query_sample_fps,)
-        intervals = intervals + (query_interval(record.query.runtime.query_time)[:3],)
+        query_intervals_for_record = query_intervals(record.query.runtime.query_time)
+        interval_fps = tuple(2.0 for _ in intervals) + tuple(
+            interval[3] for interval in query_intervals_for_record
+        )
+        intervals = intervals + tuple(interval[:3] for interval in query_intervals_for_record)
         record_id = record.query.runtime.query_id
         support_count = len(supports)
         segment_lengths: tuple[int, ...] = ()
@@ -354,11 +428,16 @@ def _cost_record(
                 for chunk in record.supports
             ),
         )
+        query_intervals_for_record = tuple(
+            interval
+            for query in record.queries
+            for interval in query_intervals(query.runtime.query_time)
+        )
         intervals = support_intervals + tuple(
-            query_interval(query.runtime.query_time)[:3] for query in record.queries
+            interval[:3] for interval in query_intervals_for_record
         )
         interval_fps = tuple(2.0 for _ in support_intervals) + tuple(
-            query_sample_fps for _ in record.queries
+            interval[3] for interval in query_intervals_for_record
         )
         record_id = record.episode_id
         support_count = record.support_count
@@ -370,12 +449,13 @@ def _cost_record(
         _frame_budget(*interval, sample_fps)
         for interval, sample_fps in zip(intervals, interval_fps, strict=True)
     )
-    query_frame_count = sum(visual_tokens[-query_count:])
+    query_role_count = query_count * (2 if split_query else 1)
+    query_frame_count = sum(visual_tokens[-query_role_count:])
     query_visual_tokens = query_frame_count
     if measurement is not None:
         query_frame_count = measurement.query_frame_count
         query_visual_tokens = measurement.query_visual_tokens
-        visual_tokens = (*visual_tokens[:-query_count], query_visual_tokens)
+        visual_tokens = (*visual_tokens[:-query_role_count], query_visual_tokens)
     chunk_count = len(visual_tokens)
     total_tokens = sum(visual_tokens)
     if measurement is None:

@@ -1085,6 +1085,8 @@ def test_truncated_a5_instant_equal_composes_all_queries_once(
 ) -> None:
     raw = config.model_dump(mode="json")
     raw["loss"]["official_weak_balance"]["mode"] = "instant_equal"
+    raw["loss"]["official_weak_balance"]["scale_min"] = 0.1
+    raw["loss"]["official_weak_balance"]["scale_max"] = 10.0
     instant_config = ProjectConfig.model_validate(raw)
     runner, _, _, _ = _system(
         instant_config,

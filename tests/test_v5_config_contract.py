@@ -42,6 +42,8 @@ def test_v6_yaml_passes_strong_validation_and_serializes_completely() -> None:
 def test_v5_project_config_accepts_explicit_instant_equal_experiment() -> None:
     raw = load_raw_config()
     raw["loss"]["official_weak_balance"]["mode"] = "instant_equal"
+    raw["loss"]["official_weak_balance"]["scale_min"] = 0.1
+    raw["loss"]["official_weak_balance"]["scale_max"] = 10.0
 
     config = ProjectConfig.model_validate(raw)
 
@@ -231,7 +233,7 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "linear_bias": True,
         "identity_normalization": "l2_fp32_unit_basis_fallback",
         "normalization_eps": 1.0e-8,
-        "parameter_count": 2_103_042,
+        "parameter_count": 2_499_843,
         "prototype_ema": 0.9,
         "confirmation_observations": 2,
         "match_threshold": 0.8,
@@ -263,7 +265,7 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "history_tubelets": 66,
         "state_owner_keys": ("video_id", "trajectory_id", "query_signature"),
         "detach_runtime_default": True,
-        "parameter_count": 9_584_643,
+        "parameter_count": 9_717_252,
         "tau_on": 0.7,
         "tau_off": 0.3,
         "completion_threshold": 0.7,
@@ -292,7 +294,7 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "checkpoint_tubelets": 5,
         "state_owner_keys": ("video_id", "trajectory_id", "query_signature"),
         "detach_runtime_default": True,
-        "parameter_count": 7_094_792,
+        "parameter_count": 7_293_449,
         "start_threshold": 0.6,
         "end_threshold": 0.6,
         "complete_threshold": 0.7,
@@ -559,11 +561,12 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "answer_causal_shift": True,
         "answer_ignore_index": -100,
         "official_weak_balance": {
-            "mode": "instant_equal",
+            "mode": "ema_answer_ref",
             "group_weight": 0.3,
-            "scale_min": 0.1,
-            "scale_max": 10.0,
+            "scale_min": 0.001,
+            "scale_max": 20.0,
             "epsilon": 1.0e-8,
+            "ema_beta": 0.99,
         },
     }
     assert config.stage_a.model_dump() == {
@@ -714,9 +717,9 @@ def test_v5_parameter_budget_matches_architecture_rounding() -> None:
         budget.o2_millions,
         budget.e1_millions,
         budget.e2_millions,
-    ) == (2.632710, 2.103042, 9.584643, 7.094792)
+    ) == (2.632710, 2.499843, 9.717252, 7.293449)
     assert budget.semantic_projector_millions == 1.316864
-    assert budget.new_modules_total_millions == 156.715683
+    assert budget.new_modules_total_millions == 157.443750
     assert (
         abs(component_total - budget.new_modules_total_millions)
         <= budget.rounding_tolerance_millions
