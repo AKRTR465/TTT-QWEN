@@ -157,6 +157,8 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
         "query_decode_strategy",
         "query_decode_max_groups",
         "query_cache_mode",
+        "state_query_cache_mode",
+        "answer_query_cache_mode",
         "query_activation_offload",
         "preprocess_cache_mode",
         "preprocess_cache_miss_policy",
@@ -202,6 +204,9 @@ def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
     assert extension.query_decode_strategy == "grouped_seek"
     assert extension.query_decode_max_groups == 16
     assert extension.query_cache_mode == "inherit"
+    assert extension.state_query_cache_mode == "inherit"
+    assert extension.answer_query_cache_mode == "disabled"
+    assert extension.cached_query_roles == frozenset(("state_query",))
     assert extension.visual_cost_mode == "exact_tokens_then_runtime"
     assert extension.visual_cost_index == "/tmp/visual_cost_index.json"
 
@@ -236,6 +241,10 @@ def test_semantic_repair_train_split_recipe_saves_only_epochs_two_and_four(
     assert extension.answer_query_visual_mode == "causal_prefix"
     assert extension.answer_query_max_frames == 256
     assert extension.query_cache_mode == "inherit"
+    assert extension.state_query_cache_mode == "inherit"
+    assert extension.answer_query_cache_mode == "disabled"
+    assert extension.query_cache_enabled("state_query")
+    assert not extension.query_cache_enabled("answer_query")
     assert extension.preprocess_cache_mode == "readonly"
 
 
@@ -352,9 +361,7 @@ def test_fullprefix256_trace_and_cost_preflight_overrides(
     }.items():
         monkeypatch.setenv(key, value)
 
-    _, extension = load_training_yaml(
-        root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml"
-    )
+    _, extension = load_training_yaml(root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml")
 
     assert extension.runtime_trace_mode == "cuda"
     assert Path(extension.runtime_trace_dir or "") == Path("/tmp/run/runtime_trace")
@@ -424,9 +431,7 @@ def test_a2_lazy_ga_fetch_pulls_each_microbatch_only_when_consumed(
 def test_a2_lazy_ga_fails_closed_on_transformers_version_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "ttt_svcbench_qwen.llamafactory_trainer.transformers.__version__", "4.58.0"
-    )
+    monkeypatch.setattr("ttt_svcbench_qwen.llamafactory_trainer.transformers.__version__", "4.58.0")
     owner = SimpleNamespace(ttt_runtime=SimpleNamespace(stage=ProductionStage.A2))
 
     with pytest.raises(RuntimeError, match="pinned to Transformers 4.57.1"):
@@ -443,9 +448,7 @@ def test_a2_runtime_cost_observation_includes_collate_preparation(
 
     observations: list[tuple[str, float]] = []
     events: list[tuple[str, dict[str, object]]] = []
-    monkeypatch.setattr(
-        "ttt_svcbench_qwen.llamafactory_trainer.A2QueryRecord", _FakeA2Record
-    )
+    monkeypatch.setattr("ttt_svcbench_qwen.llamafactory_trainer.A2QueryRecord", _FakeA2Record)
     monkeypatch.setattr(
         "ttt_svcbench_qwen.llamafactory_trainer.trace_event",
         lambda event, **fields: events.append((event, fields)),
@@ -724,18 +727,14 @@ def test_grouped_query_decode_falls_back_to_one_streaming_pass(
         calls.append("grouped")
         raise _TargetSeekUnavailable("no timestamp index")
 
-    def streaming(
-        _spec: object, values: list[float]
-    ) -> tuple[list[torch.Tensor], list[float]]:
+    def streaming(_spec: object, values: list[float]) -> tuple[list[torch.Tensor], list[float]]:
         calls.append("streaming")
         return [torch.zeros((3, 2, 2), dtype=torch.uint8) for _ in values], values
 
     monkeypatch.setattr(
         "ttt_svcbench_qwen.production_runtime._decode_query_targets_grouped", unavailable
     )
-    monkeypatch.setattr(
-        "ttt_svcbench_qwen.production_runtime._decode_targets_streaming", streaming
-    )
+    monkeypatch.setattr("ttt_svcbench_qwen.production_runtime._decode_targets_streaming", streaming)
     monkeypatch.setattr(
         "ttt_svcbench_qwen.production_runtime._decode_targets_with_seek",
         lambda *_args, **_kwargs: pytest.fail("legacy per-target seek must not run"),

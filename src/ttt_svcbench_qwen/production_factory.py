@@ -72,7 +72,12 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     answer_query_max_frames: Literal[256]
     query_decode_strategy: Literal["legacy_seek", "grouped_seek"] = "legacy_seek"
     query_decode_max_groups: int = Field(default=16, ge=1, le=16)
+    # ``query_cache_mode`` is retained as the legacy fallback for old checkpoints/configs.
+    # Production recipes should override each role explicitly so the small State Query can be
+    # cached without materializing the much larger 256-frame Answer Query cache.
     query_cache_mode: Literal["disabled", "inherit"] = "inherit"
+    state_query_cache_mode: Literal["disabled", "inherit"] | None = None
+    answer_query_cache_mode: Literal["disabled", "inherit"] | None = None
     query_activation_offload: bool = False
     preprocess_cache_mode: Literal["disabled", "read_write", "readonly"]
     preprocess_cache_miss_policy: Literal["decode", "error"]
@@ -124,6 +129,20 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             if mode == "causal_prefix" and maximum != 256:
                 raise ValueError(f"{role} causal_prefix Query requires exactly 256 frames")
         return self
+
+    def query_cache_enabled(self, role: Literal["state_query", "answer_query"]) -> bool:
+        """Resolve a role-specific cache policy with legacy-config compatibility."""
+
+        override = (
+            self.state_query_cache_mode if role == "state_query" else self.answer_query_cache_mode
+        )
+        return (self.query_cache_mode if override is None else override) == "inherit"
+
+    @property
+    def cached_query_roles(self) -> frozenset[str]:
+        return frozenset(
+            role for role in ("state_query", "answer_query") if self.query_cache_enabled(role)
+        )
 
 
 @dataclass(frozen=True, slots=True)

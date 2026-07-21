@@ -228,9 +228,7 @@ def test_prewarm_enumerates_distinct_state_and_answer_query_entries(
         sampling_weight=1.0,
     )
     root = Path(__file__).parents[1]
-    ttt_config = _load_training_config(
-        root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml"
-    )
+    ttt_config = _load_training_config(root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml")
 
     candidates = tuple(_iter_specs((record,), ttt_config))
     query_specs = [spec for spec, _source in candidates if hasattr(spec, "query_role")]
@@ -238,6 +236,12 @@ def test_prewarm_enumerates_distinct_state_and_answer_query_entries(
         ("state_query", 16),
         ("answer_query", 256),
     ]
+
+    state_only = tuple(_iter_specs((record,), ttt_config, roles=frozenset(("state_query",))))
+    assert len(state_only) == 1
+    state_spec, _source = state_only[0]
+    assert state_spec.query_role == "state_query"
+    assert state_spec.maximum_frames == 16
     fingerprinted = _fingerprinted_specs(
         candidates,
         config=load_config(),

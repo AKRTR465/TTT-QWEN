@@ -72,6 +72,8 @@ ttt_qwen:
   answer_query_visual_mode: causal_prefix
   answer_query_max_frames: 256
   query_cache_mode: inherit
+  state_query_cache_mode: inherit
+  answer_query_cache_mode: disabled
   query_activation_offload: false
   preprocess_cache_mode: readonly
   preprocess_cache_miss_policy: error

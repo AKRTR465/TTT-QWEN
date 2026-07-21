@@ -613,6 +613,7 @@ class VideoChunkMaterializer:
         maximum_pixels: int,
         preprocess_cache: PreprocessCache | None = None,
         cache_query_visuals: bool = True,
+        cache_query_roles: frozenset[str] | None = None,
         prefetch_depth: int = 2,
         decode_coalesce: bool = True,
     ) -> None:
@@ -628,6 +629,13 @@ class VideoChunkMaterializer:
         if type(cache_query_visuals) is not bool:
             raise TypeError("cache_query_visuals must be bool")
         self.cache_query_visuals = cache_query_visuals
+        if cache_query_roles is None:
+            cache_query_roles = (
+                frozenset(("state_query", "answer_query")) if cache_query_visuals else frozenset()
+            )
+        if not cache_query_roles.issubset({"state_query", "answer_query"}):
+            raise ValueError("cache_query_roles contains an unknown Query role")
+        self.cache_query_roles = cache_query_roles
         self.prefetch_depth = prefetch_depth
         self.decode_coalesce = decode_coalesce
         self._source_dataset = "runtime"
@@ -888,7 +896,10 @@ class VideoChunkMaterializer:
         return materialized
 
     def _cache_for(self, spec: ObservationSpec) -> PreprocessCache | None:
-        if isinstance(spec, QueryObservationSpec) and not self.cache_query_visuals:
+        if (
+            isinstance(spec, QueryObservationSpec)
+            and spec.observation_role not in self.cache_query_roles
+        ):
             return None
         return self.preprocess_cache
 
@@ -1638,7 +1649,7 @@ class A2PrefetchCollator:
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
-            cache_query_visuals=ttt_config.query_cache_mode == "inherit",
+            cache_query_roles=ttt_config.cached_query_roles,
             prefetch_depth=1,
             decode_coalesce=False,
         )
@@ -1676,7 +1687,9 @@ class A2PrefetchCollator:
             minimum_pixels=self.minimum_pixels,
             maximum_pixels=self.maximum_pixels,
             preprocess_cache=(
-                self.preprocess_cache if self.ttt_config.query_cache_mode == "inherit" else None
+                self.preprocess_cache
+                if self.ttt_config.query_cache_enabled("answer_query")
+                else None
             ),
             source_dataset=record.source_dataset,
         )
@@ -1759,7 +1772,7 @@ class A5PrefetchCollator:
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
-            cache_query_visuals=ttt_config.query_cache_mode == "inherit",
+            cache_query_roles=ttt_config.cached_query_roles,
             prefetch_depth=1,
             decode_coalesce=False,
         )
@@ -1803,7 +1816,7 @@ class A5PrefetchCollator:
                     maximum_pixels=self.maximum_pixels,
                     preprocess_cache=(
                         self.preprocess_cache
-                        if self.ttt_config.query_cache_mode == "inherit"
+                        if self.ttt_config.query_cache_enabled("answer_query")
                         else None
                     ),
                     source_dataset=record.source_dataset,
@@ -2414,7 +2427,7 @@ def build_runtime(
         minimum_pixels=minimum_pixels,
         maximum_pixels=maximum_pixels,
         preprocess_cache=preprocess_cache,
-        cache_query_visuals=config.query_cache_mode == "inherit",
+        cache_query_roles=config.cached_query_roles,
         prefetch_depth=support_prefetch_depth,
         decode_coalesce=support_decode_coalesce,
     )
@@ -3040,8 +3053,10 @@ def _prepared_a2_record_bytes(
     supports: Sequence[PreparedVisualCPU],
     state_query: PreparedVisualCPU,
 ) -> int:
-    return _prepared_answer_bytes(answer) + _prepared_visual_bytes(state_query) + sum(
-        _prepared_visual_bytes(chunk) for chunk in supports
+    return (
+        _prepared_answer_bytes(answer)
+        + _prepared_visual_bytes(state_query)
+        + sum(_prepared_visual_bytes(chunk) for chunk in supports)
     )
 
 
