@@ -34,7 +34,7 @@ def test_v6_yaml_passes_strong_validation_and_serializes_completely() -> None:
     assert serialized["spec_version"] == (
         "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history"
     )
-    assert serialized["config_schema_version"] == 4
+    assert serialized["config_schema_version"] == 5
     assert serialized["model"]["revision"] == "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
     assert set(serialized) == set(ProjectConfig.model_fields)
 
@@ -569,6 +569,17 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
             "ema_beta": 0.99,
         },
     }
+    assert config.outer_gradient_control.model_dump() == {
+        "mode": "per_group_l2_equal_update_cap",
+        "max_grad_norm": {
+            "qwen": 1.0,
+            "state": 0.1,
+            "w0": 0.1,
+            "predictor": 0.1,
+        },
+        "nonfinite_policy": "skip_update",
+        "audit_steps": 32,
+    }
     assert config.stage_a.model_dump() == {
         "variant": "a2",
         "inner_sgd_enabled": False,
@@ -608,7 +619,6 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
             "weight_decay": 0.01,
             "betas": (0.9, 0.999),
             "epsilon": 1.0e-8,
-            "grad_clip_norm": 1.0,
         },
         "checkpoint": {
             "format": "full_model_optimizer_scheduler_rng_v1",

@@ -78,14 +78,18 @@ class PreprocessFingerprint:
             raise ValueError("preprocess fingerprint interval is invalid")
         if self.maximum_frames < 2 or self.sample_fps <= 0.0:
             raise ValueError("preprocess fingerprint frame settings are invalid")
-        if self.observation_role not in {"support", "query"} or not self.frame_sampling:
+        if self.observation_role not in {
+            "support",
+            "state_query",
+            "answer_query",
+        } or not self.frame_sampling:
             raise ValueError("preprocess fingerprint observation role/policy is invalid")
 
     def canonical_json(self) -> str:
         values = asdict(self)
-        # Preserve the digest of the already-warmed Support cache. Query observations always
-        # retain the explicit role/policy fields, so a causal-prefix Query can never reuse a
-        # legacy 16-frame current-chunk entry.
+        # Preserve the digest of the already-warmed Support cache. State and Answer Query
+        # observations retain distinct role/policy fields, so neither can reuse a legacy
+        # single-Query entry or each other's payload.
         if self.observation_role == "support" and self.frame_sampling == "uniform":
             values.pop("observation_role")
             values.pop("frame_sampling")

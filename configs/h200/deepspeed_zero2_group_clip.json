@@ -11,15 +11,14 @@
     "enabled": false
   },
   "zero_optimization": {
-    "stage": 1,
+    "stage": 2,
     "allgather_partitions": true,
     "allgather_bucket_size": 200000000,
     "overlap_comm": false,
-    "reduce_scatter": false,
+    "reduce_scatter": true,
     "reduce_bucket_size": 200000000,
     "contiguous_gradients": true,
-    "round_robin_gradients": false,
-    "ignore_unused_parameters": false
+    "round_robin_gradients": true
   },
   "wall_clock_breakdown": false
 }

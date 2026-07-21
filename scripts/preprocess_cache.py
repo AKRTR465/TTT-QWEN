@@ -3,30 +3,37 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shutil
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
+import yaml
 from safetensors.torch import load_file
 
-from ttt_svcbench_qwen.config import load_config
+from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
     A5EpisodeRecord,
     ManifestStage,
     load_production_manifest_views,
 )
-from ttt_svcbench_qwen.preprocess_cache import PreprocessCache
+from ttt_svcbench_qwen.preprocess_cache import PreprocessCache, PreprocessFingerprint
+from ttt_svcbench_qwen.production_factory import ProductionTTTConfig
 from ttt_svcbench_qwen.production_runtime import (
     CurrentChunkSpec,
+    QueryObservationSpec,
     VideoChunkMaterializer,
     _a2_support_chunk_specs,
+    _build_preprocess_fingerprint,
     _query_chunk_spec,
     _resolve_video_path,
 )
+
+ObservationSpec = CurrentChunkSpec | QueryObservationSpec
+FingerprintedSpec = tuple[ObservationSpec, str, PreprocessFingerprint]
 
 
 def main() -> int:
@@ -39,6 +46,7 @@ def main() -> int:
     _add_cache_arguments(prewarm)
     prewarm.add_argument("--manifest", required=True, type=Path)
     prewarm.add_argument("--project-config", required=True, type=Path)
+    prewarm.add_argument("--training-config", required=True, type=Path)
     prewarm.add_argument("--video-root", required=True, type=Path)
     prewarm.add_argument("--stage", choices=("a2", "a5"), required=True)
     prewarm.add_argument("--minimum-pixels", type=int, required=True)
@@ -125,6 +133,13 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         parser.error("pixel limits must satisfy 0 < minimum <= maximum")
     os.environ["SVCBENCH_VIDEO_ROOT"] = str(args.video_root.resolve())
     config = load_config(args.project_config)
+    ttt_config = _load_training_config(args.training_config)
+    if ttt_config.stage != args.stage:
+        parser.error(
+            f"training config stage {ttt_config.stage!r} does not match --stage {args.stage!r}"
+        )
+    if ttt_config.query_cache_mode != "inherit":
+        parser.error("dual-Query prewarm requires ttt_qwen.query_cache_mode=inherit")
     cache = _cache(args)
     materializer = VideoChunkMaterializer(
         config,
@@ -138,12 +153,18 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         args.manifest,
         stage=ManifestStage(args.stage),
     )
-    specs = tuple(_iter_specs((*train.records, *evaluation.records)))
+    candidates = tuple(_iter_specs((*train.records, *evaluation.records), ttt_config))
+    specs = _fingerprinted_specs(
+        candidates,
+        config=config,
+        minimum_pixels=args.minimum_pixels,
+        maximum_pixels=args.maximum_pixels,
+    )
     selected = tuple(
-        spec for spec in specs if _owns_shard(spec, args.shard_index, args.shard_count)
+        item for item in specs if _owns_shard(item[2], args.shard_index, args.shard_count)
     )
     before = cache.disk_size_bytes()
-    for spec, source_dataset in selected:
+    for spec, source_dataset, _fingerprint in selected:
         materializer.set_source_dataset(source_dataset)
         materializer(spec)
     after = cache.disk_size_bytes()
@@ -152,6 +173,7 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         "stage": args.stage,
         "shard_index": args.shard_index,
         "shard_count": args.shard_count,
+        "candidate_chunk_count": len(candidates),
         "unique_chunk_count": len(specs),
         "selected_chunk_count": len(selected),
         "written_bytes": max(0, after - before),
@@ -166,18 +188,28 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
 def _iter_specs(
     records: Iterable[A2QueryRecord | A5EpisodeRecord],
-) -> Iterable[tuple[CurrentChunkSpec, str]]:
-    seen: set[str] = set()
+    config: ProductionTTTConfig,
+) -> Iterable[tuple[ObservationSpec, str]]:
     for record in records:
         path = _resolve_video_path(record.source_dataset, record.relative_video_path)
         if isinstance(record, A2QueryRecord):
             specs = (
                 *_a2_support_chunk_specs(record, path),
                 _query_chunk_spec(
-                    f"{record.query.runtime.query_id}:query",
+                    f"{record.query.runtime.query_id}:state_query",
                     path,
                     record.query.runtime.query_time,
                     reset_soft_state=False,
+                    config=config,
+                    role="state_query",
+                ),
+                _query_chunk_spec(
+                    f"{record.query.runtime.query_id}:answer_query",
+                    path,
+                    record.query.runtime.query_time,
+                    reset_soft_state=False,
+                    config=config,
+                    role="answer_query",
                 ),
             )
         else:
@@ -196,29 +228,67 @@ def _iter_specs(
                 )
                 for index, chunk in enumerate(chunks)
             ) + tuple(
-                _query_chunk_spec(
-                    f"{record.episode_id}:q{index}",
-                    path,
-                    query.runtime.query_time,
-                    reset_soft_state=index > 0,
-                )
+                spec
                 for index, query in enumerate(record.queries)
+                for spec in (
+                    _query_chunk_spec(
+                        f"{record.episode_id}:q{index}:state_query",
+                        path,
+                        query.runtime.query_time,
+                        reset_soft_state=index > 0,
+                        config=config,
+                        role="state_query",
+                    ),
+                    _query_chunk_spec(
+                        f"{record.episode_id}:q{index}:answer_query",
+                        path,
+                        query.runtime.query_time,
+                        reset_soft_state=index > 0,
+                        config=config,
+                        role="answer_query",
+                    ),
+                )
             )
         for spec in specs:
-            key = f"{record.source_dataset}:{spec.video_path}:{spec.start_time}:{spec.end_time}"
-            if key not in seen:
-                seen.add(key)
-                yield spec, record.source_dataset
+            yield spec, record.source_dataset
+
+
+def _fingerprinted_specs(
+    candidates: Iterable[tuple[ObservationSpec, str]],
+    *,
+    config: ProjectConfig,
+    minimum_pixels: int,
+    maximum_pixels: int,
+) -> tuple[FingerprintedSpec, ...]:
+    """Deduplicate exactly as the runtime cache does, including both Query roles."""
+
+    unique: dict[str, FingerprintedSpec] = {}
+    for spec, source_dataset in candidates:
+        fingerprint = _build_preprocess_fingerprint(
+            spec,
+            config=config,
+            minimum_pixels=minimum_pixels,
+            maximum_pixels=maximum_pixels,
+            source_dataset=source_dataset,
+        )
+        unique.setdefault(fingerprint.digest, (spec, source_dataset, fingerprint))
+    return tuple(unique.values())
 
 
 def _owns_shard(
-    item: tuple[CurrentChunkSpec, str],
+    fingerprint: PreprocessFingerprint,
     shard_index: int,
     shard_count: int,
 ) -> bool:
-    spec, source_dataset = item
-    digest = hashlib.sha256(f"{source_dataset}:{spec.chunk_id}".encode()).digest()
+    digest = bytes.fromhex(fingerprint.digest)
     return int.from_bytes(digest[:8], "little") % shard_count == shard_index
+
+
+def _load_training_config(path: Path) -> ProductionTTTConfig:
+    raw: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not isinstance(raw.get("ttt_qwen"), dict):
+        raise ValueError("training config must contain a ttt_qwen mapping")
+    return ProductionTTTConfig.model_validate(raw["ttt_qwen"])
 
 
 if __name__ == "__main__":

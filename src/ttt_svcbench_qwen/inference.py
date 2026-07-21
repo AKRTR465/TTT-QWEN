@@ -148,8 +148,8 @@ class CausalChunk:
 class AnswerInputs:
     base_input_ids: Tensor
     base_attention_mask: Tensor
-    pixel_values_videos: Tensor | None
-    video_grid_thw: Tensor | None
+    pixel_values_videos: Tensor
+    video_grid_thw: Tensor
     tokenizer: object
     embedding_owner: object
     rope_indexer: object
@@ -864,7 +864,7 @@ class PerVideoRuntimeManager:
             before_guard = _runtime_guard_stamp(runtime)
             lifecycle = PrefillLifecycle(owner)
             self.fast_adapter.last_audit = None
-            with self.fast_adapter.use_fast_state(fast):
+            with self.fast_adapter.use_fast_state(fast), torch.no_grad():
                 observation = model.observe_chunk(
                     ObservationChunkRequest(
                         owner=owner,
@@ -1502,13 +1502,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="bfloat16",
     )
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--query-visual-mode",
-        choices=("causal_prefix", "recent_chunk"),
-        default="causal_prefix",
-    )
     parser.add_argument("--query-sample-fps", type=float, default=2.0)
-    parser.add_argument("--query-max-frames", type=int, default=256)
     parser.add_argument("--video-max-pixels", type=int, default=131_072)
     return parser
 
@@ -1617,36 +1611,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         end = min(query.query_time, end + 8.0)
     if not specs:
         raise ValueError("query_time must be greater than zero for video inference")
-    visual_mode = cast(str, args.query_visual_mode)
-    query_max_frames = cast(int, args.query_max_frames)
-    if visual_mode == "causal_prefix":
-        query_start_time = 0.0
-        if query_max_frames != 256:
-            raise ValueError("causal_prefix inference requires --query-max-frames 256")
-    else:
-        query_start_time = max(0.0, query.query_time - 8.0)
-        if query_max_frames < 2 or query_max_frames > 16:
-            raise ValueError("recent_chunk inference permits --query-max-frames 2..16")
-    if query_max_frames % 2:
-        raise ValueError("--query-max-frames must be even")
-    query_spec = QueryObservationSpec(
-        chunk_id=f"query-{query.query_id}",
+    state_query_spec = QueryObservationSpec(
+        chunk_id=f"state-query-{query.query_id}",
         video_path=video_path,
-        start_time=query_start_time,
+        start_time=max(0.0, query.query_time - 8.0),
         end_time=query.query_time,
-        maximum_frames=query_max_frames,
+        maximum_frames=16,
         query_time=query.query_time,
         sampling_fps=cast(float, args.query_sample_fps),
+        query_role="state_query",
     )
-    materialized = bundle.video_materializer(query_spec)
-    latest_times = tuple(float(value) for value in materialized.tubelet_timestamps[0].tolist())
-    latest_positions = tuple(int(value) for value in materialized.tubelet_position_ids[0].tolist())
+    answer_query_spec = QueryObservationSpec(
+        chunk_id=f"answer-query-{query.query_id}",
+        video_path=video_path,
+        start_time=0.0,
+        end_time=query.query_time,
+        maximum_frames=256,
+        query_time=query.query_time,
+        sampling_fps=cast(float, args.query_sample_fps),
+        query_role="answer_query",
+    )
+    state_materialized = bundle.video_materializer(state_query_spec)
+    answer_materialized = bundle.video_materializer(answer_query_spec)
+    latest_times = tuple(
+        float(value) for value in state_materialized.tubelet_timestamps[0].tolist()
+    )
+    latest_positions = tuple(
+        int(value) for value in state_materialized.tubelet_position_ids[0].tolist()
+    )
     query_observation = CausalChunk(
-        chunk_id=query_spec.chunk_id,
+        chunk_id=state_query_spec.chunk_id,
         frames=tuple(range(len(latest_times))),
         timestamps=latest_times,
         position_ids=latest_positions,
-        model_input=materialized,
+        model_input=state_materialized,
     )
     processor = bundle.processor
     apply_template = getattr(processor, "apply_chat_template", None)
@@ -1658,8 +1656,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     prompt = _expand_qwen_video_placeholders(
         processor,
         prompt,
-        materialized.video_grid_thw,
-        materialized.frames.shape[0],
+        answer_materialized.video_grid_thw,
+        answer_materialized.frames.shape[0],
     )
     input_ids, attention_mask = _tokenize_text_only(bundle.tokenizer, prompt)
     request = InferenceRequest(
@@ -1669,8 +1667,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         answer_inputs=AnswerInputs(
             base_input_ids=input_ids,
             base_attention_mask=attention_mask,
-            pixel_values_videos=materialized.pixel_values_videos,
-            video_grid_thw=materialized.video_grid_thw,
+            pixel_values_videos=answer_materialized.pixel_values_videos,
+            video_grid_thw=answer_materialized.video_grid_thw,
             tokenizer=bundle.tokenizer,
             embedding_owner=bundle.qwen_adapter.qwen_model,
             rope_indexer=bundle.qwen_adapter.qwen_model,
@@ -1703,17 +1701,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             "prefill_count": result.generate_audit.prefill_count,
             "decode_count": result.generate_audit.decode_count,
             "chunk_count": len(result.chunk_audit),
-            "query_visual_mode": visual_mode,
-            "prepared_video_feature_count": 1,
+            "state_query_visual_mode": "recent_chunk",
+            "answer_query_visual_mode": "causal_prefix",
+            "prepared_video_feature_count": 0,
             "history_feature_set_count": 0,
-            "query_frame_count": int(materialized.frames.shape[0]),
-            "query_visual_token_count": int(materialized.pixel_values_videos.shape[0]),
-            "query_video_grid_thw": [
-                int(value) for value in materialized.video_grid_thw[0].tolist()
+            "state_query_frame_count": int(state_materialized.frames.shape[0]),
+            "answer_query_frame_count": int(answer_materialized.frames.shape[0]),
+            "state_query_visual_token_count": int(
+                state_materialized.pixel_values_videos.shape[0]
+            ),
+            "answer_query_visual_token_count": int(
+                answer_materialized.pixel_values_videos.shape[0]
+            ),
+            "state_query_video_grid_thw": [
+                int(value) for value in state_materialized.video_grid_thw[0].tolist()
             ],
-            "query_timestamp_range": [
-                float(materialized.frame_timestamps[0].item()),
-                float(materialized.frame_timestamps[-1].item()),
+            "answer_query_video_grid_thw": [
+                int(value) for value in answer_materialized.video_grid_thw[0].tolist()
+            ],
+            "state_query_timestamp_range": [
+                float(state_materialized.frame_timestamps[0].item()),
+                float(state_materialized.frame_timestamps[-1].item()),
+            ],
+            "answer_query_timestamp_range": [
+                float(answer_materialized.frame_timestamps[0].item()),
+                float(answer_materialized.frame_timestamps[-1].item()),
             ],
             "released": result.release_audit is not None,
             "runtime_unchanged_during_generate": (

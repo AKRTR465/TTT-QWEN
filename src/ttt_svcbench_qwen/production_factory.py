@@ -64,14 +64,12 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     prepared_episode_max_bytes: int = Field(default=2_147_483_648, gt=0)
     support_visual_batch_size: int = Field(default=1, gt=0)
     query_encoder_reuse: bool = True
-    query_visual_mode: Literal["recent_chunk", "causal_prefix"] = "recent_chunk"
     query_frame_sampling: Literal["llamafactory_uniform_cap"] = "llamafactory_uniform_cap"
     query_sample_fps: float = Field(default=2.0, gt=0.0)
-    query_max_frames: int = Field(default=16, ge=2, le=256)
-    state_query_visual_mode: Literal["recent_chunk", "causal_prefix"] | None = None
-    state_query_max_frames: int | None = Field(default=None, ge=2, le=256)
-    answer_query_visual_mode: Literal["recent_chunk", "causal_prefix"] | None = None
-    answer_query_max_frames: int | None = Field(default=None, ge=2, le=256)
+    state_query_visual_mode: Literal["recent_chunk"]
+    state_query_max_frames: Literal[16]
+    answer_query_visual_mode: Literal["causal_prefix"]
+    answer_query_max_frames: Literal[256]
     query_decode_strategy: Literal["legacy_seek", "grouped_seek"] = "legacy_seek"
     query_decode_max_groups: int = Field(default=16, ge=1, le=16)
     query_cache_mode: Literal["disabled", "inherit"] = "inherit"
@@ -115,24 +113,9 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             and self.preprocess_cache_miss_policy != "decode"
         ):
             raise ValueError("disabled preprocess cache requires miss_policy=decode")
-        split_fields = (
-            self.state_query_visual_mode,
-            self.state_query_max_frames,
-            self.answer_query_visual_mode,
-            self.answer_query_max_frames,
-        )
-        if any(value is not None for value in split_fields) and not all(
-            value is not None for value in split_fields
-        ):
-            raise ValueError("split State/Answer Query configuration requires all four fields")
         for role, mode, maximum in (
-            ("legacy", self.query_visual_mode, self.query_max_frames),
-            ("State", self.resolved_state_query_visual_mode, self.resolved_state_query_max_frames),
-            (
-                "Answer",
-                self.resolved_answer_query_visual_mode,
-                self.resolved_answer_query_max_frames,
-            ),
+            ("State", self.state_query_visual_mode, self.state_query_max_frames),
+            ("Answer", self.answer_query_visual_mode, self.answer_query_max_frames),
         ):
             if maximum % 2:
                 raise ValueError(f"{role} query frame limit must be even for Qwen patching")
@@ -141,26 +124,6 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             if mode == "causal_prefix" and maximum != 256:
                 raise ValueError(f"{role} causal_prefix Query requires exactly 256 frames")
         return self
-
-    @property
-    def split_query_visuals(self) -> bool:
-        return self.state_query_visual_mode is not None
-
-    @property
-    def resolved_state_query_visual_mode(self) -> Literal["recent_chunk", "causal_prefix"]:
-        return self.state_query_visual_mode or self.query_visual_mode
-
-    @property
-    def resolved_state_query_max_frames(self) -> int:
-        return self.state_query_max_frames or self.query_max_frames
-
-    @property
-    def resolved_answer_query_visual_mode(self) -> Literal["recent_chunk", "causal_prefix"]:
-        return self.answer_query_visual_mode or self.query_visual_mode
-
-    @property
-    def resolved_answer_query_max_frames(self) -> int:
-        return self.answer_query_max_frames or self.query_max_frames
 
 
 @dataclass(frozen=True, slots=True)

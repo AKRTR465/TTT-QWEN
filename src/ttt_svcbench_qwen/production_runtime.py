@@ -493,23 +493,21 @@ class PreparedAnswerCPU:
 
 @dataclass(frozen=True, slots=True)
 class PreparedA2Record:
-    """One manifest row plus its CPU-prepared Query and optional complete Support list."""
+    """One manifest row plus independent CPU-prepared State and Answer Queries."""
 
     record: A2QueryRecord
     answer: PreparedAnswerCPU
     preparation: A2PreparationTelemetry
+    state_query: PreparedVisualCPU
     supports: tuple[PreparedVisualCPU, ...] = ()
-    state_query: PreparedVisualCPU | None = None
 
     def __post_init__(self) -> None:
-        legacy = f"{self.record.query.runtime.query_id}:query"
         expected = f"{self.record.query.runtime.query_id}:answer_query"
-        if self.answer.spec.chunk_id not in {legacy, expected}:
+        if self.answer.spec.chunk_id != expected:
             raise ValueError("prepared A2 answer does not belong to its manifest Query")
-        if self.state_query is not None:
-            state_expected = f"{self.record.query.runtime.query_id}:state_query"
-            if self.state_query.spec.chunk_id != state_expected:
-                raise ValueError("prepared A2 State Query does not belong to its manifest Query")
+        state_expected = f"{self.record.query.runtime.query_id}:state_query"
+        if self.state_query.spec.chunk_id != state_expected:
+            raise ValueError("prepared A2 State Query does not belong to its manifest Query")
         if self.supports:
             _, schedule = adaptive_support_schedule(self.record.query.runtime.query_time)
             if len(self.supports) != len(schedule):
@@ -520,7 +518,7 @@ class PreparedA2Record:
             self,
             answer=self.answer.pin_memory(),
             supports=tuple(chunk.pin_memory() for chunk in self.supports),
-            state_query=(self.state_query.pin_memory() if self.state_query is not None else None),
+            state_query=self.state_query.pin_memory(),
         )
 
 
@@ -734,9 +732,11 @@ class VideoChunkMaterializer:
 
     def _materialize(self, spec: ObservationSpec) -> CurrentChunkMaterialization:
         started = time.perf_counter()
-        fingerprint = self._fingerprint(spec)
         cache = self._cache_for(spec)
+        fingerprint = self._fingerprint(spec) if cache is not None else None
         if cache is not None:
+            if fingerprint is None:
+                raise RuntimeError("enabled preprocess cache lost its fingerprint")
             cache_started = time.perf_counter()
             cache_bytes = cache.payload_size(fingerprint)
             cached = cache.get(fingerprint)
@@ -849,7 +849,7 @@ class VideoChunkMaterializer:
         spec: ObservationSpec,
         frames: Tensor,
         timestamps: Tensor,
-        fingerprint: PreprocessFingerprint,
+        fingerprint: PreprocessFingerprint | None,
         *,
         cache: PreprocessCache | None = None,
     ) -> CurrentChunkMaterialization:
@@ -882,6 +882,8 @@ class VideoChunkMaterializer:
         )
         target_cache = self._cache_for(spec) if cache is None else cache
         if target_cache is not None and target_cache.writable:
+            if fingerprint is None:
+                raise RuntimeError("writable preprocess cache requires a fingerprint")
             target_cache.put(fingerprint, _cached_from_materialized(materialized))
         return materialized
 
@@ -947,7 +949,6 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
             )
             return VisualStageOutput(
                 value=raw.value,
-                prepared_video_features=raw.prepared_video_features,
                 audit=ProductionVisualAudit(raw.source, token_audit),
             )
         chunk: CurrentChunkMaterialization | PreparedVisualCPU
@@ -988,7 +989,6 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
         )
         return VisualStageOutput(
             value=adapted,
-            prepared_video_features=prepared_features,
             audit=ProductionVisualAudit(materialized, token_audit),
         )
 
@@ -1140,18 +1140,11 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
         return tuple(outputs)
 
     def _prefill(self, request: QwenPrefillRequest) -> QwenPrefillOutput:
-        if not isinstance(request.prepared_video_features, PreparedVideoFeatures):
-            raise TypeError("production prefill requires one current PreparedVideoFeatures")
-        if not isinstance(request.pixel_values_videos, Tensor) or not isinstance(
-            request.video_grid_thw, Tensor
-        ):
-            raise TypeError("production prefill pixels/grid must be tensors")
         device = _module_device(self.qwen)
         h2d_started = time.perf_counter()
         pixels = request.pixel_values_videos.to(device=device, non_blocking=True)
         grid = request.video_grid_thw.to(device=device, non_blocking=True)
         _loader_trace("pin_memory/H2D", seconds=time.perf_counter() - h2d_started)
-        audit_current_chunk_visual_tokens(request.prepared_video_features, pixels, grid)
         if not isinstance(request.input_ids, Tensor) or not isinstance(
             request.attention_mask, Tensor
         ):
@@ -1167,7 +1160,6 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
                 attention_mask=attention_mask,
                 pixel_values_videos=pixels,
                 video_grid_thw=grid,
-                prepared_video_features=request.prepared_video_features,
                 state_embedding_payload=state_payload,
                 **kwargs,
             )
@@ -1175,18 +1167,11 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
 
     def _generate(self, request: QwenGenerateRequest) -> QwenGenerateOutput:
         prefill = request.prefill
-        if not isinstance(prefill.prepared_video_features, PreparedVideoFeatures):
-            raise TypeError("production generation requires prepared video features")
-        if not isinstance(prefill.pixel_values_videos, Tensor) or not isinstance(
-            prefill.video_grid_thw, Tensor
-        ):
-            raise TypeError("production generation pixels/grid must be tensors")
         device = _module_device(self.qwen)
         input_ids = prefill.input_ids.to(device=device)
         attention_mask = prefill.attention_mask.to(device=device)
         pixels = prefill.pixel_values_videos.to(device=device, non_blocking=True)
         grid = prefill.video_grid_thw.to(device=device, non_blocking=True)
-        audit_current_chunk_visual_tokens(prefill.prepared_video_features, pixels, grid)
         kwargs = dict(prefill.qwen_kwargs)
         kwargs.pop("labels", None)
         kwargs.update(
@@ -1200,7 +1185,6 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
             attention_mask=attention_mask,
             pixel_values_videos=pixels,
             video_grid_thw=grid,
-            prepared_video_features=prefill.prepared_video_features,
             state_embedding_payload=_state_embedding_payload(prefill, input_ids),
             **kwargs,
         )
@@ -1881,10 +1865,7 @@ class ProductionEpisodeMaterializer:
             raise ValueError("prefetched A2 Answer Query drifted before runtime assembly")
         answer, labels, _ = self._bind_answer(prepared_answer)
         materialized_state = source.state_query
-        if materialized_state is None:
-            # Legacy prepared payloads used one visual for both roles.
-            materialized_state = prepared_answer.materialized_query
-        elif materialized_state.spec != state_chunk:
+        if materialized_state.spec != state_chunk:
             raise ValueError("prefetched A2 State Query drifted before runtime assembly")
         requests_list: list[ObservationChunkRequest] = []
         for index, chunk in enumerate(supports):
@@ -2792,17 +2773,16 @@ def _query_chunk_spec(
     *,
     reset_soft_state: bool,
     config: ProductionTTTConfig,
-    role: Literal["query", "state_query", "answer_query"] = "query",
+    role: Literal["state_query", "answer_query"],
 ) -> QueryObservationSpec:
+    mode: str
+    maximum_frames: int
     if role == "state_query":
-        mode = config.resolved_state_query_visual_mode
-        maximum_frames = config.resolved_state_query_max_frames
-    elif role == "answer_query":
-        mode = config.resolved_answer_query_visual_mode
-        maximum_frames = config.resolved_answer_query_max_frames
+        mode = config.state_query_visual_mode
+        maximum_frames = config.state_query_max_frames
     else:
-        mode = config.query_visual_mode
-        maximum_frames = config.query_max_frames
+        mode = config.answer_query_visual_mode
+        maximum_frames = config.answer_query_max_frames
     end = query_time
     start = 0.0 if mode == "causal_prefix" else max(0.0, end - 8.0)
     if end <= start:
@@ -2848,14 +2828,22 @@ def _prepare_answer_cpu(
     _loader_trace("query_prepare", query_id=query.runtime.query_id)
     answer_text = query.answer.answer if query.answer.answer is not None else str(query.weak.count)
     typed_processor = _require_latest_qwen_processor(processor, context="Query preprocessing")
-    fingerprint = _build_preprocess_fingerprint(
-        spec,
-        config=config,
-        minimum_pixels=minimum_pixels,
-        maximum_pixels=maximum_pixels,
-        source_dataset=source_dataset,
+    fingerprint = (
+        _build_preprocess_fingerprint(
+            spec,
+            config=config,
+            minimum_pixels=minimum_pixels,
+            maximum_pixels=maximum_pixels,
+            source_dataset=source_dataset,
+        )
+        if preprocess_cache is not None
+        else None
     )
-    cached = preprocess_cache.get(fingerprint) if preprocess_cache is not None else None
+    cached = (
+        preprocess_cache.get(fingerprint)
+        if preprocess_cache is not None and fingerprint is not None
+        else None
+    )
     if cached is not None:
         materialized = _materialized_from_cached(spec, cached)
         frames = materialized.frames
@@ -2883,6 +2871,8 @@ def _prepare_answer_cpu(
         processor_seconds = time.perf_counter() - processor_started
         materialized = _build_materialized_query(spec, frames, timestamps, pixels, grid, config)
         if preprocess_cache is not None and preprocess_cache.writable:
+            if fingerprint is None:
+                raise RuntimeError("writable Answer Query cache requires a fingerprint")
             preprocess_cache.put(fingerprint, _cached_from_materialized(materialized))
 
     prompt_messages = [_user_message(query.runtime.question)]
@@ -3048,10 +3038,9 @@ def _prepared_answer_bytes(answer: PreparedAnswerCPU) -> int:
 def _prepared_a2_record_bytes(
     answer: PreparedAnswerCPU,
     supports: Sequence[PreparedVisualCPU],
-    state_query: PreparedVisualCPU | None = None,
+    state_query: PreparedVisualCPU,
 ) -> int:
-    state_bytes = 0 if state_query is None else _prepared_visual_bytes(state_query)
-    return _prepared_answer_bytes(answer) + state_bytes + sum(
+    return _prepared_answer_bytes(answer) + _prepared_visual_bytes(state_query) + sum(
         _prepared_visual_bytes(chunk) for chunk in supports
     )
 

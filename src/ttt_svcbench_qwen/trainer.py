@@ -219,8 +219,8 @@ class StageAModelForwardOutput:
 class StageAEpisodeAnswerInputs:
     base_input_ids: Tensor
     base_attention_mask: Tensor
-    pixel_values_videos: object
-    video_grid_thw: object
+    pixel_values_videos: Tensor
+    video_grid_thw: Tensor
     tokenizer: object
     embedding_owner: object
     rope_indexer: object

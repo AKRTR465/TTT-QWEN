@@ -404,7 +404,7 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             audit=audit,
         )
 
-    @torch.no_grad()
+    @torch.no_grad()  # type: ignore[untyped-decorator]
     def _update_ema(self, current_means: Sequence[Tensor | None]) -> None:
         if len(current_means) != _STAT_TERM_COUNT:
             raise ValueError("official-weak EMA update shape drifted")

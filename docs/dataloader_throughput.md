@@ -9,13 +9,13 @@ supported.
 
 ## Full-prefix A2 path
 
-The formal 256-frame A2 profile keeps `query_cache_mode: disabled`. Query target times still
-come from the LLaMA-Factory uniform sampler, but `grouped_seek` opens the container once and uses
-at most 16 forward decode groups; non-seekable media falls back to one sequential scan. Workers
-release raw RGB after Qwen processing and return a compact payload containing timestamps, tubelet
-metadata, patches/grid, labels, and preparation telemetry. A2 consumes the GA=4 sequence lazily,
-so each microbatch is fetched immediately before its forward/backward; the optimizer boundary is
-unchanged. A5 continues to use the upstream Trainer path.
+The formal dual-Query profiles use `query_cache_mode: inherit`. State Query and Answer Query have
+different persistent preprocessing keys (`recent_chunk/16` and `causal_prefix/256`), so neither
+can reuse the other's pixels or a legacy single-Query entry. Query target times still come from
+the LLaMA-Factory uniform sampler; a cache miss uses `grouped_seek` with at most 16 forward decode
+groups and falls back to one sequential scan for non-seekable media. The cache contains CPU input
+tensors only: State and Answer still execute independent ViT/Merger/DeepStack forwards. A2
+consumes the GA=4 sequence lazily, and A5 continues to use the upstream Trainer path.
 
 ## Launch settings
 
@@ -35,10 +35,15 @@ processor fingerprint is a miss.
 Use the helper before/after a run:
 
 ```powershell
+python scripts/preprocess_cache.py prewarm --root $env:TTT_PREPROCESS_CACHE_ROOT --namespace $env:TTT_CACHE_NAMESPACE --max-gb 200 --manifest $env:SVCBENCH_DATASET_MANIFEST --project-config configs/model_state_ttt_8b.yaml --training-config configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml --video-root $env:SVCBENCH_VIDEO_ROOT --stage a2 --minimum-pixels 256 --maximum-pixels 131072
 python scripts/preprocess_cache.py inspect --root $env:TTT_PREPROCESS_CACHE_ROOT --namespace $env:TTT_CACHE_NAMESPACE --max-gb 200
 python scripts/preprocess_cache.py verify --root $env:TTT_PREPROCESS_CACHE_ROOT --namespace $env:TTT_CACHE_NAMESPACE --max-gb 200
 python scripts/summarize_dataloader_trace.py $env:RUNTIME_TRACE_DIR
 ```
+
+Use the exact `video_min_pixels`/`video_max_pixels` values from the selected training YAML. Run
+the same command with the A5 training YAML and `--stage a5` before formal A5. Formal training uses
+`readonly/error`, so an incomplete prewarm fails closed instead of decoding repeatedly.
 
 Set `ttt_qwen.runtime_trace_mode: cuda` and `ttt_qwen.runtime_trace_dir` in a benchmark profile
 to emit buffered per-rank/process JSONL events for query preparation, processor, cache hit/miss,

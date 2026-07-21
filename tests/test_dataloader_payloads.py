@@ -11,6 +11,7 @@ from ttt_svcbench_qwen.production_runtime import (
     CurrentChunkMaterialization,
     CurrentChunkSpec,
     PreparedVisualCPU,
+    QueryObservationSpec,
     VideoChunkMaterializer,
     _compact_materialized_chunk,
     _decode_coalesced_intervals,
@@ -96,6 +97,52 @@ def test_prefetch_rejects_out_of_order_consumption(tmp_path: Path) -> None:
         materializer(specs[1])
     materializer.end_prefetch()
     materializer._executor.shutdown(wait=True)
+
+
+def test_disabled_query_cache_does_not_build_a_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "clip.mp4"
+    path.touch()
+    spec = QueryObservationSpec(
+        "state-query",
+        path,
+        0.0,
+        4.0,
+        16,
+        4.0,
+        query_role="state_query",
+    )
+    materializer = VideoChunkMaterializer.__new__(VideoChunkMaterializer)
+    materializer.config = object()  # Query FPS is owned by the spec, not the project config.
+    materializer._cache_for = lambda _spec: None  # type: ignore[method-assign]
+    materializer._fingerprint = lambda _spec: pytest.fail(  # type: ignore[method-assign]
+        "disabled Query cache must not construct a fingerprint"
+    )
+    sentinel = object()
+
+    def materialize_decoded(
+        _spec: object,
+        _frames: torch.Tensor,
+        _timestamps: torch.Tensor,
+        fingerprint: object,
+        *,
+        cache: object,
+    ) -> object:
+        assert fingerprint is None
+        assert cache is None
+        return sentinel
+
+    materializer._materialize_decoded = materialize_decoded  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.production_runtime._decode_uniform_interval",
+        lambda _spec, _fps: (
+            torch.zeros((2, 3, 2, 2), dtype=torch.uint8),
+            torch.tensor((0.0, 1.0), dtype=torch.float64),
+        ),
+    )
+
+    assert materializer._materialize(spec) is sentinel
 
 
 def test_coalesced_decode_matches_individual_decode(tmp_path: Path) -> None:

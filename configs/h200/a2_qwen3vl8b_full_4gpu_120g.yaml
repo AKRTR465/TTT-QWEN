@@ -49,7 +49,7 @@ num_train_epochs: 4.0
 lr_scheduler_type: cosine
 warmup_ratio: 0.03
 weight_decay: 0.01
-max_grad_norm: 1.0
+max_grad_norm: 0.0
 optim: adamw_torch
 bf16: true
 tf32: true
@@ -70,6 +70,11 @@ ttt_qwen:
   prepared_episode_max_bytes: 2147483648
   support_visual_batch_size: 1
   query_encoder_reuse: true
+  state_query_visual_mode: recent_chunk
+  state_query_max_frames: 16
+  answer_query_visual_mode: causal_prefix
+  answer_query_max_frames: 256
+  query_cache_mode: inherit
   preprocess_cache_mode: readonly
   preprocess_cache_miss_policy: error
   preprocess_cache_root_env: TTT_PREPROCESS_CACHE_ROOT

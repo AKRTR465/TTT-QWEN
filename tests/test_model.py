@@ -50,7 +50,7 @@ class SpySuite:
     def visual(self, request: ObservationChunkRequest) -> VisualStageOutput:
         self.events.append("visual")
         assert request.video_input == "video-input"
-        return VisualStageOutput("main-visual", "prepared-main-deepstack", "visual-audit")
+        return VisualStageOutput("main-visual", "visual-audit")
 
     def query(self, query_input: object, *, inference: bool) -> object:
         self.events.append("query")
@@ -68,7 +68,7 @@ class SpySuite:
         assert visual.value == "main-visual"
         assert query.q_target == "q-target"
         assert request.runtime_state == "runtime-0"
-        return VisualStageOutput("adapted-main", "prepared-main-deepstack", "fast-audit")
+        return VisualStageOutput("adapted-main", "fast-audit")
 
     def spatial(
         self,
@@ -297,8 +297,8 @@ def make_answer_request(owner: RuntimeOwner, observation: object) -> AnswerQuery
         observation=observation,  # type: ignore[arg-type]
         base_input_ids="base-ids",
         base_attention_mask="base-mask",
-        pixel_values_videos="pixels",
-        video_grid_thw="grid",
+        pixel_values_videos=torch.ones((8, 4)),
+        video_grid_thw=torch.tensor([[2, 2, 2]], dtype=torch.int64),
         tokenizer="tokenizer",
         embedding_owner="embedding-owner",
         rope_indexer="rope-indexer",
@@ -461,9 +461,9 @@ def test_answer_query_audits_same_retrieval_before_resampler_and_native_prefill(
     assert prefill is not None
     assert prefill.input_ids == "composed-ids"
     assert prefill.attention_mask == "composed-mask"
-    assert prefill.pixel_values_videos == "pixels"
-    assert prefill.video_grid_thw == "grid"
-    assert prefill.prepared_video_features == "prepared-main-deepstack"
+    assert torch.equal(prefill.pixel_values_videos, torch.ones((8, 4)))
+    assert torch.equal(prefill.video_grid_thw, torch.tensor([[2, 2, 2]]))
+    assert not hasattr(prefill, "prepared_video_features")
     assert prefill.state_position_mask == "state-mask"
     assert prefill.state_tokens == "state-tokens"
     assert prefill.composer_position_ids_audit == "composer-position-audit"
@@ -634,8 +634,8 @@ def test_qwen_kwargs_cannot_override_composer_or_native_visual_fields() -> None:
         observation=observation,
         base_input_ids="ids",
         base_attention_mask="mask",
-        pixel_values_videos="pixels",
-        video_grid_thw="grid",
+        pixel_values_videos=torch.ones((8, 4)),
+        video_grid_thw=torch.tensor([[2, 2, 2]], dtype=torch.int64),
         tokenizer="tokenizer",
         embedding_owner="embedding",
         rope_indexer="rope",

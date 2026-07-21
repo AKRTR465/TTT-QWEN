@@ -810,9 +810,7 @@ def test_state_embedding_payload_rejects_reentry_and_expanded_generation() -> No
     assert wrapper._state_hook_active is False
 
 
-def test_prepared_features_reuse_adapted_main_without_rerunning_visual_or_adapter(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_answer_forward_reruns_visual_and_adapter_independently() -> None:
     events: list[str] = []
     model = make_tiny_hf_model()
     owner = model.model
@@ -833,51 +831,59 @@ def test_prepared_features_reuse_adapted_main_without_rerunning_visual_or_adapte
     try:
         owner.rope_deltas = None
         with torch.no_grad():
-            expected_logits = wrapper(**inputs).logits
-        prepared = wrapper.last_prepared_video_features
-        raw = wrapper.last_visual_output
-        assert prepared is not None
-        assert raw is not None
-        assert not torch.equal(prepared.main_features[0], raw.split_main_visual_embeddings()[0])
-        assert events == ["adapter"]
-        assert len(merger_calls) == 1
-
-        injected_deepstack_ids: list[int] = []
-        original_deepstack_process = owner.language_model._deepstack_process
-
-        def recording_deepstack_process(
-            self: object,
-            hidden_states: Tensor,
-            visual_pos_masks: Tensor,
-            visual_embeds: Tensor,
-        ) -> Tensor:
-            del self
-            injected_deepstack_ids.append(id(visual_embeds))
-            return original_deepstack_process(hidden_states, visual_pos_masks, visual_embeds)
-
-        monkeypatch.setattr(
-            owner.language_model,
-            "_deepstack_process",
-            MethodType(recording_deepstack_process, owner.language_model),
-        )
+            first_logits = wrapper(**inputs).logits
+        first_prepared = wrapper.last_prepared_video_features
+        assert isinstance(first_prepared, PreparedVideoFeatures)
         owner.rope_deltas = None
         with torch.no_grad():
-            actual_logits = wrapper(
-                **inputs,
-                prepared_video_features=prepared,
-            ).logits
+            second_logits = wrapper(**inputs).logits
+        second_prepared = wrapper.last_prepared_video_features
     finally:
         merger_handle.remove()
 
-    assert torch.equal(actual_logits, expected_logits)
-    assert events == ["adapter"]
-    assert len(merger_calls) == 1
-    assert injected_deepstack_ids == [id(value) for value in prepared.deepstack_features]
-    assert wrapper.last_visual_output is None
-    assert wrapper.last_prepared_video_features is prepared
+    assert torch.equal(first_logits, second_logits)
+    assert events == ["adapter", "adapter"]
+    assert len(merger_calls) == 2
+    assert isinstance(second_prepared, PreparedVideoFeatures)
+    assert second_prepared is not first_prepared
 
 
-def test_precomputed_provider_is_single_use_per_scope_and_rejects_reentry() -> None:
+def test_state_and_answer_geometry_may_differ_and_answer_visual_receives_gradient() -> None:
+    model = make_tiny_hf_model()
+    wrapper = Qwen3VLAdapter(
+        model,
+        make_tiny_project_config(),
+        AddOneAdapter(),
+        adapter_enabled=True,
+        freeze_base=False,
+    )
+    state_pixels = torch.randn(4, 12)
+    state_grid = torch.tensor([[1, 2, 2]], dtype=torch.int64)
+    wrapper.get_video_features(state_pixels, state_grid)
+    state_prepared = wrapper.last_prepared_video_features
+    assert isinstance(state_prepared, PreparedVideoFeatures)
+
+    answer_pixels = torch.randn(8, 12)
+    answer_grid = torch.tensor([[2, 2, 2]], dtype=torch.int64)
+    output = wrapper(
+        input_ids=torch.tensor([[26, 29, 29, 27, 1]], dtype=torch.int64),
+        pixel_values_videos=answer_pixels,
+        video_grid_thw=answer_grid,
+        use_cache=False,
+    )
+    output.logits.float().sum().backward()
+
+    answer_prepared = wrapper.last_prepared_video_features
+    assert isinstance(answer_prepared, PreparedVideoFeatures)
+    assert answer_prepared is not state_prepared
+    assert torch.equal(answer_prepared.metadata.video_grid_thw, answer_grid)
+    assert any(
+        parameter.grad is not None and bool(parameter.grad.abs().sum() > 0)
+        for parameter in model.model.visual.parameters()
+    )
+
+
+def test_video_interception_scope_rejects_reentry_but_allows_multiple_native_calls() -> None:
     model = make_tiny_hf_model()
     owner = model.model
     wrapper = Qwen3VLAdapter(
@@ -891,96 +897,18 @@ def test_precomputed_provider_is_single_use_per_scope_and_rejects_reentry() -> N
     grid = inputs["video_grid_thw"]
     assert isinstance(pixels, Tensor)
     assert isinstance(grid, Tensor)
-    wrapper.get_video_features(pixels, grid)
-    prepared = wrapper.last_prepared_video_features
-    assert prepared is not None
-
-    with wrapper._patched_video_features(prepared):
-        main, deepstack = owner.get_video_features(pixels, grid)
-        assert main is prepared.main_features
-        assert deepstack is prepared.deepstack_features
-        with pytest.raises(RuntimeError, match="only once"):
-            owner.get_video_features(pixels, grid)
+    with wrapper._patched_video_features():
+        first_main, _ = owner.get_video_features(pixels, grid)
+        second_main, _ = owner.get_video_features(pixels, grid)
+        assert first_main is not second_main
         with (
             pytest.raises(RuntimeError, match="not re-entrant"),
-            wrapper._patched_video_features(prepared),
+            wrapper._patched_video_features(),
         ):
             pass
 
     assert "get_video_features" not in vars(owner)
     assert wrapper._hook_active is False
-
-
-def test_precomputed_provider_failure_clears_capture_and_restores_owner() -> None:
-    model = make_tiny_hf_model()
-    owner = model.model
-    wrapper = Qwen3VLAdapter(
-        model,
-        make_tiny_project_config(),
-        AddOneAdapter(),
-        adapter_enabled=True,
-    )
-    inputs = video_inputs()
-    pixels = inputs["pixel_values_videos"]
-    grid = inputs["video_grid_thw"]
-    assert isinstance(pixels, Tensor)
-    assert isinstance(grid, Tensor)
-    wrapper.get_video_features(pixels, grid)
-    prepared = wrapper.last_prepared_video_features
-    assert prepared is not None
-    invalid = dict(inputs)
-    invalid["input_ids"] = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
-
-    with pytest.raises(ValueError, match="Videos features and video tokens do not match"):
-        wrapper(**invalid, prepared_video_features=prepared)
-
-    assert "get_video_features" not in vars(owner)
-    assert wrapper._hook_active is False
-    assert wrapper.last_visual_output is None
-    assert wrapper.last_prepared_video_features is None
-
-
-def test_precomputed_provider_validates_geometry_and_generation_expansion() -> None:
-    model = make_tiny_hf_model()
-    wrapper = Qwen3VLAdapter(model, make_tiny_project_config())
-    inputs = video_inputs()
-    pixels = inputs["pixel_values_videos"]
-    grid = inputs["video_grid_thw"]
-    assert isinstance(pixels, Tensor)
-    assert isinstance(grid, Tensor)
-    wrapper.get_video_features(pixels, grid)
-    prepared = wrapper.last_prepared_video_features
-    assert isinstance(prepared, PreparedVideoFeatures)
-
-    mismatched = dict(inputs)
-    mismatched["pixel_values_videos"] = torch.randn(8, 12)
-    mismatched["video_grid_thw"] = torch.tensor([[1, 2, 4]], dtype=torch.int64)
-    with pytest.raises(ValueError, match="does not match prepared"):
-        wrapper(**mismatched, prepared_video_features=prepared)
-    assert wrapper.last_prepared_video_features is None
-
-    with pytest.raises(ValueError, match="num_beams=1"):
-        wrapper.generate(
-            **inputs,
-            prepared_video_features=prepared,
-            max_new_tokens=1,
-            num_beams=2,
-        )
-    assert wrapper.last_prepared_video_features is None
-
-    greedy_inputs = dict(inputs)
-    greedy_inputs["use_cache"] = True
-    generated = wrapper.generate(
-        **greedy_inputs,
-        prepared_video_features=prepared,
-        max_new_tokens=2,
-        do_sample=False,
-    )
-    assert isinstance(generated, Tensor)
-    assert generated.shape == (1, 6)
-    assert wrapper.last_visual_output is None
-    assert wrapper.last_prepared_video_features is prepared
-
 
 def test_hook_and_capture_are_restored_after_upstream_failure() -> None:
     model = make_tiny_hf_model()

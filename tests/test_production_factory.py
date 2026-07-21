@@ -18,6 +18,7 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     ProductionTrainerRuntime,
     SegmentBackwardController,
     TTTQwenTrainerMixin,
+    _ControlledDeepSpeedEngineWrapper,
     _validate_checkpoint_tree,
     make_production_outer_optimizer_factory,
     resolve_same_stage_resume,
@@ -147,10 +148,12 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
         "prepared_episode_max_bytes",
         "support_visual_batch_size",
         "query_encoder_reuse",
-        "query_visual_mode",
         "query_frame_sampling",
         "query_sample_fps",
-        "query_max_frames",
+        "state_query_visual_mode",
+        "state_query_max_frames",
+        "answer_query_visual_mode",
+        "answer_query_max_frames",
         "query_decode_strategy",
         "query_decode_max_groups",
         "query_cache_mode",
@@ -191,16 +194,14 @@ def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
     assert native["dataloader_prefetch_factor"] == 2
     assert native["save_strategy"] == "epoch"
     assert native["save_total_limit"] == 1
-    assert extension.query_visual_mode == "causal_prefix"
-    assert extension.query_max_frames == 256
-    assert extension.resolved_state_query_visual_mode == "recent_chunk"
-    assert extension.resolved_state_query_max_frames == 16
-    assert extension.resolved_answer_query_visual_mode == "causal_prefix"
-    assert extension.resolved_answer_query_max_frames == 256
-    assert extension.split_query_visuals
+    assert native["max_grad_norm"] == 0.0
+    assert extension.state_query_visual_mode == "recent_chunk"
+    assert extension.state_query_max_frames == 16
+    assert extension.answer_query_visual_mode == "causal_prefix"
+    assert extension.answer_query_max_frames == 256
     assert extension.query_decode_strategy == "grouped_seek"
     assert extension.query_decode_max_groups == 16
-    assert extension.query_cache_mode == "disabled"
+    assert extension.query_cache_mode == "inherit"
     assert extension.visual_cost_mode == "exact_tokens_then_runtime"
     assert extension.visual_cost_index == "/tmp/visual_cost_index.json"
 
@@ -230,34 +231,44 @@ def test_semantic_repair_train_split_recipe_saves_only_epochs_two_and_four(
     assert native["save_total_limit"] == 2
     assert native["resume_from_checkpoint"] is None
     assert extension.stage == "a2"
-    assert extension.resolved_state_query_visual_mode == "recent_chunk"
-    assert extension.resolved_state_query_max_frames == 16
-    assert extension.resolved_answer_query_visual_mode == "causal_prefix"
-    assert extension.resolved_answer_query_max_frames == 256
-    assert extension.query_cache_mode == "disabled"
+    assert extension.state_query_visual_mode == "recent_chunk"
+    assert extension.state_query_max_frames == 16
+    assert extension.answer_query_visual_mode == "causal_prefix"
+    assert extension.answer_query_max_frames == 256
+    assert extension.query_cache_mode == "inherit"
     assert extension.preprocess_cache_mode == "readonly"
 
 
-def test_split_query_visual_config_is_complete_and_legacy_falls_back() -> None:
+def test_dual_query_visual_config_is_required_and_legacy_is_rejected() -> None:
     fields = {
         "stage": "a2",
         "project_config": "configs/model_state_ttt_8b.yaml",
         "dataset_manifest": "manifest.json",
         "support_prefetch_depth": 2,
         "support_decode_coalesce": True,
+        "state_query_visual_mode": "recent_chunk",
+        "state_query_max_frames": 16,
+        "answer_query_visual_mode": "causal_prefix",
+        "answer_query_max_frames": 256,
         "preprocess_cache_mode": "read_write",
         "preprocess_cache_miss_policy": "decode",
         "preprocess_cache_root_env": "TTT_PREPROCESS_CACHE_ROOT",
         "preprocess_cache_max_gb": 200.0,
         "preprocess_cache_dtype": "float32",
     }
-    legacy = ProductionTTTConfig(**fields)
-    assert legacy.resolved_state_query_visual_mode == "recent_chunk"
-    assert legacy.resolved_answer_query_max_frames == 16
-    assert not legacy.split_query_visuals
-
-    with pytest.raises(ValueError, match="requires all four fields"):
-        ProductionTTTConfig(**fields, state_query_visual_mode="recent_chunk")
+    legacy_fields = {
+        key: value
+        for key, value in fields.items()
+        if not key.startswith(("state_query_", "answer_query_"))
+    }
+    with pytest.raises(ValueError, match="Field required"):
+        ProductionTTTConfig(**legacy_fields)
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        ProductionTTTConfig(
+            **fields,
+            query_visual_mode="causal_prefix",
+            query_max_frames=256,
+        )
 
 
 def test_split_query_specs_bound_state_to_16_and_answer_to_256(tmp_path: Path) -> None:
@@ -269,8 +280,6 @@ def test_split_query_specs_bound_state_to_16_and_answer_to_256(tmp_path: Path) -
         dataset_manifest="manifest.json",
         support_prefetch_depth=2,
         support_decode_coalesce=True,
-        query_visual_mode="causal_prefix",
-        query_max_frames=256,
         state_query_visual_mode="recent_chunk",
         state_query_max_frames=16,
         answer_query_visual_mode="causal_prefix",
@@ -488,6 +497,7 @@ def test_a2_uses_dynamic_graph_safe_zero1_profile() -> None:
     assert zero["reduce_scatter"] is False
     assert zero["round_robin_gradients"] is False
     assert zero["ignore_unused_parameters"] is False
+    assert profile["gradient_clipping"] == 0.0
 
 
 def test_h200_a2_entry_defaults_to_bounded_dynamic_visual_tokens() -> None:
@@ -829,6 +839,10 @@ def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoi
         "dataset_manifest": "manifest.json",
         "support_prefetch_depth": 2,
         "support_decode_coalesce": True,
+        "state_query_visual_mode": "recent_chunk",
+        "state_query_max_frames": 16,
+        "answer_query_visual_mode": "causal_prefix",
+        "answer_query_max_frames": 256,
         "preprocess_cache_mode": "read_write",
         "preprocess_cache_miss_policy": "decode",
         "preprocess_cache_root_env": "TTT_PREPROCESS_CACHE_ROOT",
@@ -982,6 +996,99 @@ def test_deepspeed_segment_backward_steps_only_after_all_segments() -> None:
         controller.finalize()
 
 
+def test_a2_controlled_wrapper_clips_only_at_the_final_ga_boundary() -> None:
+    events: list[object] = []
+
+    class _GradientController:
+        def apply_deepspeed(self, optimizer: object) -> None:
+            events.append(("clip", optimizer))
+
+    class _Engine:
+        optimizer = object()
+
+        @staticmethod
+        def set_gradient_accumulation_boundary(*, is_boundary: bool) -> None:
+            events.append(("boundary", is_boundary))
+
+        @staticmethod
+        def backward(loss: torch.Tensor, **_kwargs: object) -> None:
+            events.append(("backward", float(loss)))
+
+        @staticmethod
+        def step() -> None:
+            events.append("step")
+
+        @staticmethod
+        def get_global_grad_norm() -> float:
+            return 1.0
+
+    engine = _Engine()
+    wrapper = _ControlledDeepSpeedEngineWrapper(
+        engine,
+        _GradientController(),  # type: ignore[arg-type]
+    )
+
+    wrapper.backward(torch.tensor(1.0), sync_gradients=False)
+    wrapper.backward(torch.tensor(2.0), sync_gradients=True)
+
+    assert events == [
+        ("boundary", False),
+        ("backward", 1.0),
+        ("boundary", True),
+        ("backward", 2.0),
+        ("clip", engine.optimizer),
+        "step",
+    ]
+
+
+def test_a5_segment_controller_clips_after_all_backward_calls_before_step() -> None:
+    events: list[str] = []
+
+    class _GradientController:
+        def apply_deepspeed(self, _optimizer: object) -> None:
+            events.append("clip")
+
+    class _Engine:
+        optimizer = object()
+
+        @staticmethod
+        def set_gradient_accumulation_boundary(*, is_boundary: bool) -> None:
+            events.append(f"boundary:{is_boundary}")
+
+        @staticmethod
+        def backward(_loss: torch.Tensor, **_kwargs: object) -> None:
+            events.append("backward")
+
+        @staticmethod
+        def step() -> None:
+            events.append("step")
+
+    engine = _Engine()
+    accelerator = SimpleNamespace(
+        distributed_type="DistributedType.DEEPSPEED",
+        deepspeed_engine_wrapped=SimpleNamespace(engine=engine),
+    )
+    controller = SegmentBackwardController(
+        accelerator,
+        nn.Linear(1, 1),
+        expected_count=2,
+        gradient_controller=_GradientController(),  # type: ignore[arg-type]
+    )
+
+    controller.backward(torch.tensor(1.0))
+    controller.backward(torch.tensor(2.0))
+    controller.finalize()
+
+    assert events == [
+        "boundary:False",
+        "backward",
+        "boundary:True",
+        "backward",
+        "clip",
+        "step",
+    ]
+
+
 def test_atomic_final_checkpoint_validation_requires_model_and_resume_state(
     tmp_path: Path,
 ) -> None:
@@ -1049,6 +1156,10 @@ def test_central_outer_optimizer_has_exact_stage_groups(
             initialize_from_a2_checkpoint="a2-final",
             support_prefetch_depth=2,
             support_decode_coalesce=True,
+            state_query_visual_mode="recent_chunk",
+            state_query_max_frames=16,
+            answer_query_visual_mode="causal_prefix",
+            answer_query_max_frames=256,
             preprocess_cache_mode="read_write",
             preprocess_cache_miss_policy="decode",
             preprocess_cache_root_env="TTT_PREPROCESS_CACHE_ROOT",

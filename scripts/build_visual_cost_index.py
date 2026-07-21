@@ -166,20 +166,14 @@ def main() -> int:
     )
     parser.add_argument("--gpu-model", required=True)
     parser.add_argument(
-        "--query-visual-mode",
-        choices=("recent_chunk", "causal_prefix"),
-        default="causal_prefix",
-    )
-    parser.add_argument("--query-max-frames", type=int, default=256)
-    parser.add_argument(
         "--state-query-visual-mode",
-        choices=("recent_chunk", "causal_prefix"),
+        choices=("recent_chunk",),
         default="recent_chunk",
     )
     parser.add_argument("--state-query-max-frames", type=int, default=16)
     parser.add_argument(
         "--answer-query-visual-mode",
-        choices=("recent_chunk", "causal_prefix"),
+        choices=("causal_prefix",),
         default="causal_prefix",
     )
     parser.add_argument("--answer-query-max-frames", type=int, default=256)
@@ -254,8 +248,6 @@ def main() -> int:
             vit_per_token=args.vit_seconds_per_token,
             query_per_query=args.query_seconds_per_query,
             loss_collective=args.loss_collective_seconds,
-            query_visual_mode=args.query_visual_mode,
-            query_max_frames=args.query_max_frames,
             query_sample_fps=args.query_sample_fps,
             state_query_visual_mode=args.state_query_visual_mode,
             state_query_max_frames=args.state_query_max_frames,
@@ -345,13 +337,11 @@ def _cost_record(
     vit_per_token: float,
     query_per_query: float,
     loss_collective: float,
-    query_visual_mode: str,
-    query_max_frames: int,
     query_sample_fps: float,
-    state_query_visual_mode: str | None = None,
-    state_query_max_frames: int | None = None,
-    answer_query_visual_mode: str | None = None,
-    answer_query_max_frames: int | None = None,
+    state_query_visual_mode: str = "recent_chunk",
+    state_query_max_frames: int = 16,
+    answer_query_visual_mode: str = "causal_prefix",
+    answer_query_max_frames: int = 256,
     measurement: RuntimeMeasurement | None = None,
     media: MediaProbe | None = None,
 ) -> VisualCostRecord:
@@ -364,42 +354,19 @@ def _cost_record(
     )
     if any(not math.isfinite(value) or value < 0.0 for value in coefficients):
         raise ValueError("cost coefficients must be finite and non-negative")
-    if query_visual_mode not in {"recent_chunk", "causal_prefix"}:
-        raise ValueError("visual cost Query mode is invalid")
-    if query_max_frames < 2 or query_max_frames > 256 or query_max_frames % 2:
-        raise ValueError("visual cost Query frame cap must be even within [2, 256]")
     if not math.isfinite(query_sample_fps) or query_sample_fps <= 0.0:
         raise ValueError("visual cost Query FPS must be positive")
 
-    split_query = state_query_visual_mode is not None or answer_query_visual_mode is not None
-    if split_query and None in {
-        state_query_visual_mode,
-        state_query_max_frames,
-        answer_query_visual_mode,
-        answer_query_max_frames,
-    }:
-        raise ValueError("split visual-cost Query configuration requires both roles")
-    if split_query:
-        for role, mode, maximum in (
-            ("State", str(state_query_visual_mode), int(state_query_max_frames)),
-            ("Answer", str(answer_query_visual_mode), int(answer_query_max_frames)),
-        ):
-            if mode not in {"recent_chunk", "causal_prefix"}:
-                raise ValueError(f"visual cost {role} Query mode is invalid")
-            if maximum < 2 or maximum > 256 or maximum % 2:
-                raise ValueError(f"visual cost {role} Query frame cap is invalid")
-            if mode == "recent_chunk" and maximum > 16:
-                raise ValueError(f"visual cost {role} recent Query exceeds 16 frames")
-            if mode == "causal_prefix" and maximum != 256:
-                raise ValueError(f"visual cost {role} prefix Query requires 256 frames")
+    if (state_query_visual_mode, state_query_max_frames) != ("recent_chunk", 16):
+        raise ValueError("visual cost State Query must be recent_chunk/16")
+    if (answer_query_visual_mode, answer_query_max_frames) != ("causal_prefix", 256):
+        raise ValueError("visual cost Answer Query must be causal_prefix/256")
 
     def query_intervals(query_time: float) -> tuple[tuple[float, float, int, float], ...]:
-        roles = ((query_visual_mode, query_max_frames),)
-        if split_query:
-            roles = (
-                (str(state_query_visual_mode), int(state_query_max_frames)),
-                (str(answer_query_visual_mode), int(answer_query_max_frames)),
-            )
+        roles = (
+            (state_query_visual_mode, state_query_max_frames),
+            (answer_query_visual_mode, answer_query_max_frames),
+        )
         result: list[tuple[float, float, int, float]] = []
         for mode, maximum in roles:
             start = 0.0 if mode == "causal_prefix" else max(0.0, query_time - 8.0)
@@ -449,7 +416,7 @@ def _cost_record(
         _frame_budget(*interval, sample_fps)
         for interval, sample_fps in zip(intervals, interval_fps, strict=True)
     )
-    query_role_count = query_count * (2 if split_query else 1)
+    query_role_count = query_count * 2
     query_frame_count = sum(visual_tokens[-query_role_count:])
     query_visual_tokens = query_frame_count
     if measurement is not None:

@@ -6,7 +6,21 @@ from pathlib import Path
 
 import pytest
 import torch
+from scripts.preprocess_cache import (
+    _fingerprinted_specs,
+    _iter_specs,
+    _load_training_config,
+)
 
+from ttt_svcbench_qwen.config import load_config
+from ttt_svcbench_qwen.data import RuntimeQueryInput
+from ttt_svcbench_qwen.episode_data import (
+    A2QueryRecord,
+    AnswerSupervisionSidecar,
+    EpisodeSplit,
+    ProductionQueryRecord,
+    WeakQuerySidecar,
+)
 from ttt_svcbench_qwen.preprocess_cache import (
     CachedChunk,
     PreprocessCache,
@@ -69,25 +83,28 @@ def test_query_role_and_sampling_policy_cannot_reuse_support_cache_key(
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"video")
     support = _fingerprint(video)
-    query = build_fingerprint(
-        source_dataset="svcbench",
-        relative_video_path="clip.mp4",
-        video_path=video,
-        start_time=0.0,
-        end_time=1.0,
-        maximum_frames=4,
-        sample_fps=2.0,
-        minimum_pixels=256,
-        maximum_pixels=4096,
-        patch_size=16,
-        temporal_patch_size=2,
-        spatial_merge_size=2,
-        transformers_version="4.57.1",
-        observation_role="query",
-        frame_sampling="llamafactory_uniform_cap",
-    )
+    values = {
+        "source_dataset": "svcbench",
+        "relative_video_path": "clip.mp4",
+        "video_path": video,
+        "start_time": 0.0,
+        "end_time": 1.0,
+        "maximum_frames": 4,
+        "sample_fps": 2.0,
+        "minimum_pixels": 256,
+        "maximum_pixels": 4096,
+        "patch_size": 16,
+        "temporal_patch_size": 2,
+        "spatial_merge_size": 2,
+        "transformers_version": "4.57.1",
+        "frame_sampling": "llamafactory_uniform_cap",
+    }
+    state_query = build_fingerprint(**values, observation_role="state_query")
+    answer_query = build_fingerprint(**values, observation_role="answer_query")
 
-    assert support.digest != query.digest
+    assert len({support.digest, state_query.digest, answer_query.digest}) == 3
+    with pytest.raises(ValueError, match="observation role"):
+        build_fingerprint(**values, observation_role="query")
 
 
 def test_cache_invalidates_media_and_metadata(tmp_path: Path) -> None:
@@ -166,3 +183,71 @@ def test_put_does_not_scan_or_prune_cache_tree(
     monkeypatch.setattr(cache, "prune", lambda: pytest.fail("hot-path prune"))
 
     cache.put(_fingerprint(video), _chunk())
+
+
+def test_prewarm_enumerates_distinct_state_and_answer_query_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setenv("SVCBENCH_VIDEO_ROOT", str(tmp_path))
+    runtime = RuntimeQueryInput(
+        video_id="video-a",
+        trajectory_id="trajectory-a",
+        query_id="query-a",
+        query_index=0,
+        video=video,
+        question="How many?",
+        query_time=4.0,
+        explicit_time_values=(),
+    )
+    query = ProductionQueryRecord(
+        runtime=runtime,
+        answer=AnswerSupervisionSidecar("query-a", "1", "official_explicit"),
+        weak=WeakQuerySidecar(
+            query_id="query-a",
+            query_index=0,
+            query_time=4.0,
+            count=1,
+            counting_type="O1",
+            counting_subtype="O1-Snap",
+            operator="o1-snap",
+            time_mode="now",
+            occurrence_points=(),
+            occurrence_intervals=(),
+        ),
+    )
+    record = A2QueryRecord(
+        source_dataset="svcbench",
+        relative_video_path="clip.mp4",
+        video_id="video-a",
+        trajectory_id="trajectory-a",
+        split=EpisodeSplit.TRAIN,
+        task_class="O1",
+        query=query,
+        sampling_weight=1.0,
+    )
+    root = Path(__file__).parents[1]
+    ttt_config = _load_training_config(
+        root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml"
+    )
+
+    candidates = tuple(_iter_specs((record,), ttt_config))
+    query_specs = [spec for spec, _source in candidates if hasattr(spec, "query_role")]
+    assert [(spec.query_role, spec.maximum_frames) for spec in query_specs] == [
+        ("state_query", 16),
+        ("answer_query", 256),
+    ]
+    fingerprinted = _fingerprinted_specs(
+        candidates,
+        config=load_config(),
+        minimum_pixels=256,
+        maximum_pixels=131_072,
+    )
+    query_fingerprints = {
+        fingerprint.observation_role: fingerprint.digest
+        for _spec, _source, fingerprint in fingerprinted
+        if fingerprint.observation_role != "support"
+    }
+    assert set(query_fingerprints) == {"state_query", "answer_query"}
+    assert len(set(query_fingerprints.values())) == 2

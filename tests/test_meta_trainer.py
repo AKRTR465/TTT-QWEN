@@ -187,7 +187,7 @@ class _TinyFastController(nn.Module):
             ),
             residual_norms=tuple(float(residual[row].detach().norm()) for row in range(len(gains))),
         )
-        return replace(visual, value=adapted, prepared_video_features=adapted)
+        return replace(visual, value=adapted)
 
 
 class _VisualStage(nn.Module):
@@ -196,7 +196,6 @@ class _VisualStage(nn.Module):
             raise TypeError("tiny visual stage requires _VideoChunk")
         return VisualStageOutput(
             value=request.video_input.features,
-            prepared_video_features=request.video_input.features,
         )
 
 
@@ -507,15 +506,13 @@ class _Composer:
 class _Qwen(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.prepared_features: list[Tensor] = []
+        self.answer_features: list[Tensor] = []
 
     def forward(self, request: QwenPrefillRequest) -> object:
-        if not isinstance(request.input_ids, Tensor) or not isinstance(
-            request.prepared_video_features, Tensor
-        ):
+        if not isinstance(request.input_ids, Tensor):
             raise TypeError("tiny Qwen inputs must be tensors")
-        self.prepared_features.append(request.prepared_video_features.detach().clone())
-        score = request.prepared_video_features.float().mean(dim=(1, 2))
+        self.answer_features.append(request.pixel_values_videos.detach().clone())
+        score = request.pixel_values_videos.float().mean().reshape(1)
         zeros = torch.zeros_like(score)
         row = torch.stack((score, -score, zeros), dim=-1)
         logits = row[:, None, :].expand(-1, request.input_ids.shape[1], -1)
@@ -816,8 +813,8 @@ def _answer_inputs() -> StageAEpisodeAnswerInputs:
     return StageAEpisodeAnswerInputs(
         base_input_ids=torch.tensor([[0, 1, 2]], dtype=torch.int64),
         base_attention_mask=torch.ones((1, 3), dtype=torch.int64),
-        pixel_values_videos=None,
-        video_grid_thw=None,
+        pixel_values_videos=torch.ones((8, 4)),
+        video_grid_thw=torch.tensor([[2, 2, 2]], dtype=torch.int64),
         tokenizer=object(),
         embedding_owner=object(),
         rope_indexer=object(),

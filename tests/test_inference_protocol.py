@@ -182,7 +182,7 @@ class _FakeSuite:
         self.fast_versions.append(runtime.fast_weights.fast_version)
         self.seen_frames.append(chunk.frames)
         value = (chunk.frames, runtime.fast_weights.fast_version)
-        return VisualStageOutput(value=value, prepared_video_features=value)
+        return VisualStageOutput(value=value)
 
     @staticmethod
     def query(_query_input: object, *, inference: bool) -> object:
@@ -329,7 +329,10 @@ class _FakeSuite:
         self.prefill_calls += 1
         return SimpleNamespace(
             logits=torch.ones((1, 1, 8)),
-            signature=repr(request.prepared_video_features),
+            signature=(
+                request.pixel_values_videos.shape[0],
+                tuple(int(value) for value in request.video_grid_thw[0].tolist()),
+            ),
         )
 
     def generate(self, request: QwenGenerateRequest) -> QwenGenerateOutput:
@@ -339,9 +342,12 @@ class _FakeSuite:
             assert state is not None and state.fast_weights is not None
             with torch.no_grad():
                 state.fast_weights.w_t_1.add_(0.5)
-        signature = repr(request.prefill.prepared_video_features)
+        signature = (
+            request.prefill.pixel_values_videos.shape[0],
+            tuple(int(value) for value in request.prefill.video_grid_thw[0].tolist()),
+        )
         return QwenGenerateOutput(
-            f"answer:{signature}",
+            f"answer:{signature!r}",
             torch.tensor([[1]], dtype=torch.int64),
         )
 
@@ -525,7 +531,7 @@ class _TypedStageSuite(_FakeSuite):
         chunk = cast(CausalChunk, request.video_input)
         self.seen_frames.append(chunk.frames)
         value = (chunk.frames, "stage-a-runtime")
-        return VisualStageOutput(value=value, prepared_video_features=value)
+        return VisualStageOutput(value=value)
 
     @staticmethod
     def query(_query_input: object, *, inference: bool) -> QueryEncoderOutput:
@@ -683,8 +689,8 @@ def _answer_inputs() -> AnswerInputs:
     return AnswerInputs(
         base_input_ids=torch.ones((1, 2), dtype=torch.int64),
         base_attention_mask=torch.ones((1, 2), dtype=torch.bool),
-        pixel_values_videos="pixels",
-        video_grid_thw="grid",
+        pixel_values_videos=torch.ones((8, 4)),
+        video_grid_thw=torch.tensor([[2, 2, 2]], dtype=torch.int64),
         tokenizer="tokenizer",
         embedding_owner="embedding",
         rope_indexer="rope",
@@ -813,7 +819,7 @@ def test_audit_levels_preserve_runtime_results(
     )
 
     snapshot = result.generate_audit.state_after
-    assert result.answer_text == "answer:(('c',), 1)"
+    assert result.answer_text == "answer:(8, (2, 2, 2))"
     assert snapshot.level is audit_level
     assert (snapshot.boundary is None) is (audit_level is AuditLevel.OFF)
     assert (snapshot.content_sha256 is not None) is (audit_level is AuditLevel.FULL)

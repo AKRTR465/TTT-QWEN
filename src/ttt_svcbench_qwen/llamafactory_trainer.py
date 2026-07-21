@@ -44,6 +44,7 @@ from ttt_svcbench_qwen.meta_trainer import (
     MetaTTTEpisodeRunner,
     TruncatedMetaTTTEpisodeOutput,
 )
+from ttt_svcbench_qwen.outer_gradient_control import OuterGradientController
 from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
     OuterCheckpointAudit,
@@ -81,6 +82,29 @@ class TrainSamplerFactory(Protocol):
     def __call__(self, dataset: object, rank: int, world_size: int) -> object: ...
 
 
+class _ControlledDeepSpeedEngineWrapper:
+    """Pinned Accelerate wrapper with group clipping inserted before the real engine step."""
+
+    def __init__(self, engine: object, gradient_controller: OuterGradientController) -> None:
+        required = ("set_gradient_accumulation_boundary", "backward", "step")
+        if any(not callable(getattr(engine, name, None)) for name in required):
+            raise TypeError("controlled DeepSpeed wrapper received an invalid engine")
+        self.engine = engine
+        self.gradient_controller = gradient_controller
+
+    def backward(self, loss: Tensor, sync_gradients: bool = True, **kwargs: object) -> None:
+        engine = cast(Any, self.engine)
+        engine.set_gradient_accumulation_boundary(is_boundary=sync_gradients)
+        engine.backward(loss, **kwargs)
+        if sync_gradients:
+            self.gradient_controller.apply_deepspeed(engine.optimizer)
+            engine.step()
+
+    def get_global_grad_norm(self) -> float:
+        value = cast(Any, self.engine).get_global_grad_norm()
+        return float(value.item()) if hasattr(value, "item") else float(value)
+
+
 class SegmentBackwardController:
     """Accumulate segment gradients and make DeepSpeed step exactly once per episode.
 
@@ -90,13 +114,21 @@ class SegmentBackwardController:
     parameter versions.
     """
 
-    def __init__(self, accelerator: object, model: nn.Module, *, expected_count: int) -> None:
+    def __init__(
+        self,
+        accelerator: object,
+        model: nn.Module,
+        *,
+        expected_count: int,
+        gradient_controller: OuterGradientController | None = None,
+    ) -> None:
         if type(expected_count) is not int or expected_count <= 0:
             raise ValueError("segment backward count must be a positive integer")
         self.accelerator = accelerator
         self.expected_count = expected_count
         self.backward_count = 0
         self.step_count = 0
+        self.gradient_controller = gradient_controller
         self.is_deepspeed = (
             "deepspeed" in str(getattr(accelerator, "distributed_type", "")).casefold()
         )
@@ -139,7 +171,10 @@ class SegmentBackwardController:
         if self.step_count:
             raise RuntimeError("segment backward controller was finalized more than once")
         if self.is_deepspeed:
-            cast(Any, self.engine).step()
+            engine = cast(Any, self.engine)
+            if self.gradient_controller is not None:
+                self.gradient_controller.apply_deepspeed(engine.optimizer)
+            engine.step()
             self.step_count = 1
 
 
@@ -185,6 +220,7 @@ class ProductionTrainerRuntime:
     meta_runner: MetaTTTEpisodeRunner | None = None
     episode_adapter: EpisodeAdapter | None = None
     optimizer_factory: Callable[[nn.Module], torch.optim.Optimizer] | None = None
+    gradient_controller: OuterGradientController | None = None
     train_sampler_factory: TrainSamplerFactory | None = None
     callbacks: tuple[object, ...] = ()
 
@@ -282,6 +318,24 @@ class TTTQwenTrainerMixin:
         self.last_semantic_projector_grad_norm: float | None = None
         super().__init__(*args, **kwargs)
 
+    def _install_a2_deepspeed_gradient_control(self) -> None:
+        if "deepspeed" not in str(getattr(self.accelerator, "distributed_type", "")).casefold():  # type: ignore[attr-defined]
+            return
+        controller = self.ttt_runtime.gradient_controller
+        if not isinstance(controller, OuterGradientController):
+            raise RuntimeError("formal A2 requires an Outer gradient controller")
+        wrapper = getattr(self.accelerator, "deepspeed_engine_wrapped", None)  # type: ignore[attr-defined]
+        if isinstance(wrapper, _ControlledDeepSpeedEngineWrapper):
+            if wrapper.gradient_controller is not controller:
+                raise RuntimeError("A2 DeepSpeed wrapper changed gradient controller")
+            return
+        engine = getattr(wrapper, "engine", None)
+        if engine is None:
+            raise RuntimeError("A2 DeepSpeed engine is unavailable before backward")
+        self.accelerator.deepspeed_engine_wrapped = _ControlledDeepSpeedEngineWrapper(  # type: ignore[attr-defined]
+            engine, controller
+        )
+
     def create_optimizer(self, *args: object, **kwargs: object) -> torch.optim.Optimizer:
         factory = self.ttt_runtime.optimizer_factory
         if getattr(self, "optimizer", None) is None and factory is not None:
@@ -352,6 +406,9 @@ class TTTQwenTrainerMixin:
             enriched.update(retrieval_metrics)
         if self.last_semantic_projector_grad_norm is not None:
             enriched["grad/semantic_projector"] = self.last_semantic_projector_grad_norm
+        controller = self.ttt_runtime.gradient_controller
+        if isinstance(controller, OuterGradientController) and controller.last_audit is not None:
+            enriched.update(dict(controller.last_audit.metrics()))
         super().log(enriched, *args, **kwargs)  # type: ignore[misc]
 
     def compute_loss(
@@ -376,6 +433,7 @@ class TTTQwenTrainerMixin:
     ) -> Tensor:
         step_started = time.perf_counter()
         if self.ttt_runtime.stage is ProductionStage.A2:
+            self._install_a2_deepspeed_gradient_control()
             result = cast(
                 Tensor,
                 super().training_step(  # type: ignore[misc]
@@ -418,6 +476,7 @@ class TTTQwenTrainerMixin:
             self.accelerator,  # type: ignore[attr-defined]
             model,
             expected_count=expected_backwards,
+            gradient_controller=self.ttt_runtime.gradient_controller,
         )
 
         def distributed_backward(loss: Tensor, retain_graph: bool) -> None:
@@ -605,10 +664,10 @@ def main(argv: list[str] | None = None) -> int:
             ),
             query_decode_strategy=backbone.ttt_config.query_decode_strategy,
             query_decode_max_groups=backbone.ttt_config.query_decode_max_groups,
-            state_query_visual_mode=backbone.ttt_config.resolved_state_query_visual_mode,
-            state_query_max_frames=backbone.ttt_config.resolved_state_query_max_frames,
-            answer_query_visual_mode=backbone.ttt_config.resolved_answer_query_visual_mode,
-            answer_query_max_frames=backbone.ttt_config.resolved_answer_query_max_frames,
+            state_query_visual_mode=backbone.ttt_config.state_query_visual_mode,
+            state_query_max_frames=backbone.ttt_config.state_query_max_frames,
+            answer_query_visual_mode=backbone.ttt_config.answer_query_visual_mode,
+            answer_query_max_frames=backbone.ttt_config.answer_query_max_frames,
             query_sample_fps=backbone.ttt_config.query_sample_fps,
         )
         visual_cost_index = load_visual_cost_index(
@@ -624,11 +683,20 @@ def main(argv: list[str] | None = None) -> int:
         if checkpoint is None:
             raise RuntimeError("validated A5 config lost initialize_from_a2_checkpoint")
         checkpoint_audit = initialize_outer_model_from_a2(runtime_raw.model, checkpoint)
+    expected_gradient_groups = (
+        ("qwen", "state", "w0")
+        if configured_stage is ProductionStage.A2
+        else ("qwen", "state", "w0", "predictor")
+    )
     runtime_raw = replace(
         runtime_raw,
         optimizer_factory=make_production_outer_optimizer_factory(
             backbone,
             configured_stage,
+        ),
+        gradient_controller=OuterGradientController(
+            backbone.project_config.outer_gradient_control,
+            expected_groups=expected_gradient_groups,
         ),
         train_sampler_factory=(
             lambda dataset, rank, world_size: build_production_train_sampler(
@@ -636,29 +704,11 @@ def main(argv: list[str] | None = None) -> int:
                 rank,
                 world_size,
                 visual_cost_index=visual_cost_index,
-                query_visual_mode=backbone.ttt_config.query_visual_mode,
-                query_max_frames=backbone.ttt_config.query_max_frames,
                 query_sample_fps=backbone.ttt_config.query_sample_fps,
-                state_query_visual_mode=(
-                    backbone.ttt_config.resolved_state_query_visual_mode
-                    if backbone.ttt_config.split_query_visuals
-                    else None
-                ),
-                state_query_max_frames=(
-                    backbone.ttt_config.resolved_state_query_max_frames
-                    if backbone.ttt_config.split_query_visuals
-                    else None
-                ),
-                answer_query_visual_mode=(
-                    backbone.ttt_config.resolved_answer_query_visual_mode
-                    if backbone.ttt_config.split_query_visuals
-                    else None
-                ),
-                answer_query_max_frames=(
-                    backbone.ttt_config.resolved_answer_query_max_frames
-                    if backbone.ttt_config.split_query_visuals
-                    else None
-                ),
+                state_query_visual_mode=backbone.ttt_config.state_query_visual_mode,
+                state_query_max_frames=backbone.ttt_config.state_query_max_frames,
+                answer_query_visual_mode=backbone.ttt_config.answer_query_visual_mode,
+                answer_query_max_frames=backbone.ttt_config.answer_query_max_frames,
             )
         ),
     )
@@ -926,7 +976,7 @@ def make_production_outer_optimizer_factory(
             "w0": w0_lr,
             "predictor": predictor_lr,
         }
-        parameter_groups = [
+        parameter_groups: list[dict[str, Any]] = [
             {
                 "params": values,
                 "lr": learning_rates[name],
@@ -935,6 +985,16 @@ def make_production_outer_optimizer_factory(
             for name, values in groups.items()
             if values
         ]
+        caps = backbone.project_config.outer_gradient_control.max_grad_norm
+        update_caps: dict[str, float] = {}
+        for parameter_group in parameter_groups:
+            group_name = cast(str, parameter_group["group_name"])
+            learning_rate = cast(float, parameter_group["lr"])
+            update_caps[group_name] = learning_rate * float(getattr(caps, group_name))
+        if not math.isclose(min(update_caps.values()), max(update_caps.values()), rel_tol=1.0e-6):
+            raise ValueError(
+                "Outer group learning rates and gradient caps must have equal update-norm ceilings"
+            )
         optimizer = torch.optim.AdamW(
             parameter_groups,
             betas=(float(training_args.adam_beta1), float(training_args.adam_beta2)),

@@ -701,7 +701,6 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
     def forward(
         self,
         *args: object,
-        prepared_video_features: PreparedVideoFeatures | None = None,
         state_embedding_payload: StateEmbeddingPayload | None = None,
         **kwargs: object,
     ) -> object:
@@ -712,7 +711,7 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
             try:
                 with (
                     self._patched_state_embeddings(state_embedding_payload),
-                    self._patched_video_features(prepared_video_features),
+                    self._patched_video_features(),
                 ):
                     return cast(object, self.qwen_model(*args, **kwargs))
             except Exception:
@@ -722,7 +721,6 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
     def generate(
         self,
         *args: object,
-        prepared_video_features: PreparedVideoFeatures | None = None,
         state_embedding_payload: StateEmbeddingPayload | None = None,
         **kwargs: object,
     ) -> object:
@@ -733,12 +731,12 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
             self._clear_captures()
             if state_embedding_payload is not None:
                 self._validate_state_call(args, kwargs, state_embedding_payload)
-            if prepared_video_features is not None or state_embedding_payload is not None:
+            if state_embedding_payload is not None:
                 self._assert_unexpanded_generation(kwargs)
             try:
                 with (
                     self._patched_state_embeddings(state_embedding_payload),
-                    self._patched_video_features(prepared_video_features),
+                    self._patched_video_features(),
                 ):
                     return cast(object, generate_method(*args, **kwargs))
             except Exception:
@@ -801,7 +799,6 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
     @contextmanager
     def _patched_video_features(
         self,
-        prepared: PreparedVideoFeatures | None = None,
     ) -> Iterator[None]:
         with self._hook_lock:
             if self._hook_active:
@@ -810,24 +807,12 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
             had_instance_method = "get_video_features" in vars(owner)
             original_instance_method = vars(owner).get("get_video_features")
             original = owner.get_video_features
-            prepared_consumed = False
-
             def intercepted(
                 pixel_values_videos: Tensor,
                 video_grid_thw: Tensor | None = None,
             ) -> tuple[Sequence[Tensor], Sequence[Tensor]]:
-                nonlocal prepared_consumed
                 if video_grid_thw is None:
                     raise ValueError("video_grid_thw is required for the State-TTT boundary")
-                if prepared is not None:
-                    if prepared_consumed:
-                        raise RuntimeError(
-                            "precomputed video features may be consumed only once per prefill"
-                        )
-                    prepared.validate_request(pixel_values_videos, video_grid_thw)
-                    prepared_consumed = True
-                    self.video_boundary.last_prepared = prepared
-                    return prepared.main_features, prepared.deepstack_features
                 main, deepstack = original(pixel_values_videos, video_grid_thw)
                 return self.video_boundary.intercept_features(
                     main,
@@ -839,10 +824,6 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
             owner.get_video_features = intercepted  # type: ignore[method-assign]
             try:
                 yield
-                if prepared is not None and not prepared_consumed:
-                    raise RuntimeError(
-                        "precomputed video features were not consumed exactly once during prefill"
-                    )
             finally:
                 if had_instance_method:
                     owner.get_video_features = original_instance_method  # type: ignore[method-assign,assignment]

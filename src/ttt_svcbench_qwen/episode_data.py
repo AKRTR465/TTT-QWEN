@@ -368,13 +368,11 @@ def load_production_manifest_views(
 def _a2_visual_length_key(
     record: A2QueryRecord,
     *,
-    query_visual_mode: str = "recent_chunk",
-    query_max_frames: int = 16,
     query_sample_fps: float = 2.0,
-    state_query_visual_mode: str | None = None,
-    state_query_max_frames: int | None = None,
-    answer_query_visual_mode: str | None = None,
-    answer_query_max_frames: int | None = None,
+    state_query_visual_mode: str = "recent_chunk",
+    state_query_max_frames: int = 16,
+    answer_query_visual_mode: str = "causal_prefix",
+    answer_query_max_frames: int = 256,
 ) -> tuple[int, int, int]:
     """Return a cheap deterministic proxy for visual tokens and decode work.
 
@@ -394,19 +392,10 @@ def _a2_visual_length_key(
         frames(chunk.start_time, chunk.end_time, chunk.maximum_frames) for chunk in supports
     )
     query_end = record.query.runtime.query_time
-    query_roles = ((query_visual_mode, query_max_frames),)
-    if state_query_visual_mode is not None or answer_query_visual_mode is not None:
-        if None in {
-            state_query_visual_mode,
-            state_query_max_frames,
-            answer_query_visual_mode,
-            answer_query_max_frames,
-        }:
-            raise ValueError("split Query cost estimation requires both roles")
-        query_roles = (
-            (str(state_query_visual_mode), int(state_query_max_frames)),
-            (str(answer_query_visual_mode), int(answer_query_max_frames)),
-        )
+    query_roles = (
+        (state_query_visual_mode, state_query_max_frames),
+        (answer_query_visual_mode, answer_query_max_frames),
+    )
     for mode, maximum in query_roles:
         query_start = 0.0 if mode == "causal_prefix" else max(0.0, query_end - 8.0)
         query_desired = min(
@@ -496,13 +485,11 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         seed: int = 42,
         visual_length_fn: Callable[[A2QueryRecord], int] | None = None,
         visual_cost_index: Mapping[str, VisualCostRecord] | None = None,
-        query_visual_mode: str = "recent_chunk",
-        query_max_frames: int = 16,
         query_sample_fps: float = 2.0,
-        state_query_visual_mode: str | None = None,
-        state_query_max_frames: int | None = None,
-        answer_query_visual_mode: str | None = None,
-        answer_query_max_frames: int | None = None,
+        state_query_visual_mode: str = "recent_chunk",
+        state_query_max_frames: int = 16,
+        answer_query_visual_mode: str = "causal_prefix",
+        answer_query_max_frames: int = 256,
     ) -> None:
         if dataset.stage is not ManifestStage.A2 or dataset.split is not EpisodeSplit.TRAIN:
             raise ValueError("balanced A2 sampling requires the A2 train dataset")
@@ -514,8 +501,6 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         self.seed = seed
         self.epoch = 0
         self.visual_cost_index = visual_cost_index or {}
-        self.query_visual_mode = query_visual_mode
-        self.query_max_frames = query_max_frames
         self.query_sample_fps = query_sample_fps
         self.state_query_visual_mode = state_query_visual_mode
         self.state_query_max_frames = state_query_max_frames
@@ -575,8 +560,6 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
             return sidecar.sort_key
         return _a2_visual_length_key(
             record,
-            query_visual_mode=self.query_visual_mode,
-            query_max_frames=self.query_max_frames,
             query_sample_fps=self.query_sample_fps,
             state_query_visual_mode=self.state_query_visual_mode,
             state_query_max_frames=self.state_query_max_frames,
@@ -667,13 +650,11 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
         world_size: int,
         seed: int = 42,
         visual_cost_index: Mapping[str, VisualCostRecord] | None = None,
-        query_visual_mode: str = "recent_chunk",
-        query_max_frames: int = 16,
         query_sample_fps: float = 2.0,
-        state_query_visual_mode: str | None = None,
-        state_query_max_frames: int | None = None,
-        answer_query_visual_mode: str | None = None,
-        answer_query_max_frames: int | None = None,
+        state_query_visual_mode: str = "recent_chunk",
+        state_query_max_frames: int = 16,
+        answer_query_visual_mode: str = "causal_prefix",
+        answer_query_max_frames: int = 256,
     ) -> None:
         if dataset.stage is not ManifestStage.A5 or dataset.split is not EpisodeSplit.TRAIN:
             raise ValueError("rank-aligned A5 sampling requires the A5 train dataset")
@@ -687,8 +668,6 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
         self.seed = seed
         self.epoch = 0
         self.visual_cost_index = visual_cost_index or {}
-        self.query_visual_mode = query_visual_mode
-        self.query_max_frames = query_max_frames
         self.query_sample_fps = query_sample_fps
         self.state_query_visual_mode = state_query_visual_mode
         self.state_query_max_frames = state_query_max_frames
@@ -793,18 +772,10 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
         support_frames = record.prewarm.maximum_frames + sum(
             chunk.maximum_frames for chunk in record.supports
         )
-        query_roles = ((self.query_visual_mode, self.query_max_frames),)
-        if self.state_query_visual_mode is not None:
-            if None in {
-                self.state_query_max_frames,
-                self.answer_query_visual_mode,
-                self.answer_query_max_frames,
-            }:
-                raise ValueError("split Query cost estimation requires both roles")
-            query_roles = (
-                (self.state_query_visual_mode, int(self.state_query_max_frames)),
-                (str(self.answer_query_visual_mode), int(self.answer_query_max_frames)),
-            )
+        query_roles = (
+            (self.state_query_visual_mode, self.state_query_max_frames),
+            (self.answer_query_visual_mode, self.answer_query_max_frames),
+        )
         query_frames = tuple(
             sum(
                 _query_visual_frame_budget(
@@ -830,13 +801,11 @@ def build_production_train_sampler(
     world_size: int,
     *,
     visual_cost_index: Mapping[str, VisualCostRecord] | None = None,
-    query_visual_mode: str = "recent_chunk",
-    query_max_frames: int = 16,
     query_sample_fps: float = 2.0,
-    state_query_visual_mode: str | None = None,
-    state_query_max_frames: int | None = None,
-    answer_query_visual_mode: str | None = None,
-    answer_query_max_frames: int | None = None,
+    state_query_visual_mode: str = "recent_chunk",
+    state_query_max_frames: int = 16,
+    answer_query_visual_mode: str = "causal_prefix",
+    answer_query_max_frames: int = 256,
 ) -> Sampler[int]:
     """Shared runtime-factory hook for A2 task balance and A5 segment parity."""
 
@@ -849,8 +818,6 @@ def build_production_train_sampler(
             world_size=world_size,
             seed=dataset.manifest.seed,
             visual_cost_index=visual_cost_index,
-            query_visual_mode=query_visual_mode,
-            query_max_frames=query_max_frames,
             query_sample_fps=query_sample_fps,
             state_query_visual_mode=state_query_visual_mode,
             state_query_max_frames=state_query_max_frames,
@@ -863,8 +830,6 @@ def build_production_train_sampler(
         world_size=world_size,
         seed=dataset.manifest.seed,
         visual_cost_index=visual_cost_index,
-        query_visual_mode=query_visual_mode,
-        query_max_frames=query_max_frames,
         query_sample_fps=query_sample_fps,
         state_query_visual_mode=state_query_visual_mode,
         state_query_max_frames=state_query_max_frames,

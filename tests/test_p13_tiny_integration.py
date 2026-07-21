@@ -204,8 +204,8 @@ def test_tiny_composer_to_native_qwen_prefill_and_decode_contract() -> None:
         lambda _module, _args, output: (merger_outputs.append(output), output)[1]
     )
     wrapper.get_video_features(pixels, grid)
-    prepared = wrapper.last_prepared_video_features
-    assert prepared is not None
+    state_prepared = wrapper.last_prepared_video_features
+    assert state_prepared is not None
     assert adapter.calls == 1
     assert len(merger_outputs) == 1
 
@@ -254,7 +254,6 @@ def test_tiny_composer_to_native_qwen_prefill_and_decode_contract() -> None:
                 attention_mask=composed.attention_mask,
                 pixel_values_videos=pixels,
                 video_grid_thw=grid,
-                prepared_video_features=prepared,
                 state_embedding_payload=payload,
                 use_cache=True,
                 max_new_tokens=3,
@@ -267,6 +266,9 @@ def test_tiny_composer_to_native_qwen_prefill_and_decode_contract() -> None:
 
     prompt_length = composed.input_ids.shape[1]
     assert generated.shape == (1, prompt_length + 3)
+    answer_prepared = wrapper.last_prepared_video_features
+    assert answer_prepared is not None
+    assert answer_prepared is not state_prepared
     assert [call["inputs_embeds"].shape[1] for call in language_calls] == [  # type: ignore[union-attr]
         prompt_length,
         1,
@@ -289,9 +291,9 @@ def test_tiny_composer_to_native_qwen_prefill_and_decode_contract() -> None:
         expected_number_embeddings,
     )
     assert all(torch.equal(mask, composed.video_position_mask) for mask in deepstack_masks)
-    assert deepstack_ids == [id(value) for value in prepared.deepstack_features]
-    assert adapter.calls == 1
-    assert len(merger_outputs) == 1
+    assert deepstack_ids == [id(value) for value in answer_prepared.deepstack_features]
+    assert adapter.calls == 2
+    assert len(merger_outputs) == 2
     assert scatter_counter.calls == 2  # one State scatter plus native video scatter
     assert wrapper._state_hook_active is False
     assert wrapper._hook_active is False

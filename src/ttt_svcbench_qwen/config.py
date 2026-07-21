@@ -19,7 +19,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SPEC_VERSION = "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history"
-CONFIG_SCHEMA_VERSION = 4
+CONFIG_SCHEMA_VERSION = 5
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -573,6 +573,30 @@ class LossConfig(FrozenModel):
     official_weak_balance: OfficialWeakBalanceConfig
 
 
+class OuterGradientControlMode(StrEnum):
+    PER_GROUP_L2_EQUAL_UPDATE_CAP = "per_group_l2_equal_update_cap"
+
+
+class OuterNonfinitePolicy(StrEnum):
+    SKIP_UPDATE = "skip_update"
+
+
+class OuterMaxGradNormConfig(FrozenModel):
+    qwen: PositiveFloat
+    state: PositiveFloat
+    w0: PositiveFloat
+    predictor: PositiveFloat
+
+
+class OuterGradientControlConfig(FrozenModel):
+    """Fixed A2/A5 Outer gradient caps; audit state never affects optimization."""
+
+    mode: OuterGradientControlMode
+    max_grad_norm: OuterMaxGradNormConfig
+    nonfinite_policy: OuterNonfinitePolicy
+    audit_steps: PositiveInt
+
+
 class StageAVariant(StrEnum):
     """P15 ablations that are legal before any Meta-TTT episode."""
 
@@ -588,7 +612,6 @@ class StageAOptimizerConfig(FrozenModel):
     weight_decay: NonNegativeFloat
     betas: tuple[Probability, Probability]
     epsilon: PositiveFloat
-    grad_clip_norm: PositiveFloat
 
 
 class StageACheckpointConfig(FrozenModel):
@@ -806,6 +829,7 @@ class ProjectConfig(FrozenModel):
     input_composer: InputComposerConfig
     predictor: PredictorConfig
     loss: LossConfig
+    outer_gradient_control: OuterGradientControlConfig
     stage_a: StageATrainingConfig
     stage_b: StageBTrainingConfig
     stage_c: StageCTrainingConfig
@@ -1735,6 +1759,37 @@ class ProjectConfig(FrozenModel):
                 self.loss.official_weak_balance.ema_beta,
                 0.99,
             ),
+            (
+                "outer_gradient_control.mode",
+                self.outer_gradient_control.mode,
+                OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP,
+            ),
+            (
+                "outer_gradient_control.max_grad_norm.qwen",
+                self.outer_gradient_control.max_grad_norm.qwen,
+                1.0,
+            ),
+            (
+                "outer_gradient_control.max_grad_norm.state",
+                self.outer_gradient_control.max_grad_norm.state,
+                0.1,
+            ),
+            (
+                "outer_gradient_control.max_grad_norm.w0",
+                self.outer_gradient_control.max_grad_norm.w0,
+                0.1,
+            ),
+            (
+                "outer_gradient_control.max_grad_norm.predictor",
+                self.outer_gradient_control.max_grad_norm.predictor,
+                0.1,
+            ),
+            (
+                "outer_gradient_control.nonfinite_policy",
+                self.outer_gradient_control.nonfinite_policy,
+                OuterNonfinitePolicy.SKIP_UPDATE,
+            ),
+            ("outer_gradient_control.audit_steps", self.outer_gradient_control.audit_steps, 32),
             ("stage_a.variant", self.stage_a.variant, StageAVariant.A2),
             ("stage_a.inner_sgd_enabled", self.stage_a.inner_sgd_enabled, False),
             (
@@ -1816,7 +1871,6 @@ class ProjectConfig(FrozenModel):
             ("stage_a.optimizer.weight_decay", self.stage_a.optimizer.weight_decay, 0.01),
             ("stage_a.optimizer.betas", self.stage_a.optimizer.betas, (0.9, 0.999)),
             ("stage_a.optimizer.epsilon", self.stage_a.optimizer.epsilon, 1.0e-8),
-            ("stage_a.optimizer.grad_clip_norm", self.stage_a.optimizer.grad_clip_norm, 1.0),
             (
                 "stage_a.checkpoint.format",
                 self.stage_a.checkpoint.format,

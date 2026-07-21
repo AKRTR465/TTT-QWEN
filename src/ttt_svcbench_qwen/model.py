@@ -503,10 +503,9 @@ class ObservationChunkRequest:
 
 @dataclass(frozen=True, slots=True)
 class VisualStageOutput:
-    """Adapter-owned visual payload and its single-use Qwen continuation capability."""
+    """Adapter-owned visual payload consumed only by the State observation path."""
 
     value: object
-    prepared_video_features: object
     audit: object | None = None
 
 
@@ -581,8 +580,8 @@ class AnswerQueryRequest:
     observation: ObservationChunkOutput
     base_input_ids: Tensor
     base_attention_mask: Tensor
-    pixel_values_videos: Tensor | None
-    video_grid_thw: Tensor | None
+    pixel_values_videos: Tensor
+    video_grid_thw: Tensor
     tokenizer: object
     embedding_owner: object
     rope_indexer: object
@@ -591,6 +590,10 @@ class AnswerQueryRequest:
     def __post_init__(self) -> None:
         if self.observation.owner != self.owner:
             raise ValueError("answer request and observation owners must match")
+        if self.pixel_values_videos.ndim != 2 or not self.pixel_values_videos.is_floating_point():
+            raise ValueError("Answer Query pixels must be packed floating [sum(N_patch), D]")
+        if self.video_grid_thw.ndim != 2 or self.video_grid_thw.shape[1] != 3:
+            raise ValueError("Answer Query video_grid_thw must be [B, 3]")
         names = tuple(name for name, _ in self.qwen_kwargs)
         if any(not name for name in names) or len(set(names)) != len(names):
             raise ValueError("qwen_kwargs names must be unique and non-empty")
@@ -622,9 +625,8 @@ class QwenPrefillRequest:
 
     input_ids: Tensor
     attention_mask: Tensor
-    pixel_values_videos: Tensor | None
-    video_grid_thw: Tensor | None
-    prepared_video_features: object
+    pixel_values_videos: Tensor
+    video_grid_thw: Tensor
     state_position_mask: Tensor | None
     state_tokens: Tensor | None
     composer_position_ids_audit: Tensor
@@ -1186,7 +1188,6 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             attention_mask=composed.attention_mask,
             pixel_values_videos=request.pixel_values_videos,
             video_grid_thw=request.video_grid_thw,
-            prepared_video_features=observation.visual.prepared_video_features,
             state_position_mask=composed.state_position_mask,
             state_tokens=state_tokens,
             composer_position_ids_audit=composed.position_ids,
