@@ -1,4 +1,4 @@
-"""Stateless distributed composition for Answer-dominant official-weak outer losses."""
+"""Distributed Answer-dominant official-weak loss composition with checkpointed EMA state."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-from torch import Tensor
+from torch import Tensor, nn
 
 from ttt_svcbench_qwen.config import OfficialWeakBalanceConfig, OfficialWeakBalanceMode
 from ttt_svcbench_qwen.losses import (
@@ -64,6 +64,8 @@ class OfficialWeakBalanceAudit:
     auxiliary_to_answer_ratio: float
     group_guard: float
     group_guard_active: bool
+    ema_means: tuple[float | None, ...] = ()
+    ema_update_counts: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.answer_global_mean) or self.answer_global_mean < 0.0:
@@ -80,6 +82,13 @@ class OfficialWeakBalanceAudit:
             raise ValueError("official-weak auxiliary/Answer ratio is invalid")
         if not math.isfinite(self.group_guard) or not 0.0 <= self.group_guard <= 1.0:
             raise ValueError("official-weak group guard must be within [0, 1]")
+        if self.ema_means and len(self.ema_means) != _STAT_TERM_COUNT:
+            raise ValueError("official-weak EMA means must include Answer plus four terms")
+        if self.ema_update_counts and (
+            len(self.ema_update_counts) != _STAT_TERM_COUNT
+            or any(value < 0 for value in self.ema_update_counts)
+        ):
+            raise ValueError("official-weak EMA update counts are invalid")
 
     def metrics(self) -> tuple[tuple[str, float | None], ...]:
         values: list[tuple[str, float | None]] = [
@@ -104,6 +113,15 @@ class OfficialWeakBalanceAudit:
                 ("loss/group_guard_active", float(self.group_guard_active)),
             )
         )
+        if self.ema_means:
+            for name, mean, updates in zip(
+                ("answer", *_TERM_NAMES),
+                self.ema_means,
+                self.ema_update_counts,
+                strict=True,
+            ):
+                values.append((f"loss/ema/{name}", mean))
+                values.append((f"loss/ema_updates/{name}", float(updates)))
         return tuple(values)
 
 
@@ -126,7 +144,7 @@ class OfficialWeakBalancedBatch:
 ReduceSum = Callable[[Tensor], Tensor]
 
 
-class OfficialWeakOuterLossComposer:
+class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
     """Compose one A2 micro-step or all A5 Query points with one fixed collective."""
 
     def __init__(
@@ -136,6 +154,7 @@ class OfficialWeakOuterLossComposer:
         reduce_sum: ReduceSum | None = None,
         world_size: int | None = None,
     ) -> None:
+        super().__init__()
         if not isinstance(config, OfficialWeakBalanceConfig):
             raise TypeError("official-weak composer requires validated balance config")
         if (reduce_sum is None) != (world_size is None):
@@ -145,6 +164,22 @@ class OfficialWeakOuterLossComposer:
         self.config = config
         self._reduce_sum = reduce_sum
         self._world_size = world_size
+        persistent = config.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF
+        self.register_buffer(
+            "ema_values",
+            torch.zeros(_STAT_TERM_COUNT, dtype=torch.float64),
+            persistent=persistent,
+        )
+        self.register_buffer(
+            "ema_valid",
+            torch.zeros(_STAT_TERM_COUNT, dtype=torch.bool),
+            persistent=persistent,
+        )
+        self.register_buffer(
+            "ema_update_counts",
+            torch.zeros(_STAT_TERM_COUNT, dtype=torch.int64),
+            persistent=persistent,
+        )
 
     def compose(
         self,
@@ -207,21 +242,56 @@ class OfficialWeakOuterLossComposer:
         finalize_started = time.perf_counter()
         global_sums, global_counts = _unpack_stats(reduced)
         if global_counts[0] <= 0:
-            raise ValueError("instant_equal requires at least one global valid Answer row")
+            raise ValueError("official-weak balancing requires a valid Answer row")
 
         epsilon = float(self.config.epsilon)
+        current_means = tuple(
+            (
+                None
+                if global_count <= 0
+                else global_sum.detach() / float(global_count)
+            )
+            for global_sum, global_count in zip(global_sums, global_counts, strict=True)
+        )
+        if self.config.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF and self.training:
+            self._update_ema(current_means)
+        if (
+            self.config.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF
+            and not bool(self.ema_valid[0].item())
+        ):
+            raise ValueError("EMA Answer reference is uninitialized")
         answer_mean = global_sums[0] / float(global_counts[0])
+        answer_reference = (
+            self.ema_values[0].detach()
+            if self.config.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF
+            else answer_mean.detach()
+        )
         scales: list[Tensor | None] = []
         aligned_means: list[Tensor | None] = []
         clamped: list[bool] = []
         for global_sum, global_count in zip(global_sums[1:], global_counts[1:], strict=True):
+            term_index = len(scales) + 1
             if global_count <= 0:
-                scales.append(None)
+                historical_scale: Tensor | None = None
+                if (
+                    self.config.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF
+                    and bool(self.ema_valid[term_index].item())
+                ):
+                    ratio = answer_reference / (self.ema_values[term_index].detach() + epsilon)
+                    historical_scale = ratio.clamp(
+                        min=float(self.config.scale_min), max=float(self.config.scale_max)
+                    )
+                scales.append(historical_scale)
                 aligned_means.append(None)
                 clamped.append(False)
                 continue
             raw_mean = global_sum / float(global_count)
-            ratio = answer_mean / (raw_mean + epsilon)
+            term_reference = (
+                self.ema_values[term_index].detach()
+                if self.config.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF
+                else raw_mean.detach()
+            )
+            ratio = answer_reference / (term_reference + epsilon)
             scale = ratio.clamp(min=float(self.config.scale_min), max=float(self.config.scale_max))
             scales.append(scale)
             aligned_means.append(scale * raw_mean)
@@ -313,6 +383,8 @@ class OfficialWeakOuterLossComposer:
             auxiliary_to_answer_ratio=min(float(self.config.group_weight), ratio_value),
             group_guard=float(group_guard.item()),
             group_guard_active=bool((group_guard < 1.0).item()),
+            ema_means=self._ema_means_for_audit(),
+            ema_update_counts=tuple(int(value.item()) for value in self.ema_update_counts),
         )
         trace_event(
             "outer_loss_balance_finalize",
@@ -330,6 +402,30 @@ class OfficialWeakOuterLossComposer:
             objectives=objective_tuple,
             mean_total=torch.stack(tuple(item.total for item in objective_tuple)).mean(),
             audit=audit,
+        )
+
+    @torch.no_grad()
+    def _update_ema(self, current_means: Sequence[Tensor | None]) -> None:
+        if len(current_means) != _STAT_TERM_COUNT:
+            raise ValueError("official-weak EMA update shape drifted")
+        beta = float(self.config.ema_beta)
+        for index, current in enumerate(current_means):
+            if current is None:
+                continue
+            value = current.to(device=self.ema_values.device, dtype=torch.float64)
+            if not bool(self.ema_valid[index].item()):
+                self.ema_values[index].copy_(value)
+                self.ema_valid[index] = True
+            else:
+                self.ema_values[index].mul_(beta).add_(value, alpha=1.0 - beta)
+            self.ema_update_counts[index] += 1
+
+    def _ema_means_for_audit(self) -> tuple[float | None, ...]:
+        if self.config.mode is not OfficialWeakBalanceMode.EMA_ANSWER_REF:
+            return ()
+        return tuple(
+            float(value.item()) if bool(valid.item()) else None
+            for value, valid in zip(self.ema_values, self.ema_valid, strict=True)
         )
 
     def compose_one_from_audit(

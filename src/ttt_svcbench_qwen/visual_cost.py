@@ -1,4 +1,4 @@
-"""Strict schema-3 measured visual/runtime cost index for rank-aligned sampling."""
+"""Strict schema-4 measured visual/runtime cost index for rank-aligned sampling."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch.distributed as dist
 
-VISUAL_COST_SCHEMA_VERSION = 3
+VISUAL_COST_SCHEMA_VERSION = 4
 FINGERPRINT_FIELDS = frozenset(
     {
         "manifest_sha256",
@@ -31,6 +31,11 @@ FINGERPRINT_FIELDS = frozenset(
         "gpu_model",
         "query_decode_strategy",
         "query_decode_max_groups",
+        "state_query_visual_mode",
+        "state_query_max_frames",
+        "answer_query_visual_mode",
+        "answer_query_max_frames",
+        "query_sample_fps",
     }
 )
 
@@ -54,6 +59,11 @@ def make_visual_cost_fingerprint(
     gpu_model: str,
     query_decode_strategy: str,
     query_decode_max_groups: int,
+    state_query_visual_mode: str,
+    state_query_max_frames: int,
+    answer_query_visual_mode: str,
+    answer_query_max_frames: int,
+    query_sample_fps: float,
 ) -> dict[str, object]:
     return validate_visual_cost_fingerprint(locals())
 
@@ -200,7 +210,7 @@ class EpochBoundaryCostEMA:
 
 def validate_visual_cost_fingerprint(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping) or set(value) != FINGERPRINT_FIELDS:
-        raise ValueError("visual cost fingerprint fields do not match schema 3")
+        raise ValueError("visual cost fingerprint fields do not match schema 4")
     result = {str(key): item for key, item in value.items()}
     string_fields = (
         "manifest_sha256",
@@ -212,6 +222,8 @@ def validate_visual_cost_fingerprint(value: object) -> dict[str, object]:
         "loss_mode",
         "gpu_model",
         "query_decode_strategy",
+        "state_query_visual_mode",
+        "answer_query_visual_mode",
     )
     for field in string_fields:
         item = result[field]
@@ -222,6 +234,8 @@ def validate_visual_cost_fingerprint(value: object) -> dict[str, object]:
         "maximum_pixels",
         "visual_batch_size",
         "query_decode_max_groups",
+        "state_query_max_frames",
+        "answer_query_max_frames",
     ):
         item = result[field]
         if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
@@ -232,6 +246,22 @@ def validate_visual_cost_fingerprint(value: object) -> dict[str, object]:
         raise ValueError("visual cost fingerprint Query decode strategy is invalid")
     if int(result["query_decode_max_groups"]) > 16:
         raise ValueError("visual cost fingerprint Query decode group cap exceeds 16")
+    for role in ("state", "answer"):
+        mode = result[f"{role}_query_visual_mode"]
+        maximum = int(result[f"{role}_query_max_frames"])
+        if mode not in {"recent_chunk", "causal_prefix"}:
+            raise ValueError(f"visual cost fingerprint {role} Query mode is invalid")
+        if maximum % 2 or maximum > 256:
+            raise ValueError(f"visual cost fingerprint {role} Query frame cap is invalid")
+        if mode == "recent_chunk" and maximum > 16:
+            raise ValueError(f"visual cost fingerprint {role} recent Query exceeds 16 frames")
+        if mode == "causal_prefix" and maximum != 256:
+            raise ValueError(f"visual cost fingerprint {role} prefix Query must use 256 frames")
+    sample_fps = result["query_sample_fps"]
+    if isinstance(sample_fps, bool) or not isinstance(sample_fps, (int, float)):
+        raise ValueError("visual cost fingerprint Query FPS must be numeric")
+    if not math.isfinite(float(sample_fps)) or float(sample_fps) <= 0.0:
+        raise ValueError("visual cost fingerprint Query FPS must be positive")
     for field in ("loss_group_weight", "loss_scale_min", "loss_scale_max", "loss_epsilon"):
         item = result[field]
         if isinstance(item, bool) or not isinstance(item, (int, float)):
@@ -254,9 +284,9 @@ def load_visual_cost_index(
         "fingerprint",
         "records",
     }:
-        raise ValueError("visual cost index must use strict schema 3")
+        raise ValueError("visual cost index must use strict schema 4")
     if raw["schema_version"] != VISUAL_COST_SCHEMA_VERSION:
-        raise ValueError("visual cost index schema_version must be 3")
+        raise ValueError("visual cost index schema_version must be 4")
     fingerprint = validate_visual_cost_fingerprint(raw["fingerprint"])
     if expected_fingerprint is not None:
         expected = validate_visual_cost_fingerprint(expected_fingerprint)
@@ -288,7 +318,7 @@ def load_visual_cost_index(
 def _parse_visual_cost_record(value: object) -> VisualCostRecord:
     fields = set(VisualCostRecord.__dataclass_fields__)
     if not isinstance(value, Mapping) or set(value) != fields:
-        raise ValueError("visual cost record fields do not match schema 3")
+        raise ValueError("visual cost record fields do not match schema 4")
     record_id = value["record_id"]
     if not isinstance(record_id, str):
         raise ValueError("visual cost record_id must be a string")

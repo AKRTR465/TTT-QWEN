@@ -1081,6 +1081,7 @@ class MetaTTTEpisodeRunner:
         raw_support_visual_batcher: RawSupportVisualBatcher | None = None,
         support_visual_batch_size: int = 1,
         query_activation_offload: bool = False,
+        outer_composer: OfficialWeakOuterLossComposer | None = None,
     ) -> None:
         if not isinstance(config, ProjectConfig):
             raise TypeError("Meta-TTT runner requires validated ProjectConfig")
@@ -1109,7 +1110,9 @@ class MetaTTTEpisodeRunner:
         if type(query_activation_offload) is not bool:
             raise TypeError("query_activation_offload must be bool")
         self.query_activation_offload = query_activation_offload
-        self.outer_composer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
+        self.outer_composer = outer_composer or OfficialWeakOuterLossComposer(
+            config.loss.official_weak_balance
+        )
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
         if config.fast_ttt.optimizer.meta_gradient_mode != "full_second_order":
             raise ValueError("the training runner only permits full_second_order inner updates")
@@ -1451,7 +1454,8 @@ class MetaTTTEpisodeRunner:
         query_runtime_snapshot = adapted.runtime
         balance_audit: OfficialWeakBalanceAudit | None = None
         if (
-            self.config.loss.official_weak_balance.mode is OfficialWeakBalanceMode.INSTANT_EQUAL
+            self.config.loss.official_weak_balance.mode
+            is not OfficialWeakBalanceMode.LEGACY_SUM
             and (
                 all(query.supervision.official_weak for query in episode.query_points)
                 or bool(
@@ -1848,8 +1852,11 @@ class MetaTTTEpisodeRunner:
             self.last_balance_audit = None
             return objectives
         if not all(official):
-            if self.config.loss.official_weak_balance.mode is OfficialWeakBalanceMode.INSTANT_EQUAL:
-                raise ValueError("instant_equal cannot mix dense and official-weak Query losses")
+            if (
+                self.config.loss.official_weak_balance.mode
+                is not OfficialWeakBalanceMode.LEGACY_SUM
+            ):
+                raise ValueError("balanced official-weak mode cannot mix dense Query losses")
             self.last_balance_audit = None
             return objectives
         states = tuple(cast(OfficialWeakStateLossOutput, item.state) for item in objectives)

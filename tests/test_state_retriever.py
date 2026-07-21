@@ -319,6 +319,9 @@ def test_query_history_reprojects_detached_sources_and_backpropagates_to_project
         hard_operators=(Operator.O1_SNAP,),
         time=SimpleNamespace(resolutions=(_resolution(query_time=3.0),)),
     )
+    parameters_before = tuple(
+        parameter.detach().clone() for parameter in bank.semantic_projector.parameters()
+    )
 
     output = retriever.retrieve_query_history(
         bank,
@@ -346,6 +349,16 @@ def test_query_history_reprojects_detached_sources_and_backpropagates_to_project
     assert any(
         gradient is not None and float(gradient.abs().sum().item()) > 0.0
         for gradient in projector_grads
+    )
+    optimizer = torch.optim.SGD(bank.semantic_projector.parameters(), lr=1.0e-3)
+    optimizer.step()
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(
+            parameters_before,
+            bank.semantic_projector.parameters(),
+            strict=True,
+        )
     )
     assert all(source.grad is None for source in support_sources)
     assert all(

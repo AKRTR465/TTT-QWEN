@@ -28,7 +28,7 @@ SESSION="${SESSION:-${MODE}_fullprefix256_8step_${RUN_ID}}"
 RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/runs/$RUN_ID}"
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs/$RUN_ID}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/experiment.log}"
-VISUAL_COST_INDEX="${VISUAL_COST_INDEX:-$PROJECT_ROOT/artifacts/a2_fullprefix256_visual_cost_index.json}"
+VISUAL_COST_INDEX="${VISUAL_COST_INDEX:-$PROJECT_ROOT/artifacts/a2_state16_answer256_ema_visual_cost_index.json}"
 
 if [[ "$(id -un)" != "$EXPECTED_USER" ]]; then
   echo "refusing to benchmark as $(id -un); expected $EXPECTED_USER" >&2

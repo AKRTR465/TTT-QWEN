@@ -605,6 +605,11 @@ def main(argv: list[str] | None = None) -> int:
             ),
             query_decode_strategy=backbone.ttt_config.query_decode_strategy,
             query_decode_max_groups=backbone.ttt_config.query_decode_max_groups,
+            state_query_visual_mode=backbone.ttt_config.resolved_state_query_visual_mode,
+            state_query_max_frames=backbone.ttt_config.resolved_state_query_max_frames,
+            answer_query_visual_mode=backbone.ttt_config.resolved_answer_query_visual_mode,
+            answer_query_max_frames=backbone.ttt_config.resolved_answer_query_max_frames,
+            query_sample_fps=backbone.ttt_config.query_sample_fps,
         )
         visual_cost_index = load_visual_cost_index(
             raw_cost_index,
@@ -634,6 +639,26 @@ def main(argv: list[str] | None = None) -> int:
                 query_visual_mode=backbone.ttt_config.query_visual_mode,
                 query_max_frames=backbone.ttt_config.query_max_frames,
                 query_sample_fps=backbone.ttt_config.query_sample_fps,
+                state_query_visual_mode=(
+                    backbone.ttt_config.resolved_state_query_visual_mode
+                    if backbone.ttt_config.split_query_visuals
+                    else None
+                ),
+                state_query_max_frames=(
+                    backbone.ttt_config.resolved_state_query_max_frames
+                    if backbone.ttt_config.split_query_visuals
+                    else None
+                ),
+                answer_query_visual_mode=(
+                    backbone.ttt_config.resolved_answer_query_visual_mode
+                    if backbone.ttt_config.split_query_visuals
+                    else None
+                ),
+                answer_query_max_frames=(
+                    backbone.ttt_config.resolved_answer_query_max_frames
+                    if backbone.ttt_config.split_query_visuals
+                    else None
+                ),
             )
         ),
     )

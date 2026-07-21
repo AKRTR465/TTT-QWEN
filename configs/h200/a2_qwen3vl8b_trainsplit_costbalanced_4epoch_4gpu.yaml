@@ -12,8 +12,6 @@ finetuning_type: full
 freeze_vision_tower: false
 freeze_multi_modal_projector: false
 freeze_language_model: false
-# A2 has a sample-dependent official-weak graph. Reduce the fully anchored
-# gradient set after backward instead of constructing ZeRO-2 hook buckets.
 deepspeed: configs/h200/deepspeed_zero1_dynamic_graph.json
 
 dataset_dir: $DATASET_DIR
@@ -31,8 +29,9 @@ remove_unused_columns: false
 
 output_dir: $OUTPUT_DIR
 logging_steps: 1
-save_strategy: epoch
-save_total_limit: 1
+save_strategy: steps
+save_steps: 0.5
+save_total_limit: 2
 save_only_model: false
 overwrite_output_dir: false
 report_to: none
@@ -60,6 +59,7 @@ ttt_qwen:
   stage: a2
   project_config: configs/model_state_ttt_8b.yaml
   dataset_manifest: $SVCBENCH_DATASET_MANIFEST
+  visual_cost_index: $VISUAL_COST_INDEX
   support_prefetch_depth: 2
   support_decode_coalesce: true
   support_materialization: dataloader_episode
@@ -81,10 +81,9 @@ ttt_qwen:
   preprocess_cache_mode: readonly
   preprocess_cache_miss_policy: error
   preprocess_cache_root_env: TTT_PREPROCESS_CACHE_ROOT
-  preprocess_cache_max_gb: 200
+  preprocess_cache_max_gb: 800
   preprocess_cache_dtype: float32
-  visual_cost_mode: exact_tokens_then_runtime
-  visual_cost_index: $VISUAL_COST_INDEX
-  runtime_trace_mode: "off"
-  runtime_trace_dir: null
+  visual_cost_mode: exact_tokens
+  runtime_trace_mode: cuda
+  runtime_trace_dir: $RUN_ROOT/runtime_trace
   segment_prefetch_depth: 0

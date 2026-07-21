@@ -539,16 +539,18 @@ class OfficialWeakBalanceMode(StrEnum):
 
     LEGACY_SUM = "legacy_sum"
     INSTANT_EQUAL = "instant_equal"
+    EMA_ANSWER_REF = "ema_answer_ref"
 
 
 class OfficialWeakBalanceConfig(FrozenModel):
-    """Stateless Answer-dominant composition for the four official-weak terms."""
+    """Answer-dominant composition for the four official-weak terms."""
 
     mode: OfficialWeakBalanceMode
     group_weight: Probability
     scale_min: PositiveFloat
     scale_max: PositiveFloat
     epsilon: PositiveFloat
+    ema_beta: Probability = 0.99
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
     def validate_scale_bounds(self) -> Self:
@@ -1706,17 +1708,32 @@ class ProjectConfig(FrozenModel):
             (
                 "loss.official_weak_balance.scale_min",
                 self.loss.official_weak_balance.scale_min,
-                0.1,
+                (
+                    0.001
+                    if self.loss.official_weak_balance.mode
+                    is OfficialWeakBalanceMode.EMA_ANSWER_REF
+                    else 0.1
+                ),
             ),
             (
                 "loss.official_weak_balance.scale_max",
                 self.loss.official_weak_balance.scale_max,
-                10.0,
+                (
+                    20.0
+                    if self.loss.official_weak_balance.mode
+                    is OfficialWeakBalanceMode.EMA_ANSWER_REF
+                    else 10.0
+                ),
             ),
             (
                 "loss.official_weak_balance.epsilon",
                 self.loss.official_weak_balance.epsilon,
                 1.0e-8,
+            ),
+            (
+                "loss.official_weak_balance.ema_beta",
+                self.loss.official_weak_balance.ema_beta,
+                0.99,
             ),
             ("stage_a.variant", self.stage_a.variant, StageAVariant.A2),
             ("stage_a.inner_sgd_enabled", self.stage_a.inner_sgd_enabled, False),
@@ -2107,7 +2124,7 @@ class ProjectConfig(FrozenModel):
                 "l2_fp32_unit_basis_fallback",
             ),
             ("o2.normalization_eps", heads.o2.normalization_eps, 1.0e-8),
-            ("o2.parameter_count", heads.o2.parameter_count, 2_103_042),
+            ("o2.parameter_count", heads.o2.parameter_count, 2_499_843),
             ("o2.prototype_ema", heads.o2.prototype_ema, 0.9),
             ("o2.confirmation_observations", heads.o2.confirmation_observations, 2),
             ("o2.match_threshold", heads.o2.match_threshold, 0.8),
@@ -2161,7 +2178,7 @@ class ProjectConfig(FrozenModel):
                 ("video_id", "trajectory_id", "query_signature"),
             ),
             ("e1.detach_runtime_default", heads.e1.detach_runtime_default, True),
-            ("e1.parameter_count", heads.e1.parameter_count, 9_584_643),
+            ("e1.parameter_count", heads.e1.parameter_count, 9_717_252),
             ("e1.tau_on", heads.e1.tau_on, 0.7),
             ("e1.tau_off", heads.e1.tau_off, 0.3),
             ("e1.completion_threshold", heads.e1.completion_threshold, 0.7),
@@ -2207,7 +2224,7 @@ class ProjectConfig(FrozenModel):
                 ("video_id", "trajectory_id", "query_signature"),
             ),
             ("e2.detach_runtime_default", heads.e2.detach_runtime_default, True),
-            ("e2.parameter_count", heads.e2.parameter_count, 7_094_792),
+            ("e2.parameter_count", heads.e2.parameter_count, 7_293_449),
             ("e2.start_threshold", heads.e2.start_threshold, 0.6),
             ("e2.end_threshold", heads.e2.end_threshold, 0.6),
             ("e2.complete_threshold", heads.e2.complete_threshold, 0.7),
@@ -2401,7 +2418,7 @@ class ProjectConfig(FrozenModel):
         exact_projector_millions = self.state_bank.semantic_projector.parameter_count / 1_000_000
         if abs(exact_projector_millions - budget.semantic_projector_millions) > 1.0e-9:
             raise ValueError("Semantic Projector budget must use the exact P9 parameter count")
-        exact_total_millions = 156_715_683 / 1_000_000
+        exact_total_millions = 157_443_750 / 1_000_000
         if abs(exact_total_millions - budget.new_modules_total_millions) > 1.0e-9:
             raise ValueError("new module budget must use the frozen P9 component total")
 
