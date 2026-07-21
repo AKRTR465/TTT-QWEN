@@ -75,6 +75,8 @@ ttt_qwen:
   query_decode_strategy: grouped_seek
   query_decode_max_groups: 16
   query_cache_mode: inherit
+  state_query_cache_mode: inherit
+  answer_query_cache_mode: disabled
   query_activation_offload: false
   preprocess_cache_mode: readonly
   preprocess_cache_miss_policy: error

@@ -53,6 +53,13 @@ def main() -> int:
     prewarm.add_argument("--maximum-pixels", type=int, required=True)
     prewarm.add_argument("--shard-index", type=int, default=0)
     prewarm.add_argument("--shard-count", type=int, default=1)
+    prewarm.add_argument("--split", choices=("train", "validation", "all"), default="all")
+    prewarm.add_argument(
+        "--roles",
+        nargs="+",
+        choices=("support", "state_query", "answer_query"),
+        default=("support", "state_query", "answer_query"),
+    )
     prewarm.add_argument("--summary", type=Path, default=None)
     args = parser.parse_args()
     if args.max_gb <= 0.0:
@@ -138,14 +145,17 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         parser.error(
             f"training config stage {ttt_config.stage!r} does not match --stage {args.stage!r}"
         )
-    if ttt_config.query_cache_mode != "inherit":
-        parser.error("dual-Query prewarm requires ttt_qwen.query_cache_mode=inherit")
+    roles = frozenset(args.roles)
+    for role in ("state_query", "answer_query"):
+        if role in roles and not ttt_config.query_cache_enabled(role):
+            parser.error(f"{role} prewarm requires its cache mode to be inherit")
     cache = _cache(args)
     materializer = VideoChunkMaterializer(
         config,
         minimum_pixels=args.minimum_pixels,
         maximum_pixels=args.maximum_pixels,
         preprocess_cache=cache,
+        cache_query_roles=frozenset(roles & {"state_query", "answer_query"}),
         prefetch_depth=1,
         decode_coalesce=False,
     )
@@ -153,7 +163,12 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         args.manifest,
         stage=ManifestStage(args.stage),
     )
-    candidates = tuple(_iter_specs((*train.records, *evaluation.records), ttt_config))
+    records = {
+        "train": train.records,
+        "validation": evaluation.records,
+        "all": (*train.records, *evaluation.records),
+    }[args.split]
+    candidates = tuple(_iter_specs(records, ttt_config, roles=roles))
     specs = _fingerprinted_specs(
         candidates,
         config=config,
@@ -171,6 +186,8 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     payload = {
         **_inspect(cache),
         "stage": args.stage,
+        "split": args.split,
+        "roles": sorted(roles),
         "shard_index": args.shard_index,
         "shard_count": args.shard_count,
         "candidate_chunk_count": len(candidates),
@@ -189,45 +206,58 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 def _iter_specs(
     records: Iterable[A2QueryRecord | A5EpisodeRecord],
     config: ProductionTTTConfig,
+    *,
+    roles: frozenset[str] = frozenset(("support", "state_query", "answer_query")),
 ) -> Iterable[tuple[ObservationSpec, str]]:
     for record in records:
         path = _resolve_video_path(record.source_dataset, record.relative_video_path)
         if isinstance(record, A2QueryRecord):
-            specs = (
-                *_a2_support_chunk_specs(record, path),
-                _query_chunk_spec(
-                    f"{record.query.runtime.query_id}:state_query",
-                    path,
-                    record.query.runtime.query_time,
-                    reset_soft_state=False,
-                    config=config,
-                    role="state_query",
-                ),
-                _query_chunk_spec(
-                    f"{record.query.runtime.query_id}:answer_query",
-                    path,
-                    record.query.runtime.query_time,
-                    reset_soft_state=False,
-                    config=config,
-                    role="answer_query",
-                ),
-            )
+            specs: tuple[ObservationSpec, ...] = ()
+            if "support" in roles:
+                specs += _a2_support_chunk_specs(record, path)
+            if "state_query" in roles:
+                specs += (
+                    _query_chunk_spec(
+                        f"{record.query.runtime.query_id}:state_query",
+                        path,
+                        record.query.runtime.query_time,
+                        reset_soft_state=False,
+                        config=config,
+                        role="state_query",
+                    ),
+                )
+            if "answer_query" in roles:
+                specs += (
+                    _query_chunk_spec(
+                        f"{record.query.runtime.query_id}:answer_query",
+                        path,
+                        record.query.runtime.query_time,
+                        reset_soft_state=False,
+                        config=config,
+                        role="answer_query",
+                    ),
+                )
         else:
             query_time = record.queries[0].runtime.query_time
             chunks = (record.prewarm, *record.supports)
-            specs = tuple(
-                CurrentChunkSpec(
-                    chunk_id=f"{record.episode_id}:prewarm"
-                    if index == 0
-                    else f"{record.episode_id}:s{index}",
-                    video_path=path,
-                    start_time=chunk.start_time,
-                    end_time=chunk.end_time,
-                    maximum_frames=chunk.maximum_frames,
-                    query_time=query_time,
+            specs = (
+                tuple(
+                    CurrentChunkSpec(
+                        chunk_id=f"{record.episode_id}:prewarm"
+                        if index == 0
+                        else f"{record.episode_id}:s{index}",
+                        video_path=path,
+                        start_time=chunk.start_time,
+                        end_time=chunk.end_time,
+                        maximum_frames=chunk.maximum_frames,
+                        query_time=query_time,
+                    )
+                    for index, chunk in enumerate(chunks)
                 )
-                for index, chunk in enumerate(chunks)
-            ) + tuple(
+                if "support" in roles
+                else ()
+            )
+            specs += tuple(
                 spec
                 for index, query in enumerate(record.queries)
                 for spec in (
@@ -248,6 +278,7 @@ def _iter_specs(
                         role="answer_query",
                     ),
                 )
+                if spec.observation_role in roles
             )
         for spec in specs:
             yield spec, record.source_dataset
