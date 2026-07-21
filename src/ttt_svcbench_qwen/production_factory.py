@@ -140,8 +140,12 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
 
     @property
     def cached_query_roles(self) -> frozenset[str]:
+        roles: tuple[Literal["state_query", "answer_query"], ...] = (
+            "state_query",
+            "answer_query",
+        )
         return frozenset(
-            role for role in ("state_query", "answer_query") if self.query_cache_enabled(role)
+            role for role in roles if self.query_cache_enabled(role)
         )
 
 

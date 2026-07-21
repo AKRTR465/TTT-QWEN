@@ -34,7 +34,7 @@ def test_v6_yaml_passes_strong_validation_and_serializes_completely() -> None:
     assert serialized["spec_version"] == (
         "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history"
     )
-    assert serialized["config_schema_version"] == 5
+    assert serialized["config_schema_version"] == 6
     assert serialized["model"]["revision"] == "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
     assert set(serialized) == set(ProjectConfig.model_fields)
 
@@ -42,12 +42,29 @@ def test_v6_yaml_passes_strong_validation_and_serializes_completely() -> None:
 def test_v5_project_config_accepts_explicit_instant_equal_experiment() -> None:
     raw = load_raw_config()
     raw["loss"]["official_weak_balance"]["mode"] = "instant_equal"
+    raw["loss"]["official_weak_balance"]["experimental"] = True
     raw["loss"]["official_weak_balance"]["scale_min"] = 0.1
     raw["loss"]["official_weak_balance"]["scale_max"] = 10.0
 
     config = ProjectConfig.model_validate(raw)
 
     assert config.loss.official_weak_balance.mode == "instant_equal"
+
+
+def test_non_ema_modes_require_explicit_experimental_flag() -> None:
+    raw = load_raw_config()
+    raw["loss"]["official_weak_balance"]["mode"] = "legacy_sum"
+
+    with pytest.raises(ValidationError, match="require explicit"):
+        ProjectConfig.model_validate(raw)
+
+
+def test_old_and_new_state_gradient_caps_cannot_be_mixed() -> None:
+    raw = load_raw_config()
+    raw["outer_gradient_control"]["max_grad_norm"]["state"] = 0.1
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ProjectConfig.model_validate(raw)
 
 
 def test_v6_retrieval_history_source_dim_is_frozen_to_projector_input() -> None:
@@ -562,18 +579,25 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "answer_ignore_index": -100,
         "official_weak_balance": {
             "mode": "ema_answer_ref",
+            "experimental": False,
             "group_weight": 0.3,
             "scale_min": 0.001,
             "scale_max": 20.0,
             "epsilon": 1.0e-8,
             "ema_beta": 0.99,
+            "grad_ema_beta": 0.99,
+            "grad_scale_min": 0.1,
+            "grad_scale_max": 10.0,
         },
     }
     assert config.outer_gradient_control.model_dump() == {
         "mode": "per_group_l2_equal_update_cap",
         "max_grad_norm": {
             "qwen": 1.0,
-            "state": 0.1,
+            "state_shared": 0.05,
+            "state_task": 0.05,
+            "state_router_time": 0.05,
+            "state_retrieval": 0.05,
             "w0": 0.1,
             "predictor": 0.1,
         },

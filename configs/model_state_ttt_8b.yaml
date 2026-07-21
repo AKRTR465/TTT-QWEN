@@ -1,5 +1,5 @@
 spec_version: state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history
-config_schema_version: 5
+config_schema_version: 6
 
 paths:
   model_root_env: QWEN_MODEL_ROOT
@@ -457,17 +457,24 @@ loss:
   answer_ignore_index: -100
   official_weak_balance:
     mode: ema_answer_ref
+    experimental: false
     group_weight: 0.3
     scale_min: 0.001
     scale_max: 20.0
     epsilon: 1.0e-8
     ema_beta: 0.99
+    grad_ema_beta: 0.99
+    grad_scale_min: 0.1
+    grad_scale_max: 10.0
 
 outer_gradient_control:
   mode: per_group_l2_equal_update_cap
   max_grad_norm:
     qwen: 1.0
-    state: 0.1
+    state_shared: 0.05
+    state_task: 0.05
+    state_router_time: 0.05
+    state_retrieval: 0.05
     w0: 0.1
     predictor: 0.1
   nonfinite_policy: skip_update

@@ -11,7 +11,10 @@ from ttt_svcbench_qwen.config import (
     OfficialWeakBalanceMode,
 )
 from ttt_svcbench_qwen.losses import AnswerLossOutput, LossSkipReason, LossTerm
-from ttt_svcbench_qwen.outer_loss_balance import OfficialWeakOuterLossComposer
+from ttt_svcbench_qwen.outer_loss_balance import (
+    OfficialWeakGradientAnchors,
+    OfficialWeakOuterLossComposer,
+)
 from ttt_svcbench_qwen.stage_a_targets import (
     OfficialWeakLossAudit,
     OfficialWeakLossTerm,
@@ -22,6 +25,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
 def _config(mode: OfficialWeakBalanceMode) -> OfficialWeakBalanceConfig:
     return OfficialWeakBalanceConfig(
         mode=mode,
+        experimental=mode is not OfficialWeakBalanceMode.EMA_ANSWER_REF,
         group_weight=0.3,
         scale_min=0.1,
         scale_max=10.0,
@@ -87,6 +91,39 @@ def _remote_sum(values: tuple[float, ...]) -> Callable[[Tensor], Tensor]:
         return local + torch.tensor(values, dtype=local.dtype, device=local.device)
 
     return reduce
+
+
+def _loss_and_empty_gradient_stats(values: tuple[float, ...]) -> tuple[float, ...]:
+    assert len(values) == 10
+    return values + (0.0,) * 8
+
+
+def _gradient_connected_state(
+    anchors: OfficialWeakGradientAnchors,
+    factors: tuple[float, float, float, float],
+    *,
+    value: float = 1.0,
+    valid: tuple[bool, bool, bool, bool] = (True, True, True, True),
+) -> OfficialWeakStateLossOutput:
+    source = (
+        anchors.q_target,
+        anchors.q_operator,
+        anchors.q_target,
+        anchors.q_time,
+    )
+    values = tuple(
+        factor * anchor.sum() + (value - factor)
+        for factor, anchor in zip(factors, source, strict=True)
+    )
+    return _state(*values, valid=valid)
+
+
+def _anchors() -> OfficialWeakGradientAnchors:
+    return OfficialWeakGradientAnchors(
+        q_target=torch.ones((1, 1), requires_grad=True),
+        q_operator=torch.ones((1, 1), requires_grad=True),
+        q_time=torch.ones((1, 1), requires_grad=True),
+    )
 
 
 def test_legacy_sum_is_exact_and_collective_free() -> None:
@@ -172,7 +209,7 @@ def test_sparse_rank_term_uses_global_valid_count_for_ddp_gradient() -> None:
     retrieval = torch.tensor(4.0, requires_grad=True)
     anchor = torch.tensor(0.0, requires_grad=True)
     # Remote rank contributes one Answer row with sum 6 and no official-weak rows.
-    remote = (6.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    remote = _loss_and_empty_gradient_stats((6.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
     composer = OfficialWeakOuterLossComposer(
         _config(OfficialWeakBalanceMode.INSTANT_EQUAL),
         reduce_sum=_remote_sum(remote),
@@ -197,7 +234,7 @@ def test_multiple_local_queries_mean_to_one_global_rank_objective() -> None:
     task_values = tuple(torch.tensor(value, requires_grad=True) for value in (1.0, 3.0))
     anchor = torch.tensor(0.0, requires_grad=True)
     # Remote rank contributes one Answer=6 and one Task=2.
-    remote = (6.0, 1.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    remote = _loss_and_empty_gradient_stats((6.0, 1.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
     collective_calls = 0
 
     def reduce(local: Tensor) -> Tensor:
@@ -231,6 +268,7 @@ def test_config_rejects_inverted_scale_bounds() -> None:
     with pytest.raises(ValueError, match="scale_min"):
         OfficialWeakBalanceConfig(
             mode=OfficialWeakBalanceMode.INSTANT_EQUAL,
+            experimental=True,
             group_weight=0.3,
             scale_min=10.0,
             scale_max=0.1,
@@ -241,31 +279,189 @@ def test_config_rejects_inverted_scale_bounds() -> None:
 def test_ema_answer_reference_persists_and_missing_term_keeps_history() -> None:
     config = OfficialWeakBalanceConfig(
         mode=OfficialWeakBalanceMode.EMA_ANSWER_REF,
+        experimental=False,
         group_weight=0.3,
         scale_min=0.001,
         scale_max=20.0,
         epsilon=1.0e-8,
         ema_beta=0.5,
+        grad_ema_beta=0.5,
     )
     composer = OfficialWeakOuterLossComposer(config)
-    values = tuple(torch.tensor(2.0, requires_grad=True) for _ in range(4))
-    first = composer.compose((_answer(torch.tensor(4.0, requires_grad=True)),), (_state(*values),))
+    first_anchors = _anchors()
+    first = composer.compose(
+        (_answer(torch.tensor(4.0, requires_grad=True)),),
+        (
+            _gradient_connected_state(
+                first_anchors,
+                (2.0, 2.0, 2.0, 2.0),
+                value=2.0,
+            ),
+        ),
+        gradient_anchors=(first_anchors,),
+    )
     assert first.audit is not None
+    assert tuple(term.scale for term in first.audit.terms) == pytest.approx((1.0,) * 4)
     assert first.audit.ema_means == pytest.approx((4.0, 2.0, 2.0, 2.0, 2.0))
     assert first.audit.ema_update_counts == (1, 1, 1, 1, 1)
+    assert first.audit.gradient_ema_rms == pytest.approx((2.0, 2.0, 2.0, 2.0))
+    assert all(
+        anchor.grad is None
+        for anchor in (
+            first_anchors.q_target,
+            first_anchors.q_operator,
+            first_anchors.q_time,
+        )
+    )
 
-    second_values = tuple(torch.tensor(8.0, requires_grad=True) for _ in range(4))
+    second_anchors = _anchors()
     second = composer.compose(
         (_answer(torch.tensor(2.0, requires_grad=True)),),
-        (_state(*second_values, valid=(True, True, False, True)),),
+        (
+            _gradient_connected_state(
+                second_anchors,
+                (8.0, 8.0, 8.0, 8.0),
+                value=8.0,
+                valid=(True, True, False, True),
+            ),
+        ),
+        gradient_anchors=(second_anchors,),
     )
     assert second.audit is not None
     assert second.audit.ema_means == pytest.approx((3.0, 5.0, 5.0, 2.0, 5.0))
     assert second.audit.ema_update_counts == (2, 2, 2, 1, 2)
+    assert second.audit.gradient_ema_rms == pytest.approx((9.0, 9.0, 2.0, 9.0))
+    assert second.audit.gradient_ema_update_counts == (2, 2, 1, 2)
     assert second.audit.terms[2].global_valid_count == 0
-    assert second.audit.terms[2].scale == pytest.approx(1.5)
+    assert second.audit.terms[2].scale is None
+    assert second.audit.terms[2].raw_gradient_rms is None
+    assert second.audit.terms[0].loss_scale == pytest.approx(2.0)
 
     restored = OfficialWeakOuterLossComposer(config)
     restored.load_state_dict(composer.state_dict(), strict=True)
     assert torch.equal(restored.ema_values, composer.ema_values)
     assert torch.equal(restored.ema_update_counts, composer.ema_update_counts)
+    assert torch.equal(restored.gradient_ema_values, composer.gradient_ema_values)
+    assert int(restored.balance_schema_version.item()) == 6
+
+
+def test_gradient_ema_uses_previous_step_and_balances_activation_rms() -> None:
+    composer = OfficialWeakOuterLossComposer(
+        OfficialWeakBalanceConfig(
+            mode=OfficialWeakBalanceMode.EMA_ANSWER_REF,
+            experimental=False,
+            group_weight=0.3,
+            scale_min=0.001,
+            scale_max=20.0,
+            epsilon=1.0e-8,
+            ema_beta=0.99,
+            grad_ema_beta=0.99,
+            grad_scale_min=0.1,
+            grad_scale_max=10.0,
+        )
+    )
+    factors = (1.0, 10.0, 100.0, 1000.0)
+    first_anchors = _anchors()
+    first = composer.compose(
+        (_answer(torch.tensor(1.0, requires_grad=True)),),
+        (_gradient_connected_state(first_anchors, factors),),
+        gradient_anchors=(first_anchors,),
+    )
+    assert first.audit is not None
+    assert tuple(term.scale for term in first.audit.terms) == pytest.approx((1.0,) * 4)
+
+    second_anchors = _anchors()
+    second = composer.compose(
+        (_answer(torch.tensor(1.0, requires_grad=True)),),
+        (_gradient_connected_state(second_anchors, factors),),
+        gradient_anchors=(second_anchors,),
+    )
+    assert second.audit is not None
+    assert tuple(term.gradient_scale for term in second.audit.terms) == pytest.approx(
+        (10.0, 10.0**0.5, 10.0**-0.5, 0.1),
+        rel=1.0e-5,
+    )
+    assert tuple(term.scale for term in second.audit.terms) == pytest.approx(
+        (10.0, 10.0**0.5, 10.0**-0.5, 0.1),
+        rel=1.0e-5,
+    )
+    assert all(
+        anchor.grad is None
+        for anchor in (
+            second_anchors.q_target,
+            second_anchors.q_operator,
+            second_anchors.q_time,
+        )
+    )
+    second.mean_total.backward()
+    assert all(
+        anchor.grad is not None
+        for anchor in (
+            second_anchors.q_target,
+            second_anchors.q_operator,
+            second_anchors.q_time,
+        )
+    )
+
+
+def test_formal_collectives_have_fixed_loss_then_streamed_gradient_lengths() -> None:
+    calls: list[int] = []
+
+    def reduce(values: Tensor) -> Tensor:
+        calls.append(values.numel())
+        return values * 4.0
+
+    composer = OfficialWeakOuterLossComposer(
+        OfficialWeakBalanceConfig(
+            mode=OfficialWeakBalanceMode.EMA_ANSWER_REF,
+            experimental=False,
+            group_weight=0.3,
+            scale_min=0.001,
+            scale_max=20.0,
+            epsilon=1.0e-8,
+        ),
+        reduce_sum=reduce,
+        world_size=4,
+    )
+    calibration_anchors = _anchors()
+    state = _gradient_connected_state(
+        calibration_anchors,
+        (1.0, 2.0, 3.0, 4.0),
+        valid=(True, True, False, True),
+    )
+    calibrated = composer.calibrate(
+        (_answer(torch.tensor(1.0, requires_grad=True)),),
+        (state,),
+    )
+    assert calibrated.audit is not None
+    statistics = composer.measure_streamed_gradients(
+        state,
+        calibration_anchors,
+        calibrated.audit,
+    )
+    committed = composer.commit_streamed_gradients((statistics,), calibrated.audit)
+
+    assert calls == [18, 8]
+    assert tuple(term.global_valid_count for term in committed.terms) == (4, 4, 0, 4)
+    assert committed.terms[2].raw_gradient_rms is None
+
+
+def test_old_ema_checkpoint_cannot_silently_load_into_schema_six() -> None:
+    composer = OfficialWeakOuterLossComposer(
+        OfficialWeakBalanceConfig(
+            mode=OfficialWeakBalanceMode.EMA_ANSWER_REF,
+            experimental=False,
+            group_weight=0.3,
+            scale_min=0.001,
+            scale_max=20.0,
+            epsilon=1.0e-8,
+        )
+    )
+    old_state = {
+        "ema_values": torch.zeros(5, dtype=torch.float64),
+        "ema_valid": torch.zeros(5, dtype=torch.bool),
+        "ema_update_counts": torch.zeros(5, dtype=torch.int64),
+    }
+
+    with pytest.raises(RuntimeError, match="Missing key"):
+        composer.load_state_dict(old_state, strict=True)

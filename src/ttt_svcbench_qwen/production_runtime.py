@@ -79,6 +79,7 @@ from ttt_svcbench_qwen.observation_heads import (
 )
 from ttt_svcbench_qwen.outer_loss_balance import (
     OfficialWeakBalanceAudit,
+    OfficialWeakGradientAnchors,
     OfficialWeakOuterLossComposer,
 )
 from ttt_svcbench_qwen.preprocess_cache import (
@@ -2277,7 +2278,17 @@ class ProductionA2LossStep:
             batch.supervision.official_weak,
         )
         self.last_weak_audit = weak.audit
-        balanced = self.outer_composer.compose((answer,), (weak,))
+        balanced = self.outer_composer.compose(
+            (answer,),
+            (weak,),
+            gradient_anchors=(
+                OfficialWeakGradientAnchors(
+                    q_target=raw.query.q_target,
+                    q_operator=raw.query.q_operator,
+                    q_time=raw.query.q_time,
+                ),
+            ),
+        )
         total = balanced.mean_total
         self.last_balance_audit = balanced.audit
         # Official task masks and hard routing intentionally produce a sample-dependent graph.
