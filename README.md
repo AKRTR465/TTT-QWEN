@@ -15,8 +15,9 @@
 - State Bank 同时维护写后 aggregate/Confirmed 状态和 append-only retrieval history；Query 从写前 history 重投影 768D source，Reader 直接读取写后状态。
 - Reader 负责精确计数及证据，Qwen 负责自然语言答案。
 - A5 使用 `L_pred + 0.5 L_id + 0.5 L_event`，K=8 截断二阶梯度并重锚 W0。
-- A2/A5 正式训练默认使用 `instant_equal`：按当前全局 sum/count 对齐四项
-  official-weak loss，并将辅助组限制为 Answer 的至多 30%；`legacy_sum` 仅保留为兼容消融。
+- A2/A5 正式训练唯一使用 `ema_answer_ref`：loss EMA 对齐 Answer 尺度，再按
+  `q_target/q_operator/q_time` 激活面的梯度 RMS EMA 平衡四项 official-weak loss；辅助组仍限制为
+  Answer 的至多 30%。
 
 完整设计见 [ARCHITECTURE.md](./ARCHITECTURE.md)，固定决策见 [DECISIONS.md](./DECISIONS.md)。
 
@@ -52,9 +53,14 @@ bash scripts/h200/train_fullprefix256.sh a5 /absolute/path/a2/checkpoints/final-
 - checkpoint 保存模型、optimizer、scheduler、RNG，但排除 Wt、Bank、cache 和 FSM runtime；
 - `formal_evaluation_enabled=false`，直至独立校准和正式评估完成。
 
-`loss.official_weak_balance.mode` 默认为 `instant_equal`。它无 EMA、无额外 checkpoint
-状态；每个 A2 micro-step 或 A5 episode 使用一次固定长度 collective，Task、Operator、
-Retrieval、Time 各占固定四分之一插槽，缺失监督不重分配预算。`legacy_sum` 仍可用于消融。
+`loss.official_weak_balance.mode` 正式值为 `ema_answer_ref`，`experimental=false`。loss 与
+gradient EMA 均采用一步滞后并随同阶段 checkpoint 恢复；A2 初始化 A5 时清零。Task、
+Operator、Retrieval、Time 始终占固定四槽，缺失监督不更新对应 EMA，也不重分配预算。
+`instant_equal/legacy_sum` 只有显式 `experimental=true` 才可作为消融运行。
+
+Outer AdamW 将状态参数拆为 `state_shared`、`state_task`、`state_router_time` 和
+`state_retrieval` 四个独立裁剪组；四组 cap 均为 0.05，RSS 更新预算等于旧单组 0.1，
+因此 Task 尖峰不会再同步缩小 SemanticProjector/Retrieval 梯度。
 
 ## 在线推理
 

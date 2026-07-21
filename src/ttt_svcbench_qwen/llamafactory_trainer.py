@@ -29,8 +29,13 @@ if __name__ == "__main__":
 
 import torch
 import transformers
+from safetensors import safe_open
 from torch import Tensor, nn
 
+from ttt_svcbench_qwen.config import (
+    OfficialWeakBalanceConfig,
+    OfficialWeakBalanceMode,
+)
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
     A5EpisodeRecord,
@@ -45,6 +50,7 @@ from ttt_svcbench_qwen.meta_trainer import (
     TruncatedMetaTTTEpisodeOutput,
 )
 from ttt_svcbench_qwen.outer_gradient_control import OuterGradientController
+from ttt_svcbench_qwen.outer_loss_balance import OfficialWeakOuterLossComposer
 from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
     OuterCheckpointAudit,
@@ -516,7 +522,7 @@ class TTTQwenTrainerMixin:
         elif isinstance(record, A5EpisodeRecord):
             record_id = record.episode_id
             answers = getattr(prepared, "query_answers", ())
-            for answer in (answers if isinstance(answers, tuple) else ()):
+            for answer in answers if isinstance(answers, tuple) else ():
                 telemetry = getattr(answer, "preparation", None)
                 raw_seconds = getattr(telemetry, "total_seconds", 0.0)
                 if isinstance(raw_seconds, (int, float)):
@@ -599,12 +605,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("usage: python -m ttt_svcbench_qwen.llamafactory_trainer CONFIG.yaml")
     started = time.monotonic()
     backbone = load_llamafactory_backbone(arguments[0])
-    balance_mode = backbone.project_config.loss.official_weak_balance.mode.value
-    if balance_mode != "instant_equal" and os.environ.get("TTT_LEGACY_SUM_ABLATION") != "1":
-        raise ValueError(
-            "formal A2/A5 requires instant_equal; set TTT_LEGACY_SUM_ABLATION=1 "
-            "only for an explicit ablation run"
-        )
+    _validate_formal_balance(backbone.project_config.loss.official_weak_balance)
     unfreeze_audit = fully_unfreeze_qwen(backbone.model, backbone.project_config)
     configured_stage = ProductionStage(backbone.ttt_config.stage)
     if getattr(backbone.training_args, "resume_from_checkpoint", None) is not None:
@@ -615,6 +616,8 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.get("TTT_RESUME_CHECKPOINT"),
         configured_stage,
     )
+    if same_stage_resume is not None:
+        _validate_resume_balance_schema(same_stage_resume)
     from ttt_svcbench_qwen.production_runtime import _video_pixel_bounds, build_runtime
 
     runtime_raw = build_runtime(backbone, backbone.ttt_config)
@@ -683,10 +686,26 @@ def main(argv: list[str] | None = None) -> int:
         if checkpoint is None:
             raise RuntimeError("validated A5 config lost initialize_from_a2_checkpoint")
         checkpoint_audit = initialize_outer_model_from_a2(runtime_raw.model, checkpoint)
+        _reset_a2_to_a5_balance(runtime_raw.model)
     expected_gradient_groups = (
-        ("qwen", "state", "w0")
+        (
+            "qwen",
+            "state_shared",
+            "state_task",
+            "state_router_time",
+            "state_retrieval",
+            "w0",
+        )
         if configured_stage is ProductionStage.A2
-        else ("qwen", "state", "w0", "predictor")
+        else (
+            "qwen",
+            "state_shared",
+            "state_task",
+            "state_router_time",
+            "state_retrieval",
+            "w0",
+            "predictor",
+        )
     )
     runtime_raw = replace(
         runtime_raw,
@@ -889,6 +908,31 @@ def resolve_same_stage_resume(
     return root
 
 
+def _validate_resume_balance_schema(checkpoint: Path) -> None:
+    key = "official_weak_balancer.balance_schema_version"
+    single = checkpoint / "model.safetensors"
+    index = checkpoint / "model.safetensors.index.json"
+    source: Path
+    if single.is_file():
+        source = single
+    elif index.is_file():
+        raw = cast(object, json.loads(index.read_text(encoding="utf-8")))
+        weight_map = raw.get("weight_map") if isinstance(raw, dict) else None
+        if not isinstance(weight_map, dict) or not isinstance(weight_map.get(key), str):
+            raise ValueError("resume checkpoint predates ema_answer_ref schema 6")
+        source = checkpoint / cast(str, weight_map[key])
+    else:
+        raise ValueError("same-stage resume requires schema-6 safetensors weights")
+    if not source.is_file():
+        raise FileNotFoundError("resume balance-schema shard is missing")
+    with safe_open(source, framework="pt", device="cpu") as reader:
+        if key not in set(reader.keys()):
+            raise ValueError("resume checkpoint predates ema_answer_ref schema 6")
+        value = reader.get_tensor(key)
+    if value.numel() != 1 or int(value.item()) != 6:
+        raise ValueError("resume checkpoint has incompatible ema_answer_ref schema")
+
+
 def _audit_outer_parameters(
     backbone: LlamaFactoryBackboneBundle,
     runtime: ProductionTrainerRuntime,
@@ -940,18 +984,18 @@ def make_production_outer_optimizer_factory(
     def factory(model: nn.Module) -> torch.optim.Optimizer:
         groups: dict[str, list[nn.Parameter]] = {
             "qwen": [],
-            "state": [],
+            "state_shared": [],
+            "state_task": [],
+            "state_router_time": [],
+            "state_retrieval": [],
             "w0": [],
             "predictor": [],
         }
-        seen: set[int] = set()
-        for name, parameter in model.named_parameters():
+        ownership: dict[int, str] = {}
+        for name, parameter in model.named_parameters(remove_duplicate=False):
             if not parameter.requires_grad:
                 continue
             parameter_id = id(parameter)
-            if parameter_id in seen:
-                raise ValueError("outer optimizer encountered an aliased trainable parameter")
-            seen.add(parameter_id)
             lowered = name.casefold()
             if "transient_w_t" in lowered or lowered.endswith(("w_t_1", "w_t_2")):
                 raise ValueError("transient W_t cannot enter the Outer optimizer")
@@ -961,18 +1005,49 @@ def make_production_outer_optimizer_factory(
                 group = "predictor"
             elif lowered.endswith(("w0_1", "w0_2")) or "meta_fast" in lowered:
                 group = "w0"
+            elif "component_modules.observation_heads" in lowered:
+                group = "state_task"
+            elif "operator_router" in lowered or "time_resolver" in lowered:
+                group = "state_router_time"
+            elif "semantic_projector" in lowered or "component_modules.retriever" in lowered:
+                group = "state_retrieval"
             else:
-                group = "state"
+                group = "state_shared"
+            previous = ownership.get(parameter_id)
+            if previous is not None:
+                if previous != group:
+                    raise ValueError(
+                        f"aliased Outer parameter crossed optimizer groups: {previous}/{group}"
+                    )
+                continue
+            ownership[parameter_id] = group
             groups[group].append(parameter)
-        if not groups["qwen"] or not groups["state"] or not groups["w0"]:
-            raise ValueError("Outer AdamW requires non-empty Qwen/state/W0 groups")
+        required = (
+            "qwen",
+            "state_shared",
+            "state_task",
+            "state_router_time",
+            "state_retrieval",
+            "w0",
+        )
+        empty = tuple(name for name in required if not groups[name])
+        if empty:
+            raise ValueError(f"Outer AdamW requires non-empty formal groups: {empty}")
         if stage is ProductionStage.A2 and groups["predictor"]:
             raise ValueError("A2 Outer AdamW cannot own Predictor")
         if stage is ProductionStage.A5 and not groups["predictor"]:
             raise ValueError("A5 Outer AdamW must own Predictor")
+        trainable_ids = {
+            id(parameter) for parameter in model.parameters() if parameter.requires_grad
+        }
+        if set(ownership) != trainable_ids or sum(map(len, groups.values())) != len(trainable_ids):
+            raise ValueError("every trainable Outer parameter must belong to exactly one group")
         learning_rates = {
             "qwen": qwen_lr,
-            "state": state_lr,
+            "state_shared": state_lr,
+            "state_task": state_lr,
+            "state_router_time": state_lr,
+            "state_retrieval": state_lr,
             "w0": w0_lr,
             "predictor": predictor_lr,
         }
@@ -986,15 +1061,31 @@ def make_production_outer_optimizer_factory(
             if values
         ]
         caps = backbone.project_config.outer_gradient_control.max_grad_norm
-        update_caps: dict[str, float] = {}
-        for parameter_group in parameter_groups:
-            group_name = cast(str, parameter_group["group_name"])
-            learning_rate = cast(float, parameter_group["lr"])
-            update_caps[group_name] = learning_rate * float(getattr(caps, group_name))
-        if not math.isclose(min(update_caps.values()), max(update_caps.values()), rel_tol=1.0e-6):
-            raise ValueError(
-                "Outer group learning rates and gradient caps must have equal update-norm ceilings"
-            )
+        reference_budget = qwen_lr * float(caps.qwen)
+        independent_budgets = {
+            "w0": w0_lr * float(caps.w0),
+            **(
+                {"predictor": predictor_lr * float(caps.predictor)}
+                if stage is ProductionStage.A5
+                else {}
+            ),
+        }
+        if any(
+            not math.isclose(value, reference_budget, rel_tol=1.0e-6)
+            for value in independent_budgets.values()
+        ):
+            raise ValueError("Qwen/W0/Predictor update-norm budgets must remain aligned")
+        state_names = (
+            "state_shared",
+            "state_task",
+            "state_router_time",
+            "state_retrieval",
+        )
+        state_rss_budget = math.sqrt(
+            sum((state_lr * float(getattr(caps, name))) ** 2 for name in state_names)
+        )
+        if not math.isclose(state_rss_budget, reference_budget, rel_tol=1.0e-6):
+            raise ValueError("state subgroup RSS update-norm budget drifted from the formal cap")
         optimizer = torch.optim.AdamW(
             parameter_groups,
             betas=(float(training_args.adam_beta1), float(training_args.adam_beta2)),
@@ -1018,6 +1109,20 @@ def make_production_outer_optimizer_factory(
         return optimizer
 
     return factory
+
+
+def _validate_formal_balance(config: OfficialWeakBalanceConfig) -> None:
+    if config.mode is not OfficialWeakBalanceMode.EMA_ANSWER_REF or config.experimental:
+        raise ValueError(
+            "formal A2/A5 requires official_weak_balance mode=ema_answer_ref and experimental=false"
+        )
+
+
+def _reset_a2_to_a5_balance(model: nn.Module) -> None:
+    balancer = getattr(model, "official_weak_balancer", None)
+    if not isinstance(balancer, OfficialWeakOuterLossComposer):
+        raise RuntimeError("A5 outer model lost the official-weak EMA reset boundary")
+    balancer.reset_ema()
 
 
 def _semantic_projector_gradient_norm(model: nn.Module) -> float | None:

@@ -12,14 +12,21 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
-from ttt_svcbench_qwen.config import load_config
+from ttt_svcbench_qwen.config import (
+    OfficialWeakBalanceConfig,
+    OfficialWeakBalanceMode,
+    load_config,
+)
 from ttt_svcbench_qwen.llamafactory_trainer import (
     ProductionStage,
     ProductionTrainerRuntime,
     SegmentBackwardController,
     TTTQwenTrainerMixin,
     _ControlledDeepSpeedEngineWrapper,
+    _reset_a2_to_a5_balance,
     _validate_checkpoint_tree,
+    _validate_formal_balance,
+    _validate_resume_balance_schema,
     make_production_outer_optimizer_factory,
     resolve_same_stage_resume,
 )
@@ -62,11 +69,33 @@ class _GroupedOuterToy(nn.Module):
     def __init__(self, qwen: nn.Module, *, predictor_trainable: bool) -> None:
         super().__init__()
         self.qwen = qwen
-        self.state = nn.Linear(4, 4)
+        self.state_model = nn.Module()
+        self.state_model.component_modules = nn.ModuleDict(
+            {
+                "spatial_encoder": nn.Linear(4, 4),
+                "observation_heads": nn.Linear(4, 4),
+                "query_encoder": _GroupedQueryToy(),
+                "state_bank": _GroupedStateBankToy(),
+            }
+        )
         self.w0_1 = nn.Parameter(torch.ones(4, 4))
         self.w0_2 = nn.Parameter(torch.ones(4, 4))
         self.predictor = nn.Linear(4, 4)
         self.predictor.requires_grad_(predictor_trainable)
+
+
+class _GroupedQueryToy(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.target_head = nn.Linear(4, 4)
+        self.operator_router = nn.Linear(4, 4)
+        self.time_resolver = nn.Linear(4, 4)
+
+
+class _GroupedStateBankToy(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.semantic_projector = nn.Linear(4, 4)
 
 
 class _QwenOwnerToy(nn.Module):
@@ -117,6 +146,62 @@ def test_production_outer_checkpoint_owns_ema_balance_state() -> None:
     assert "official_weak_balancer.ema_values" in keys
     assert "official_weak_balancer.ema_valid" in keys
     assert "official_weak_balancer.ema_update_counts" in keys
+    assert "official_weak_balancer.gradient_ema_values" in keys
+    assert "official_weak_balancer.gradient_ema_valid" in keys
+    assert "official_weak_balancer.gradient_ema_update_counts" in keys
+    assert "official_weak_balancer.balance_schema_version" in keys
+
+
+def test_formal_entry_accepts_only_nonexperimental_ema_answer_ref() -> None:
+    _validate_formal_balance(load_config().loss.official_weak_balance)
+    experimental = OfficialWeakBalanceConfig(
+        mode=OfficialWeakBalanceMode.INSTANT_EQUAL,
+        experimental=True,
+        group_weight=0.3,
+        scale_min=0.1,
+        scale_max=10.0,
+        epsilon=1.0e-8,
+    )
+
+    with pytest.raises(ValueError, match="formal A2/A5 requires"):
+        _validate_formal_balance(experimental)
+
+
+def test_a2_to_a5_resets_loss_and_gradient_ema() -> None:
+    config = load_config()
+    balancer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
+    balancer.ema_values.fill_(3.0)
+    balancer.ema_valid.fill_(True)
+    balancer.ema_update_counts.fill_(4)
+    balancer.gradient_ema_values.fill_(5.0)
+    balancer.gradient_ema_valid.fill_(True)
+    balancer.gradient_ema_update_counts.fill_(6)
+    outer = ProductionOuterModel(nn.Linear(2, 2), nn.Linear(2, 2), nn.Linear(2, 2), balancer)
+
+    _reset_a2_to_a5_balance(outer)
+
+    assert not bool(balancer.ema_valid.any())
+    assert not bool(balancer.gradient_ema_valid.any())
+    assert not bool(balancer.ema_update_counts.any())
+    assert not bool(balancer.gradient_ema_update_counts.any())
+    assert int(balancer.balance_schema_version.item()) == 6
+
+
+def test_same_stage_resume_rejects_old_balance_schema(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    save_file(
+        {"official_weak_balancer.ema_values": torch.zeros(5)},
+        checkpoint / "model.safetensors",
+    )
+    with pytest.raises(ValueError, match="predates"):
+        _validate_resume_balance_schema(checkpoint)
+
+    save_file(
+        {"official_weak_balancer.balance_schema_version": torch.tensor(6)},
+        checkpoint / "model.safetensors",
+    )
+    _validate_resume_balance_schema(checkpoint)
 
 
 def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
@@ -1108,11 +1193,30 @@ def test_atomic_final_checkpoint_validation_requires_model_and_resume_state(
 @pytest.mark.parametrize(
     ("stage", "predictor_trainable", "expected_lrs"),
     [
-        (ProductionStage.A2, False, {"qwen": 1.0e-5, "state": 1.0e-4, "w0": 1.0e-4}),
+        (
+            ProductionStage.A2,
+            False,
+            {
+                "qwen": 1.0e-5,
+                "state_shared": 1.0e-4,
+                "state_task": 1.0e-4,
+                "state_router_time": 1.0e-4,
+                "state_retrieval": 1.0e-4,
+                "w0": 1.0e-4,
+            },
+        ),
         (
             ProductionStage.A5,
             True,
-            {"qwen": 5.0e-6, "state": 5.0e-5, "w0": 5.0e-5, "predictor": 5.0e-5},
+            {
+                "qwen": 5.0e-6,
+                "state_shared": 5.0e-5,
+                "state_task": 5.0e-5,
+                "state_router_time": 5.0e-5,
+                "state_retrieval": 5.0e-5,
+                "w0": 5.0e-5,
+                "predictor": 5.0e-5,
+            },
         ),
     ],
 )

@@ -19,7 +19,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SPEC_VERSION = "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history"
-CONFIG_SCHEMA_VERSION = 5
+CONFIG_SCHEMA_VERSION = 6
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -546,16 +546,29 @@ class OfficialWeakBalanceConfig(FrozenModel):
     """Answer-dominant composition for the four official-weak terms."""
 
     mode: OfficialWeakBalanceMode
+    experimental: bool
     group_weight: Probability
     scale_min: PositiveFloat
     scale_max: PositiveFloat
     epsilon: PositiveFloat
     ema_beta: Probability = 0.99
+    grad_ema_beta: Probability = 0.99
+    grad_scale_min: PositiveFloat = 0.1
+    grad_scale_max: PositiveFloat = 10.0
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
     def validate_scale_bounds(self) -> Self:
         if self.scale_min > self.scale_max:
             raise ValueError("official-weak scale_min cannot exceed scale_max")
+        if self.grad_scale_min > self.grad_scale_max:
+            raise ValueError("official-weak grad_scale_min cannot exceed grad_scale_max")
+        if self.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF:
+            if self.experimental:
+                raise ValueError("formal ema_answer_ref requires experimental=false")
+        elif not self.experimental:
+            raise ValueError(
+                "instant_equal/legacy_sum require explicit official_weak_balance.experimental=true"
+            )
         return self
 
 
@@ -583,7 +596,10 @@ class OuterNonfinitePolicy(StrEnum):
 
 class OuterMaxGradNormConfig(FrozenModel):
     qwen: PositiveFloat
-    state: PositiveFloat
+    state_shared: PositiveFloat
+    state_task: PositiveFloat
+    state_router_time: PositiveFloat
+    state_retrieval: PositiveFloat
     w0: PositiveFloat
     predictor: PositiveFloat
 
@@ -1760,6 +1776,21 @@ class ProjectConfig(FrozenModel):
                 0.99,
             ),
             (
+                "loss.official_weak_balance.grad_ema_beta",
+                self.loss.official_weak_balance.grad_ema_beta,
+                0.99,
+            ),
+            (
+                "loss.official_weak_balance.grad_scale_min",
+                self.loss.official_weak_balance.grad_scale_min,
+                0.1,
+            ),
+            (
+                "loss.official_weak_balance.grad_scale_max",
+                self.loss.official_weak_balance.grad_scale_max,
+                10.0,
+            ),
+            (
                 "outer_gradient_control.mode",
                 self.outer_gradient_control.mode,
                 OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP,
@@ -1770,9 +1801,24 @@ class ProjectConfig(FrozenModel):
                 1.0,
             ),
             (
-                "outer_gradient_control.max_grad_norm.state",
-                self.outer_gradient_control.max_grad_norm.state,
-                0.1,
+                "outer_gradient_control.max_grad_norm.state_shared",
+                self.outer_gradient_control.max_grad_norm.state_shared,
+                0.05,
+            ),
+            (
+                "outer_gradient_control.max_grad_norm.state_task",
+                self.outer_gradient_control.max_grad_norm.state_task,
+                0.05,
+            ),
+            (
+                "outer_gradient_control.max_grad_norm.state_router_time",
+                self.outer_gradient_control.max_grad_norm.state_router_time,
+                0.05,
+            ),
+            (
+                "outer_gradient_control.max_grad_norm.state_retrieval",
+                self.outer_gradient_control.max_grad_norm.state_retrieval,
+                0.05,
             ),
             (
                 "outer_gradient_control.max_grad_norm.w0",

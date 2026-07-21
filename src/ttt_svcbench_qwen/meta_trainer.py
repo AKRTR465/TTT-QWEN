@@ -78,6 +78,7 @@ from ttt_svcbench_qwen.model import (
 from ttt_svcbench_qwen.observation_heads import ObservationOutputs
 from ttt_svcbench_qwen.outer_loss_balance import (
     OfficialWeakBalanceAudit,
+    OfficialWeakGradientAnchors,
     OfficialWeakOuterLossComposer,
 )
 from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput
@@ -762,6 +763,7 @@ class MetaQueryObjective:
     state: StateLossOutput | OfficialWeakStateLossOutput
     outer: OuterLossOutput
     metrics: QueryMetricSnapshot
+    gradient_anchors: OfficialWeakGradientAnchors
 
 
 @dataclass(frozen=True, slots=True)
@@ -1454,8 +1456,7 @@ class MetaTTTEpisodeRunner:
         query_runtime_snapshot = adapted.runtime
         balance_audit: OfficialWeakBalanceAudit | None = None
         if (
-            self.config.loss.official_weak_balance.mode
-            is not OfficialWeakBalanceMode.LEGACY_SUM
+            self.config.loss.official_weak_balance.mode is not OfficialWeakBalanceMode.LEGACY_SUM
             and (
                 all(query.supervision.official_weak for query in episode.query_points)
                 or bool(
@@ -1493,7 +1494,7 @@ class MetaTTTEpisodeRunner:
                 )
                 output = self._answer(query, observation, lifecycle, with_grad=False)
                 calibration.append(self._query_objective(query, output, ()))
-            self._balance_query_objectives(tuple(calibration))
+            self._balance_query_objectives(tuple(calibration), calibration=True)
             balance_audit = self.last_balance_audit
             calibration.clear()
             calibration_queries.clear()
@@ -1502,6 +1503,7 @@ class MetaTTTEpisodeRunner:
             auxiliary_scale * torch.stack(tuple(output.total for output in segment_outputs)).sum()
         )
         query_audits: list[TruncatedQueryPointAudit] = []
+        streamed_gradient_statistics: list[Tensor] = []
         prepared_queries: dict[tuple[int, str, str], PreparedQueryOutput] = {}
         query_loss_detached = final_segment_loss.detach().new_zeros(())
         query_count = len(episode.query_points)
@@ -1533,6 +1535,17 @@ class MetaTTTEpisodeRunner:
             immutable = observation_versions == _tensor_version_signature(observation)
             objective = self._query_objective(query, output, ())
             if balance_audit is not None:
+                if (
+                    self.config.loss.official_weak_balance.mode
+                    is OfficialWeakBalanceMode.EMA_ANSWER_REF
+                ):
+                    streamed_gradient_statistics.append(
+                        self.outer_composer.measure_streamed_gradients(
+                            cast(OfficialWeakStateLossOutput, objective.state),
+                            objective.gradient_anchors,
+                            balance_audit,
+                        )
+                    )
                 balanced_outer = self.outer_composer.compose_one_from_audit(
                     objective.answer,
                     cast(OfficialWeakStateLossOutput, objective.state),
@@ -1567,6 +1580,17 @@ class MetaTTTEpisodeRunner:
                 )
             )
             del backward_loss, normalized_query_loss, objective, output, observation
+
+        if (
+            balance_audit is not None
+            and self.config.loss.official_weak_balance.mode
+            is OfficialWeakBalanceMode.EMA_ANSWER_REF
+        ):
+            balance_audit = self.outer_composer.commit_streamed_gradients(
+                tuple(streamed_gradient_statistics),
+                balance_audit,
+            )
+            self.last_balance_audit = balance_audit
 
         adapted.runtime = query_runtime_snapshot
         active_segment = ()
@@ -1837,11 +1861,23 @@ class MetaTTTEpisodeRunner:
                     support_ttt=support,
                 )
             )
-        return MetaQueryObjective(answer, state, outer, _query_metrics(answer, state))
+        return MetaQueryObjective(
+            answer,
+            state,
+            outer,
+            _query_metrics(answer, state),
+            OfficialWeakGradientAnchors(
+                q_target=output.query.q_target,
+                q_operator=getattr(output.query, "q_operator", output.query.q_target),
+                q_time=getattr(output.query, "q_time", output.query.q_target),
+            ),
+        )
 
     def _balance_query_objectives(
         self,
         objectives: tuple[MetaQueryObjective, ...],
+        *,
+        calibration: bool = False,
     ) -> tuple[MetaQueryObjective, ...]:
         if not objectives:
             raise ValueError("Meta-TTT requires at least one Query objective")
@@ -1860,9 +1896,17 @@ class MetaTTTEpisodeRunner:
             self.last_balance_audit = None
             return objectives
         states = tuple(cast(OfficialWeakStateLossOutput, item.state) for item in objectives)
-        balanced = self.outer_composer.compose(
-            tuple(item.answer for item in objectives),
-            states,
+        balanced = (
+            self.outer_composer.calibrate(
+                tuple(item.answer for item in objectives),
+                states,
+            )
+            if calibration
+            else self.outer_composer.compose(
+                tuple(item.answer for item in objectives),
+                states,
+                gradient_anchors=tuple(item.gradient_anchors for item in objectives),
+            )
         )
         self.last_balance_audit = balanced.audit
         if balanced.audit is None:
