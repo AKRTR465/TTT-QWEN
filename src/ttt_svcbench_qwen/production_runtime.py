@@ -2281,8 +2281,8 @@ class ProductionA2LossStep:
                 * 0.0
             )
             total = total + graph_anchor
-        if total.ndim != 0 or not total.requires_grad or not bool(torch.isfinite(total).item()):
-            raise ValueError("A2 production loss must be one finite differentiable scalar")
+        if total.ndim != 0 or not total.requires_grad:
+            raise ValueError("A2 production loss must be one differentiable scalar")
         self.progress.emit(call_index, "loss_ready")
 
         def trace_backward_start(gradient: Tensor) -> Tensor:

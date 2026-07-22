@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import torch
+
 from ttt_svcbench_qwen.runtime_metrics import RuntimeMetricsWriter
 
 
@@ -17,7 +19,12 @@ def test_runtime_metrics_off_is_a_true_noop(tmp_path: Path) -> None:
 
 def test_runtime_metrics_buffers_process_local_jsonl(tmp_path: Path) -> None:
     writer = RuntimeMetricsWriter("cuda", tmp_path)
-    writer.emit("video_decode", seconds=0.25, record_id="r0")
+    writer.emit(
+        "video_decode",
+        seconds=torch.tensor(0.25),
+        record_id="r0",
+        nested=(torch.tensor(True),),
+    )
 
     assert not tuple(tmp_path.rglob("*.jsonl"))
     writer.flush()
@@ -28,3 +35,4 @@ def test_runtime_metrics_buffers_process_local_jsonl(tmp_path: Path) -> None:
     assert row["event"] == "video_decode"
     assert row["seconds"] == 0.25
     assert row["record_id"] == "r0"
+    assert row["nested"] == [True]

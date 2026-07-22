@@ -137,42 +137,44 @@ class StageASoftWriteOutput:
         )
         if not all(torch.is_floating_point(tensor) for tensor in float_values):
             raise TypeError("Stage A semantic values must be floating")
-        if reference.device.type != "meta":
-            for values, mask in (
-                (self.o1_semantics, self.o1_present_mask),
-                (self.o2_semantics, self.o2_present_mask),
-                (self.e1_semantics, self.e1_present_mask),
-                (self.e2_semantics, self.e2_present_mask),
-            ):
-                if not bool(torch.isfinite(values).all()):
-                    raise ValueError("Stage A soft semantics must be finite")
-                if bool(torch.any(values[~mask] != 0.0)):
-                    raise ValueError("invalid Stage A semantic sources must be zero")
-                valid = values[mask]
-                if valid.numel():
-                    norms = torch.linalg.vector_norm(valid.float(), dim=-1)
-                    norm_tolerance = max(
-                        5.0e-4,
-                        2.0 * float(torch.finfo(valid.dtype).eps),
-                    )
-                    if not torch.allclose(
-                        norms,
-                        torch.ones_like(norms),
-                        atol=norm_tolerance,
-                        rtol=0.0,
-                    ):
-                        raise ValueError("valid Stage A semantics must have unit norm")
-            source_masks = (
-                (self.o1_sources, self.o1_present_mask),
-                (self.o2_sources, self.o2_present_mask),
-                (self.e1_sources, self.e1_present_mask.any(dim=1)),
-                (self.e2_sources, self.e2_present_mask.any(dim=1)),
-            )
-            for source, mask in source_masks:
-                if not bool(torch.isfinite(source).all()):
-                    raise ValueError("Stage A retrieval sources must be finite")
-                if bool(torch.any(source[~mask] != 0.0)):
-                    raise ValueError("invalid Stage A retrieval sources must be zero")
+
+    def validate_commit_boundary(self) -> None:
+        """Run full-value checks once, immediately before hard Bank/FSM mutation."""
+
+        if self.o1_semantics.device.type == "meta":
+            return
+        for values, mask in (
+            (self.o1_semantics, self.o1_present_mask),
+            (self.o2_semantics, self.o2_present_mask),
+            (self.e1_semantics, self.e1_present_mask),
+            (self.e2_semantics, self.e2_present_mask),
+        ):
+            if not bool(torch.isfinite(values).all()):
+                raise ValueError("Stage A soft semantics must be finite")
+            if bool(torch.any(values[~mask] != 0.0)):
+                raise ValueError("invalid Stage A semantic sources must be zero")
+            valid = values[mask]
+            if valid.numel():
+                norms = torch.linalg.vector_norm(valid.float(), dim=-1)
+                norm_tolerance = max(5.0e-4, 2.0 * float(torch.finfo(valid.dtype).eps))
+                if not torch.allclose(
+                    norms,
+                    torch.ones_like(norms),
+                    atol=norm_tolerance,
+                    rtol=0.0,
+                ):
+                    raise ValueError("valid Stage A semantics must have unit norm")
+        source_masks = (
+            (self.o1_sources, self.o1_present_mask),
+            (self.o2_sources, self.o2_present_mask),
+            (self.e1_sources, self.e1_present_mask.any(dim=1)),
+            (self.e2_sources, self.e2_present_mask.any(dim=1)),
+        )
+        for source, mask in source_masks:
+            if not bool(torch.isfinite(source).all()):
+                raise ValueError("Stage A retrieval sources must be finite")
+            if bool(torch.any(source[~mask] != 0.0)):
+                raise ValueError("invalid Stage A retrieval sources must be zero")
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +287,7 @@ class StageABankWriter:
             raise ValueError("Stage A spatial output must return detached next_states")
 
         soft = self._project_soft(spatial, temporal, observations)
+        soft.validate_commit_boundary()
         next_banks = list(runtime.state_bank_states)
         next_identities = list(runtime.identity_bank_states)
         identity_decisions: list[tuple[IdentityObservationDecision, ...]] = [

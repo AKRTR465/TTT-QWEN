@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, cast
@@ -40,6 +41,8 @@ class OuterGradientAudit:
     skipped_update_count: int
     within_initial_audit_window: bool
     skipped_nonfinite: bool
+    skipped_nonfinite_loss: bool
+    nonfinite_loss_sources: tuple[str, ...]
     groups: tuple[GroupGradientAudit, ...]
 
     def metrics(self) -> tuple[tuple[str, float], ...]:
@@ -48,6 +51,7 @@ class OuterGradientAudit:
             ("outer_grad/successful_updates", float(self.successful_update_count)),
             ("outer_grad/skipped_updates", float(self.skipped_update_count)),
             ("outer_grad/nonfinite_skip", float(self.skipped_nonfinite)),
+            ("outer_grad/nonfinite_loss_skip", float(self.skipped_nonfinite_loss)),
             ("outer_grad/initial_audit_window", float(self.within_initial_audit_window)),
         ]
         for group in self.groups:
@@ -84,6 +88,23 @@ class OuterGradientController:
         self.successful_update_count = 0
         self.skipped_update_count = 0
         self.last_audit: OuterGradientAudit | None = None
+        self._loss_nonfinite: Tensor | None = None
+        self._loss_nonfinite_sources: dict[str, Tensor] = {}
+
+    def record_loss(self, loss: Tensor, source: str) -> None:
+        """Accumulate one device-side nonfinite flag until the next real update boundary."""
+
+        if loss.ndim != 0 or not loss.requires_grad:
+            raise ValueError(f"{source} loss must be one differentiable scalar Tensor")
+        flag = ~torch.isfinite(loss.detach())
+        if self._loss_nonfinite is None:
+            self._loss_nonfinite = flag
+        else:
+            self._loss_nonfinite = self._loss_nonfinite.to(flag.device) | flag
+        prior = self._loss_nonfinite_sources.get(source)
+        self._loss_nonfinite_sources[source] = (
+            flag if prior is None else prior.to(flag.device) | flag
+        )
 
     def apply_deepspeed(self, optimizer: object) -> OuterGradientAudit:
         """Scale DeepSpeed ZeRO-1/2 partition gradients immediately before engine.step()."""
@@ -124,6 +145,11 @@ class OuterGradientController:
             )
 
         self.attempted_update_count += 1
+        loss_nonfinite, local_loss_nonfinite = self._synchronize_loss_nonfinite(
+            zero, averaged
+        )
+        if loss_nonfinite:
+            self._inject_loss_overflow(averaged)
         group_nonfinite = tuple(
             self._distributed_nonfinite_count(
                 cast(list[Tensor], averaged[index]), self._process_group(zero, index)
@@ -139,7 +165,25 @@ class OuterGradientController:
                 self._nonfinite_group_audit(group, count)
                 for group, count in zip(groups, group_nonfinite, strict=True)
             )
-            return self._record(nonfinite_audits, skipped_nonfinite=True)
+            sources: tuple[str, ...] = ()
+            if loss_nonfinite:
+                sources = (
+                    self._materialize_loss_sources()
+                    if local_loss_nonfinite
+                    else ("remote_rank",)
+                )
+                warnings.warn(
+                    "nonfinite Outer loss detected; DeepSpeed overflow will skip the complete "
+                    f"optimizer/scheduler update ({', '.join(sources)})",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            return self._record(
+                nonfinite_audits,
+                skipped_nonfinite=True,
+                skipped_nonfinite_loss=loss_nonfinite,
+                nonfinite_loss_sources=sources,
+            )
 
         loss_scale = float(zero.loss_scale)
         if not math.isfinite(loss_scale) or loss_scale <= 0.0:
@@ -172,7 +216,12 @@ class OuterGradientController:
                 )
             )
         self.successful_update_count += 1
-        return self._record(tuple(group_audits), skipped_nonfinite=False)
+        return self._record(
+            tuple(group_audits),
+            skipped_nonfinite=False,
+            skipped_nonfinite_loss=False,
+            nonfinite_loss_sources=(),
+        )
 
     def _validate_param_groups(
         self, param_groups: list[dict[str, Any]]
@@ -200,7 +249,12 @@ class OuterGradientController:
         return max_norm / max(pre_norm, float(torch.finfo(torch.float32).tiny))
 
     def _record(
-        self, groups: tuple[GroupGradientAudit, ...], *, skipped_nonfinite: bool
+        self,
+        groups: tuple[GroupGradientAudit, ...],
+        *,
+        skipped_nonfinite: bool,
+        skipped_nonfinite_loss: bool,
+        nonfinite_loss_sources: tuple[str, ...],
     ) -> OuterGradientAudit:
         audit = OuterGradientAudit(
             attempted_update_count=self.attempted_update_count,
@@ -210,10 +264,64 @@ class OuterGradientController:
                 self.successful_update_count <= self.config.audit_steps
             ),
             skipped_nonfinite=skipped_nonfinite,
+            skipped_nonfinite_loss=skipped_nonfinite_loss,
+            nonfinite_loss_sources=nonfinite_loss_sources,
             groups=groups,
         )
         self.last_audit = audit
+        self._loss_nonfinite = None
+        self._loss_nonfinite_sources.clear()
         return audit
+
+    def _synchronize_loss_nonfinite(
+        self, zero: Any, averaged: object
+    ) -> tuple[bool, bool]:
+        device = self._collective_device(zero, averaged)
+        flag = torch.zeros((), dtype=torch.int64, device=device)
+        if self._loss_nonfinite is not None:
+            flag.copy_(self._loss_nonfinite.to(device=device, dtype=torch.int64))
+        local_nonfinite = bool(flag.item())
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                flag,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self._process_group(zero, 0),
+            )
+        return bool(flag.item()), local_nonfinite
+
+    def _materialize_loss_sources(self) -> tuple[str, ...]:
+        sources = tuple(
+            sorted(
+                source
+                for source, flag in self._loss_nonfinite_sources.items()
+                if bool(flag.item())
+            )
+        )
+        if not sources:
+            raise RuntimeError("local nonfinite loss flag had no owning source")
+        return sources
+
+    @staticmethod
+    def _collective_device(zero: Any, averaged: object) -> torch.device:
+        for gradients in cast(dict[int, list[Tensor]], averaged).values():
+            for gradient in gradients:
+                return gradient.device
+        for parameters in zero.params_in_partition:
+            for parameter in parameters:
+                if isinstance(parameter, Tensor):
+                    return parameter.device
+        raise RuntimeError("no ZeRO partition tensor is available for nonfinite synchronization")
+
+    @staticmethod
+    def _inject_loss_overflow(averaged: object) -> None:
+        for gradients in cast(dict[int, list[Tensor]], averaged).values():
+            for gradient in gradients:
+                if gradient.numel() > 0:
+                    gradient.reshape(-1)[0] = float("nan")
+                    return
+        raise RuntimeError(
+            "nonfinite loss was synchronized but no ZeRO averaged gradient was available"
+        )
 
     @staticmethod
     def _nonfinite_group_audit(
@@ -269,8 +377,27 @@ class OuterGradientController:
         return int(count.item()), float(maximum.item()) / loss_scale
 
 
+def sanitize_scalar_loss(
+    loss: Tensor,
+    *,
+    source: str,
+    controller: OuterGradientController,
+) -> Tensor:
+    """Keep the autograd/collective schedule while deferring skip ownership to DeepSpeed."""
+
+    if not isinstance(loss, Tensor) or loss.ndim != 0 or not loss.requires_grad:
+        raise ValueError(f"{source} loss must be one differentiable scalar Tensor")
+    controller.record_loss(loss, source)
+    return torch.where(
+        torch.isfinite(loss.detach()),
+        loss,
+        torch.nan_to_num(loss) * 0.0,
+    )
+
+
 __all__ = [
     "GroupGradientAudit",
     "OuterGradientAudit",
     "OuterGradientController",
+    "sanitize_scalar_loss",
 ]

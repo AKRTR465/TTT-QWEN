@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 from torch import Tensor
@@ -163,8 +165,9 @@ def test_ema_answer_reference_persists_and_missing_term_keeps_history() -> None:
     assert second.audit.gradient_ema_rms == pytest.approx((9.0, 9.0, 2.0, 9.0))
     assert second.audit.gradient_ema_update_counts == (2, 2, 1, 2)
     assert second.audit.terms[2].global_valid_count == 0
-    assert second.audit.terms[2].scale is None
-    assert second.audit.terms[2].raw_gradient_rms is None
+    assert torch.isnan(second.audit.terms[2].scale)
+    assert torch.isnan(second.audit.terms[2].raw_gradient_rms)
+    assert dict(second.audit.metrics())["loss/scale/retrieval"] is None
     assert second.audit.terms[0].loss_scale == pytest.approx(2.0)
 
     restored = OfficialWeakOuterLossComposer(config)
@@ -269,7 +272,8 @@ def test_formal_collectives_have_fixed_loss_then_streamed_gradient_lengths() -> 
 
     assert calls == [18, 8]
     assert tuple(term.global_valid_count for term in committed.terms) == (4, 4, 0, 4)
-    assert committed.terms[2].raw_gradient_rms is None
+    assert torch.isnan(committed.terms[2].raw_gradient_rms)
+    assert dict(committed.metrics())["grad_balance/raw_rms/retrieval"] is None
 
 
 def test_old_ema_checkpoint_cannot_silently_load_into_schema_six() -> None:
@@ -289,3 +293,9 @@ def test_old_ema_checkpoint_cannot_silently_load_into_schema_six() -> None:
 
     with pytest.raises(RuntimeError, match="Missing key"):
         composer.load_state_dict(old_state, strict=True)
+
+
+def test_compose_hot_path_has_no_host_item_control_flow() -> None:
+    source = inspect.getsource(OfficialWeakOuterLossComposer.compose)
+
+    assert ".item(" not in source

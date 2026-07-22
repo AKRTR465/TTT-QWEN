@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import Tensor
 
@@ -437,6 +438,13 @@ def test_stage_a_soft_write_masks_carried_slots_without_new_temporal_positions()
     assert torch.count_nonzero(soft.o2_semantics) == 0
     assert torch.count_nonzero(soft.o1_sources) == 0
     assert torch.count_nonzero(soft.o2_sources) == 0
+
+    nonfinite = replace(
+        soft,
+        o1_sources=torch.full_like(soft.o1_sources, float("nan")),
+    )
+    with pytest.raises(ValueError, match="retrieval sources must be finite"):
+        nonfinite.validate_commit_boundary()
 
 
 def test_o2_history_is_written_only_when_candidates_promote() -> None:

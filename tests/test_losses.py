@@ -744,13 +744,13 @@ def test_outer_auxiliary_mean_excludes_invalid_support_rows() -> None:
     assert torch.allclose(output.total, output.outer + 0.2)
 
 
-def test_loss_inputs_reject_nonfinite_values_and_entrypoint_is_not_a_skeleton() -> None:
-    with pytest.raises(ValueError, match="finite"):
-        AnswerLossInput(
-            logits=torch.tensor([[[0.0, float("nan")], [0.0, 0.0]]]),
-            labels=torch.tensor([[-100, 0]]),
-            number_token_mask=torch.zeros(1, 2, dtype=torch.bool),
-        )
+def test_loss_inputs_defer_nonfinite_ownership_and_entrypoint_is_not_a_skeleton() -> None:
+    inputs = AnswerLossInput(
+        logits=torch.tensor([[[0.0, float("nan")], [0.0, 0.0]]]),
+        labels=torch.tensor([[-100, 0]]),
+        number_token_mask=torch.zeros(1, 2, dtype=torch.bool),
+    )
+    assert not torch.isfinite(compute_answer_loss(inputs).loss.value)
     with pytest.raises(ValueError, match="TrainingLossInput"):
         compute_losses()
 

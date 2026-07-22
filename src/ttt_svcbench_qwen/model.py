@@ -52,6 +52,7 @@ from ttt_svcbench_qwen.state_encoder import (
 )
 from ttt_svcbench_qwen.state_reader import ReaderResult, StateResamplerOutput
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
+from ttt_svcbench_qwen.tensor_contracts import validate_finite_tensor_tree
 
 
 class LifecycleError(RuntimeError):
@@ -1032,6 +1033,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             raise LifecycleError("soft observation must commit with its exact originating request")
         lifecycle._begin("observe", request.owner)
         try:
+            validate_finite_tensor_tree(soft, "soft observation commit")
             soft.commit_guard.claim(request.owner)
             runtime_state = request.runtime_state
             bank_states = request.bank_states

@@ -45,7 +45,10 @@ from ttt_svcbench_qwen.meta_trainer import (
     MetaTTTEpisodeRunner,
     TruncatedMetaTTTEpisodeOutput,
 )
-from ttt_svcbench_qwen.outer_gradient_control import OuterGradientController
+from ttt_svcbench_qwen.outer_gradient_control import (
+    OuterGradientController,
+    sanitize_scalar_loss,
+)
 from ttt_svcbench_qwen.outer_loss_balance import OfficialWeakOuterLossComposer
 from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
@@ -160,6 +163,14 @@ class SegmentBackwardController:
             stage="a5_segment",
             segment_index=self.backward_count,
         ):
+            if isinstance(self.gradient_controller, OuterGradientController):
+                loss = sanitize_scalar_loss(
+                    loss,
+                    source=f"A5 backward {self.backward_count}",
+                    controller=self.gradient_controller,
+                )
+            elif loss.ndim != 0 or not loss.requires_grad:
+                raise ValueError("A5 segment loss must be one differentiable scalar Tensor")
             if self.is_deepspeed:
                 engine = cast(Any, self.engine)
                 is_final_segment = self.backward_count + 1 == self.expected_count
@@ -428,8 +439,14 @@ class TTTQwenTrainerMixin:
         if self.ttt_runtime.stage is ProductionStage.A2:
             step = cast(StageALossStep, self.ttt_runtime.stage_a_loss_step)
             loss = step(model, inputs)
-            _validate_scalar_loss(loss, "A2 state+answer")
-            return loss
+            controller = self.ttt_runtime.gradient_controller
+            if not isinstance(controller, OuterGradientController):
+                raise RuntimeError("formal A2 requires an Outer gradient controller")
+            return sanitize_scalar_loss(
+                loss,
+                source="A2 state+answer",
+                controller=controller,
+            )
         return cast(Tensor, super().compute_loss(model, inputs, *args, **kwargs))  # type: ignore[misc]
 
     def training_step(
@@ -1013,13 +1030,6 @@ def _validate_checkpoint_tree(checkpoint: Path) -> None:
         raise RuntimeError("final checkpoint is missing trainer_state.json")
     if not resume_state.is_dir() or not any(resume_state.iterdir()):
         raise RuntimeError("final checkpoint is missing complete Accelerate resume state")
-
-
-def _validate_scalar_loss(loss: Tensor, name: str) -> None:
-    if not isinstance(loss, Tensor) or loss.ndim != 0 or not loss.requires_grad:
-        raise ValueError(f"{name} loss must be one differentiable scalar Tensor")
-    if not bool(torch.isfinite(loss.detach()).item()):
-        raise ValueError(f"{name} loss must be finite")
 
 
 def resolve_same_stage_resume(

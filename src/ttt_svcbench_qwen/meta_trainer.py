@@ -1274,7 +1274,6 @@ class MetaTTTEpisodeRunner:
                 objective = replace(
                     objective,
                     outer=balanced_outer,
-                    metrics=_with_balance_metrics(objective.metrics, balance_audit),
                 )
             normalized_query_loss = objective.outer.outer / float(query_count)
             query_loss_detached = query_loss_detached + normalized_query_loss.detach()
@@ -1585,7 +1584,6 @@ class MetaTTTEpisodeRunner:
                 replace(
                     objective,
                     outer=balanced_outer,
-                    metrics=_with_balance_metrics(objective.metrics, balanced.audit),
                 )
             )
         return tuple(outputs)
@@ -1735,15 +1733,6 @@ def _query_metrics(
             ("state/e2", _term_float(state.e2)),
         )
     return QueryMetricSnapshot(metrics=(*common, *state_metrics))
-
-
-def _with_balance_metrics(
-    snapshot: QueryMetricSnapshot,
-    audit: OfficialWeakBalanceAudit,
-) -> QueryMetricSnapshot:
-    merged = dict(snapshot.metrics)
-    merged.update(audit.metrics())
-    return QueryMetricSnapshot(metrics=tuple(merged.items()))
 
 
 def _weak_term_float(term: object) -> float | None:

@@ -28,6 +28,7 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     make_production_outer_optimizer_factory,
     resolve_same_stage_resume,
 )
+from ttt_svcbench_qwen.outer_gradient_control import OuterGradientController
 from ttt_svcbench_qwen.outer_loss_balance import OfficialWeakOuterLossComposer
 from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
@@ -1132,6 +1133,36 @@ def test_a2_controlled_wrapper_clips_only_at_the_final_ga_boundary() -> None:
     ]
 
 
+def test_a2_compute_loss_sanitizes_middle_ga_microbatch_without_dropping_backward() -> None:
+    parameter = nn.Parameter(torch.tensor(1.0))
+    factors = iter((1.0, float("nan"), 2.0))
+
+    class _Step:
+        def __call__(self, _model: nn.Module, _inputs: object) -> torch.Tensor:
+            return parameter * next(factors)
+
+    gradient_controller = OuterGradientController(
+        load_config().outer_gradient_control,
+        expected_groups=("qwen",),
+    )
+    owner = SimpleNamespace(
+        ttt_runtime=SimpleNamespace(
+            stage=ProductionStage.A2,
+            stage_a_loss_step=_Step(),
+            gradient_controller=gradient_controller,
+        )
+    )
+    backward_count = 0
+    for _ in range(3):
+        loss = TTTQwenTrainerMixin.compute_loss(owner, nn.Linear(1, 1), {})
+        assert torch.isfinite(loss)
+        loss.backward()
+        backward_count += 1
+
+    assert backward_count == 3
+    assert parameter.grad is not None
+
+
 def test_a5_segment_controller_clips_after_all_backward_calls_before_step() -> None:
     events: list[str] = []
 
@@ -1166,8 +1197,8 @@ def test_a5_segment_controller_clips_after_all_backward_calls_before_step() -> N
         gradient_controller=_GradientController(),  # type: ignore[arg-type]
     )
 
-    controller.backward(torch.tensor(1.0))
-    controller.backward(torch.tensor(2.0))
+    controller.backward(torch.tensor(1.0, requires_grad=True))
+    controller.backward(torch.tensor(2.0, requires_grad=True))
     controller.finalize()
 
     assert events == [
@@ -1178,6 +1209,93 @@ def test_a5_segment_controller_clips_after_all_backward_calls_before_step() -> N
         "clip",
         "step",
     ]
+
+
+def test_a5_nonfinite_segment_preserves_backward_parity_and_skips_episode_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ttt_svcbench_qwen.outer_gradient_control.version", lambda _name: "0.18.8")
+    parameter = nn.Parameter(torch.tensor(1.0))
+    parameter.grad = torch.zeros_like(parameter)
+    optimizer = torch.optim.SGD(
+        [{"params": [parameter], "lr": 1.0e-4, "group_name": "predictor"}]
+    )
+
+    class _Zero:
+        def __init__(self) -> None:
+            self.optimizer = optimizer
+            self.averaged_gradients = {0: [parameter.grad]}
+            self.params_in_partition = [[parameter]]
+            self.real_dp_process_group = [None]
+            self.loss_scale = 1.0
+            self.partition_gradients = True
+            self.clip_grad = 0.0
+
+        @staticmethod
+        def get_grad_norm_direct(
+            gradients: list[torch.Tensor], _params: object
+        ) -> torch.Tensor:
+            return torch.stack(
+                [gradient.double().square().sum() for gradient in gradients]
+            ).sum().sqrt()
+
+        def has_overflow(self, *, partition_gradients: bool) -> bool:
+            assert partition_gradients
+            return not bool(torch.isfinite(parameter.grad).all())
+
+    zero = _Zero()
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.optimizer = zero
+            self.boundaries: list[bool] = []
+            self.backward_calls = 0
+            self.step_calls = 0
+            self.scheduler_steps = 0
+
+        def set_gradient_accumulation_boundary(self, *, is_boundary: bool) -> None:
+            self.boundaries.append(is_boundary)
+
+        def backward(self, loss: torch.Tensor, **kwargs: object) -> None:
+            loss.backward(**kwargs)
+            self.backward_calls += 1
+
+        def step(self) -> None:
+            self.step_calls += 1
+            if not zero.has_overflow(partition_gradients=True):
+                optimizer.step()
+                self.scheduler_steps += 1
+
+    engine = _Engine()
+    gradient_controller = OuterGradientController(
+        load_config().outer_gradient_control,
+        expected_groups=("predictor",),
+    )
+    controller = SegmentBackwardController(
+        SimpleNamespace(
+            distributed_type="DistributedType.DEEPSPEED",
+            deepspeed_engine_wrapped=SimpleNamespace(engine=engine),
+        ),
+        nn.Linear(1, 1),
+        expected_count=3,
+        gradient_controller=gradient_controller,
+    )
+    before = parameter.detach().clone()
+
+    controller.backward(parameter * 1.0)
+    controller.backward(parameter * float("nan"))
+    controller.backward(parameter * 2.0)
+    with pytest.warns(RuntimeWarning, match="A5 backward 1"):
+        controller.finalize()
+
+    assert engine.boundaries == [False, False, True]
+    assert engine.backward_calls == 3
+    assert engine.step_calls == 1
+    assert engine.scheduler_steps == 0
+    assert torch.equal(parameter.detach(), before)
+    assert gradient_controller.last_audit is not None
+    assert gradient_controller.last_audit.skipped_update_count == 1
+    assert gradient_controller.last_audit.nonfinite_loss_sources == ("A5 backward 1",)
 
 
 def test_atomic_final_checkpoint_validation_requires_model_and_resume_state(

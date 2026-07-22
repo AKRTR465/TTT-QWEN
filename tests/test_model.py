@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -422,6 +422,28 @@ def test_soft_observation_recompute_boundary_cannot_duplicate_hard_commit(
     with pytest.raises(LifecycleError, match="already committed"):
         model.commit_observation(request, soft, lifecycle)
     assert suite.events.count("bank") == 1
+
+
+def test_soft_observation_nonfinite_fails_before_hard_commit(
+    config: ProjectConfig,
+) -> None:
+    suite = make_suite()
+    model = build_model(config, components=make_components(suite))
+    owner = make_owner()
+    lifecycle = PrefillLifecycle(owner)
+    request = make_observation_request(owner)
+    soft = model.observe_chunk_soft(request)
+    poisoned = replace(
+        soft,
+        visual=VisualStageOutput(torch.tensor(float("nan")), "poisoned"),
+    )
+
+    with pytest.raises(ValueError, match="soft observation commit contains a nonfinite"):
+        model.commit_observation(request, poisoned, lifecycle)
+
+    assert "bank" not in suite.events
+    assert not soft.commit_guard.committed
+    assert lifecycle.phase is LifecyclePhase.FAILED
 
 
 def test_answer_query_audits_same_retrieval_before_resampler_and_native_prefill(
