@@ -62,6 +62,5 @@ exec "$PYTHON" scripts/build_visual_cost_index.py \
   --answer-query-visual-mode causal_prefix \
   --answer-query-max-frames 256 \
   --query-sample-fps 2.0 \
-  --query-decode-strategy grouped_seek \
   --query-decode-max-groups 16 \
   --video-root "$VIDEO_ROOT"

@@ -149,11 +149,11 @@ if not torch.cuda.is_available():
 PY
 
 if [[ "$STAGE" == "a2" ]]; then
-  TASK_NAME="a2_full8b_4h200"
-  CONFIG="${YAML:-configs/h200/a2_qwen3vl8b_full_4gpu.yaml}"
+  TASK_NAME="a2_fullprefix256_8b_4h200"
+  CONFIG="${YAML:-configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml}"
 else
-  TASK_NAME="a5_k8_full8b_4h200"
-  CONFIG="${YAML:-configs/h200/a5_meta_ttt_k8_4gpu.yaml}"
+  TASK_NAME="a5_k8_fullprefix256_8b_4h200"
+  CONFIG="${YAML:-configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml}"
 fi
 if [[ "${TTT_PREFLIGHT_ONLY:-0}" == "1" ]]; then
   TASK_NAME="${TASK_NAME}_preflight"

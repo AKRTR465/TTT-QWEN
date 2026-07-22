@@ -41,9 +41,9 @@ from ttt_svcbench_qwen.production_factory import (
     load_training_yaml,
 )
 from ttt_svcbench_qwen.production_runtime import (
-    CurrentChunkSpec,
     ProductionOuterModel,
     QueryObservationSpec,
+    SupportChunkSpec,
     _decode_query_targets_grouped,
     _decode_targets_with_seek,
     _decode_uniform_interval,
@@ -187,7 +187,7 @@ def test_same_stage_resume_rejects_old_balance_schema(tmp_path: Path) -> None:
     _validate_resume_balance_schema(checkpoint)
 
 
-def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
+def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = Path(__file__).parents[1]
@@ -196,13 +196,16 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
     monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
     monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
     monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
+    monkeypatch.setenv("VISUAL_COST_INDEX", "/tmp/visual_cost_index.json")
 
-    native, extension = load_training_yaml(root / "configs/h200/a2_qwen3vl8b_full_4gpu.yaml")
+    native, extension = load_training_yaml(
+        root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml"
+    )
 
     assert native["num_train_epochs"] == 4.0
-    assert native["save_strategy"] == "no"
+    assert native["save_strategy"] == "epoch"
     assert "save_steps" not in native
-    assert "save_total_limit" not in native
+    assert native["save_total_limit"] == 1
     assert native["save_only_model"] is False
     assert native["video_max_pixels"] == 131_072
     assert extension.stage == "a2"
@@ -210,6 +213,7 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
         "stage",
         "project_config",
         "dataset_manifest",
+        "visual_cost_index",
         "support_prefetch_depth",
         "support_decode_coalesce",
         "support_materialization",
@@ -222,9 +226,7 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
         "state_query_max_frames",
         "answer_query_visual_mode",
         "answer_query_max_frames",
-        "query_decode_strategy",
         "query_decode_max_groups",
-        "query_cache_mode",
         "state_query_cache_mode",
         "answer_query_cache_mode",
         "query_activation_offload",
@@ -269,9 +271,7 @@ def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
     assert extension.state_query_max_frames == 16
     assert extension.answer_query_visual_mode == "causal_prefix"
     assert extension.answer_query_max_frames == 256
-    assert extension.query_decode_strategy == "grouped_seek"
     assert extension.query_decode_max_groups == 16
-    assert extension.query_cache_mode == "inherit"
     assert extension.state_query_cache_mode == "inherit"
     assert extension.answer_query_cache_mode == "disabled"
     assert extension.cached_query_roles == frozenset(("state_query",))
@@ -308,7 +308,6 @@ def test_semantic_repair_train_split_recipe_saves_only_epochs_two_and_four(
     assert extension.state_query_max_frames == 16
     assert extension.answer_query_visual_mode == "causal_prefix"
     assert extension.answer_query_max_frames == 256
-    assert extension.query_cache_mode == "inherit"
     assert extension.state_query_cache_mode == "inherit"
     assert extension.answer_query_cache_mode == "disabled"
     assert extension.query_cache_enabled("state_query")
@@ -323,10 +322,13 @@ def test_dual_query_visual_config_is_required_and_legacy_is_rejected() -> None:
         "dataset_manifest": "manifest.json",
         "support_prefetch_depth": 2,
         "support_decode_coalesce": True,
+        "support_materialization": "dataloader_episode",
         "state_query_visual_mode": "recent_chunk",
         "state_query_max_frames": 16,
         "answer_query_visual_mode": "causal_prefix",
         "answer_query_max_frames": 256,
+        "state_query_cache_mode": "inherit",
+        "answer_query_cache_mode": "disabled",
         "preprocess_cache_mode": "read_write",
         "preprocess_cache_miss_policy": "decode",
         "preprocess_cache_root_env": "TTT_PREPROCESS_CACHE_ROOT",
@@ -346,6 +348,12 @@ def test_dual_query_visual_config_is_required_and_legacy_is_rejected() -> None:
             query_visual_mode="causal_prefix",
             query_max_frames=256,
         )
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        ProductionTTTConfig(**fields, query_cache_mode="inherit")
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        ProductionTTTConfig(**fields, query_decode_strategy="legacy_seek")
+    with pytest.raises(ValueError, match="support_materialization"):
+        ProductionTTTConfig(**{**fields, "support_materialization": "trainer_prefetch"})
 
 
 def test_split_query_specs_bound_state_to_16_and_answer_to_256(tmp_path: Path) -> None:
@@ -357,10 +365,13 @@ def test_split_query_specs_bound_state_to_16_and_answer_to_256(tmp_path: Path) -
         dataset_manifest="manifest.json",
         support_prefetch_depth=2,
         support_decode_coalesce=True,
+        support_materialization="dataloader_episode",
         state_query_visual_mode="recent_chunk",
         state_query_max_frames=16,
         answer_query_visual_mode="causal_prefix",
         answer_query_max_frames=256,
+        state_query_cache_mode="inherit",
+        answer_query_cache_mode="disabled",
         preprocess_cache_mode="read_write",
         preprocess_cache_miss_policy="decode",
         preprocess_cache_root_env="TTT_PREPROCESS_CACHE_ROOT",
@@ -550,14 +561,12 @@ def test_a2_runtime_cost_observation_includes_collate_preparation(
     ]
 
 
-def test_a2_uses_dynamic_graph_safe_zero1_profile() -> None:
+def test_a2_fullprefix_uses_dynamic_graph_safe_zero1_profile() -> None:
     root = Path(__file__).parents[1]
-    for yaml_name in (
-        "a2_qwen3vl8b_full_4gpu.yaml",
-        "a2_qwen3vl8b_full_4gpu_120g.yaml",
-    ):
-        text = (root / "configs/h200" / yaml_name).read_text(encoding="utf-8")
-        assert "deepspeed: configs/h200/deepspeed_zero1_dynamic_graph.json" in text
+    text = (root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "deepspeed: configs/h200/deepspeed_zero1_dynamic_graph.json" in text
 
     profile = json.loads(
         (root / "configs/h200/deepspeed_zero1_dynamic_graph.json").read_text(encoding="utf-8")
@@ -571,10 +580,22 @@ def test_a2_uses_dynamic_graph_safe_zero1_profile() -> None:
     assert profile["gradient_clipping"] == 0.0
 
 
-def test_h200_a2_entry_defaults_to_bounded_dynamic_visual_tokens() -> None:
+def test_h200_entries_default_to_fullprefix256_profiles() -> None:
     root = Path(__file__).parents[1]
-    launcher = (root / "scripts/h200/train_a2_a5.sh").read_text(encoding="utf-8")
-    assert 'YAML="${YAML:-$PROJECT_ROOT/configs/h200/a2_qwen3vl8b_full_4gpu.yaml}"' in launcher
+    train = (root / "scripts/h200/train_a2_a5.sh").read_text(encoding="utf-8")
+    launch = (root / "scripts/h200/launch_4gpu.sh").read_text(encoding="utf-8")
+    for text in (train, launch):
+        assert "a2_qwen3vl8b_fullprefix256_4gpu.yaml" in text
+        assert "a5_meta_ttt_k8_fullprefix256_4gpu.yaml" in text
+    for removed in (
+        "configs/h200/a2_qwen3vl8b_full_4gpu.yaml",
+        "configs/h200/a2_qwen3vl8b_full_4gpu_120g.yaml",
+        "configs/h200/a5_meta_ttt_k8_4gpu.yaml",
+        "scripts/h200/launch_qwen3vl8b_ttt_a2_full4.sh",
+        "scripts/h200/launch_qwen3vl8b_ttt_a5_k8_full4.sh",
+        "scripts/h200/train_a2_allsvcbench_4epoch.sh",
+    ):
+        assert not (root / removed).exists()
 
 
 def test_production_video_pixel_bounds_use_model_arguments_and_keep_tokens_dynamic() -> None:
@@ -639,7 +660,7 @@ def test_long_interval_decoder_seeks_targets_without_retaining_all_frames(
                 yield _Frame(index)
 
     monkeypatch.setattr("ttt_svcbench_qwen.production_runtime.av.open", lambda _path: _Container())
-    spec = CurrentChunkSpec(
+    spec = SupportChunkSpec(
         chunk_id="long-support",
         video_path=path,
         start_time=0.0,
@@ -680,7 +701,7 @@ def test_query_prefix_allows_256_frames_without_relaxing_support_limit(
     assert targets[-1] == 663.0
     assert all(value <= query.query_time for value in targets)
     with pytest.raises(ValueError, match="Support chunks permit"):
-        CurrentChunkSpec("support", path, 0.0, 8.0, 256, 8.0)
+        SupportChunkSpec("support", path, 0.0, 8.0, 256, 8.0)
 
 
 def test_query_uniform_indices_match_llamafactory_523f801_reference() -> None:
@@ -747,7 +768,6 @@ def test_grouped_query_decode_matches_legacy_frames_with_at_most_sixteen_seeks(
         maximum_frames=256,
         query_time=663.0,
         sampling_fps=2.0,
-        decode_strategy="grouped_seek",
         decode_max_groups=16,
     )
     targets = _uniform_target_times(query, query.sampling_fps)
@@ -782,7 +802,6 @@ def test_grouped_query_decode_falls_back_to_one_streaming_pass(
         32.0,
         64,
         32.0,
-        decode_strategy="grouped_seek",
     )
     calls: list[str] = []
     targets = [float(index) * 32.0 / 63.0 for index in range(64)]
@@ -824,7 +843,7 @@ def test_short_interval_decoder_streams_once_instead_of_seeking_every_target(
     calls: list[str] = []
 
     def decode(name: str):
-        def inner(_spec: CurrentChunkSpec, targets: list[float]):
+        def inner(_spec: SupportChunkSpec, targets: list[float]):
             calls.append(name)
             frames = [torch.zeros((3, 2, 3), dtype=torch.uint8) for _ in targets]
             return frames, list(targets)
@@ -839,8 +858,8 @@ def test_short_interval_decoder_streams_once_instead_of_seeking_every_target(
         "ttt_svcbench_qwen.production_runtime._decode_targets_with_seek",
         decode("seek"),
     )
-    short = CurrentChunkSpec("short", path, 10.0, 18.0, 16, 20.0)
-    long = CurrentChunkSpec("long", path, 10.0, 42.0, 8, 50.0)
+    short = SupportChunkSpec("short", path, 10.0, 18.0, 16, 20.0)
+    long = SupportChunkSpec("long", path, 10.0, 42.0, 8, 50.0)
 
     short_frames, _ = _decode_uniform_interval(short, sample_fps=2.0)
     long_frames, _ = _decode_uniform_interval(long, sample_fps=2.0)
@@ -885,7 +904,9 @@ def test_training_yaml_expands_required_environment_and_keeps_a5_fresh(
     monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
     monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
 
-    native, extension = load_training_yaml(root / "configs/h200/a5_meta_ttt_k8_4gpu.yaml")
+    native, extension = load_training_yaml(
+        root / "configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml"
+    )
 
     assert native["resume_from_checkpoint"] is None
     assert native["output_dir"] == "/tmp/output"
@@ -894,7 +915,7 @@ def test_training_yaml_expands_required_environment_and_keeps_a5_fresh(
 
     monkeypatch.delenv("A2_CHECKPOINT")
     with pytest.raises(ValueError, match="unresolved environment variables"):
-        load_training_yaml(root / "configs/h200/a5_meta_ttt_k8_4gpu.yaml")
+        load_training_yaml(root / "configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml")
 
 
 def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoint(
@@ -906,10 +927,13 @@ def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoi
         "dataset_manifest": "manifest.json",
         "support_prefetch_depth": 2,
         "support_decode_coalesce": True,
+        "support_materialization": "dataloader_episode",
         "state_query_visual_mode": "recent_chunk",
         "state_query_max_frames": 16,
         "answer_query_visual_mode": "causal_prefix",
         "answer_query_max_frames": 256,
+        "state_query_cache_mode": "inherit",
+        "answer_query_cache_mode": "disabled",
         "preprocess_cache_mode": "read_write",
         "preprocess_cache_miss_policy": "decode",
         "preprocess_cache_root_env": "TTT_PREPROCESS_CACHE_ROOT",
@@ -1291,10 +1315,14 @@ def test_central_outer_optimizer_has_exact_stage_groups(
             initialize_from_a2_checkpoint="a2-final",
             support_prefetch_depth=2,
             support_decode_coalesce=True,
+            support_materialization="segment_double_buffer",
+            segment_prefetch_depth=1,
             state_query_visual_mode="recent_chunk",
             state_query_max_frames=16,
             answer_query_visual_mode="causal_prefix",
             answer_query_max_frames=256,
+            state_query_cache_mode="inherit",
+            answer_query_cache_mode="disabled",
             preprocess_cache_mode="read_write",
             preprocess_cache_miss_policy="decode",
             preprocess_cache_root_env="TTT_PREPROCESS_CACHE_ROOT",

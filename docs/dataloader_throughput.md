@@ -9,11 +9,11 @@ supported.
 
 ## Full-prefix A2 path
 
-The formal dual-Query profiles use `query_cache_mode: inherit`. State Query and Answer Query have
-different persistent preprocessing keys (`recent_chunk/16` and `causal_prefix/256`), so neither
-can reuse the other's pixels or a legacy single-Query entry. Query target times still come from
-the LLaMA-Factory uniform sampler; a cache miss uses `grouped_seek` with at most 16 forward decode
-groups and falls back to one sequential scan for non-seekable media. The cache contains CPU input
+The formal dual-Query profiles require explicit role policies:
+`state_query_cache_mode: inherit` and `answer_query_cache_mode: disabled`. Their preprocessing keys
+remain distinct (`recent_chunk/16` and `causal_prefix/256`). Query target times come from the
+LLaMA-Factory uniform sampler; cache misses always use `grouped_seek` with at most 16 forward decode
+groups and fall back to one sequential scan for non-seekable media. The cache contains CPU input
 tensors only: State and Answer still execute independent ViT/Merger/DeepStack forwards. A2
 consumes the GA=4 sequence lazily, and A5 continues to use the upstream Trainer path.
 

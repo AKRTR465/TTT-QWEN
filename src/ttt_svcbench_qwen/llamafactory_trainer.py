@@ -665,7 +665,7 @@ def main(argv: list[str] | None = None) -> int:
                 if torch.cuda.is_available()
                 else "cpu"
             ),
-            query_decode_strategy=backbone.ttt_config.query_decode_strategy,
+            query_decode_strategy="grouped_seek",
             query_decode_max_groups=backbone.ttt_config.query_decode_max_groups,
             state_query_visual_mode=backbone.ttt_config.state_query_visual_mode,
             state_query_max_frames=backbone.ttt_config.state_query_max_frames,

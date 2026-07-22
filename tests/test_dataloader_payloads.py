@@ -9,9 +9,9 @@ import torch
 
 from ttt_svcbench_qwen.production_runtime import (
     CurrentChunkMaterialization,
-    CurrentChunkSpec,
     PreparedVisualCPU,
     QueryObservationSpec,
+    SupportChunkSpec,
     VideoChunkMaterializer,
     _compact_materialized_chunk,
     _decode_coalesced_intervals,
@@ -19,11 +19,11 @@ from ttt_svcbench_qwen.production_runtime import (
 )
 
 
-def _specs(tmp_path: Path, count: int = 4) -> tuple[CurrentChunkSpec, ...]:
+def _specs(tmp_path: Path, count: int = 4) -> tuple[SupportChunkSpec, ...]:
     path = tmp_path / "clip.mp4"
     path.touch()
     return tuple(
-        CurrentChunkSpec(
+        SupportChunkSpec(
             chunk_id=f"chunk-{index}",
             video_path=path,
             start_time=float(index),
@@ -68,7 +68,7 @@ def test_bounded_prefetch_preserves_order_and_depth(tmp_path: Path) -> None:
     materializer._remaining_specs = deque()
     calls: list[str] = []
 
-    def fake_materialize(spec: CurrentChunkSpec) -> CurrentChunkSpec:
+    def fake_materialize(spec: SupportChunkSpec) -> SupportChunkSpec:
         calls.append(spec.chunk_id)
         return spec
 
@@ -159,7 +159,7 @@ def test_coalesced_decode_matches_individual_decode(tmp_path: Path) -> None:
         for packet in stream.encode():
             container.mux(packet)
     specs = tuple(
-        CurrentChunkSpec(
+        SupportChunkSpec(
             f"c{index}", path, float(index), float(index + 2), 8, 20.0
         )
         for index in range(3)

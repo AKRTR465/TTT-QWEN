@@ -6,8 +6,6 @@ usage() {
 usage:
   bash scripts/h200/train_a2_a5.sh a2 [dataset_manifest.json]
   bash scripts/h200/train_a2_a5.sh a5 <a2_final_checkpoint> [dataset_manifest.json]
-  bash scripts/h200/launch_qwen3vl8b_ttt_a2_full4.sh [dataset_manifest.json]
-  bash scripts/h200/launch_qwen3vl8b_ttt_a5_k8_full4.sh <a2_final_checkpoint> [dataset_manifest.json]
 
 If dataset_manifest.json is omitted, the script builds the fixed fold0/K=8 manifest from the
 existing H200 SVCBench conversion. Environment overrides: TTT_PROJECT_ROOT,
@@ -94,14 +92,11 @@ else
 fi
 
 if [[ "$STAGE" == "a2" ]]; then
-  TASK_NAME="qwen3vl8b_ttt_a2_full4"
-  # Keep the default long-run profile below the observed 136 GB/card ZeRO-1
-  # high-pixel peak. Visual tokens remain dynamic within each current chunk;
-  # callers may explicitly select the 120g profile through YAML=... for stress tests.
-  YAML="${YAML:-$PROJECT_ROOT/configs/h200/a2_qwen3vl8b_full_4gpu.yaml}"
+  TASK_NAME="qwen3vl8b_ttt_a2_fullprefix256_4h200"
+  YAML="${YAML:-$PROJECT_ROOT/configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml}"
 else
-  TASK_NAME="qwen3vl8b_ttt_a5_k8_full4"
-  YAML="${YAML:-$PROJECT_ROOT/configs/h200/a5_meta_ttt_k8_4gpu.yaml}"
+  TASK_NAME="qwen3vl8b_ttt_a5_k8_fullprefix256_4h200"
+  YAML="${YAML:-$PROJECT_ROOT/configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml}"
 fi
 RUN_ID="${RUN_ID:-$(date +%y%m%d_%H%M%S)_${TASK_NAME}}"
 SESSION="${SESSION:-${TASK_NAME}_${RUN_ID}}"

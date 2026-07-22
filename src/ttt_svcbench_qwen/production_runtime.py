@@ -239,7 +239,6 @@ class QueryObservationSpec:
     history_chunk_ids: tuple[str, ...] = ()
     sampling_fps: float = 2.0
     sampling_policy: str = "llamafactory_uniform_cap"
-    decode_strategy: str = "legacy_seek"
     decode_max_groups: int = 16
     query_role: Literal["query", "state_query", "answer_query"] = "query"
 
@@ -261,8 +260,6 @@ class QueryObservationSpec:
             raise ValueError("Query sampling_fps must be finite and positive")
         if self.sampling_policy != "llamafactory_uniform_cap":
             raise ValueError("unsupported Query frame sampling policy")
-        if self.decode_strategy not in {"legacy_seek", "grouped_seek"}:
-            raise ValueError("unsupported Query decode strategy")
         if self.decode_max_groups < 1 or self.decode_max_groups > 16:
             raise ValueError("Query decode_max_groups must be within [1, 16]")
         if self.history_chunk_ids:
@@ -283,8 +280,6 @@ class QueryObservationSpec:
         return self.sampling_policy
 
 
-# Compatibility surface for existing Support-only callers and ablation tests.
-CurrentChunkSpec = SupportChunkSpec
 ObservationSpec = SupportChunkSpec | QueryObservationSpec
 
 
@@ -1001,7 +996,7 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
             raise ValueError("support visual batch_size must be a positive integer")
         chunks: list[CurrentChunkMaterialization | PreparedVisualCPU] = []
         for value in values:
-            if isinstance(value, CurrentChunkSpec):
+            if isinstance(value, SupportChunkSpec):
                 chunks.append(self.materializer(value))
             elif isinstance(value, (CurrentChunkMaterialization, PreparedVisualCPU)):
                 chunks.append(value)
@@ -1069,7 +1064,7 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
         materialized: list[CurrentChunkMaterialization] = []
         for chunk in chunks:
             value = chunk.request.video_input
-            if isinstance(value, CurrentChunkSpec):
+            if isinstance(value, SupportChunkSpec):
                 materialized.append(self.materializer(value))
             elif isinstance(value, CurrentChunkMaterialization):
                 materialized.append(value)
@@ -1613,7 +1608,6 @@ class A2PrefetchCollator:
         minimum_pixels: int,
         maximum_pixels: int,
         preprocess_cache: PreprocessCache | None = None,
-        support_materialization: str = "trainer_prefetch",
         prepared_episode_max_bytes: int = 2_147_483_648,
     ) -> None:
         _require_latest_qwen_processor(processor, context="A2 prefetch")
@@ -1624,11 +1618,8 @@ class A2PrefetchCollator:
         self.minimum_pixels = minimum_pixels
         self.maximum_pixels = maximum_pixels
         self.preprocess_cache = preprocess_cache
-        if support_materialization not in {"trainer_prefetch", "dataloader_episode"}:
-            raise ValueError("A2 collator received an invalid support materialization mode")
         if prepared_episode_max_bytes <= 0:
             raise ValueError("prepared episode byte limit must be positive")
-        self.support_materialization = support_materialization
         self.prepared_episode_max_bytes = prepared_episode_max_bytes
         self.video = VideoChunkMaterializer(
             config,
@@ -1679,15 +1670,12 @@ class A2PrefetchCollator:
             ),
             source_dataset=record.source_dataset,
         )
-        supports: tuple[PreparedVisualCPU, ...] = ()
-        support_prepare_seconds = 0.0
-        if self.support_materialization == "dataloader_episode":
-            support_started = time.perf_counter()
-            supports = tuple(
-                _compact_materialized_chunk(self.video(support_spec))
-                for support_spec in _a2_support_chunk_specs(record, video_path)
-            )
-            support_prepare_seconds = time.perf_counter() - support_started
+        support_started = time.perf_counter()
+        supports = tuple(
+            _compact_materialized_chunk(self.video(support_spec))
+            for support_spec in _a2_support_chunk_specs(record, video_path)
+        )
+        support_prepare_seconds = time.perf_counter() - support_started
         prepared_bytes = _prepared_a2_record_bytes(answer, supports, state_query)
         if prepared_bytes > self.prepared_episode_max_bytes:
             raise MemoryError(
@@ -2009,7 +1997,7 @@ class ProductionEpisodeMaterializer:
         suffix: str,
         episode_nonce: int,
     ) -> MetaCausalChunk:
-        spec = CurrentChunkSpec(
+        spec = SupportChunkSpec(
             chunk_id=f"{query.query_id}:{suffix}",
             video_path=video_path,
             start_time=chunk.start_time,
@@ -2044,7 +2032,7 @@ class ProductionEpisodeMaterializer:
     ) -> ObservationChunkRequest:
         return ObservationChunkRequest(
             owner=owner,
-            video_input=CurrentChunkSpec(
+            video_input=SupportChunkSpec(
                 chunk_id=f"{query.query_id}:a2:{index}",
                 video_path=video_path,
                 start_time=chunk.start_time,
@@ -2219,7 +2207,7 @@ class ProductionA2LossStep:
         support_specs = tuple(
             request.video_input
             for request in model_inputs.observation_requests
-            if isinstance(request.video_input, CurrentChunkSpec)
+            if isinstance(request.video_input, SupportChunkSpec)
         )
         self.materializer.video.begin_prefetch(support_specs, source_dataset=record.source_dataset)
         try:
@@ -2337,7 +2325,7 @@ class ProductionA5EpisodeAdapter:
     def _begin_prefetch(self, episode: MetaTTTEpisode) -> None:
         video = self.materializer.video
         specs = tuple(
-            cast(CurrentChunkSpec, chunk.request.video_input)
+            cast(SupportChunkSpec, chunk.request.video_input)
             for chunk in (
                 *((episode.prewarm_chunk,) if episode.prewarm_chunk is not None else ()),
                 *episode.support_chunks,
@@ -2478,7 +2466,6 @@ def build_runtime(
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
-            support_materialization=config.support_materialization,
             prepared_episode_max_bytes=config.prepared_episode_max_bytes,
         )
         predictor.requires_grad_(False)
@@ -2758,10 +2745,10 @@ def _official_weak(query: ProductionQueryRecord) -> OfficialWeakSupervision:
 def _a2_support_chunk_specs(
     record: A2QueryRecord,
     video_path: Path,
-) -> tuple[CurrentChunkSpec, ...]:
+) -> tuple[SupportChunkSpec, ...]:
     _, supports = adaptive_support_schedule(record.query.runtime.query_time)
     return tuple(
-        CurrentChunkSpec(
+        SupportChunkSpec(
             chunk_id=f"{record.query.runtime.query_id}:a2:{index}",
             video_path=video_path,
             start_time=chunk.start_time,
@@ -2804,7 +2791,6 @@ def _query_chunk_spec(
         reset_soft_state=reset_soft_state,
         sampling_fps=config.query_sample_fps,
         sampling_policy=config.query_frame_sampling,
-        decode_strategy=config.query_decode_strategy,
         decode_max_groups=config.query_decode_max_groups,
         query_role=role,
     )
@@ -2864,7 +2850,7 @@ def _prepare_answer_cpu(
             "query_decode",
             query_id=query.runtime.query_id,
             frame_count=len(frames),
-            strategy=spec.decode_strategy,
+            strategy="grouped_seek",
             max_groups=spec.decode_max_groups,
             seconds=decode_seconds,
         )
@@ -3277,7 +3263,7 @@ def _decode_uniform_interval(
     # still bounded by the current chunk's dynamic frame cap.
     if spec.end_time - spec.start_time <= 16.0 + 1.0e-6:
         frames, timestamps = _decode_targets_streaming(spec, target_times)
-    elif isinstance(spec, QueryObservationSpec) and spec.decode_strategy == "grouped_seek":
+    elif isinstance(spec, QueryObservationSpec):
         try:
             frames, timestamps = _decode_query_targets_grouped(
                 spec,
@@ -3823,7 +3809,6 @@ __all__ = [
     "A2PrefetchCollator",
     "A5PrefetchCollator",
     "CurrentChunkMaterialization",
-    "CurrentChunkSpec",
     "QueryObservationSpec",
     "SupportChunkSpec",
     "A2PreparationTelemetry",
