@@ -216,6 +216,8 @@ class QueryEmbeddingOutput:
         batch_size, width, _ = states.shape
         if self.pooling_weights.shape != (batch_size, width):
             raise ValueError("pooling_weights must be [B, L_q]")
+        if not torch.is_floating_point(self.pooling_weights):
+            raise ValueError("pooling_weights must be floating")
         if self.padding_mask.shape != (batch_size, width) or self.padding_mask.dtype != torch.bool:
             raise ValueError("padding_mask must be bool [B, L_q]")
         output_dim = self.q_target.shape[1] if self.q_target.ndim == 2 else -1
@@ -237,7 +239,11 @@ class QueryEmbeddingOutput:
             raise ValueError("padding pooling weights must be exactly zero")
         if not torch.allclose(
             self.pooling_weights.sum(dim=1),
-            torch.ones(batch_size, dtype=states.dtype, device=states.device),
+            torch.ones(
+                batch_size,
+                dtype=self.pooling_weights.dtype,
+                device=self.pooling_weights.device,
+            ),
             atol=1.0e-6,
             rtol=0.0,
         ):
@@ -536,9 +542,19 @@ class QueryEmbeddingEncoder(nn.Module):  # type: ignore[misc]
         )
         scores = self.pool_scorer(torch.tanh(self.pool_projection(token_states))).squeeze(-1)
         scores = scores.masked_fill(padding_mask, -torch.inf)
-        pooling_weights = torch.softmax(scores, dim=1).masked_fill(padding_mask, 0.0)
+        # Keep learned-attention probabilities in FP32.  Under BF16 autocast,
+        # normalizing in the model dtype can still leave the reduced sum at
+        # 1 +/- 1 BF16 ULP (for example 1.0078125), which is large enough to
+        # trip the structural invariant below and desynchronize DDP ranks.
+        pooling_weights = torch.softmax(scores.float(), dim=1).masked_fill(
+            padding_mask,
+            0.0,
+        )
         pooling_weights = pooling_weights / pooling_weights.sum(dim=1, keepdim=True)
-        pooled = torch.sum(pooling_weights.unsqueeze(-1) * token_states, dim=1)
+        pooled = torch.sum(
+            pooling_weights.unsqueeze(-1) * token_states.float(),
+            dim=1,
+        ).to(dtype=token_states.dtype)
         return QueryEmbeddingOutput(
             token_states=token_states,
             pooling_weights=pooling_weights,

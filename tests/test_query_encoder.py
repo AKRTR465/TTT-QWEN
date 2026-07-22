@@ -173,6 +173,34 @@ def test_tiny_backbone_is_bidirectional_and_padding_invariant() -> None:
         assert torch.allclose(query_embedding.norm(dim=-1), torch.ones(2), atol=1.0e-6)
 
 
+def test_bfloat16_autocast_keeps_pooling_weights_normalized_in_float32() -> None:
+    torch.manual_seed(11)
+    encoder = QueryEmbeddingEncoder(make_tiny_query_config()).eval()
+    embeddings = torch.randn(2, 17, 16)
+    padding_mask = torch.tensor(
+        [
+            [False] * 17,
+            [False] * 7 + [True] * 10,
+        ]
+    )
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = encoder(embeddings, padding_mask)
+
+    assert output.token_states.dtype == torch.bfloat16
+    assert output.pooling_weights.dtype == torch.float32
+    assert torch.equal(output.pooling_weights[padding_mask], torch.zeros(10))
+    assert torch.allclose(
+        output.pooling_weights.sum(dim=1),
+        torch.ones(2),
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+    for embedding in (output.q_target, output.q_operator, output.q_time):
+        assert embedding.dtype == torch.bfloat16
+        assert torch.isfinite(embedding).all()
+
+
 def test_sinusoidal_positions_make_token_order_observable_without_adding_parameters() -> None:
     torch.manual_seed(4)
     encoder = QueryEmbeddingEncoder(make_tiny_query_config()).eval()
