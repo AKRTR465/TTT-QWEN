@@ -28,7 +28,7 @@ import transformers
 from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
 
-from ttt_svcbench_qwen.config import MetaTTTVariant, ProjectConfig, StageAVariant, load_config
+from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
@@ -2227,7 +2227,7 @@ class ProductionA2LossStep:
         finally:
             self.materializer.video.end_prefetch()
         self.progress.emit(call_index, "forward_complete")
-        raw.audit.validate_for(StageAVariant.A2)
+        raw.audit.validate()
         if (
             not isinstance(raw.composed_input, ComposedInput)
             or raw.observations is None
@@ -2490,7 +2490,6 @@ def build_runtime(
         )
         runner = StageAEpisodeRunner(
             model=state_model,
-            variant=StageAVariant.A2,
             metric_builder=lambda _output, _supervision: ((), ()),
             query_encoder_reuse=config.query_encoder_reuse,
             query_activation_offload=config.query_activation_offload,
@@ -2530,7 +2529,6 @@ def build_runtime(
         fast_controller=fast,
         predictor=predictor,
         runtime_resetter=lambda owner: _reset_meta_runtime(writer, owner),
-        variant=MetaTTTVariant.A5,
         query_encoder_reuse=config.query_encoder_reuse,
         raw_support_visual_batcher=qwen_runtime.prepare_raw_support_batch,
         support_visual_batch_size=config.support_visual_batch_size,
