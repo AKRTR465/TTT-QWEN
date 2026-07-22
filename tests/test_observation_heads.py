@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import Tensor, nn
 
+from tests.support import parameter_count
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.observation_heads import (
     E1PointEventDecoder,
@@ -16,8 +17,6 @@ from ttt_svcbench_qwen.observation_heads import (
     E2SoftOutput,
     ObservationHeads,
     build_observation_heads,
-    observation_head_parameter_counts,
-    observation_heads_parameter_count,
 )
 from ttt_svcbench_qwen.state_encoder import (
     SpatialEncoderOutput,
@@ -210,8 +209,10 @@ def test_meta_topology_builder_and_exact_parameter_counts() -> None:
 
     assert isinstance(module, ObservationHeads)
     assert set(dict(module.named_children())) == {"o1", "o2", "e1", "e2"}
-    assert observation_head_parameter_counts(module) == EXACT_HEAD_COUNTS
-    assert observation_heads_parameter_count(module) == EXACT_TOTAL
+    assert {name: parameter_count(getattr(module, name)) for name in EXACT_HEAD_COUNTS} == (
+        EXACT_HEAD_COUNTS
+    )
+    assert parameter_count(module) == EXACT_TOTAL
     assert [block.dilation for block in module.e1.blocks] == [1, 2, 4, 8, 16]
     assert [block.left_padding for block in module.e1.blocks] == [2, 4, 8, 16, 32]
     assert all(block.filter_conv.bias is not None for block in module.e1.blocks)
@@ -490,7 +491,6 @@ def test_o2_zero_identity_fallback_and_raw_score_logits(heads: ObservationHeads)
             output.score_probabilities[mask],
             torch.sigmoid(torch.tensor([[-2.0, 3.0], [-2.0, 3.0]])),
         )
-        assert output.score is output.score_logits
     finally:
         with torch.no_grad():
             decoder.identity_projection.weight.copy_(saved["identity_weight"])

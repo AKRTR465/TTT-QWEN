@@ -20,6 +20,7 @@ from torch import Tensor
 from ttt_svcbench_qwen.config import InnerSGDConfig
 from ttt_svcbench_qwen.fast_ttt import FastWeightsState, OptimizerRuntimeState
 from ttt_svcbench_qwen.losses import LossSkipReason, LossTerm, TTTLossOutput
+from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
 
 
 class UpdateSkipReason(StrEnum):
@@ -167,13 +168,6 @@ class FunctionalSGDResult:
         expected_attempts = self.fast_state.update_count + self.fast_state.skip_count
         if self.optimizer_state.attempted_update_count != expected_attempts:
             raise ValueError("optimizer attempts must equal accepted updates plus skips")
-
-    @property
-    def differentiable_update(self) -> bool:
-        """Compatibility view; ``gradient_mode`` is the authoritative record."""
-
-        return self.gradient_mode is GradientMode.META_FULL_SECOND_ORDER
-
 
 def initialize_optimizer_state(config: InnerSGDConfig) -> OptimizerRuntimeState:
     """Create empty runtime counters from the frozen stateless-SGD config."""
@@ -347,7 +341,7 @@ def functional_sgd_steps_from_ttt(
     if not all(isinstance(state, OptimizerRuntimeState) for state in runtimes):
         raise TypeError("TTT batch bridge requires only OptimizerRuntimeState values")
     fast_values = tuple(value for state in states for value in state.fast_parameters)
-    if len({_storage_key(value) for value in fast_values}) != len(fast_values):
+    if len({tensor_storage_key(value) for value in fast_values}) != len(fast_values):
         raise ValueError("batched fast states must use storage-isolated W_t tensors")
     valid_rows = tuple(
         row for row in range(batch_size) if bool(ttt_output.update_valid_mask[row].item())
@@ -727,14 +721,6 @@ def _invalid_ttt_row_reason(
     if pred_reason is LossSkipReason.INSUFFICIENT_TIME:
         return UpdateSkipReason.INSUFFICIENT_TIME
     return UpdateSkipReason.NO_VALID_TERM
-
-
-def _storage_key(value: Tensor) -> tuple[str, int | None, int]:
-    return (
-        value.device.type,
-        value.device.index,
-        int(value.untyped_storage().data_ptr()),
-    )
 
 
 def _gradient_mode(

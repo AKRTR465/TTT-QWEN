@@ -594,18 +594,6 @@ def reanchor_fast_state(
     return next_state, audit
 
 
-def adapter_parameter_count(module: FastTTTAdapter) -> int:
-    return sum(parameter.numel() for parameter in module.parameters())
-
-
-def slow_parameter_count(module: FastTTTAdapter) -> int:
-    return sum(parameter.numel() for parameter in module.collect_slow_parameters())
-
-
-def online_parameter_count(state: FastWeightsState) -> int:
-    return sum(parameter.numel() for parameter in collect_fast_parameters(state))
-
-
 def build_fast_ttt_adapter(config: ProjectConfig | None = None) -> FastTTTAdapter:
     if config is None:
         raise ValueError("build_fast_ttt_adapter requires a validated ProjectConfig")

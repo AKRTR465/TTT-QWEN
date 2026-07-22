@@ -1511,8 +1511,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Load one strict request, run production inference, and write one fixed JSON result."""
 
     from ttt_svcbench_qwen.production_runtime import (
-        CurrentChunkSpec,
         QueryObservationSpec,
+        SupportChunkSpec,
         _expand_qwen_video_placeholders,
         _tokenize_text_only,
         _user_message,
@@ -1576,12 +1576,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     encoded = bundle.state_model.components.query_encoder(query, inference=True)
     query_signature = encoded.q_target[0].detach().clone()
     chunks: list[CausalChunk] = []
-    specs: list[CurrentChunkSpec] = []
+    specs: list[SupportChunkSpec] = []
     end = min(8.0, query.query_time)
     index = 0
     while end > 0.0:
         start = max(0.0, end - 8.0)
-        spec = CurrentChunkSpec(
+        spec = SupportChunkSpec(
             chunk_id=f"chunk-{index:06d}",
             video_path=video_path,
             start_time=start,

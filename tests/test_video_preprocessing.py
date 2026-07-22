@@ -9,10 +9,9 @@ import numpy as np
 import torch
 
 from ttt_svcbench_qwen.config import load_config
-from ttt_svcbench_qwen.production_runtime import CurrentChunkSpec, VideoChunkMaterializer
+from ttt_svcbench_qwen.production_runtime import SupportChunkSpec, VideoChunkMaterializer
 from ttt_svcbench_qwen.video_preprocessing import (
     QwenVideoPreprocessor,
-    build_demo_video,
     causal_right_cut,
     chunk_causal_cut,
     decode_video_causally,
@@ -39,7 +38,7 @@ def _write_tiny_video(path: Path) -> None:
 
 def test_real_qwen_processor_demo_contract() -> None:
     processor = QwenVideoPreprocessor(load_config())
-    demo = build_demo_video()
+    demo = torch.zeros((1, 16, 3, 224, 224), dtype=torch.uint8)
     processed = processor.process(demo)
 
     assert demo.shape == (1, 16, 3, 224, 224)
@@ -85,7 +84,7 @@ def test_support_materializer_prefetches_in_order_with_bounded_queue(tmp_path: P
     path = tmp_path / "placeholder.mp4"
     path.touch()
     specs = tuple(
-        CurrentChunkSpec(
+        SupportChunkSpec(
             chunk_id=f"chunk-{index}",
             video_path=path,
             start_time=float(index),
@@ -103,7 +102,7 @@ def test_support_materializer_prefetches_in_order_with_bounded_queue(tmp_path: P
     materializer._remaining_specs = deque()
     calls: list[str] = []
 
-    def fake_materialize(spec: CurrentChunkSpec) -> CurrentChunkSpec:
+    def fake_materialize(spec: SupportChunkSpec) -> SupportChunkSpec:
         calls.append(spec.chunk_id)
         return spec
 

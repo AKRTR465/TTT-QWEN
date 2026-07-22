@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import Tensor, nn
 
+from tests.support import parameter_count
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.identity_bank import CandidateIdentity, ConfirmedIdentity
 from ttt_svcbench_qwen.observation_heads import (
@@ -32,7 +33,6 @@ from ttt_svcbench_qwen.state_bank import (
     StructuredStateBank,
     build_state_bank,
     clone_state_record,
-    semantic_projector_parameter_count,
 )
 
 EXACT_PROJECTOR_PARAMETERS = 1_316_864
@@ -236,7 +236,7 @@ def test_meta_topology_exact_parameter_count_builder_and_state_dict_boundary() -
 
     assert isinstance(module, StructuredStateBank)
     assert isinstance(module.semantic_projector, SemanticProjector)
-    assert semantic_projector_parameter_count(module) == EXACT_PROJECTOR_PARAMETERS
+    assert parameter_count(module.semantic_projector) == EXACT_PROJECTOR_PARAMETERS
     assert module.semantic_projector.head_type_embeddings.weight.shape == (4, HIDDEN_DIM)
     assert module.semantic_projector.hidden_projection.in_features == HIDDEN_DIM
     assert module.semantic_projector.hidden_projection.out_features == 1024

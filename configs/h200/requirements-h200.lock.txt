@@ -16,14 +16,8 @@ aiosignal==1.4.0
     # via aiohttp
 annotated-types==0.7.0
     # via pydantic
-antlr4-python3-runtime==4.9.3
-    # via
-    #   hydra-core
-    #   omegaconf
 attrs==26.1.0
-    # via
-    #   aiohttp
-    #   jsonlines
+    # via aiohttp
 av==16.0.0
     # via
     #   qwen-vl-utils
@@ -45,9 +39,7 @@ dill==0.3.8
     #   datasets
     #   multiprocess
 einops==0.8.2
-    # via
-    #   deepspeed
-    #   ttt-svcbench-qwen
+    # via deepspeed
 filelock==3.29.7
     # via
     #   datasets
@@ -73,16 +65,12 @@ huggingface-hub==0.36.2
     #   tokenizers
     #   transformers
     #   ttt-svcbench-qwen
-hydra-core==1.3.4
-    # via ttt-svcbench-qwen
 idna==3.18
     # via
     #   requests
     #   yarl
 joblib==1.5.3
     # via scikit-learn
-jsonlines==4.0.0
-    # via ttt-svcbench-qwen
 msgpack==1.2.1
     # via deepspeed
 multidict==6.7.1
@@ -100,31 +88,23 @@ numpy==2.5.1
     #   accelerate
     #   datasets
     #   deepspeed
-    #   opencv-python-headless
     #   pandas
     #   peft
     #   scikit-learn
     #   scipy
     #   transformers
     #   ttt-svcbench-qwen
-omegaconf==2.3.1
-    # via hydra-core
-opencv-python-headless==4.13.0.92
-    # via ttt-svcbench-qwen
 packaging==26.2
     # via
     #   accelerate
     #   datasets
     #   deepspeed
     #   huggingface-hub
-    #   hydra-core
     #   peft
     #   qwen-vl-utils
     #   transformers
 pandas==3.0.3
-    # via
-    #   datasets
-    #   ttt-svcbench-qwen
+    # via datasets
 peft==0.18.1
     # via ttt-svcbench-qwen
 pillow==12.3.0
@@ -140,7 +120,6 @@ psutil==7.2.2
     #   accelerate
     #   deepspeed
     #   peft
-    #   ttt-svcbench-qwen
 py-cpuinfo==9.0.0
     # via deepspeed
 pyarrow==25.0.0
@@ -158,7 +137,6 @@ pyyaml==6.0.3
     #   accelerate
     #   datasets
     #   huggingface-hub
-    #   omegaconf
     #   peft
     #   transformers
 qwen-vl-utils==0.0.14
@@ -180,9 +158,7 @@ safetensors==0.8.0
 scikit-learn==1.9.0
     # via ttt-svcbench-qwen
 scipy==1.18.0
-    # via
-    #   scikit-learn
-    #   ttt-svcbench-qwen
+    # via scikit-learn
 sentencepiece==0.2.1
     # via ttt-svcbench-qwen
 six==1.17.0
@@ -198,7 +174,6 @@ tqdm==4.68.4
     #   huggingface-hub
     #   peft
     #   transformers
-    #   ttt-svcbench-qwen
 transformers==4.57.1
     # via
     #   peft

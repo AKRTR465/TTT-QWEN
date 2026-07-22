@@ -11,7 +11,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
@@ -105,7 +105,7 @@ class RuntimeMetricsWriter:
         path = directory / f"runtime_{self._pid}_{_worker_id()}.jsonl"
         with path.open("a", encoding="utf-8") as stream:
             stream.writelines(
-                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                json.dumps(_materialize_trace_tree(row), ensure_ascii=False, sort_keys=True) + "\n"
                 for row in self._records
             )
         self._records.clear()
@@ -170,6 +170,20 @@ def _worker_id() -> str:
     except RuntimeError:
         worker = None
     return "main" if worker is None else str(worker.id)
+
+
+def _materialize_trace_tree(value: object) -> object:
+    """Move buffered scalar tensors to host only when the trace is flushed."""
+
+    if isinstance(value, torch.Tensor):
+        if value.ndim != 0 or value.requires_grad:
+            raise ValueError("runtime trace tensors must be detached scalars")
+        return value.detach().cpu().item()
+    if isinstance(value, Mapping):
+        return {str(key): _materialize_trace_tree(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [_materialize_trace_tree(item) for item in value]
+    return value
 
 
 atexit.register(flush_runtime_metrics)

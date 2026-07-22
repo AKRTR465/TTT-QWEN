@@ -58,9 +58,7 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     initialize_from_a2_checkpoint: str | None = Field(default=None, min_length=1)
     support_prefetch_depth: int = Field(gt=0)
     support_decode_coalesce: bool
-    support_materialization: Literal[
-        "trainer_prefetch", "dataloader_episode", "segment_double_buffer"
-    ] = "trainer_prefetch"
+    support_materialization: Literal["dataloader_episode", "segment_double_buffer"]
     prepared_episode_max_bytes: int = Field(default=2_147_483_648, gt=0)
     support_visual_batch_size: int = Field(default=1, gt=0)
     query_encoder_reuse: bool = True
@@ -70,14 +68,9 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     state_query_max_frames: Literal[16]
     answer_query_visual_mode: Literal["causal_prefix"]
     answer_query_max_frames: Literal[256]
-    query_decode_strategy: Literal["legacy_seek", "grouped_seek"] = "legacy_seek"
     query_decode_max_groups: int = Field(default=16, ge=1, le=16)
-    # ``query_cache_mode`` is retained as the legacy fallback for old checkpoints/configs.
-    # Production recipes should override each role explicitly so the small State Query can be
-    # cached without materializing the much larger 256-frame Answer Query cache.
-    query_cache_mode: Literal["disabled", "inherit"] = "inherit"
-    state_query_cache_mode: Literal["disabled", "inherit"] | None = None
-    answer_query_cache_mode: Literal["disabled", "inherit"] | None = None
+    state_query_cache_mode: Literal["disabled", "inherit"]
+    answer_query_cache_mode: Literal["disabled", "inherit"]
     query_activation_offload: bool = False
     preprocess_cache_mode: Literal["disabled", "read_write", "readonly"]
     preprocess_cache_miss_policy: Literal["decode", "error"]
@@ -95,11 +88,11 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             raise ValueError("A2 must not initialize from an A2 checkpoint")
         if self.stage == "a5" and self.initialize_from_a2_checkpoint is None:
             raise ValueError("A5 requires initialize_from_a2_checkpoint")
-        allowed_materialization = {
-            "a2": {"trainer_prefetch", "dataloader_episode"},
-            "a5": {"trainer_prefetch", "segment_double_buffer"},
+        required_materialization = {
+            "a2": "dataloader_episode",
+            "a5": "segment_double_buffer",
         }
-        if self.support_materialization not in allowed_materialization[self.stage]:
+        if self.support_materialization != required_materialization[self.stage]:
             raise ValueError("support_materialization is incompatible with the configured stage")
         if self.stage == "a2" and self.segment_prefetch_depth != 0:
             raise ValueError("A2 cannot enable segment prefetch")
@@ -131,12 +124,14 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
         return self
 
     def query_cache_enabled(self, role: Literal["state_query", "answer_query"]) -> bool:
-        """Resolve a role-specific cache policy with legacy-config compatibility."""
+        """Return the explicit role-specific cache policy."""
 
-        override = (
-            self.state_query_cache_mode if role == "state_query" else self.answer_query_cache_mode
+        mode = (
+            self.state_query_cache_mode
+            if role == "state_query"
+            else self.answer_query_cache_mode
         )
-        return (self.query_cache_mode if override is None else override) == "inherit"
+        return mode == "inherit"
 
     @property
     def cached_query_roles(self) -> frozenset[str]:

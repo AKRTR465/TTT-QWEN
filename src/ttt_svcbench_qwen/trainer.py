@@ -7,14 +7,12 @@ Forbidden: Inner SGD, transient runtime checkpoints, or label leakage into model
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
-from typing import Protocol, cast
+from typing import Protocol
 
 import torch
 from torch import Tensor
 
-from ttt_svcbench_qwen.config import StageAVariant
 from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.input_composer import ComposedInput
 from ttt_svcbench_qwen.model import (
@@ -36,6 +34,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     StageATargetBatch,
 )
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
+from ttt_svcbench_qwen.training_context import query_activation_context
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +58,7 @@ class StageAExecutionAudit:
     inner_sgd_updated: int = 0
     inner_sgd_skipped: int = 0
 
-    def validate_for(self, variant: StageAVariant) -> None:
+    def validate(self) -> None:
         values = (
             tuple(self.__dict__.values())
             if hasattr(self, "__dict__")
@@ -92,44 +91,26 @@ class StageAExecutionAudit:
             raise ValueError("Reader exact count cannot consume ground-truth labels")
         if any((self.inner_sgd_attempted, self.inner_sgd_updated, self.inner_sgd_skipped)):
             raise ValueError("Stage A cannot attempt, update, or skip Inner SGD")
-        state_counts = (
-            self.hard_state_row_count,
+        if self.observed_chunk_count <= 0 or self.hard_state_row_count <= 0:
+            raise ValueError("A2 requires causal observation and hard-state rollout")
+        if self.hard_state_row_count != self.row_count:
+            raise ValueError("A2 hard-state rollout must cover every supported task row")
+        row_aligned = (
             self.query_router_row_count,
             self.time_resolver_row_count,
             self.retrieval_row_count,
             self.reader_result_count,
             self.bank_reset_count,
-            self.bank_write_count,
-            self.cache_advance_count,
-            self.fsm_rollout_count,
         )
-        if variant is StageAVariant.A1:
-            if any(state_counts):
-                raise ValueError("A1 must keep every explicit-state component disabled")
-        else:
-            if self.observed_chunk_count <= 0 or self.hard_state_row_count <= 0:
-                raise ValueError("A2 requires causal observation and hard-state rollout")
-            if self.hard_state_row_count != self.row_count:
-                raise ValueError("A2 hard-state rollout must cover every supported task row")
-            row_aligned = (
-                self.query_router_row_count,
-                self.time_resolver_row_count,
-                self.retrieval_row_count,
-                self.reader_result_count,
-                self.bank_reset_count,
-            )
-            if any(value != self.row_count for value in row_aligned):
-                raise ValueError("A2 router/time/retrieval/Reader/reset must cover every row")
-            if self.cache_advance_count <= 0:
-                raise ValueError("A2 requires temporal cache advancement")
-            # A randomly initialized label-free router may legitimately choose UNSUPPORTED for
-            # every row in an early batch.  The hard writer still ran (the episode runner checks
-            # its typed audit), but there is intentionally no Bank write to commit.  Requiring a
-            # write here would force official operator labels into the runtime path and leak
-            # supervision before the loss builder.
-            # O1/O2 counting rows legitimately exercise Bank state without an event FSM.
-            # Dataset-level task balancing guarantees E1/E2 coverage; a per-batch FSM
-            # requirement would reject every valid one-row O1/O2 production batch.
+        if any(value != self.row_count for value in row_aligned):
+            raise ValueError("A2 router/time/retrieval/Reader/reset must cover every row")
+        if self.cache_advance_count <= 0:
+            raise ValueError("A2 requires temporal cache advancement")
+        # A randomly initialized label-free router may legitimately choose UNSUPPORTED for
+        # every row in an early batch. The hard writer still ran (the episode runner checks
+        # its typed audit), but there is intentionally no Bank write to commit. Requiring a
+        # write here would force official operator labels into the runtime path and leak
+        # supervision before the loss builder. O1/O2 rows also need no event FSM rollout.
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,13 +247,11 @@ class StageAEpisodeRunner:
         self,
         *,
         model: StateTTTModel,
-        variant: StageAVariant,
         metric_builder: StageAEpisodeMetricBuilder,
         query_encoder_reuse: bool = False,
         query_activation_offload: bool = False,
     ) -> None:
         self.model = model
-        self.variant = variant
         self.metric_builder = metric_builder
         if type(query_encoder_reuse) is not bool:
             raise TypeError("query_encoder_reuse must be bool")
@@ -307,7 +286,7 @@ class StageAEpisodeRunner:
         bank_write_count = fsm_rollout_count = cache_advance_count = 0
         prepared_query: PreparedQueryOutput | None = None
         detached_query: PreparedQueryOutput | None = None
-        if self.variant is StageAVariant.A2 and self.query_encoder_reuse:
+        if self.query_encoder_reuse:
             final_request = episode.observation_requests[-1]
             prepared_query = PreparedQueryOutput.bind(
                 final_request.query_input,
@@ -325,7 +304,7 @@ class StageAEpisodeRunner:
                 bank_states=bank_states,
                 prepared_query=(prepared_query if is_current_query_chunk else detached_query),
             )
-            if self.variant is StageAVariant.A2 and not is_current_query_chunk:
+            if not is_current_query_chunk:
                 # A2's loss is defined on the current Query chunk.  Earlier Support chunks
                 # only causally commit detached Bank/FSM/temporal state, so retaining their
                 # Qwen activation graphs both violates the bounded-current-token design and
@@ -336,7 +315,7 @@ class StageAEpisodeRunner:
                 with torch.no_grad():
                     observed = self.model.observe_chunk(request, lifecycle)
             else:
-                with self._query_activation_context():
+                with query_activation_context(self.query_activation_offload):
                     observed = self.model.observe_chunk(request, lifecycle)
             observations.append(observed)
             runtime = observed.runtime_state
@@ -345,7 +324,7 @@ class StageAEpisodeRunner:
                 raise ValueError("Stage A runtime chunk index did not advance causally")
             cache_advance_count += len(episode.owner.video_ids)
             audit = observed.state_audit
-            if self.variant is StageAVariant.A2 and not isinstance(audit, StageAWriteAudit):
+            if not isinstance(audit, StageAWriteAudit):
                 raise TypeError("A2 observation must execute the typed hard-state writer")
             if isinstance(audit, StageAWriteAudit):
                 bank_write_count += len(audit.head_types) - len(audit.skipped_rows)
@@ -366,7 +345,7 @@ class StageAEpisodeRunner:
             rope_indexer=answer_inputs.rope_indexer,
             qwen_kwargs=answer_inputs.qwen_kwargs,
         )
-        with self._query_activation_context():
+        with query_activation_context(self.query_activation_offload):
             output = self.model.prefill_answer(
                 self.model.prepare_answer(answer_request, lifecycle),
                 lifecycle,
@@ -393,27 +372,21 @@ class StageAEpisodeRunner:
                 reader_counts[row] = exact_count
                 reader_valid[row] = True
         metrics, failure_cases = self.metric_builder(output, batch.supervision)
-        if self.variant is StageAVariant.A2:
-            observations_output = output.observations
-            query_output = output.query
-            retrieval_output = output.retrieval
-            if not isinstance(observations_output, ObservationOutputs):
-                raise TypeError("A2 episode must expose ObservationOutputs")
-            if not isinstance(query_output, QueryEncoderOutput):
-                raise TypeError("A2 episode must expose QueryEncoderOutput")
-            if not isinstance(retrieval_output, RetrieverOutput):
-                raise TypeError("A2 episode must expose RetrieverOutput")
-            # This is execution coverage, not the number of currently supported predictions.
-            # UNSUPPORTED is a valid pre-training model decision; the official weak operator
-            # target is joined only after this label-free runtime forward has completed.
-            hard_state_rows = row_count
-            router_rows = time_rows = retrieval_rows = row_count
-            reader_rows = len(output.reader)
-        else:
-            observations_output = None
-            query_output = None
-            retrieval_output = None
-            hard_state_rows = router_rows = time_rows = retrieval_rows = reader_rows = 0
+        observations_output = output.observations
+        query_output = output.query
+        retrieval_output = output.retrieval
+        if not isinstance(observations_output, ObservationOutputs):
+            raise TypeError("A2 episode must expose ObservationOutputs")
+        if not isinstance(query_output, QueryEncoderOutput):
+            raise TypeError("A2 episode must expose QueryEncoderOutput")
+        if not isinstance(retrieval_output, RetrieverOutput):
+            raise TypeError("A2 episode must expose RetrieverOutput")
+        # This is execution coverage, not the number of currently supported predictions.
+        # UNSUPPORTED is a valid pre-training model decision; the official weak operator
+        # target is joined only after this label-free runtime forward has completed.
+        hard_state_rows = row_count
+        router_rows = time_rows = retrieval_rows = row_count
+        reader_rows = len(output.reader)
         return StageAModelForwardOutput(
             answer_logits=output.answer_logits,
             composed_input=output.composed,
@@ -439,12 +412,4 @@ class StageAEpisodeRunner:
             retrieval=retrieval_output,
             metrics=metrics,
             failure_cases=failure_cases,
-        )
-
-    def _query_activation_context(self) -> AbstractContextManager[object]:
-        if not self.query_activation_offload or not torch.cuda.is_available():
-            return nullcontext()
-        return cast(
-            AbstractContextManager[object],
-            torch.autograd.graph.save_on_cpu(pin_memory=True),
         )

@@ -20,7 +20,6 @@ from ttt_svcbench_qwen.identity_bank import (
     IdentityDecisionStatus,
     IdentityUpdateResult,
     build_identity_bank,
-    evaluate_identity_quality,
 )
 from ttt_svcbench_qwen.observation_heads import O2SoftOutput
 from ttt_svcbench_qwen.state_bank import (
@@ -1067,21 +1066,6 @@ def test_hard_writes_detach_clone_and_do_not_break_soft_gradients_or_state_dict(
     assert semantic_leaf.grad is not None and torch.isfinite(semantic_leaf.grad).all()
     assert tuple(state_bank.state_dict()) == before_keys
     assert not isinstance(bank, torch.nn.Module)
-
-
-def test_offline_duplicate_and_missed_new_metrics_are_explicit_and_label_free_runtime() -> None:
-    metrics = evaluate_identity_quality(
-        ("A", "A", "B", "C", "C"),
-        ("identity-1", "identity-2", None, "identity-3", "identity-3"),
-    )
-    assert metrics.duplicate_excess_count == 1
-    assert metrics.duplicate_denominator == 3
-    assert metrics.duplicate_rate == pytest.approx(1.0 / 3.0)
-    assert metrics.missed_new_count == 1
-    assert metrics.ground_truth_identity_denominator == 3
-    assert metrics.missed_new_identity_rate == pytest.approx(1.0 / 3.0)
-    with pytest.raises(ValueError, match="equal length"):
-        evaluate_identity_quality(("A",), (None, None))
 
 
 def test_ann_is_disabled_and_every_decision_reports_full_cpu_scan(

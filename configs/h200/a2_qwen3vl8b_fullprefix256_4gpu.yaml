@@ -72,9 +72,7 @@ ttt_qwen:
   state_query_max_frames: 16
   answer_query_visual_mode: causal_prefix
   answer_query_max_frames: 256
-  query_decode_strategy: grouped_seek
   query_decode_max_groups: 16
-  query_cache_mode: inherit
   state_query_cache_mode: inherit
   answer_query_cache_mode: disabled
   query_activation_offload: false

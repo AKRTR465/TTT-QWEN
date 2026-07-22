@@ -23,8 +23,8 @@ from ttt_svcbench_qwen.episode_data import (
 from ttt_svcbench_qwen.preprocess_cache import PreprocessCache, PreprocessFingerprint
 from ttt_svcbench_qwen.production_factory import ProductionTTTConfig
 from ttt_svcbench_qwen.production_runtime import (
-    CurrentChunkSpec,
     QueryObservationSpec,
+    SupportChunkSpec,
     VideoChunkMaterializer,
     _a2_support_chunk_specs,
     _build_preprocess_fingerprint,
@@ -32,7 +32,7 @@ from ttt_svcbench_qwen.production_runtime import (
     _resolve_video_path,
 )
 
-ObservationSpec = CurrentChunkSpec | QueryObservationSpec
+ObservationSpec = SupportChunkSpec | QueryObservationSpec
 FingerprintedSpec = tuple[ObservationSpec, str, PreprocessFingerprint]
 
 
@@ -242,7 +242,7 @@ def _iter_specs(
             chunks = (record.prewarm, *record.supports)
             specs = (
                 tuple(
-                    CurrentChunkSpec(
+                    SupportChunkSpec(
                         chunk_id=f"{record.episode_id}:prewarm"
                         if index == 0
                         else f"{record.episode_id}:s{index}",

@@ -242,8 +242,8 @@ def validate_visual_cost_fingerprint(value: object) -> dict[str, object]:
             raise ValueError(f"visual cost fingerprint {field} must be positive")
     if int(result["minimum_pixels"]) > int(result["maximum_pixels"]):
         raise ValueError("visual cost fingerprint pixel bounds are invalid")
-    if result["query_decode_strategy"] not in {"legacy_seek", "grouped_seek"}:
-        raise ValueError("visual cost fingerprint Query decode strategy is invalid")
+    if result["query_decode_strategy"] != "grouped_seek":
+        raise ValueError("visual cost fingerprint Query decode strategy must be grouped_seek")
     if int(result["query_decode_max_groups"]) > 16:
         raise ValueError("visual cost fingerprint Query decode group cap exceeds 16")
     for role in ("state", "answer"):

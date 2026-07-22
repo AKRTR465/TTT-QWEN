@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 
-from ttt_svcbench_qwen.config import OfficialWeakBalanceConfig, OfficialWeakBalanceMode
+from ttt_svcbench_qwen.config import OfficialWeakBalanceConfig
 from ttt_svcbench_qwen.losses import (
     AnswerLossOutput,
     OuterLossOutput,
@@ -61,22 +61,20 @@ class OfficialWeakGradientAnchors:
 @dataclass(frozen=True, slots=True)
 class OfficialWeakTermBalanceMetrics:
     name: str
-    raw_global_mean: float | None
-    scale: float | None
-    aligned_global_mean: float | None
-    weighted_global_mean: float | None
-    global_valid_count: int
-    scale_clamped: bool
-    loss_scale: float | None = None
-    gradient_scale: float | None = None
-    raw_gradient_rms: float | None = None
-    ema_gradient_rms: float | None = None
+    raw_global_mean: Tensor
+    scale: Tensor
+    aligned_global_mean: Tensor
+    weighted_global_mean: Tensor
+    global_valid_count: Tensor
+    scale_clamped: Tensor
+    loss_scale: Tensor
+    gradient_scale: Tensor
+    raw_gradient_rms: Tensor
+    ema_gradient_rms: Tensor
 
     def __post_init__(self) -> None:
         if self.name not in _TERM_NAMES:
             raise ValueError(f"unknown official-weak balance term: {self.name}")
-        if self.global_valid_count < 0:
-            raise ValueError("official-weak global valid counts must be non-negative")
         values = (
             self.raw_global_mean,
             self.scale,
@@ -86,90 +84,111 @@ class OfficialWeakTermBalanceMetrics:
             self.gradient_scale,
             self.raw_gradient_rms,
             self.ema_gradient_rms,
+            self.global_valid_count,
+            self.scale_clamped,
         )
-        if any(value is not None and not math.isfinite(value) for value in values):
-            raise ValueError("official-weak balance metrics must be finite or absent")
+        if any(value.ndim != 0 or value.requires_grad for value in values):
+            raise ValueError("official-weak balance audit values must be detached scalars")
+        if self.global_valid_count.dtype != torch.float64:
+            raise TypeError("official-weak audit counts must use the packed float64 dtype")
+        if self.scale_clamped.dtype != torch.bool:
+            raise TypeError("official-weak audit clamp flags must be bool")
 
 
 @dataclass(frozen=True, slots=True)
 class OfficialWeakBalanceAudit:
-    answer_global_mean: float
-    answer_global_count: int
-    state_global_mean: float
+    answer_global_mean: Tensor
+    answer_global_count: Tensor
+    state_global_mean: Tensor
     terms: tuple[OfficialWeakTermBalanceMetrics, ...]
-    auxiliary_to_answer_ratio: float
-    group_guard: float
-    group_guard_active: bool
-    ema_means: tuple[float | None, ...] = ()
-    ema_update_counts: tuple[int, ...] = ()
-    gradient_ema_rms: tuple[float | None, ...] = ()
-    gradient_ema_update_counts: tuple[int, ...] = ()
+    auxiliary_to_answer_ratio: Tensor
+    group_guard: Tensor
+    group_guard_active: Tensor
+    ema_means: tuple[Tensor, ...] = ()
+    ema_update_counts: tuple[Tensor, ...] = ()
+    gradient_ema_rms: tuple[Tensor, ...] = ()
+    gradient_ema_update_counts: tuple[Tensor, ...] = ()
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.answer_global_mean) or self.answer_global_mean < 0.0:
-            raise ValueError("official-weak Answer mean must be finite and non-negative")
-        if self.answer_global_count <= 0:
-            raise ValueError("official-weak Answer global count must be positive")
-        if not math.isfinite(self.state_global_mean) or self.state_global_mean < 0.0:
-            raise ValueError("official-weak State mean must be finite and non-negative")
         if tuple(term.name for term in self.terms) != _TERM_NAMES:
             raise ValueError("official-weak balance audit term order drifted")
-        if not math.isfinite(self.auxiliary_to_answer_ratio) or not (
-            0.0 <= self.auxiliary_to_answer_ratio <= 1.0
-        ):
-            raise ValueError("official-weak auxiliary/Answer ratio is invalid")
-        if not math.isfinite(self.group_guard) or not 0.0 <= self.group_guard <= 1.0:
-            raise ValueError("official-weak group guard must be within [0, 1]")
+        scalars = (
+            self.answer_global_mean,
+            self.answer_global_count,
+            self.state_global_mean,
+            self.auxiliary_to_answer_ratio,
+            self.group_guard,
+            self.group_guard_active,
+            *self.ema_means,
+            *self.ema_update_counts,
+            *self.gradient_ema_rms,
+            *self.gradient_ema_update_counts,
+        )
+        if any(value.ndim != 0 or value.requires_grad for value in scalars):
+            raise ValueError("official-weak audit values must be detached scalar tensors")
+        if self.group_guard_active.dtype != torch.bool:
+            raise TypeError("official-weak group guard audit flag must be bool")
         if self.ema_means and len(self.ema_means) != _STAT_TERM_COUNT:
             raise ValueError("official-weak EMA means must include Answer plus four terms")
-        if self.ema_update_counts and (
-            len(self.ema_update_counts) != _STAT_TERM_COUNT
-            or any(value < 0 for value in self.ema_update_counts)
-        ):
+        if self.ema_update_counts and (len(self.ema_update_counts) != _STAT_TERM_COUNT):
             raise ValueError("official-weak EMA update counts are invalid")
         if self.gradient_ema_rms and len(self.gradient_ema_rms) != _TERM_SLOT_COUNT:
             raise ValueError("official-weak gradient EMA must contain four slots")
         if self.gradient_ema_update_counts and (
             len(self.gradient_ema_update_counts) != _TERM_SLOT_COUNT
-            or any(value < 0 for value in self.gradient_ema_update_counts)
         ):
             raise ValueError("official-weak gradient EMA update counts are invalid")
 
     def metrics(self) -> tuple[tuple[str, float | None], ...]:
         values: list[tuple[str, float | None]] = [
-            ("loss/answer", self.answer_global_mean),
-            ("loss/state", self.state_global_mean),
-            ("loss/outer_total", self.answer_global_mean + self.state_global_mean),
+            ("loss/answer", _audit_float(self.answer_global_mean)),
+            ("loss/state", _audit_float(self.state_global_mean)),
+            ("loss/outer_total", _audit_float(self.answer_global_mean + self.state_global_mean)),
         ]
         for term in self.terms:
             values.extend(
                 (
-                    (f"loss/raw/{term.name}", term.raw_global_mean),
-                    (f"loss/scale/{term.name}", term.scale),
-                    (f"loss/aligned/{term.name}", term.aligned_global_mean),
-                    (f"loss/weighted/{term.name}", term.weighted_global_mean),
-                    (f"loss/global_valid_count/{term.name}", float(term.global_valid_count)),
-                    (f"loss/scale_clamped/{term.name}", float(term.scale_clamped)),
-                    (f"grad_balance/raw_rms/{term.name}", term.raw_gradient_rms),
-                    (f"grad_balance/ema_rms/{term.name}", term.ema_gradient_rms),
-                    (f"grad_balance/loss_scale/{term.name}", term.loss_scale),
-                    (f"grad_balance/grad_scale/{term.name}", term.gradient_scale),
-                    (f"grad_balance/final_scale/{term.name}", term.scale),
+                    (f"loss/raw/{term.name}", _audit_optional_float(term.raw_global_mean)),
+                    (f"loss/scale/{term.name}", _audit_optional_float(term.scale)),
+                    (f"loss/aligned/{term.name}", _audit_optional_float(term.aligned_global_mean)),
+                    (
+                        f"loss/weighted/{term.name}",
+                        _audit_optional_float(term.weighted_global_mean),
+                    ),
+                    (f"loss/global_valid_count/{term.name}", _audit_float(term.global_valid_count)),
+                    (f"loss/scale_clamped/{term.name}", _audit_float(term.scale_clamped)),
+                    (
+                        f"grad_balance/raw_rms/{term.name}",
+                        _audit_optional_float(term.raw_gradient_rms),
+                    ),
+                    (
+                        f"grad_balance/ema_rms/{term.name}",
+                        _audit_optional_float(term.ema_gradient_rms),
+                    ),
+                    (
+                        f"grad_balance/loss_scale/{term.name}",
+                        _audit_optional_float(term.loss_scale),
+                    ),
+                    (
+                        f"grad_balance/grad_scale/{term.name}",
+                        _audit_optional_float(term.gradient_scale),
+                    ),
+                    (f"grad_balance/final_scale/{term.name}", _audit_optional_float(term.scale)),
                     (
                         f"grad_balance/scale_clamped/{term.name}",
-                        float(term.scale_clamped),
+                        _audit_float(term.scale_clamped),
                     ),
                     (
                         f"grad_balance/global_valid_count/{term.name}",
-                        float(term.global_valid_count),
+                        _audit_float(term.global_valid_count),
                     ),
                 )
             )
         values.extend(
             (
-                ("loss/aux_to_answer_ratio", self.auxiliary_to_answer_ratio),
-                ("loss/group_guard", self.group_guard),
-                ("loss/group_guard_active", float(self.group_guard_active)),
+                ("loss/aux_to_answer_ratio", _audit_float(self.auxiliary_to_answer_ratio)),
+                ("loss/group_guard", _audit_float(self.group_guard)),
+                ("loss/group_guard_active", _audit_float(self.group_guard_active)),
             )
         )
         if self.ema_means:
@@ -179,8 +198,8 @@ class OfficialWeakBalanceAudit:
                 self.ema_update_counts,
                 strict=True,
             ):
-                values.append((f"loss/ema/{name}", mean))
-                values.append((f"loss/ema_updates/{name}", float(updates)))
+                values.append((f"loss/ema/{name}", _audit_optional_float(mean)))
+                values.append((f"loss/ema_updates/{name}", _audit_float(updates)))
         if self.gradient_ema_rms:
             for name, _rms, updates in zip(
                 _TERM_NAMES,
@@ -188,7 +207,7 @@ class OfficialWeakBalanceAudit:
                 self.gradient_ema_update_counts,
                 strict=True,
             ):
-                values.append((f"grad_balance/ema_updates/{name}", float(updates)))
+                values.append((f"grad_balance/ema_updates/{name}", _audit_float(updates)))
         return tuple(values)
 
 
@@ -201,11 +220,8 @@ class OfficialWeakBalancedBatch:
     def __post_init__(self) -> None:
         if not self.objectives:
             raise ValueError("official-weak composition requires at least one objective")
-        expected = torch.stack(tuple(item.total for item in self.objectives)).mean()
-        if not torch.allclose(
-            self.mean_total.detach(), expected.detach(), atol=1.0e-7, rtol=1.0e-7
-        ):
-            raise ValueError("official-weak batch total must equal the mean point objective")
+        if self.mean_total.ndim != 0:
+            raise ValueError("official-weak batch total must be scalar")
 
 
 ReduceSum = Callable[[Tensor], Tensor]
@@ -231,41 +247,40 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         self.config = config
         self._reduce_sum = reduce_sum
         self._world_size = world_size
-        persistent = config.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF
         self.register_buffer(
             "ema_values",
             torch.zeros(_STAT_TERM_COUNT, dtype=torch.float64),
-            persistent=persistent,
+            persistent=True,
         )
         self.register_buffer(
             "ema_valid",
             torch.zeros(_STAT_TERM_COUNT, dtype=torch.bool),
-            persistent=persistent,
+            persistent=True,
         )
         self.register_buffer(
             "ema_update_counts",
             torch.zeros(_STAT_TERM_COUNT, dtype=torch.int64),
-            persistent=persistent,
+            persistent=True,
         )
         self.register_buffer(
             "gradient_ema_values",
             torch.zeros(_TERM_SLOT_COUNT, dtype=torch.float64),
-            persistent=persistent,
+            persistent=True,
         )
         self.register_buffer(
             "gradient_ema_valid",
             torch.zeros(_TERM_SLOT_COUNT, dtype=torch.bool),
-            persistent=persistent,
+            persistent=True,
         )
         self.register_buffer(
             "gradient_ema_update_counts",
             torch.zeros(_TERM_SLOT_COUNT, dtype=torch.int64),
-            persistent=persistent,
+            persistent=True,
         )
         self.register_buffer(
             "balance_schema_version",
             torch.tensor(_BALANCE_CHECKPOINT_SCHEMA, dtype=torch.int64),
-            persistent=persistent,
+            persistent=True,
         )
 
     def compose(
@@ -292,25 +307,7 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             state.total.device != device for state in state_items
         ):
             raise ValueError("official-weak composed losses must share one device")
-        if self.config.mode is OfficialWeakBalanceMode.LEGACY_SUM:
-            legacy_objectives = tuple(
-                compose_outer_loss_terms(
-                    answer_after=answer.loss.value,
-                    state_after=state.total,
-                    support_ttt=support,
-                )
-                for answer, state, support in zip(answer_items, state_items, supports, strict=True)
-            )
-            return OfficialWeakBalancedBatch(
-                objectives=legacy_objectives,
-                mean_total=torch.stack(tuple(item.total for item in legacy_objectives)).mean(),
-                audit=None,
-            )
-        if (
-            self.config.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF
-            and measure_gradients
-            and len(anchors) != len(answer_items)
-        ):
+        if measure_gradients and len(anchors) != len(answer_items):
             raise ValueError("ema_answer_ref requires one gradient-anchor set per Query")
         if measure_gradients and anchors and not torch.is_grad_enabled():
             raise RuntimeError("official-weak activation gradients require grad-enabled execution")
@@ -332,11 +329,11 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             *(sum(counts) for counts in term_counts),
         )
         prior_loss_scales, loss_scale_clamped = self._prior_loss_scales(device)
-        if self.config.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF and measure_gradients:
+        if measure_gradients:
             local_gradient_squares, local_gradient_counts = _gradient_local_statistics(
                 term_items,
                 anchors,
-                prior_loss_scales,
+                tuple(prior_loss_scales.unbind()),
             )
         else:
             local_gradient_squares = tuple(
@@ -357,124 +354,85 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         with trace_cuda_phase("outer_loss_balance_collective", payload_values=stats.numel()):
             reduced, world_size = self._global_sum(stats)
         finalize_started = time.perf_counter()
-        (
+        global_sums, global_counts, global_gradient_squares, global_gradient_counts = _unpack_stats(
+            reduced
+        )
+        _validate_reduced_statistics(
             global_sums,
             global_counts,
             global_gradient_squares,
             global_gradient_counts,
-        ) = _unpack_stats(reduced)
-        if global_counts[0] <= 0:
-            raise ValueError("official-weak balancing requires a valid Answer row")
-
+        )
         epsilon = float(self.config.epsilon)
-        current_means = tuple(
-            (None if global_count <= 0 else global_sum.detach() / float(global_count))
-            for global_sum, global_count in zip(global_sums, global_counts, strict=True)
+        loss_valid = global_counts > 0.0
+        gradient_valid = global_gradient_counts > 0.0
+        loss_update_valid = loss_valid & torch.isfinite(global_sums)
+        gradient_update_valid = gradient_valid & torch.isfinite(
+            global_gradient_squares
         )
-        current_gradient_rms = tuple(
-            (None if count <= 0 else (squared.detach() / float(count)).sqrt())
-            for squared, count in zip(
-                global_gradient_squares,
-                global_gradient_counts,
-                strict=True,
-            )
+        nan = torch.full((), float("nan"), dtype=torch.float64, device=device)
+        current_means = torch.where(
+            loss_valid,
+            global_sums.detach() / global_counts.clamp_min(1.0),
+            nan,
         )
-        answer_mean = global_sums[0] / float(global_counts[0])
-        loss_scales: list[Tensor | None] = []
-        gradient_scales: list[Tensor | None] = []
-        scales: list[Tensor | None] = []
-        aligned_means: list[Tensor | None] = []
-        clamped: list[bool] = []
+        current_gradient_rms = torch.where(
+            gradient_valid,
+            (global_gradient_squares.detach() / global_gradient_counts.clamp_min(1.0)).sqrt(),
+            nan,
+        )
+        answer_mean = global_sums[0] / global_counts[0]
         prior_gradient_scales, gradient_scale_clamped = self._prior_gradient_scales(
-            global_counts[1:],
-            device,
+            global_counts[1:], device
         )
-        for slot, (global_sum, global_count) in enumerate(
-            zip(global_sums[1:], global_counts[1:], strict=True)
-        ):
-            if global_count <= 0:
-                loss_scales.append(None)
-                gradient_scales.append(None)
-                scales.append(None)
-                aligned_means.append(None)
-                clamped.append(False)
-                continue
-            raw_mean = global_sum / float(global_count)
-            if self.config.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF:
-                loss_scale = prior_loss_scales[slot]
-                gradient_scale = prior_gradient_scales[slot]
-                cold_start = not (
-                    bool(self.ema_valid[0].item())
-                    and bool(self.ema_valid[slot + 1].item())
-                    and bool(self.gradient_ema_valid[slot].item())
-                )
-                unbounded = loss_scale * gradient_scale
-                scale = (
-                    torch.ones_like(unbounded)
-                    if cold_start
-                    else unbounded.clamp(
-                        min=float(self.config.scale_min),
-                        max=float(self.config.scale_max),
-                    )
-                )
-                was_clamped = (
-                    False
-                    if cold_start
-                    else (
-                        loss_scale_clamped[slot]
-                        or gradient_scale_clamped[slot]
-                        or not bool(torch.isclose(scale, unbounded).item())
-                    )
-                )
-            else:
-                ratio = answer_mean.detach() / (raw_mean.detach() + epsilon)
-                loss_scale = ratio.clamp(
-                    min=float(self.config.scale_min),
-                    max=float(self.config.scale_max),
-                )
-                gradient_scale = torch.ones_like(loss_scale)
-                scale = loss_scale
-                was_clamped = not bool(torch.isclose(scale, ratio).item())
-            loss_scales.append(loss_scale)
-            gradient_scales.append(gradient_scale)
-            scales.append(scale)
-            aligned_means.append(scale * raw_mean)
-            clamped.append(was_clamped)
-
-        auxiliary_mean = sum(
-            (value for value in aligned_means if value is not None),
-            start=answer_mean * 0.0,
-        ) / float(_TERM_SLOT_COUNT)
-        if bool((auxiliary_mean > 0.0).item()):
-            group_guard = torch.minimum(
+        history_valid = self.ema_valid[0].to(device) & self.ema_valid[1:].to(device)
+        history_valid &= self.gradient_ema_valid.to(device)
+        unbounded_scales = prior_loss_scales * prior_gradient_scales
+        bounded_scales = unbounded_scales.clamp(
+            min=float(self.config.scale_min),
+            max=float(self.config.scale_max),
+        )
+        scales = torch.where(history_valid, bounded_scales, torch.ones_like(bounded_scales))
+        clamped = history_valid & (
+            loss_scale_clamped | gradient_scale_clamped | ~torch.isclose(scales, unbounded_scales)
+        )
+        term_raw_means = global_sums[1:] / global_counts[1:].clamp_min(1.0)
+        aligned_means = torch.where(
+            loss_valid[1:],
+            scales * term_raw_means,
+            torch.zeros_like(term_raw_means),
+        )
+        auxiliary_mean = aligned_means.sum() / float(_TERM_SLOT_COUNT)
+        group_guard = torch.where(
+            auxiliary_mean > 0.0,
+            torch.minimum(
                 torch.ones_like(answer_mean),
                 answer_mean / auxiliary_mean.clamp_min(epsilon),
-            )
-        else:
-            group_guard = torch.ones_like(answer_mean)
+            ),
+            torch.ones_like(answer_mean),
+        )
         query_count = len(answer_items)
         objectives: list[OuterLossOutput] = []
         for item_index, (_answer, support) in enumerate(zip(answer_items, supports, strict=True)):
             answer_contribution = (
-                float(query_count * world_size) * answer_sums[item_index] / float(global_counts[0])
+                float(query_count * world_size)
+                * answer_sums[item_index]
+                / global_counts[0].to(dtype=answer_sums[item_index].dtype)
             )
-            aligned_contributions: list[Tensor] = []
-            for term_index, scale in enumerate(scales):
-                local_sum = term_sums[term_index][item_index]
-                global_count = global_counts[term_index + 1]
-                contribution = local_sum * 0.0
-                if scale is not None and global_count > 0:
-                    contribution = (
-                        float(query_count * world_size)
-                        * scale.to(dtype=local_sum.dtype)
-                        * local_sum
-                        / float(global_count)
-                    )
-                aligned_contributions.append(contribution)
+            item_term_sums = torch.stack(
+                tuple(term_sums[term_index][item_index] for term_index in range(_TERM_SLOT_COUNT))
+            )
+            aligned_contributions = (
+                float(query_count * world_size)
+                * scales.to(dtype=item_term_sums.dtype)
+                * item_term_sums
+                / global_counts[1:].clamp_min(1.0).to(dtype=item_term_sums.dtype)
+                * loss_valid[1:].to(dtype=item_term_sums.dtype)
+            )
             state_contribution = (
                 float(self.config.group_weight)
                 * group_guard.to(dtype=answer_contribution.dtype)
-                * torch.stack(tuple(aligned_contributions)).sum()
+                * aligned_contributions.sum()
                 / float(_TERM_SLOT_COUNT)
             )
             objectives.append(
@@ -485,80 +443,87 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
                 )
             )
 
-        if self.config.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF and self.training:
-            self._update_ema(current_means)
+        if self.training:
+            self._update_ema(current_means, loss_update_valid)
             if measure_gradients:
-                self._update_gradient_ema(current_gradient_rms)
+                self._update_gradient_ema(
+                    current_gradient_rms, gradient_update_valid
+                )
         gradient_ema_rms = self._gradient_ema_for_audit()
-        term_gradient_ema_rms = gradient_ema_rms or (None,) * _TERM_SLOT_COUNT
-        weighted_factor = float(self.config.group_weight) * float(group_guard.item())
+        term_gradient_ema_rms = torch.stack(gradient_ema_rms)
+        weighted_factor = float(self.config.group_weight) * group_guard
         term_metrics = tuple(
             OfficialWeakTermBalanceMetrics(
                 name=name,
-                raw_global_mean=(
-                    None if global_count <= 0 else float((global_sum / float(global_count)).item())
-                ),
-                scale=None if scale is None else float(scale.item()),
-                aligned_global_mean=None if aligned is None else float(aligned.item()),
-                weighted_global_mean=(
-                    None
-                    if aligned is None
-                    else weighted_factor * float(aligned.item()) / float(_TERM_SLOT_COUNT)
-                ),
-                global_valid_count=global_count,
-                scale_clamped=was_clamped,
-                loss_scale=(None if loss_scale is None else float(loss_scale.item())),
-                gradient_scale=(None if gradient_scale is None else float(gradient_scale.item())),
-                raw_gradient_rms=(
-                    None if raw_gradient_rms is None else float(raw_gradient_rms.item())
-                ),
-                ema_gradient_rms=ema_gradient_rms,
+                raw_global_mean=torch.where(active, raw_mean, nan).detach().clone(),
+                scale=torch.where(active, scale, nan).detach().clone(),
+                aligned_global_mean=torch.where(active, aligned, nan).detach().clone(),
+                weighted_global_mean=torch.where(
+                    active,
+                    weighted_factor * aligned / float(_TERM_SLOT_COUNT),
+                    nan,
+                )
+                .detach()
+                .clone(),
+                global_valid_count=global_count.detach().clone(),
+                scale_clamped=(was_clamped & active).detach().clone(),
+                loss_scale=torch.where(active, loss_scale, nan).detach().clone(),
+                gradient_scale=torch.where(active, gradient_scale, nan).detach().clone(),
+                raw_gradient_rms=torch.where(raw_gradient_valid, raw_gradient_rms, nan)
+                .detach()
+                .clone(),
+                ema_gradient_rms=ema_gradient_rms.detach().clone(),
             )
             for (
                 name,
-                global_sum,
                 global_count,
                 scale,
                 loss_scale,
                 gradient_scale,
+                raw_mean,
                 aligned,
                 was_clamped,
                 raw_gradient_rms,
                 ema_gradient_rms,
+                active,
+                raw_gradient_valid,
             ) in zip(
                 _TERM_NAMES,
-                global_sums[1:],
-                global_counts[1:],
-                scales,
-                loss_scales,
-                gradient_scales,
-                aligned_means,
-                clamped,
-                current_gradient_rms,
-                term_gradient_ema_rms,
+                global_counts[1:].unbind(),
+                scales.unbind(),
+                prior_loss_scales.unbind(),
+                prior_gradient_scales.unbind(),
+                term_raw_means.unbind(),
+                aligned_means.unbind(),
+                clamped.unbind(),
+                current_gradient_rms.unbind(),
+                term_gradient_ema_rms.unbind(),
+                loss_valid[1:].unbind(),
+                gradient_valid.unbind(),
                 strict=True,
             )
         )
-        answer_mean_value = float(answer_mean.item())
-        weighted_auxiliary = weighted_factor * float(auxiliary_mean.item())
-        ratio_value = (
-            0.0 if answer_mean_value <= epsilon else weighted_auxiliary / answer_mean_value
+        weighted_auxiliary = weighted_factor * auxiliary_mean
+        ratio_value = torch.where(
+            answer_mean > epsilon,
+            weighted_auxiliary / answer_mean.clamp_min(epsilon),
+            torch.zeros_like(answer_mean),
         )
-        if ratio_value > float(self.config.group_weight) + 1.0e-6:
-            raise ValueError("official-weak group guard failed to preserve Answer dominance")
         audit = OfficialWeakBalanceAudit(
-            answer_global_mean=answer_mean_value,
-            answer_global_count=global_counts[0],
-            state_global_mean=weighted_auxiliary,
+            answer_global_mean=answer_mean.detach().clone(),
+            answer_global_count=global_counts[0].detach().clone(),
+            state_global_mean=weighted_auxiliary.detach().clone(),
             terms=term_metrics,
-            auxiliary_to_answer_ratio=min(float(self.config.group_weight), ratio_value),
-            group_guard=float(group_guard.item()),
-            group_guard_active=bool((group_guard < 1.0).item()),
+            auxiliary_to_answer_ratio=ratio_value.clamp_max(float(self.config.group_weight))
+            .detach()
+            .clone(),
+            group_guard=group_guard.detach().clone(),
+            group_guard_active=(group_guard < 1.0).detach().clone(),
             ema_means=self._ema_means_for_audit(),
-            ema_update_counts=tuple(int(value.item()) for value in self.ema_update_counts),
+            ema_update_counts=tuple(value.detach().clone() for value in self.ema_update_counts),
             gradient_ema_rms=gradient_ema_rms,
             gradient_ema_update_counts=tuple(
-                int(value.item()) for value in self.gradient_ema_update_counts
+                value.detach().clone() for value in self.gradient_ema_update_counts
             ),
         )
         trace_event(
@@ -580,101 +545,72 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         )
 
     @torch.no_grad()  # type: ignore[untyped-decorator]
-    def _update_ema(self, current_means: Sequence[Tensor | None]) -> None:
-        if len(current_means) != _STAT_TERM_COUNT:
+    def _update_ema(self, current_means: Tensor, valid: Tensor) -> None:
+        if current_means.shape != (_STAT_TERM_COUNT,) or valid.shape != (_STAT_TERM_COUNT,):
             raise ValueError("official-weak EMA update shape drifted")
         beta = float(self.config.ema_beta)
-        for index, current in enumerate(current_means):
-            if current is None:
-                continue
-            value = current.to(device=self.ema_values.device, dtype=torch.float64)
-            if not bool(self.ema_valid[index].item()):
-                self.ema_values[index].copy_(value)
-                self.ema_valid[index] = True
-            else:
-                self.ema_values[index].mul_(beta).add_(value, alpha=1.0 - beta)
-            self.ema_update_counts[index] += 1
+        values = current_means.to(device=self.ema_values.device, dtype=torch.float64)
+        update = valid.to(device=self.ema_valid.device, dtype=torch.bool)
+        prior_valid = self.ema_valid.clone()
+        candidate = torch.where(
+            prior_valid,
+            self.ema_values * beta + values * (1.0 - beta),
+            values,
+        )
+        self.ema_values.copy_(torch.where(update, candidate, self.ema_values))
+        self.ema_valid.logical_or_(update)
+        self.ema_update_counts.add_(update.to(dtype=torch.int64))
 
-    def _prior_loss_scales(
-        self, device: torch.device
-    ) -> tuple[tuple[Tensor, ...], tuple[bool, ...]]:
-        one = torch.ones((), dtype=torch.float64, device=device)
-        if self.config.mode is not OfficialWeakBalanceMode.EMA_ANSWER_REF:
-            return (one,) * _TERM_SLOT_COUNT, (False,) * _TERM_SLOT_COUNT
-        values: list[Tensor] = []
-        clamped: list[bool] = []
+    def _prior_loss_scales(self, device: torch.device) -> tuple[Tensor, Tensor]:
+        values = self.ema_values.detach().to(device=device, dtype=torch.float64)
+        history_valid = self.ema_valid[0].to(device) & self.ema_valid[1:].to(device)
         epsilon = float(self.config.epsilon)
-        answer_valid = bool(self.ema_valid[0].item())
-        for slot in range(_TERM_SLOT_COUNT):
-            if not answer_valid or not bool(self.ema_valid[slot + 1].item()):
-                values.append(one.clone())
-                clamped.append(False)
-                continue
-            ratio = self.ema_values[0].detach().to(device) / (
-                self.ema_values[slot + 1].detach().to(device) + epsilon
-            )
-            scale = ratio.clamp(
-                min=float(self.config.scale_min),
-                max=float(self.config.scale_max),
-            )
-            values.append(scale)
-            clamped.append(not bool(torch.isclose(scale, ratio).item()))
-        return tuple(values), tuple(clamped)
+        ratio = values[0] / (values[1:] + epsilon)
+        bounded = ratio.clamp(
+            min=float(self.config.scale_min),
+            max=float(self.config.scale_max),
+        )
+        scales = torch.where(history_valid, bounded, torch.ones_like(bounded))
+        return scales, history_valid & ~torch.isclose(bounded, ratio)
 
     def _prior_gradient_scales(
         self,
-        active_counts: Sequence[int],
+        active_counts: Tensor,
         device: torch.device,
-    ) -> tuple[tuple[Tensor, ...], tuple[bool, ...]]:
-        if len(active_counts) != _TERM_SLOT_COUNT:
+    ) -> tuple[Tensor, Tensor]:
+        if active_counts.shape != (_TERM_SLOT_COUNT,):
             raise ValueError("official-weak gradient active-count shape drifted")
-        one = torch.ones((), dtype=torch.float64, device=device)
-        if self.config.mode is not OfficialWeakBalanceMode.EMA_ANSWER_REF:
-            return (one,) * _TERM_SLOT_COUNT, (False,) * _TERM_SLOT_COUNT
         epsilon = float(self.config.epsilon)
-        active_history = tuple(
-            slot
-            for slot, count in enumerate(active_counts)
-            if count > 0 and bool(self.gradient_ema_valid[slot].item())
+        historical = self.gradient_ema_values.detach().to(device=device, dtype=torch.float64)
+        active = (active_counts > 0.0) & self.gradient_ema_valid.to(device)
+        active_float = active.to(dtype=torch.float64)
+        target = (
+            ((historical + epsilon).log() * active_float).sum() / active_float.sum().clamp_min(1.0)
+        ).exp()
+        ratio = target / (historical + epsilon)
+        bounded = ratio.clamp(
+            min=float(self.config.grad_scale_min),
+            max=float(self.config.grad_scale_max),
         )
-        if active_history:
-            historical = torch.stack(
-                tuple(self.gradient_ema_values[slot].detach().to(device) for slot in active_history)
-            )
-            target = (historical + epsilon).log().mean().exp()
-        else:
-            target = one
-        values: list[Tensor] = []
-        clamped: list[bool] = []
-        for slot, count in enumerate(active_counts):
-            if count <= 0 or not bool(self.gradient_ema_valid[slot].item()):
-                values.append(one.clone())
-                clamped.append(False)
-                continue
-            ratio = target / (self.gradient_ema_values[slot].detach().to(device) + epsilon)
-            scale = ratio.clamp(
-                min=float(self.config.grad_scale_min),
-                max=float(self.config.grad_scale_max),
-            )
-            values.append(scale)
-            clamped.append(not bool(torch.isclose(scale, ratio).item()))
-        return tuple(values), tuple(clamped)
+        scales = torch.where(active, bounded, torch.ones_like(bounded))
+        return scales, active & ~torch.isclose(bounded, ratio)
 
     @torch.no_grad()  # type: ignore[untyped-decorator]
-    def _update_gradient_ema(self, current_rms: Sequence[Tensor | None]) -> None:
-        if len(current_rms) != _TERM_SLOT_COUNT:
+    def _update_gradient_ema(self, current_rms: Tensor, valid: Tensor) -> None:
+        if current_rms.shape != (_TERM_SLOT_COUNT,) or valid.shape != (_TERM_SLOT_COUNT,):
             raise ValueError("official-weak gradient EMA update shape drifted")
         beta = float(self.config.grad_ema_beta)
-        for slot, current in enumerate(current_rms):
-            if current is None:
-                continue
-            value = current.to(device=self.gradient_ema_values.device, dtype=torch.float64)
-            if not bool(self.gradient_ema_valid[slot].item()):
-                self.gradient_ema_values[slot].copy_(value)
-                self.gradient_ema_valid[slot] = True
-            else:
-                self.gradient_ema_values[slot].mul_(beta).add_(value, alpha=1.0 - beta)
-            self.gradient_ema_update_counts[slot] += 1
+        values = current_rms.to(device=self.gradient_ema_values.device, dtype=torch.float64)
+        update = valid.to(device=self.gradient_ema_valid.device, dtype=torch.bool)
+        prior_valid = self.gradient_ema_valid.clone()
+        candidate = torch.where(
+            prior_valid,
+            self.gradient_ema_values * beta + values * (1.0 - beta),
+            values,
+        )
+        self.gradient_ema_values.copy_(torch.where(update, candidate, self.gradient_ema_values))
+        self.gradient_ema_valid.logical_or_(update)
+        self.gradient_ema_update_counts.add_(update.to(dtype=torch.int64))
 
     @torch.no_grad()  # type: ignore[untyped-decorator]
     def reset_ema(self) -> None:
@@ -687,25 +623,21 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         self.gradient_ema_valid.zero_()
         self.gradient_ema_update_counts.zero_()
 
-    def _ema_means_for_audit(self) -> tuple[float | None, ...]:
-        if self.config.mode is not OfficialWeakBalanceMode.EMA_ANSWER_REF:
-            return ()
-        return tuple(
-            float(value.item()) if bool(valid.item()) else None
-            for value, valid in zip(self.ema_values, self.ema_valid, strict=True)
+    def _ema_means_for_audit(self) -> tuple[Tensor, ...]:
+        values = torch.where(
+            self.ema_valid,
+            self.ema_values,
+            torch.full_like(self.ema_values, float("nan")),
         )
+        return tuple(value.detach().clone() for value in values)
 
-    def _gradient_ema_for_audit(self) -> tuple[float | None, ...]:
-        if self.config.mode is not OfficialWeakBalanceMode.EMA_ANSWER_REF:
-            return ()
-        return tuple(
-            float(value.item()) if bool(valid.item()) else None
-            for value, valid in zip(
-                self.gradient_ema_values,
-                self.gradient_ema_valid,
-                strict=True,
-            )
+    def _gradient_ema_for_audit(self) -> tuple[Tensor, ...]:
+        values = torch.where(
+            self.gradient_ema_valid,
+            self.gradient_ema_values,
+            torch.full_like(self.gradient_ema_values, float("nan")),
         )
+        return tuple(value.detach().clone() for value in values)
 
     def calibrate(
         self,
@@ -730,12 +662,7 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
 
         device = state.total.device
         loss_scales = tuple(
-            torch.tensor(
-                1.0 if term.loss_scale is None else term.loss_scale,
-                dtype=torch.float64,
-                device=device,
-            )
-            for term in audit.terms
+            term.loss_scale.to(device=device, dtype=torch.float64) for term in audit.terms
         )
         squares, counts = _gradient_local_statistics(
             tuple((getattr(state, name),) for name in _TERM_NAMES),
@@ -758,27 +685,36 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         with trace_cuda_phase("outer_gradient_balance_collective", payload_values=packed.numel()):
             reduced = self._global_gradient_sum(packed)
         squares, counts = _unpack_gradient_stats(reduced)
-        current_rms = tuple(
-            None if count <= 0 else (squared.detach() / float(count)).sqrt()
-            for squared, count in zip(squares, counts, strict=True)
+        _validate_reduced_statistics(
+            torch.zeros(_STAT_TERM_COUNT, dtype=torch.float64, device=reduced.device),
+            torch.ones(_STAT_TERM_COUNT, dtype=torch.float64, device=reduced.device),
+            squares,
+            counts,
         )
-        if self.config.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF and self.training:
-            self._update_gradient_ema(current_rms)
+        valid = counts > 0.0
+        update_valid = valid & torch.isfinite(squares)
+        current_rms = torch.where(
+            valid,
+            (squares.detach() / counts.clamp_min(1.0)).sqrt(),
+            torch.full_like(squares, float("nan")),
+        )
+        if self.training:
+            self._update_gradient_ema(current_rms, update_valid)
         ema_rms = self._gradient_ema_for_audit()
         terms = tuple(
             replace(
                 term,
-                raw_gradient_rms=None if raw is None else float(raw.item()),
+                raw_gradient_rms=raw.detach().clone(),
                 ema_gradient_rms=ema,
             )
-            for term, raw, ema in zip(audit.terms, current_rms, ema_rms, strict=True)
+            for term, raw, ema in zip(audit.terms, current_rms.unbind(), ema_rms, strict=True)
         )
         return replace(
             audit,
             terms=terms,
             gradient_ema_rms=ema_rms,
             gradient_ema_update_counts=tuple(
-                int(value.item()) for value in self.gradient_ema_update_counts
+                value.detach().clone() for value in self.gradient_ema_update_counts
             ),
         )
 
@@ -797,25 +733,33 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             raise ValueError("streamed Query balance requires a positive query_count")
         world_size = self._configured_world_size()
         answer_sum = _answer_local_sum(answer)
-        answer_contribution = (
-            float(query_count * world_size) * answer_sum / float(audit.answer_global_count)
+        answer_count = audit.answer_global_count.to(
+            device=answer_sum.device, dtype=answer_sum.dtype
         )
-        aligned: list[Tensor] = []
-        for name, metrics in zip(_TERM_NAMES, audit.terms, strict=True):
-            term = getattr(state, name)
-            contribution = term.value * 0.0
-            if metrics.scale is not None and metrics.global_valid_count > 0:
-                contribution = (
-                    float(query_count * world_size)
-                    * float(metrics.scale)
-                    * _weak_local_sum(term)
-                    / float(metrics.global_valid_count)
-                )
-            aligned.append(contribution)
+        answer_contribution = float(query_count * world_size) * answer_sum / answer_count
+        term_sums = torch.stack(
+            tuple(_weak_local_sum(getattr(state, name)) for name in _TERM_NAMES)
+        )
+        counts = torch.stack(tuple(term.global_valid_count for term in audit.terms)).to(
+            device=term_sums.device, dtype=term_sums.dtype
+        )
+        active = counts > 0.0
+        scales = torch.stack(tuple(term.scale for term in audit.terms)).to(
+            device=term_sums.device, dtype=term_sums.dtype
+        )
+        aligned = (
+            float(query_count * world_size)
+            * torch.where(active, scales, torch.ones_like(scales))
+            * term_sums
+            / counts.clamp_min(1.0)
+            * active.to(dtype=term_sums.dtype)
+        )
         state_contribution = (
             float(self.config.group_weight)
-            * float(audit.group_guard)
-            * torch.stack(tuple(aligned)).sum()
+            * audit.group_guard.to(
+                device=answer_contribution.device, dtype=answer_contribution.dtype
+            )
+            * aligned.sum()
             / float(_TERM_SLOT_COUNT)
         )
         return compose_outer_loss_terms(
@@ -842,7 +786,6 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             reduced.shape != values.shape
             or reduced.dtype != torch.float64
             or reduced.device != values.device
-            or not bool(torch.isfinite(reduced).all().item())
         ):
             raise ValueError("official-weak collective returned an invalid payload")
         return reduced, int(world_size)
@@ -861,7 +804,6 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             reduced.shape != values.shape
             or reduced.dtype != torch.float64
             or reduced.device != values.device
-            or not bool(torch.isfinite(reduced).all().item())
         ):
             raise ValueError("official-weak gradient collective returned an invalid payload")
         return reduced
@@ -874,12 +816,12 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         return 1
 
 
-def _answer_valid_rows(answer: AnswerLossOutput) -> int:
-    return int(answer.loss.row_valid_mask.sum(dtype=torch.int64).item())
+def _answer_valid_rows(answer: AnswerLossOutput) -> Tensor:
+    return answer.loss.row_valid_mask.sum(dtype=torch.int64)
 
 
 def _answer_local_sum(answer: AnswerLossOutput) -> Tensor:
-    return answer.loss.value * float(_answer_valid_rows(answer))
+    return answer.loss.value * _answer_valid_rows(answer).to(dtype=answer.loss.value.dtype)
 
 
 def _weak_local_sum(term: OfficialWeakLossTerm) -> Tensor:
@@ -895,7 +837,7 @@ def _sum_tensors(values: Sequence[Tensor]) -> Tensor:
 
 def _pack_stats(
     local_sums: Sequence[Tensor],
-    local_counts: Sequence[int],
+    local_counts: Sequence[Tensor | int],
     gradient_squares: Sequence[Tensor],
     gradient_counts: Sequence[int],
 ) -> Tensor:
@@ -903,10 +845,15 @@ def _pack_stats(
         raise ValueError("official-weak local statistics contract drifted")
     values: list[Tensor] = []
     for local_sum, local_count in zip(local_sums, local_counts, strict=True):
+        count = (
+            local_count.detach().to(device=local_sum.device, dtype=torch.float64)
+            if isinstance(local_count, Tensor)
+            else torch.tensor(float(local_count), dtype=torch.float64, device=local_sum.device)
+        )
         values.extend(
             (
                 local_sum.detach().to(dtype=torch.float64),
-                torch.tensor(float(local_count), dtype=torch.float64, device=local_sum.device),
+                count,
             )
         )
     values.extend(_pack_gradient_stats(gradient_squares, gradient_counts).unbind())
@@ -918,12 +865,12 @@ def _pack_stats(
 
 def _unpack_stats(
     values: Tensor,
-) -> tuple[tuple[Tensor, ...], tuple[int, ...], tuple[Tensor, ...], tuple[int, ...]]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     if values.shape != (_STAT_VECTOR_LENGTH,):
         raise ValueError("official-weak reduced statistics length drifted")
     loss_values = values[:_LOSS_STAT_VECTOR_LENGTH]
-    sums = tuple(loss_values[index] for index in range(0, _LOSS_STAT_VECTOR_LENGTH, 2))
-    counts = _unpack_counts(loss_values, start=1)
+    sums = loss_values[0::2]
+    counts = loss_values[1::2]
     gradient_squares, gradient_counts = _unpack_gradient_stats(values[_LOSS_STAT_VECTOR_LENGTH:])
     return sums, counts, gradient_squares, gradient_counts
 
@@ -992,22 +939,61 @@ def _pack_gradient_stats(squared_sums: Sequence[Tensor], counts: Sequence[int]) 
     return torch.stack(values)
 
 
-def _unpack_gradient_stats(values: Tensor) -> tuple[tuple[Tensor, ...], tuple[int, ...]]:
+def _unpack_gradient_stats(values: Tensor) -> tuple[Tensor, Tensor]:
     if values.shape != (_GRAD_STAT_VECTOR_LENGTH,):
         raise ValueError("official-weak reduced gradient statistics length drifted")
-    squares = tuple(values[index] for index in range(0, _GRAD_STAT_VECTOR_LENGTH, 2))
-    return squares, _unpack_counts(values, start=1)
+    return values[0::2], values[1::2]
 
 
-def _unpack_counts(values: Tensor, *, start: int) -> tuple[int, ...]:
-    counts: list[int] = []
-    for index in range(start, values.numel(), 2):
-        raw = float(values[index].item())
-        count = int(round(raw))
-        if count < 0 or not math.isclose(raw, float(count), abs_tol=1.0e-6):
-            raise ValueError("official-weak reduced counts must be non-negative integers")
-        counts.append(count)
-    return tuple(counts)
+def _validate_reduced_statistics(
+    sums: Tensor,
+    counts: Tensor,
+    gradient_squares: Tensor,
+    gradient_counts: Tensor,
+) -> None:
+    """Validate one collective result at the explicit statistics boundary."""
+
+    expected = (
+        (sums, (_STAT_TERM_COUNT,)),
+        (counts, (_STAT_TERM_COUNT,)),
+        (gradient_squares, (_TERM_SLOT_COUNT,)),
+        (gradient_counts, (_TERM_SLOT_COUNT,)),
+    )
+    if any(value.shape != shape or value.dtype != torch.float64 for value, shape in expected):
+        raise ValueError("official-weak reduced statistics contract drifted")
+    if len({value.device for value, _shape in expected}) != 1:
+        raise ValueError("official-weak reduced statistics must share one device")
+    if not bool(torch.isfinite(torch.cat((counts, gradient_counts))).all()):
+        raise ValueError("official-weak reduced counts must be finite")
+    if not bool(
+        torch.all(counts >= 0.0)
+        and torch.all(gradient_counts >= 0.0)
+        and torch.allclose(counts, counts.round(), atol=1.0e-6, rtol=0.0)
+        and torch.allclose(gradient_counts, gradient_counts.round(), atol=1.0e-6, rtol=0.0)
+    ):
+        raise ValueError("official-weak reduced counts must be non-negative integers")
+    finite_gradient_squares = torch.isfinite(gradient_squares)
+    if not bool(
+        torch.where(
+            finite_gradient_squares,
+            gradient_squares.ge(0.0),
+            torch.ones_like(finite_gradient_squares),
+        ).all()
+    ):
+        raise ValueError("official-weak reduced gradient squares must be non-negative")
+    if not bool(counts[0] > 0.0):
+        raise ValueError("official-weak balancing requires a valid Answer row")
+
+
+def _audit_float(value: Tensor) -> float:
+    if value.ndim != 0 or value.requires_grad:
+        raise ValueError("official-weak audit metric must be one detached scalar")
+    return float(value.detach().cpu().item())
+
+
+def _audit_optional_float(value: Tensor) -> float | None:
+    materialized = _audit_float(value)
+    return None if math.isnan(materialized) else materialized
 
 
 __all__ = [

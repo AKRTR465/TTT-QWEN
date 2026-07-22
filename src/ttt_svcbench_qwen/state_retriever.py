@@ -28,8 +28,6 @@ from ttt_svcbench_qwen.query_encoder import (
 from ttt_svcbench_qwen.state_bank import (
     RetrievalHistoryRecord,
     RetrievalHistoryView,
-    StateBankRuntimeState,
-    StateBankView,
     StateRecord,
     StateRecordKind,
     StructuredStateBank,
@@ -38,7 +36,6 @@ from ttt_svcbench_qwen.state_bank import (
 )
 
 type RetrievalCandidate = StateRecord | RetrievalHistoryRecord
-type RetrievalView = StateBankView | RetrievalHistoryView
 
 
 class RetrievalStatus(StrEnum):
@@ -372,23 +369,6 @@ class RetrieverOutput:
             raise ValueError("Retriever audit counts must align to output counts")
 
 
-@dataclass(frozen=True, slots=True)
-class RetrievalQualityMetrics:
-    true_positive_count: int
-    selected_denominator: int
-    relevant_denominator: int
-    precision: float | None
-    recall: float | None
-    empty_retrieval_count: int
-    query_denominator: int
-    empty_retrieval_rate: float | None
-    unsupported_count: int
-    invalid_count: int
-    total_query_count: int
-    unsupported_rate: float | None
-    invalid_rate: float | None
-
-
 class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
     """Zero-parameter exact scorer; soft scores retain q_target gradients."""
 
@@ -397,105 +377,31 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
         _validate_retriever_config(config)
         self.config = config
 
-    def retrieve_states(
-        self,
-        state_bank: StructuredStateBank,
-        states: Sequence[StateBankRuntimeState],
-        q_target: Tensor,
-        hard_operators: Sequence[Operator],
-        time_resolutions: Sequence[TimeResolution],
-        *,
-        video_ids: Sequence[str],
-        trajectory_ids: Sequence[str],
-    ) -> RetrieverOutput:
-        """Create the row-wise owner/head snapshot, then retrieve from that exact version."""
-
-        if q_target.ndim == 0:
-            raise ValueError("q_target must be floating [B, 512]")
-        operators = _normalize_operators(hard_operators, q_target.shape[0])
-        heads = tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in operators)
-        view = state_bank.view(states, heads)
-        return self.forward(
-            q_target,
-            operators,
-            time_resolutions,
-            view,
-            video_ids=video_ids,
-            trajectory_ids=trajectory_ids,
-        )
-
-    def retrieve_query(
-        self,
-        state_bank: StructuredStateBank,
-        states: Sequence[StateBankRuntimeState],
-        query: QueryEncoderOutput,
-        *,
-        video_ids: Sequence[str],
-        trajectory_ids: Sequence[str],
-    ) -> RetrieverOutput:
-        return self.retrieve_states(
-            state_bank,
-            states,
-            query.q_target,
-            query.hard_operators,
-            query.time.resolutions,
-            video_ids=video_ids,
-            trajectory_ids=trajectory_ids,
-        )
-
-    def retrieve_query_history(
-        self,
-        state_bank: StructuredStateBank,
-        states: Sequence[StateBankRuntimeState],
-        query: QueryEncoderOutput,
-        *,
-        video_ids: Sequence[str],
-        trajectory_ids: Sequence[str],
-    ) -> RetrieverOutput:
-        """Reproject detached history sources inside the grad-enabled Query path."""
-
-        operators = _normalize_operators(query.hard_operators, query.q_target.shape[0])
-        heads = tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in operators)
-        view = state_bank.retrieval_view(states, heads)
-        projected = _project_history_sources(state_bank, view)
-        return self.forward(
-            query.q_target,
-            operators,
-            query.time.resolutions,
-            view,
-            video_ids=video_ids,
-            trajectory_ids=trajectory_ids,
-            state_embeddings=projected,
-        )
-
     def forward(
         self,
-        q_target: Tensor,
-        hard_operators: Sequence[Operator],
-        time_resolutions: Sequence[TimeResolution],
-        state_view: RetrievalView,
+        state_bank: StructuredStateBank,
+        history: RetrievalHistoryView,
+        query: QueryEncoderOutput,
         *,
         video_ids: Sequence[str],
         trajectory_ids: Sequence[str],
-        state_embeddings: Tensor | None = None,
-        apply_similarity_threshold: bool = True,
     ) -> RetrieverOutput:
-        if type(apply_similarity_threshold) is not bool:
-            raise TypeError("apply_similarity_threshold must be bool")
-        if isinstance(state_view, StateBankView):
-            if state_embeddings is not None:
-                raise ValueError("StateBankView already owns its projected embeddings")
-            aligned_embeddings = state_view.embeddings
-        else:
-            if state_embeddings is None:
-                raise ValueError("RetrievalHistoryView requires Query-time projected embeddings")
-            aligned_embeddings = state_embeddings
+        """Reproject one write-before history snapshot in the grad-enabled Query path."""
+
+        if not isinstance(state_bank, StructuredStateBank):
+            raise TypeError("Retriever requires the StructuredStateBank projector owner")
+        if not isinstance(history, RetrievalHistoryView):
+            raise TypeError("Retriever requires a write-before RetrievalHistoryView")
+        q_target = query.q_target
+        hard_operators = query.hard_operators
+        time_resolutions = query.time.resolutions
+        aligned_embeddings = _project_history_sources(state_bank, history)
         batch_size = _validate_retrieval_inputs(
             self.config,
             q_target,
             hard_operators,
             time_resolutions,
-            state_view,
+            history,
             video_ids,
             trajectory_ids,
             aligned_embeddings,
@@ -525,8 +431,8 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
             aligned_embeddings.float(), dim=-1, eps=self.config.normalization_eps
         )
         scores = torch.einsum("bd,bnd->bn", normalized_query, normalized_state)
-        scores = torch.where(state_view.present_mask, scores, torch.zeros_like(scores))
-        selected_mask = torch.zeros_like(state_view.present_mask)
+        scores = torch.where(history.present_mask, scores, torch.zeros_like(scores))
+        selected_mask = torch.zeros_like(history.present_mask)
         statuses: list[RetrievalStatus] = []
         reasons: list[RetrievalReason] = []
         audits: list[RetrievalFilterAudit] = []
@@ -534,7 +440,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
         selected_scores: list[tuple[float, ...]] = []
         selected_records: list[tuple[RetrievalCandidate, ...]] = []
         n_retrieved = torch.zeros(batch_size, dtype=torch.int64, device=scores.device)
-        causal_mask = _causal_mask(state_view, resolutions, scores.device)
+        causal_mask = _causal_mask(history, resolutions, scores.device)
         for row in range(batch_size):
             row_result = self._retrieve_row(
                 row,
@@ -542,12 +448,11 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
                 selected_mask,
                 operators[row],
                 resolutions[row],
-                state_view,
+                history,
                 causal_mask,
                 query_video_ids[row],
                 query_trajectory_ids[row],
                 float(query_norms[row].detach().item()),
-                apply_similarity_threshold,
             )
             status, reason, audit, ids, row_scores, records = row_result
             statuses.append(status)
@@ -562,30 +467,30 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
             selected_record_ids=tuple(selected_ids),
             selected_scores=tuple(selected_scores),
             selected_records=tuple(selected_records),
-            candidate_record_ids=state_view.record_ids,
+            candidate_record_ids=history.record_ids,
             candidate_records=tuple(
                 tuple(_clone_candidate(record) if record is not None else None for record in row)
-                for row in state_view.cloned_records
+                for row in history.cloned_records
             ),
             state_embeddings=aligned_embeddings,
             scores=scores,
-            present_mask=state_view.present_mask.detach().clone(),
-            record_valid_mask=state_view.record_valid_mask.detach().clone(),
-            retrieval_eligible_mask=state_view.retrieval_eligible_mask.detach().clone(),
+            present_mask=history.present_mask.detach().clone(),
+            record_valid_mask=history.record_valid_mask.detach().clone(),
+            retrieval_eligible_mask=history.retrieval_eligible_mask.detach().clone(),
             causal_mask=causal_mask.detach().clone(),
             selected_mask=selected_mask,
             status=tuple(statuses),
             reason=tuple(reasons),
             hard_operators=operators,
             time_resolutions=resolutions,
-            n_state=state_view.n_state.detach().clone(),
+            n_state=history.n_state.detach().clone(),
             n_retrieved=n_retrieved,
             audit=tuple(audits),
             video_ids=query_video_ids,
             trajectory_ids=query_trajectory_ids,
-            bank_video_ids=state_view.video_ids,
-            bank_trajectory_ids=state_view.trajectory_ids,
-            bank_versions=state_view.bank_versions,
+            bank_video_ids=history.video_ids,
+            bank_trajectory_ids=history.trajectory_ids,
+            bank_versions=history.bank_versions,
         )
 
     def _retrieve_row(
@@ -595,12 +500,11 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
         selected_mask: Tensor,
         operator: Operator,
         resolution: TimeResolution,
-        state_view: RetrievalView,
+        state_view: RetrievalHistoryView,
         causal_mask: Tensor,
         video_id: str,
         trajectory_id: str,
         query_norm: float,
-        apply_similarity_threshold: bool,
     ) -> tuple[
         RetrievalStatus,
         RetrievalReason,
@@ -678,9 +582,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
                 record, resolution.window
             ):
                 outside += 1
-            elif apply_similarity_threshold and bool(
-                scores[row, column].detach() < similarity_threshold
-            ):
+            elif bool(scores[row, column].detach() < similarity_threshold):
                 below += 1
             else:
                 selected_columns.append(column)
@@ -721,65 +623,6 @@ def build_state_retriever(config: ProjectConfig | None = None) -> EmbeddingState
     if config is None:
         raise ValueError("build_state_retriever requires a validated ProjectConfig")
     return EmbeddingStateRetriever(config.retriever)
-
-
-def evaluate_retrieval_quality(
-    selected_record_ids: Sequence[Sequence[str]],
-    relevant_record_ids: Sequence[Sequence[str]],
-    statuses: Sequence[RetrievalStatus],
-) -> RetrievalQualityMetrics:
-    """Compute status-aware offline metrics; GT IDs never enter Retriever runtime."""
-
-    selected_rows = tuple(tuple(row) for row in selected_record_ids)
-    relevant_rows = tuple(tuple(row) for row in relevant_record_ids)
-    normalized_statuses = tuple(statuses)
-    if len({len(selected_rows), len(relevant_rows), len(normalized_statuses)}) != 1:
-        raise ValueError("selected, relevant, and status retrieval rows must have equal length")
-    if any(not isinstance(status, RetrievalStatus) for status in normalized_statuses):
-        raise ValueError("retrieval quality statuses must contain RetrievalStatus values")
-    true_positive = selected_total = relevant_total = empty = 0
-    unsupported = invalid = 0
-    for selected, relevant, status in zip(
-        selected_rows,
-        relevant_rows,
-        normalized_statuses,
-        strict=True,
-    ):
-        if any(not record_id for record_id in selected + relevant):
-            raise ValueError("retrieval quality IDs must be non-empty strings")
-        if len(set(selected)) != len(selected) or len(set(relevant)) != len(relevant):
-            raise ValueError("retrieval quality rows cannot contain duplicate IDs")
-        if (status is RetrievalStatus.OK) != bool(selected):
-            raise ValueError("only retrieval status OK may contain selected record IDs")
-        selected_set = set(selected)
-        relevant_set = set(relevant)
-        true_positive += len(selected_set & relevant_set)
-        selected_total += len(selected_set)
-        relevant_total += len(relevant_set)
-        if status is RetrievalStatus.UNSUPPORTED:
-            unsupported += 1
-            continue
-        if status is RetrievalStatus.INVALID:
-            invalid += 1
-            continue
-        empty += int(status is RetrievalStatus.EMPTY)
-    query_denominator = len(normalized_statuses) - unsupported - invalid
-    total_query_count = len(normalized_statuses)
-    return RetrievalQualityMetrics(
-        true_positive_count=true_positive,
-        selected_denominator=selected_total,
-        relevant_denominator=relevant_total,
-        precision=true_positive / selected_total if selected_total else None,
-        recall=true_positive / relevant_total if relevant_total else None,
-        empty_retrieval_count=empty,
-        query_denominator=query_denominator,
-        empty_retrieval_rate=empty / query_denominator if query_denominator else None,
-        unsupported_count=unsupported,
-        invalid_count=invalid,
-        total_query_count=total_query_count,
-        unsupported_rate=(unsupported / total_query_count if total_query_count else None),
-        invalid_rate=invalid / total_query_count if total_query_count else None,
-    )
 
 
 def _validate_retriever_config(config: RetrieverConfig) -> None:
@@ -829,7 +672,7 @@ def _validate_retrieval_inputs(
     q_target: Tensor,
     hard_operators: Sequence[Operator],
     time_resolutions: Sequence[TimeResolution],
-    state_view: RetrievalView,
+    state_view: RetrievalHistoryView,
     video_ids: Sequence[str],
     trajectory_ids: Sequence[str],
     state_embeddings: Tensor,
@@ -950,7 +793,7 @@ def _project_history_sources(
 
 
 def _causal_mask(
-    view: RetrievalView,
+    view: RetrievalHistoryView,
     resolutions: Sequence[TimeResolution],
     device: torch.device,
 ) -> Tensor:
@@ -983,14 +826,14 @@ def _intersects_window(record: RetrievalCandidate, window: TimeWindow) -> bool:
     return bool(start <= window.end_time and end >= window.start_time)
 
 
-def _required_record_id(view: RetrievalView, row: int, column: int) -> str:
+def _required_record_id(view: RetrievalHistoryView, row: int, column: int) -> str:
     record_id = view.record_ids[row][column]
     if not isinstance(record_id, str) or not record_id:
         raise ValueError("present State Bank records require record IDs")
     return record_id
 
 
-def _required_record(view: RetrievalView, row: int, column: int) -> RetrievalCandidate:
+def _required_record(view: RetrievalHistoryView, row: int, column: int) -> RetrievalCandidate:
     record = view.cloned_records[row][column]
     if record is None:
         raise ValueError("present State Bank records require cloned records")

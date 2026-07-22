@@ -5,7 +5,7 @@
 - A2 全量状态模型训练，再初始化 A5 Meta-TTT；
 - 按视频隔离、按 chunk 因果更新的在线推理。
 
-当前规范版本为 `state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history`。配置、运行时和测试均以 v6 为准；历史阶段 gate 与 synthetic 报告不再随源码分发。
+当前架构规范为 `state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history`，正式配置 schema 为 7；历史阶段 gate 与 synthetic 报告不再随源码分发。
 
 ## 架构摘要
 
@@ -50,13 +50,12 @@ bash scripts/h200/train_fullprefix256.sh a5 /absolute/path/a2/checkpoints/final-
 - A5 多 Query 逐个 forward/backward，释放各自激活；所有 Query 共用同一 `W_after` 和只读
   Bank/FSM snapshot；
 - 四卡 sampler 保持任务/segment parity，padding 样本 loss 权重为零；
-- checkpoint 保存模型、optimizer、scheduler、RNG，但排除 Wt、Bank、cache 和 FSM runtime；
-- `formal_evaluation_enabled=false`，直至独立校准和正式评估完成。
+- checkpoint 保存模型、optimizer、scheduler、RNG，但排除 Wt、Bank、cache 和 FSM runtime。
 
-`loss.official_weak_balance.mode` 正式值为 `ema_answer_ref`，`experimental=false`。loss 与
-gradient EMA 均采用一步滞后并随同阶段 checkpoint 恢复；A2 初始化 A5 时清零。Task、
-Operator、Retrieval、Time 始终占固定四槽，缺失监督不更新对应 EMA，也不重分配预算。
-`instant_equal/legacy_sum` 只有显式 `experimental=true` 才可作为消融运行。
+`ema_answer_ref` 是唯一 official-weak loss-balance 算法，不再提供 mode 或 experimental
+开关。loss 与 gradient EMA 均采用一步滞后并随同阶段 checkpoint 恢复；A2 初始化 A5 时
+清零。Task、Operator、Retrieval、Time 始终占固定四槽，缺失监督不更新对应 EMA，也不
+重分配预算。
 
 Outer AdamW 将状态参数拆为 `state_shared`、`state_task`、`state_router_time` 和
 `state_retrieval` 四个独立裁剪组；四组 cap 均为 0.05，RSS 更新预算等于旧单组 0.1，

@@ -393,10 +393,6 @@ class QueryEncoderOutput:
         return self.route.logits
 
     @property
-    def operator_confidence(self) -> Tensor:
-        return self.route.confidence
-
-    @property
     def padding_mask(self) -> Tensor:
         return self.embeddings.padding_mask
 
@@ -932,20 +928,6 @@ def build_query_encoder(config: ProjectConfig | None = None) -> QueryEncoder:
     if config is None:
         raise ValueError("build_query_encoder requires a validated ProjectConfig")
     return QueryEncoder(config)
-
-
-def query_embedding_parameter_count(module: QueryEmbeddingEncoder) -> int:
-    """Count the P4 36.03M backbone/pooling/three-head parameters only."""
-
-    return sum(parameter.numel() for parameter in module.parameters())
-
-
-def operator_router_parameter_count(module: OperatorRouter) -> int:
-    return sum(parameter.numel() for parameter in module.parameters())
-
-
-def time_resolver_parameter_count(module: TimeWindowResolver) -> int:
-    return sum(parameter.numel() for parameter in module.parameters())
 
 
 def _embedding_head(hidden_dim: int, output_dim: int) -> nn.Sequential:

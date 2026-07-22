@@ -192,19 +192,6 @@ class StateResamplerOutput:
         ):
             raise ValueError("selected attention mass must be one for hits and zero for empty rows")
 
-    @property
-    def h_state(self) -> Tensor:
-        """Architecture-name alias for ``hidden_states``."""
-
-        return self.hidden_states
-
-    @property
-    def r_t(self) -> Tensor:
-        """Architecture-name alias for ``state_tokens``."""
-
-        return self.state_tokens
-
-
 @dataclass(frozen=True, slots=True)
 class ReaderResult:
     status: ReaderStatus
@@ -1107,12 +1094,6 @@ def build_state_resampler(config: ProjectConfig | None = None) -> StateResampler
     if config is None:
         raise ValueError("build_state_resampler requires a validated ProjectConfig")
     return StateResampler(config.state_resampler)
-
-
-def state_resampler_parameter_count(module: StateResampler) -> int:
-    """Return the exact P12 learned-parameter count (14,722,048 for v5)."""
-
-    return sum(parameter.numel() for parameter in module.parameters())
 
 
 def build_state_reader(

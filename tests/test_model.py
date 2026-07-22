@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.support import make_test_model as build_model
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
@@ -25,9 +26,32 @@ from ttt_svcbench_qwen.model import (
     StateTTTModel,
     VisualStageOutput,
     assert_training_number_agreement,
-    build_model,
-    evaluate_number_agreement,
 )
+from ttt_svcbench_qwen.query_encoder import Operator
+from ttt_svcbench_qwen.state_bank import RetrievalHistoryView
+
+
+class _StateBankComponent:
+    def retrieval_view(self, states: Any, heads: Any) -> RetrievalHistoryView:
+        assert tuple(states) == ("bank-0",)
+        assert len(tuple(heads)) == 1
+        return RetrievalHistoryView(
+            sources=torch.zeros((1, 0, 768)),
+            present_mask=torch.zeros((1, 0), dtype=torch.bool),
+            record_valid_mask=torch.zeros((1, 0), dtype=torch.bool),
+            retrieval_eligible_mask=torch.zeros((1, 0), dtype=torch.bool),
+            timestamps=torch.full((1, 0), -1.0, dtype=torch.float64),
+            time_ranges=torch.full((1, 0, 2), -1.0, dtype=torch.float64),
+            n_state=torch.zeros(1, dtype=torch.int64),
+            owner_record_counts=torch.zeros(1, dtype=torch.int64),
+            video_ids=("video-a",),
+            trajectory_ids=("trajectory-a",),
+            bank_versions=(0,),
+            record_ids=((),),
+            head_types=((),),
+            record_kinds=((),),
+            cloned_records=((),),
+        )
 
 
 @pytest.fixture(scope="module")
@@ -56,7 +80,7 @@ class SpySuite:
         self.events.append("query")
         assert query_input == "query-input"
         assert inference is True
-        return SimpleNamespace(q_target="q-target")
+        return SimpleNamespace(q_target="q-target", hard_operators=(Operator.O1_SNAP,))
 
     def fast(
         self,
@@ -114,34 +138,18 @@ class SpySuite:
         assert (spatial, temporal) == ("spatial-soft", "temporal-soft")
         return BankWriteOutput("runtime-1", ("bank-1",), "bank-audit")
 
-    def retrieve_query(
+    def __call__(
         self,
         state_bank: object,
-        states: Any,
-        query: object,
-        *,
-        video_ids: Any,
-        trajectory_ids: Any,
-    ) -> object:
-        self.events.append("retriever")
-        assert state_bank == "state-bank-component"
-        assert tuple(states) == ("bank-1",)
-        assert tuple(video_ids) == ("video-a",)
-        assert tuple(trajectory_ids) == ("trajectory-a",)
-        return self.retrieval
-
-    def retrieve_query_history(
-        self,
-        state_bank: object,
-        states: Any,
+        history: RetrievalHistoryView,
         query: object,
         *,
         video_ids: Any,
         trajectory_ids: Any,
     ) -> object:
         self.events.append("retriever.history")
-        assert state_bank == "state-bank-component"
-        assert tuple(states) == ("bank-0",)
+        assert isinstance(state_bank, _StateBankComponent)
+        assert history.bank_versions == (0,)
         assert tuple(video_ids) == ("video-a",)
         assert tuple(trajectory_ids) == ("trajectory-a",)
         return self.retrieval
@@ -161,7 +169,7 @@ class SpySuite:
         trajectory_ids: Any,
     ) -> tuple[object, ...]:
         self.events.append("reader.bank")
-        assert state_bank == "state-bank-component"
+        assert isinstance(state_bank, _StateBankComponent)
         assert tuple(states) == ("bank-1",)
         assert tuple(video_ids) == ("video-a",)
         assert tuple(trajectory_ids) == ("trajectory-a",)
@@ -188,7 +196,7 @@ class SpySuite:
         trajectory_ids: Any,
     ) -> tuple[object, ...]:
         self.events.append("reader.audit")
-        assert state_bank == "state-bank-component"
+        assert isinstance(state_bank, _StateBankComponent)
         assert tuple(states) == ("bank-1",)
         assert tuple(video_ids) == ("video-a",)
         assert tuple(trajectory_ids) == ("trajectory-a",)
@@ -267,7 +275,7 @@ def make_components(suite: SpySuite, **updates: object) -> ModelComponents:
         "spatial_encoder": suite.spatial,
         "temporal_encoder": suite.temporal,
         "observation_heads": suite.heads,
-        "state_bank": "state-bank-component",
+        "state_bank": _StateBankComponent(),
         "bank_writer": suite.write_bank,
         "retriever": suite,
         "reader": suite,
@@ -322,14 +330,10 @@ def run_answer(
     return model.prefill_answer(model.prepare_answer(request, lifecycle), lifecycle)
 
 
-def test_build_model_validates_feature_dependencies_before_any_stage(
+def test_model_validates_feature_dependencies_before_any_stage(
     config: ProjectConfig,
 ) -> None:
     suite = make_suite()
-    with pytest.raises(ValueError, match="validated ProjectConfig"):
-        build_model(components=make_components(suite))
-    with pytest.raises(ValueError, match="explicit ModelComponents"):
-        build_model(config)
     with pytest.raises(ValueError, match="fast_adapter"):
         build_model(config, components=make_components(suite, fast_adapter=None))
     with pytest.raises(ValueError, match="reader"):
@@ -418,6 +422,28 @@ def test_soft_observation_recompute_boundary_cannot_duplicate_hard_commit(
     with pytest.raises(LifecycleError, match="already committed"):
         model.commit_observation(request, soft, lifecycle)
     assert suite.events.count("bank") == 1
+
+
+def test_soft_observation_nonfinite_fails_before_hard_commit(
+    config: ProjectConfig,
+) -> None:
+    suite = make_suite()
+    model = build_model(config, components=make_components(suite))
+    owner = make_owner()
+    lifecycle = PrefillLifecycle(owner)
+    request = make_observation_request(owner)
+    soft = model.observe_chunk_soft(request)
+    poisoned = replace(
+        soft,
+        visual=VisualStageOutput(torch.tensor(float("nan")), "poisoned"),
+    )
+
+    with pytest.raises(ValueError, match="soft observation commit contains a nonfinite"):
+        model.commit_observation(request, poisoned, lifecycle)
+
+    assert "bank" not in suite.events
+    assert not soft.commit_guard.committed
+    assert lifecycle.phase is LifecyclePhase.FAILED
 
 
 def test_answer_query_audits_same_retrieval_before_resampler_and_native_prefill(
@@ -650,7 +676,7 @@ def test_qwen_kwargs_cannot_override_composer_or_native_visual_fields() -> None:
     assert suite.events == []
 
 
-def test_reader_number_agreement_is_independent_and_training_mismatch_is_blocked() -> None:
+def test_training_number_agreement_blocks_reader_mismatch_or_missing_target() -> None:
     results = (
         SimpleNamespace(exact_count=2),
         SimpleNamespace(exact_count=0),
@@ -658,13 +684,8 @@ def test_reader_number_agreement_is_independent_and_training_mismatch_is_blocked
         SimpleNamespace(exact_count=-3),
     )
 
-    metrics = evaluate_number_agreement(results, (2, 7, 999, None))
-
-    assert metrics.comparable_rows == 3
-    assert metrics.matched_rows == 1
-    assert metrics.mismatched_rows == 1
-    assert metrics.missing_rows == 1
-    assert metrics.accuracy == pytest.approx(1 / 3)
     with pytest.raises(ValueError, match="authoritative Reader"):
         assert_training_number_agreement(results, (2, 7, None, -3))
+    with pytest.raises(ValueError, match="authoritative Reader"):
+        assert_training_number_agreement(results, (2, 0, None, None))
     assert_training_number_agreement(results, (2, 0, None, -3))

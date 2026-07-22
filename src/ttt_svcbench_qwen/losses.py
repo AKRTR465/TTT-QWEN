@@ -105,19 +105,6 @@ class LossTerm:
             raise ValueError("valid_counts cannot exceed mask_counts")
         if not torch.equal(self.row_valid_mask, self.valid_counts > 0):
             raise ValueError("row validity must exactly match positive valid_counts")
-        if bool(torch.any(self.per_row[~self.row_valid_mask] != 0.0)):
-            raise ValueError("invalid loss rows must have exact zero values")
-        _require_finite(self.value, "loss value")
-        _require_finite(self.per_row, "loss per_row")
-        expected_value = (
-            self.per_row[self.row_valid_mask].mean()
-            if bool(self.row_valid_mask.any().item())
-            else self.per_row.sum() * 0.0
-        )
-        if not torch.allclose(
-            self.value.detach(), expected_value.detach(), atol=1.0e-6, rtol=1.0e-6
-        ):
-            raise ValueError("loss value must be the mean of union-valid per_row values")
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,7 +128,6 @@ class TemporalPredictionInput:
         _require_same_device(
             (self.hidden, self.valid_mask, self.position_ids), "temporal prediction input"
         )
-        _require_finite(self.hidden, "temporal hidden")
         if self.hidden.device.type != "meta":
             if bool(torch.any(self.hidden[~self.valid_mask] != 0.0)):
                 raise ValueError("invalid temporal hidden positions must be zero")
@@ -186,9 +172,7 @@ class TemporalPredictor(nn.Module):  # type: ignore[misc]
             or not torch.is_floating_point(hidden)
         ):
             raise ValueError(f"predictor input must be floating [B, T, {self.input_dim}]")
-        _require_finite(hidden, "predictor input")
         output = self.network(hidden)
-        _require_finite(output, "predictor output")
         return output
 
 
@@ -226,7 +210,6 @@ class IdentityConsistencyInput:
                 or not torch.is_floating_point(tensor)
             ):
                 raise ValueError(f"identity {name} must be floating [B, N, 256]")
-            _require_finite(tensor, f"identity {name}")
         batch_size = self.current_predictions.shape[0]
         if self.previous_targets.shape[0] != batch_size:
             raise ValueError("current and previous identity banks must share B")
@@ -282,8 +265,6 @@ class IdentityConsistencyInput:
             ),
             "identity consistency input",
         )
-        _require_finite(self.current_timestamps, "current identity timestamps")
-        _require_finite(self.previous_timestamps, "previous identity timestamps")
         if self.current_predictions.device.type == "meta":
             return
         allowed = torch.tensor(
@@ -556,19 +537,6 @@ class TTTLossOutput:
             raise ValueError("P14 TTT weights are frozen at 1/0.5/0.5")
         if self.o1_unlabeled_weight != 0.0:
             raise ValueError("O1 unlabeled loss is forbidden")
-        _require_finite(self.total, "TTT total")
-        _require_finite(self.per_row_total, "TTT per_row_total")
-        if bool(torch.any(self.per_row_total[~self.update_valid_mask] != 0.0)):
-            raise ValueError("invalid TTT rows must have exact zero values")
-        expected_total = (
-            self.per_row_total[self.update_valid_mask].mean()
-            if bool(self.update_valid_mask.any().item())
-            else self.per_row_total.sum() * 0.0
-        )
-        if not torch.allclose(
-            self.total.detach(), expected_total.detach(), atol=1.0e-6, rtol=1.0e-6
-        ):
-            raise ValueError("TTT total must be the mean of union-valid per_row_total")
 
 
 def compute_temporal_prediction_loss(
@@ -781,13 +749,6 @@ class O2StateTarget:
             self.slot_mask,
         )
         _require_same_device(tensors, "O2 State target")
-        for tensor, name in (
-            (self.identity_predictions, "O2 identity predictions"),
-            (self.identity_targets, "O2 identity targets"),
-            (self.score_logits, "O2 score logits"),
-            (self.score_targets, "O2 score targets"),
-        ):
-            _require_finite(tensor, name)
         _require_probability_targets(self.score_targets, "O2 score targets")
         _require_unit_norm(self.identity_predictions, self.slot_mask, "O2 identity predictions")
         _require_unit_norm(self.identity_targets, self.slot_mask, "O2 identity targets")
@@ -843,9 +804,6 @@ class E2StateTarget:
             self.time_mask,
         )
         _require_same_device(tensors, "E2 State target")
-        _require_finite(self.event_logits, "E2 event logits")
-        _require_finite(self.event_targets, "E2 event targets")
-        _require_finite(self.phase_logits, "E2 phase logits")
         _require_probability_targets(self.event_targets, "E2 event targets")
         if self.phase_targets.device.type != "meta":
             valid = self.time_mask
@@ -870,7 +828,6 @@ class OperatorLossInput:
         if self.valid_mask.shape != (batch_size,) or self.valid_mask.dtype != torch.bool:
             raise ValueError("operator valid_mask must be bool [B]")
         _require_same_device((self.logits, self.targets, self.valid_mask), "operator loss input")
-        _require_finite(self.logits, "operator logits")
         if self.targets.device.type != "meta" and bool(
             torch.any(self.valid_mask & ((self.targets < 0) | (self.targets >= 9)))
         ):
@@ -900,8 +857,6 @@ class RetrievalLossInput:
             (self.logits, self.targets, self.present_mask, self.label_mask),
             "retrieval loss input",
         )
-        _require_finite(self.logits, "retrieval logits")
-        _require_finite(self.targets, "retrieval targets")
         _require_probability_targets(self.targets, "retrieval targets")
         if self.logits.device.type != "meta" and bool(
             torch.any(self.label_mask & ~self.present_mask)
@@ -960,9 +915,6 @@ class TimeLossInput:
             self.token_valid_mask,
         )
         _require_same_device(tensors, "time loss input")
-        _require_finite(self.mode_logits, "time mode logits")
-        _require_finite(self.span_start_logits, "time span start logits")
-        _require_finite(self.span_end_logits, "time span end logits")
         if self.mode_targets.device.type == "meta":
             return
         if bool(
@@ -1056,8 +1008,6 @@ class TimeLossOutput:
             raise ValueError("time per_row_total must be FP32 [B]")
         if self.row_valid_mask.shape != (batch_size,) or self.row_valid_mask.dtype != torch.bool:
             raise ValueError("time row_valid_mask must be bool [B]")
-        _require_finite(self.total, "time total")
-        _require_finite(self.per_row_total, "time per_row_total")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1092,8 +1042,6 @@ class StateLossOutput:
             self.time_weight,
         ) != (1.0, 1.0, 1.0, 1.0):
             raise ValueError("P14 State weights are frozen at one")
-        _require_finite(self.total, "State total")
-        _require_finite(self.per_row_total, "State per_row_total")
 
 
 def compute_state_loss(inputs: StateLossInput) -> StateLossOutput:
@@ -1222,7 +1170,6 @@ class AnswerLossInput:
         _require_same_device(
             (self.logits, self.labels, self.number_token_mask), "Answer loss input"
         )
-        _require_finite(self.logits, "answer logits")
         if self.logits.device.type != "meta":
             supervised = self.labels != -100
             vocab_size = self.logits.shape[-1]
@@ -1360,7 +1307,6 @@ class OuterLossOutput:
             (self.total, "total loss"),
         ):
             _require_fp32_scalar(value, name)
-            _require_finite(value, name)
         if self.auxiliary_weight != 0.1:
             raise ValueError("P14 auxiliary outer weight is frozen at 0.1")
 
@@ -1415,7 +1361,6 @@ class TrainingLossOutput:
 
     def __post_init__(self) -> None:
         _require_fp32_scalar(self.total, "training total")
-        _require_finite(self.total, "training total")
 
 
 def compute_losses(
@@ -1649,7 +1594,6 @@ def _reduce_items(
     if item_losses.shape != valid_mask.shape or valid_mask.dtype != torch.bool:
         raise ValueError("item losses and bool valid mask must share [B, N]")
     losses = item_losses.float()
-    _require_finite(losses, "item losses")
     valid_counts = valid_mask.sum(dim=1, dtype=torch.int64)
     per_row = (losses * valid_mask).sum(dim=1) / valid_counts.clamp_min(1).float()
     per_row = torch.where(valid_counts > 0, per_row, torch.zeros_like(per_row))
@@ -1720,8 +1664,6 @@ def _validate_dense_binary_target(
     if mask.shape != logits.shape[:2] or mask.dtype != torch.bool:
         raise ValueError(f"{name} mask must be bool [R, N]")
     _require_same_device((row_indices, logits, targets, mask), f"{name} State target")
-    _require_finite(logits, f"{name} logits")
-    _require_finite(targets, f"{name} targets")
     _require_probability_targets(targets, f"{name} targets")
 
 
@@ -1779,10 +1721,6 @@ def _validate_overlap_probabilities(
         previous_timestamps,
     )
     _require_same_device(tensors, f"{name} consistency input")
-    _require_finite(current, f"{name} current probabilities")
-    _require_finite(previous, f"{name} target probabilities")
-    _require_finite(current_timestamps, f"{name} current timestamps")
-    _require_finite(previous_timestamps, f"{name} previous timestamps")
     _require_probability_targets(current, f"{name} current probabilities")
     _require_probability_targets(previous, f"{name} target probabilities")
     if current.device.type == "meta":
@@ -1877,11 +1815,6 @@ def _differentiable_zero(reference: Tensor) -> Tensor:
 def _require_fp32_scalar(value: Tensor, name: str) -> None:
     if value.ndim != 0 or value.dtype != torch.float32:
         raise ValueError(f"{name} must be an FP32 scalar tensor")
-
-
-def _require_finite(value: Tensor, name: str) -> None:
-    if value.device.type != "meta" and not bool(torch.isfinite(value.detach()).all().item()):
-        raise ValueError(f"{name} must be finite")
 
 
 def _require_same_device(tensors: tuple[Tensor, ...], name: str) -> None:

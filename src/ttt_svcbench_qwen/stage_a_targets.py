@@ -611,17 +611,6 @@ class StageATargetBuilder:
                 raise ValueError("explicit operator label does not match the row's head target")
 
 
-def build_stage_a_targets(
-    observations: ObservationOutputs,
-    query: QueryEncoderOutput,
-    retrieval: RetrieverOutput,
-    labels: StageATargetBatch,
-) -> StateLossInput:
-    """Functional convenience wrapper around :class:`StageATargetBuilder`."""
-
-    return StageATargetBuilder().build(observations, query, retrieval, labels)
-
-
 def _validate_builder_inputs(
     observations: ObservationOutputs,
     query: QueryEncoderOutput,
@@ -1314,42 +1303,20 @@ def _official_weak_term(losses: Sequence[Tensor], anchor: Tensor) -> OfficialWea
     return OfficialWeakLossTerm(value=value, valid_rows=len(values))
 
 
-# Short aliases keep the public vocabulary discoverable without creating more provenance values.
-Provenance = TargetProvenance
-O1Labels = O1TargetLabels
-O2Labels = O2TargetLabels
-E1Labels = E1TargetLabels
-E2Labels = E2TargetLabels
-QueryLabels = QueryTargetLabels
-RetrievalLabels = RetrievalTargetLabels
-AnswerLabels = AnswerTargetLabels
-StageATargetLabels = StageATargetBatch
-
-
 __all__ = [
-    "E1Labels",
     "E1TargetLabels",
-    "E2Labels",
     "E2TargetLabels",
     "OfficialWeakLossAudit",
     "OfficialWeakLossTerm",
     "OfficialWeakStateLossOutput",
     "OfficialWeakSupervision",
     "OfficialWeakTargetBuilder",
-    "O1Labels",
     "O1TargetLabels",
-    "O2Labels",
     "O2TargetLabels",
-    "AnswerLabels",
     "AnswerTargetLabels",
-    "Provenance",
-    "QueryLabels",
     "QueryTargetLabels",
-    "RetrievalLabels",
     "RetrievalTargetLabels",
     "StageATargetBatch",
     "StageATargetBuilder",
-    "StageATargetLabels",
     "TargetProvenance",
-    "build_stage_a_targets",
 ]

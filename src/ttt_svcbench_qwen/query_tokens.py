@@ -9,14 +9,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol, cast
 
 import torch
 from torch import Tensor
-from transformers import AutoTokenizer
-
-from ttt_svcbench_qwen.config import ProjectConfig
 
 
 class TokenizerProtocol(Protocol):
@@ -91,21 +87,6 @@ class QuestionTokenBatch:
                 )
             if bool(torch.any(offsets[span.end :] != 0)):
                 raise ValueError("padding token offsets must be [0, 0]")
-
-
-def load_pinned_tokenizer(
-    config: ProjectConfig,
-    *,
-    cache_dir: str | Path | None = None,
-    local_files_only: bool = False,
-) -> TokenizerProtocol:
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model.base_model,
-        revision=config.model.revision,
-        cache_dir=cache_dir,
-        local_files_only=local_files_only,
-    )
-    return cast(TokenizerProtocol, tokenizer)
 
 
 def tokenize_questions(

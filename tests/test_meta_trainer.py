@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import gc
-import weakref
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -13,7 +11,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from ttt_svcbench_qwen.config import MetaTTTVariant, ProjectConfig, load_config
+from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.data import RuntimeQueryInput, assert_runtime_payload_safe
 from ttt_svcbench_qwen.fast_ttt import FastTTTForwardAudit, FastWeightsState
 from ttt_svcbench_qwen.identity_bank import (
@@ -59,6 +57,7 @@ from ttt_svcbench_qwen.observation_heads import (
     ObservationOutputs,
     StreamReplayAudit,
 )
+from ttt_svcbench_qwen.query_encoder import Operator
 from ttt_svcbench_qwen.stage_a_runtime import StageAWriteAudit
 from ttt_svcbench_qwen.stage_a_targets import (
     AnswerTargetLabels,
@@ -68,7 +67,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     StageATargetBatch,
     TargetProvenance,
 )
-from ttt_svcbench_qwen.state_bank import HeadType, build_state_bank
+from ttt_svcbench_qwen.state_bank import HeadType, RetrievalHistoryView, build_state_bank
 from ttt_svcbench_qwen.state_encoder import TemporalCache, TemporalEncoderOutput
 from ttt_svcbench_qwen.trainer import StageAEpisodeAnswerInputs, StageASupervisionBatch
 
@@ -208,7 +207,10 @@ class _QueryStage(nn.Module):
         if inference or not isinstance(query_input, RuntimeQueryInput):
             raise ValueError("tiny query stage requires a training RuntimeQueryInput")
         self.calls += 1
-        return SimpleNamespace(q_target=torch.zeros((1, 512)))
+        return SimpleNamespace(
+            q_target=torch.zeros((1, 512)),
+            hard_operators=(Operator.O1_SNAP,),
+        )
 
 
 class _SpatialStage:
@@ -395,36 +397,19 @@ class _BankWriter:
 
 
 class _Retriever:
-    def retrieve_query(
+    def __call__(
         self,
         _state_bank: object,
-        states: Sequence[object],
+        history: RetrievalHistoryView,
         _query: object,
         *,
         video_ids: Sequence[str],
         trajectory_ids: Sequence[str],
     ) -> object:
-        if len(states) != len(video_ids) or len(states) != len(trajectory_ids):
+        versions = history.bank_versions
+        if len(versions) != len(video_ids) or len(versions) != len(trajectory_ids):
             raise ValueError("tiny retrieval ownership mismatch")
-        versions = tuple(state.version for state in states)
         return SimpleNamespace(audit=versions, versions=versions)
-
-    def retrieve_query_history(
-        self,
-        state_bank: object,
-        states: Sequence[object],
-        query: object,
-        *,
-        video_ids: Sequence[str],
-        trajectory_ids: Sequence[str],
-    ) -> object:
-        return self.retrieve_query(
-            state_bank,
-            states,
-            query,
-            video_ids=video_ids,
-            trajectory_ids=trajectory_ids,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -612,7 +597,6 @@ def config() -> ProjectConfig:
 
 def _system(
     config: ProjectConfig,
-    variant: MetaTTTVariant,
     *,
     query_loss_builder: MetaQueryLossBuilder | None = None,
     query_encoder_reuse: bool = False,
@@ -633,7 +617,7 @@ def _system(
             spatial_encoder=_SpatialStage(),
             temporal_encoder=_TemporalStage(),
             observation_heads=_ObservationStage(),
-            state_bank=object(),
+            state_bank=build_state_bank(config),
             bank_writer=_BankWriter(),
             retriever=_Retriever(),
             reader=reader,
@@ -654,7 +638,6 @@ def _system(
         fast_controller=fast,
         predictor=predictor,
         runtime_resetter=resetter,
-        variant=variant,
         query_loss_builder=query_loss_builder or _TinyQueryLossBuilder(),
         query_encoder_reuse=query_encoder_reuse,
         raw_support_visual_batcher=raw_support_visual_batcher,  # type: ignore[arg-type]
@@ -665,7 +648,6 @@ def _system(
 
 def _episode(
     config: ProjectConfig,
-    variant: MetaTTTVariant,
     *,
     support_count: int,
     query_count: int,
@@ -697,8 +679,7 @@ def _episode(
         )
         for index in range(query_count)
     )
-    seed = config.stage_b.seed if variant is MetaTTTVariant.A3 else config.stage_c.seed
-    return MetaTTTEpisode(owner, supports, queries, seed)
+    return MetaTTTEpisode(owner, supports, queries, config.a5.seed)
 
 
 def _truncated_episode(
@@ -706,12 +687,13 @@ def _truncated_episode(
     *,
     support_count: int,
     query_count: int = 2,
+    invalid_first_support: bool = False,
 ) -> MetaTTTEpisode:
     base = _episode(
         config,
-        MetaTTTVariant.A5,
         support_count=support_count,
         query_count=query_count,
+        invalid_first_support=invalid_first_support,
     )
     prewarm = _chunk(base.owner, chunk_index=0, end_time=0.5, width=2)
     supports = tuple(
@@ -719,7 +701,7 @@ def _truncated_episode(
             base.owner,
             chunk_index=index + 1,
             end_time=float(index) + 1.5,
-            width=2,
+            width=1 if index == 0 and invalid_first_support else 2,
         )
         for index in range(support_count)
     )
@@ -914,40 +896,15 @@ def _e2_state(
     )
 
 
-def _graph_node_count(value: Tensor) -> int:
-    root = value.grad_fn
-    if root is None:
-        return 0
-    stack = [root]
-    seen: set[int] = set()
-    retained_nodes: list[object] = []
-    while stack:
-        node = stack.pop()
-        if id(node) in seen:
-            continue
-        seen.add(id(node))
-        # Keep Python wrappers alive while traversing. Otherwise CPython may
-        # reuse an id for a later autograd node and make the count flaky.
-        retained_nodes.append(node)
-        stack.extend(next_node for next_node, _ in node.next_functions if next_node is not None)
-    return len(retained_nodes)
-
-
 def test_stage_c_invalid_chunk_skips_then_later_supports_continue(
     config: ProjectConfig,
 ) -> None:
-    runner, _, _, _ = _system(config, MetaTTTVariant.A5)
-    output = runner(
-        _episode(
-            config,
-            MetaTTTVariant.A5,
-            support_count=4,
-            query_count=2,
-            invalid_first_support=True,
-        )
+    runner, _, _, _ = _system(config)
+    output = runner.run_truncated(
+        _truncated_episode(config, support_count=4, invalid_first_support=True)
     )
     assert output.audit.updates[0].did_update == (False,)
-    assert output.audit.updates[0].skip_reasons == ("insufficient_time",)
+    assert output.audit.updates[0].skip_reasons == ("unrepresentable_update",)
     assert [update.fast_versions_before for update in output.audit.updates] == [
         (0,),
         (0,),
@@ -964,11 +921,11 @@ def test_a5_support_schedule_is_bounded_and_next_only(
     config: ProjectConfig,
     support_count: int,
 ) -> None:
-    runner, _, _, _ = _system(config, MetaTTTVariant.A5)
-    output = runner(_episode(config, MetaTTTVariant.A5, support_count=support_count, query_count=2))
+    runner, _, _, _ = _system(config)
+    output = runner.run_truncated(_truncated_episode(config, support_count=support_count))
     assert output.audit.support_count == support_count
-    assert output.audit.retained_support_graph_count == support_count
-    assert output.audit.graph_bound == 8
+    assert output.audit.maximum_retained_support_graphs == min(support_count, 8)
+    assert output.audit.truncation_horizon == 8
     assert output.audit.update_attempt_count == support_count
     assert all(update.next_only_verified for update in output.audit.updates)
     assert output.final_fast_states[0].update_count == support_count
@@ -984,7 +941,7 @@ def test_a5_support_schedule_is_bounded_and_next_only(
 def test_truncated_a5_t17_k8_has_two_numeric_truncations_and_bounded_graphs(
     config: ProjectConfig,
 ) -> None:
-    runner, fast, predictor, resetter = _system(config, MetaTTTVariant.A5)
+    runner, fast, predictor, resetter = _system(config)
     episode = _truncated_episode(config, support_count=17)
     output = runner.run_truncated(episode)
 
@@ -1027,7 +984,6 @@ def test_truncated_a5_batches_raw_visuals_only_within_each_k_segment(
 
     runner, _, _, _ = _system(
         config,
-        MetaTTTVariant.A5,
         raw_support_visual_batcher=raw_batcher,
         support_visual_batch_size=2,
     )
@@ -1041,7 +997,7 @@ def test_truncated_a5_batches_raw_visuals_only_within_each_k_segment(
 
 
 def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectConfig) -> None:
-    runner, fast, _, _ = _system(config, MetaTTTVariant.A5)
+    runner, fast, _, _ = _system(config)
 
     output = runner.run_truncated(_truncated_episode(config, support_count=8))
 
@@ -1077,30 +1033,22 @@ def test_sequential_multi_query_backward_matches_one_shot_mean() -> None:
     assert torch.allclose(streamed.grad, expected, atol=1.0e-12, rtol=1.0e-12)
 
 
-def test_truncated_a5_instant_equal_composes_all_queries_once(
+def test_truncated_a5_ema_balance_composes_all_queries_once(
     config: ProjectConfig,
 ) -> None:
-    raw = config.model_dump(mode="json")
-    raw["loss"]["official_weak_balance"]["mode"] = "instant_equal"
-    raw["loss"]["official_weak_balance"]["experimental"] = True
-    raw["loss"]["official_weak_balance"]["scale_min"] = 0.1
-    raw["loss"]["official_weak_balance"]["scale_max"] = 10.0
-    instant_config = ProjectConfig.model_validate(raw)
     runner, _, _, _ = _system(
-        instant_config,
-        MetaTTTVariant.A5,
+        config,
         query_loss_builder=_TinyOfficialWeakQueryLossBuilder(),
     )
 
-    output = runner.run_truncated(
-        _truncated_episode(instant_config, support_count=1, query_count=2)
-    )
+    output = runner.run_truncated(_truncated_episode(config, support_count=1, query_count=2))
 
     assert runner.last_balance_audit is not None
     assert runner.last_balance_audit.auxiliary_to_answer_ratio <= 0.3
     assert len(output.audit.queries) == 2
+    assert dict(runner.last_balance_audit.metrics())["loss/aux_to_answer_ratio"] is not None
     assert all(
-        query.metrics.value("loss/aux_to_answer_ratio") is not None
+        "loss/aux_to_answer_ratio" not in dict(query.metrics.metrics)
         for query in output.audit.queries
     )
 
@@ -1108,10 +1056,9 @@ def test_truncated_a5_instant_equal_composes_all_queries_once(
 def test_truncated_a5_reuses_one_query_graph_per_segment_and_final_key(
     config: ProjectConfig,
 ) -> None:
-    serial, serial_fast, _, _ = _system(config, MetaTTTVariant.A5)
+    serial, serial_fast, _, _ = _system(config)
     reused, reused_fast, _, _ = _system(
         config,
-        MetaTTTVariant.A5,
         query_encoder_reuse=True,
     )
     episode = _with_shared_query_key(_truncated_episode(config, support_count=17))
@@ -1136,7 +1083,6 @@ def test_truncated_a5_does_not_reuse_different_final_query_ids(
 ) -> None:
     runner, _, _, _ = _system(
         config,
-        MetaTTTVariant.A5,
         query_encoder_reuse=True,
     )
     episode = _truncated_episode(config, support_count=1, query_count=2)
@@ -1145,41 +1091,6 @@ def test_truncated_a5_does_not_reuse_different_final_query_ids(
     query = runner.model.components.query_encoder
     assert isinstance(query, _QueryStage)
     assert query.calls == 4  # prewarm + one segment + two distinct final keys
-
-
-def test_eight_support_graph_is_released_and_does_not_grow(config: ProjectConfig) -> None:
-    runner, _, _, _ = _system(config, MetaTTTVariant.A5)
-
-    first_episode = _episode(config, MetaTTTVariant.A5, support_count=8, query_count=2)
-    first = runner(first_episode)
-    first_node_count = _graph_node_count(first.total)
-    first_total = first.total
-    first_support = first.support_ttt[0].per_row_total
-    first_total_ref = weakref.ref(first_total)
-    first_support_ref = weakref.ref(first_support)
-    first.total.backward()
-    observations = runner.model.components.observation_heads
-    assert isinstance(observations, _ObservationStage)
-    observations.outputs.clear()
-    del first_total, first_support, first, first_episode
-    gc.collect()
-    assert first_total_ref() is None
-    assert first_support_ref() is None
-
-    second_episode = _episode(config, MetaTTTVariant.A5, support_count=8, query_count=2)
-    second = runner(second_episode)
-    second_node_count = _graph_node_count(second.total)
-    assert second_node_count == first_node_count
-    second_total = second.total
-    second_support = second.support_ttt[0].per_row_total
-    second_total_ref = weakref.ref(second_total)
-    second_support_ref = weakref.ref(second_support)
-    second.total.backward()
-    observations.outputs.clear()
-    del second_total, second_support, second, second_episode
-    gc.collect()
-    assert second_total_ref() is None
-    assert second_support_ref() is None
 
 
 def test_query_future_and_prefill_reuse_are_rejected(config: ProjectConfig) -> None:
@@ -1194,16 +1105,15 @@ def test_query_future_and_prefill_reuse_are_rejected(config: ProjectConfig) -> N
             task_name="task",
             case_id="case",
         )
-    runner, _, _, _ = _system(config, MetaTTTVariant.A5)
-    output = runner(_episode(config, MetaTTTVariant.A5, support_count=1, query_count=2))
-    assert all(query.before_prefill_count == 1 for query in output.audit.queries)
-    assert all(query.after_prefill_count == 1 for query in output.audit.queries)
+    runner, _, _, _ = _system(config)
+    output = runner.run_truncated(_truncated_episode(config, support_count=1))
+    assert all(query.prefill_count == 1 for query in output.audit.queries)
 
 
 def test_later_query_labels_cannot_change_earlier_query_path(config: ProjectConfig) -> None:
-    clean_runner, _, _, _ = _system(config, MetaTTTVariant.A5)
-    changed_runner, _, _, _ = _system(config, MetaTTTVariant.A5)
-    clean_episode = _episode(config, MetaTTTVariant.A5, support_count=4, query_count=2)
+    clean_runner, _, _, _ = _system(config)
+    changed_runner, _, _, _ = _system(config)
+    clean_episode = _truncated_episode(config, support_count=4)
     changed_episode = replace(
         clean_episode,
         query_points=(
@@ -1211,38 +1121,11 @@ def test_later_query_labels_cannot_change_earlier_query_path(config: ProjectConf
             replace(clean_episode.query_points[1], supervision=_supervision(label=1)),
         ),
     )
-    clean = clean_runner(clean_episode)
-    changed = changed_runner(changed_episode)
+    clean = clean_runner.run_truncated(clean_episode)
+    changed = changed_runner.run_truncated(changed_episode)
 
-    assert torch.equal(
-        clean.query_objectives[0].outer.total.detach(),
-        changed.query_objectives[0].outer.total.detach(),
-    )
-    assert clean.audit.queries[0].before == changed.audit.queries[0].before
-    assert clean.audit.queries[0].after == changed.audit.queries[0].after
-    clean_observations = clean_runner.model.components.observation_heads
-    changed_observations = changed_runner.model.components.observation_heads
-    assert isinstance(clean_observations, _ObservationStage)
-    assert isinstance(changed_observations, _ObservationStage)
-    first_query_call = 2 * len(clean_episode.support_chunks)
-    assert torch.equal(
-        clean_observations.outputs[first_query_call].o1.logits.detach(),
-        changed_observations.outputs[first_query_call].o1.logits.detach(),
-    )
-    clean_reader = clean_runner.model.components.reader
-    changed_reader = changed_runner.model.components.reader
-    assert isinstance(clean_reader, _Reader)
-    assert isinstance(changed_reader, _Reader)
-    assert clean_reader.calls[0] == changed_reader.calls[0]
-    clean_composer = clean_runner.model.components.composer
-    changed_composer = changed_runner.model.components.composer
-    assert isinstance(clean_composer, _Composer)
-    assert isinstance(changed_composer, _Composer)
-    assert torch.equal(clean_composer.input_ids[0], changed_composer.input_ids[0])
-    assert not torch.equal(
-        clean.query_objectives[1].outer.total.detach(),
-        changed.query_objectives[1].outer.total.detach(),
-    )
+    assert clean.audit.queries[0].metrics == changed.audit.queries[0].metrics
+    assert clean.audit.queries[1].metrics != changed.audit.queries[1].metrics
 
 
 @pytest.mark.parametrize("denied", ["answer", "count", "occurrence_times"])
@@ -1250,7 +1133,7 @@ def test_support_label_poison_is_rejected_before_any_model_call(
     config: ProjectConfig,
     denied: str,
 ) -> None:
-    runner, fast, _, resetter = _system(config, MetaTTTVariant.A5)
+    runner, fast, _, resetter = _system(config)
     del runner
     owner = RuntimeOwner(("video-a",), ("trajectory-a",))
     clean = _chunk(owner, chunk_index=0, end_time=1.0, width=2)

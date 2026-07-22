@@ -183,12 +183,6 @@ class QwenVideoPreprocessor:
         return QwenProcessedVideo(pixel_values_videos=raw_pixels.unsqueeze(0), video_grid_thw=grid)
 
 
-def build_demo_video() -> Tensor:
-    """Return the fixed uint8 shape fixture X=[1,16,3,224,224]."""
-
-    return torch.zeros((1, 16, 3, 224, 224), dtype=torch.uint8)
-
-
 def causal_right_cut(frames: Tensor, timestamps: Tensor, query_time: float) -> CausalCut:
     _validate_frames_and_timestamps(frames, timestamps)
     if query_time < 0.0:
@@ -314,7 +308,7 @@ def decode_video_causally(
         stream = container.streams.video[0]
         source_fps = float(stream.average_rate) if stream.average_rate is not None else sample_fps
         for frame in container.decode(stream):
-            timestamp = _frame_timestamp(frame)
+            timestamp = av_frame_timestamp(frame)
             if timestamp > query_time:
                 break
             if timestamp + 1.0e-9 < next_sample_time:
@@ -356,7 +350,7 @@ def _build_tubelet_audit(
     return timestamps, valid, counts, grouped_indices
 
 
-def _frame_timestamp(frame: av.VideoFrame) -> float:
+def av_frame_timestamp(frame: av.VideoFrame) -> float:
     if frame.time is not None:
         return float(frame.time)
     if frame.pts is None or frame.time_base is None:

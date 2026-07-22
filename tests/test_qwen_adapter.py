@@ -294,7 +294,6 @@ def test_variable_video_mapping_and_deepstack_objects_are_preserved() -> None:
     assert captured.merged_grid_thw.tolist() == [[2, 2, 2], [1, 1, 2]]
     assert captured.token_offsets == (0, 8, 10)
     assert all(captured.deepstack_features[index] is deepstack[index] for index in range(3))
-    assert captured.padded_deepstack_feature(0).shape == captured.main_visual_embeddings.shape
     assert prepared is not None
     assert prepared.main_features == main
     assert all(prepared.deepstack_features[index] is deepstack[index] for index in range(3))

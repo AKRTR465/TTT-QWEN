@@ -32,10 +32,6 @@ import transformers
 from safetensors import safe_open
 from torch import Tensor, nn
 
-from ttt_svcbench_qwen.config import (
-    OfficialWeakBalanceConfig,
-    OfficialWeakBalanceMode,
-)
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
     A5EpisodeRecord,
@@ -49,7 +45,10 @@ from ttt_svcbench_qwen.meta_trainer import (
     MetaTTTEpisodeRunner,
     TruncatedMetaTTTEpisodeOutput,
 )
-from ttt_svcbench_qwen.outer_gradient_control import OuterGradientController
+from ttt_svcbench_qwen.outer_gradient_control import (
+    OuterGradientController,
+    sanitize_scalar_loss,
+)
 from ttt_svcbench_qwen.outer_loss_balance import OfficialWeakOuterLossComposer
 from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
@@ -164,6 +163,14 @@ class SegmentBackwardController:
             stage="a5_segment",
             segment_index=self.backward_count,
         ):
+            if isinstance(self.gradient_controller, OuterGradientController):
+                loss = sanitize_scalar_loss(
+                    loss,
+                    source=f"A5 backward {self.backward_count}",
+                    controller=self.gradient_controller,
+                )
+            elif loss.ndim != 0 or not loss.requires_grad:
+                raise ValueError("A5 segment loss must be one differentiable scalar Tensor")
             if self.is_deepspeed:
                 engine = cast(Any, self.engine)
                 is_final_segment = self.backward_count + 1 == self.expected_count
@@ -432,8 +439,14 @@ class TTTQwenTrainerMixin:
         if self.ttt_runtime.stage is ProductionStage.A2:
             step = cast(StageALossStep, self.ttt_runtime.stage_a_loss_step)
             loss = step(model, inputs)
-            _validate_scalar_loss(loss, "A2 state+answer")
-            return loss
+            controller = self.ttt_runtime.gradient_controller
+            if not isinstance(controller, OuterGradientController):
+                raise RuntimeError("formal A2 requires an Outer gradient controller")
+            return sanitize_scalar_loss(
+                loss,
+                source="A2 state+answer",
+                controller=controller,
+            )
         return cast(Tensor, super().compute_loss(model, inputs, *args, **kwargs))  # type: ignore[misc]
 
     def training_step(
@@ -473,10 +486,10 @@ class TTTQwenTrainerMixin:
             raise ValueError("A5 episode loss weight must be one or deterministic-padding zero")
         runner = cast(MetaTTTEpisodeRunner, self.ttt_runtime.meta_runner)
         expected_segments = math.ceil(
-            len(episode.support_chunks) / runner.config.stage_c.truncation_horizon
+            len(episode.support_chunks) / runner.config.a5.truncation_horizon
         )
         expected_backwards = expected_segments + len(episode.query_points) - 1
-        horizon = runner.config.stage_c.truncation_horizon
+        horizon = runner.config.a5.truncation_horizon
         segment_lengths = tuple(
             min(horizon, len(episode.support_chunks) - start)
             for start in range(0, len(episode.support_chunks), horizon)
@@ -610,7 +623,6 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("usage: python -m ttt_svcbench_qwen.llamafactory_trainer CONFIG.yaml")
     started = time.monotonic()
     backbone = load_llamafactory_backbone(arguments[0])
-    _validate_formal_balance(backbone.project_config.loss.official_weak_balance)
     unfreeze_audit = fully_unfreeze_qwen(backbone.model, backbone.project_config)
     configured_stage = ProductionStage(backbone.ttt_config.stage)
     if getattr(backbone.training_args, "resume_from_checkpoint", None) is not None:
@@ -660,7 +672,7 @@ def main(argv: list[str] | None = None) -> int:
             dtype=str(parameter.dtype).removeprefix("torch."),
             visual_batch_size=backbone.ttt_config.support_visual_batch_size,
             cache_mode=backbone.ttt_config.preprocess_cache_mode,
-            loss_mode=balance.mode.value,
+            loss_mode="ema_answer_ref",
             loss_group_weight=balance.group_weight,
             loss_scale_min=balance.scale_min,
             loss_scale_max=balance.scale_max,
@@ -670,7 +682,7 @@ def main(argv: list[str] | None = None) -> int:
                 if torch.cuda.is_available()
                 else "cpu"
             ),
-            query_decode_strategy=backbone.ttt_config.query_decode_strategy,
+            query_decode_strategy="grouped_seek",
             query_decode_max_groups=backbone.ttt_config.query_decode_max_groups,
             state_query_visual_mode=backbone.ttt_config.state_query_visual_mode,
             state_query_max_frames=backbone.ttt_config.state_query_max_frames,
@@ -1020,13 +1032,6 @@ def _validate_checkpoint_tree(checkpoint: Path) -> None:
         raise RuntimeError("final checkpoint is missing complete Accelerate resume state")
 
 
-def _validate_scalar_loss(loss: Tensor, name: str) -> None:
-    if not isinstance(loss, Tensor) or loss.ndim != 0 or not loss.requires_grad:
-        raise ValueError(f"{name} loss must be one differentiable scalar Tensor")
-    if not bool(torch.isfinite(loss.detach()).item()):
-        raise ValueError(f"{name} loss must be finite")
-
-
 def resolve_same_stage_resume(
     checkpoint: str | None,
     stage: ProductionStage,
@@ -1125,13 +1130,13 @@ def make_production_outer_optimizer_factory(
     qwen_ids = {id(parameter) for parameter in backbone.model.parameters()}
     training_args = cast(Any, backbone.training_args)
     if stage is ProductionStage.A2:
-        qwen_lr = backbone.project_config.stage_a.optimizer.qwen_learning_rate
-        state_lr = backbone.project_config.stage_a.optimizer.state_learning_rate
-        w0_lr = backbone.project_config.stage_a.optimizer.w0_learning_rate
+        qwen_lr = backbone.project_config.a2.optimizer.qwen_learning_rate
+        state_lr = backbone.project_config.a2.optimizer.state_learning_rate
+        w0_lr = backbone.project_config.a2.optimizer.w0_learning_rate
         predictor_lr = state_lr
     else:
         qwen_lr = float(training_args.learning_rate)
-        optimizer = backbone.project_config.stage_c.optimizer
+        optimizer = backbone.project_config.a5.optimizer
         state_lr = optimizer.state_learning_rate
         w0_lr = optimizer.w0_learning_rate
         predictor_lr = optimizer.predictor_learning_rate
@@ -1264,13 +1269,6 @@ def make_production_outer_optimizer_factory(
         return optimizer
 
     return factory
-
-
-def _validate_formal_balance(config: OfficialWeakBalanceConfig) -> None:
-    if config.mode is not OfficialWeakBalanceMode.EMA_ANSWER_REF or config.experimental:
-        raise ValueError(
-            "formal A2/A5 requires official_weak_balance mode=ema_answer_ref and experimental=false"
-        )
 
 
 def _reset_a2_to_a5_balance(model: nn.Module) -> None:

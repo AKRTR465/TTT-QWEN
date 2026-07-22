@@ -12,11 +12,7 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
-from ttt_svcbench_qwen.config import (
-    OfficialWeakBalanceConfig,
-    OfficialWeakBalanceMode,
-    load_config,
-)
+from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.llamafactory_trainer import (
     CheckpointPolicy,
     ProductionStage,
@@ -28,11 +24,11 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     _publish_epoch_two_four_checkpoints,
     _reset_a2_to_a5_balance,
     _validate_checkpoint_tree,
-    _validate_formal_balance,
     _validate_resume_balance_schema,
     make_production_outer_optimizer_factory,
     resolve_same_stage_resume,
 )
+from ttt_svcbench_qwen.outer_gradient_control import OuterGradientController
 from ttt_svcbench_qwen.outer_loss_balance import OfficialWeakOuterLossComposer
 from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
@@ -46,9 +42,9 @@ from ttt_svcbench_qwen.production_factory import (
     load_training_yaml,
 )
 from ttt_svcbench_qwen.production_runtime import (
-    CurrentChunkSpec,
     ProductionOuterModel,
     QueryObservationSpec,
+    SupportChunkSpec,
     _decode_query_targets_grouped,
     _decode_targets_with_seek,
     _decode_uniform_interval,
@@ -155,21 +151,6 @@ def test_production_outer_checkpoint_owns_ema_balance_state() -> None:
     assert "official_weak_balancer.balance_schema_version" in keys
 
 
-def test_formal_entry_accepts_only_nonexperimental_ema_answer_ref() -> None:
-    _validate_formal_balance(load_config().loss.official_weak_balance)
-    experimental = OfficialWeakBalanceConfig(
-        mode=OfficialWeakBalanceMode.INSTANT_EQUAL,
-        experimental=True,
-        group_weight=0.3,
-        scale_min=0.1,
-        scale_max=10.0,
-        epsilon=1.0e-8,
-    )
-
-    with pytest.raises(ValueError, match="formal A2/A5 requires"):
-        _validate_formal_balance(experimental)
-
-
 def test_a2_to_a5_resets_loss_and_gradient_ema() -> None:
     config = load_config()
     balancer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
@@ -207,7 +188,7 @@ def test_same_stage_resume_rejects_old_balance_schema(tmp_path: Path) -> None:
     _validate_resume_balance_schema(checkpoint)
 
 
-def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
+def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = Path(__file__).parents[1]
@@ -216,13 +197,16 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
     monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
     monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
     monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
+    monkeypatch.setenv("VISUAL_COST_INDEX", "/tmp/visual_cost_index.json")
 
-    native, extension = load_training_yaml(root / "configs/h200/a2_qwen3vl8b_full_4gpu.yaml")
+    native, extension = load_training_yaml(
+        root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml"
+    )
 
     assert native["num_train_epochs"] == 4.0
-    assert native["save_strategy"] == "no"
+    assert native["save_strategy"] == "epoch"
     assert "save_steps" not in native
-    assert "save_total_limit" not in native
+    assert native["save_total_limit"] == 1
     assert native["save_only_model"] is False
     assert native["video_max_pixels"] == 131_072
     assert extension.stage == "a2"
@@ -230,6 +214,7 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
         "stage",
         "project_config",
         "dataset_manifest",
+        "visual_cost_index",
         "support_prefetch_depth",
         "support_decode_coalesce",
         "support_materialization",
@@ -242,9 +227,7 @@ def test_a2_yaml_runs_four_epochs_and_only_saves_the_final_checkpoint(
         "state_query_max_frames",
         "answer_query_visual_mode",
         "answer_query_max_frames",
-        "query_decode_strategy",
         "query_decode_max_groups",
-        "query_cache_mode",
         "state_query_cache_mode",
         "answer_query_cache_mode",
         "query_activation_offload",
@@ -289,9 +272,7 @@ def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
     assert extension.state_query_max_frames == 16
     assert extension.answer_query_visual_mode == "causal_prefix"
     assert extension.answer_query_max_frames == 256
-    assert extension.query_decode_strategy == "grouped_seek"
     assert extension.query_decode_max_groups == 16
-    assert extension.query_cache_mode == "inherit"
     assert extension.state_query_cache_mode == "inherit"
     assert extension.answer_query_cache_mode == "disabled"
     assert extension.cached_query_roles == frozenset(("state_query",))
@@ -328,7 +309,6 @@ def test_semantic_repair_train_split_recipe_saves_only_epochs_two_and_four(
     assert extension.state_query_max_frames == 16
     assert extension.answer_query_visual_mode == "causal_prefix"
     assert extension.answer_query_max_frames == 256
-    assert extension.query_cache_mode == "inherit"
     assert extension.state_query_cache_mode == "inherit"
     assert extension.answer_query_cache_mode == "disabled"
     assert extension.query_cache_enabled("state_query")
@@ -343,10 +323,13 @@ def test_dual_query_visual_config_is_required_and_legacy_is_rejected() -> None:
         "dataset_manifest": "manifest.json",
         "support_prefetch_depth": 2,
         "support_decode_coalesce": True,
+        "support_materialization": "dataloader_episode",
         "state_query_visual_mode": "recent_chunk",
         "state_query_max_frames": 16,
         "answer_query_visual_mode": "causal_prefix",
         "answer_query_max_frames": 256,
+        "state_query_cache_mode": "inherit",
+        "answer_query_cache_mode": "disabled",
         "preprocess_cache_mode": "read_write",
         "preprocess_cache_miss_policy": "decode",
         "preprocess_cache_root_env": "TTT_PREPROCESS_CACHE_ROOT",
@@ -366,6 +349,12 @@ def test_dual_query_visual_config_is_required_and_legacy_is_rejected() -> None:
             query_visual_mode="causal_prefix",
             query_max_frames=256,
         )
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        ProductionTTTConfig(**fields, query_cache_mode="inherit")
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        ProductionTTTConfig(**fields, query_decode_strategy="legacy_seek")
+    with pytest.raises(ValueError, match="support_materialization"):
+        ProductionTTTConfig(**{**fields, "support_materialization": "trainer_prefetch"})
 
 
 def test_split_query_specs_bound_state_to_16_and_answer_to_256(tmp_path: Path) -> None:
@@ -377,10 +366,13 @@ def test_split_query_specs_bound_state_to_16_and_answer_to_256(tmp_path: Path) -
         dataset_manifest="manifest.json",
         support_prefetch_depth=2,
         support_decode_coalesce=True,
+        support_materialization="dataloader_episode",
         state_query_visual_mode="recent_chunk",
         state_query_max_frames=16,
         answer_query_visual_mode="causal_prefix",
         answer_query_max_frames=256,
+        state_query_cache_mode="inherit",
+        answer_query_cache_mode="disabled",
         preprocess_cache_mode="read_write",
         preprocess_cache_miss_policy="decode",
         preprocess_cache_root_env="TTT_PREPROCESS_CACHE_ROOT",
@@ -570,14 +562,12 @@ def test_a2_runtime_cost_observation_includes_collate_preparation(
     ]
 
 
-def test_a2_uses_dynamic_graph_safe_zero1_profile() -> None:
+def test_a2_fullprefix_uses_dynamic_graph_safe_zero1_profile() -> None:
     root = Path(__file__).parents[1]
-    for yaml_name in (
-        "a2_qwen3vl8b_full_4gpu.yaml",
-        "a2_qwen3vl8b_full_4gpu_120g.yaml",
-    ):
-        text = (root / "configs/h200" / yaml_name).read_text(encoding="utf-8")
-        assert "deepspeed: configs/h200/deepspeed_zero1_dynamic_graph.json" in text
+    text = (root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "deepspeed: configs/h200/deepspeed_zero1_dynamic_graph.json" in text
 
     profile = json.loads(
         (root / "configs/h200/deepspeed_zero1_dynamic_graph.json").read_text(encoding="utf-8")
@@ -591,10 +581,22 @@ def test_a2_uses_dynamic_graph_safe_zero1_profile() -> None:
     assert profile["gradient_clipping"] == 0.0
 
 
-def test_h200_a2_entry_defaults_to_bounded_dynamic_visual_tokens() -> None:
+def test_h200_entries_default_to_fullprefix256_profiles() -> None:
     root = Path(__file__).parents[1]
-    launcher = (root / "scripts/h200/train_a2_a5.sh").read_text(encoding="utf-8")
-    assert 'YAML="${YAML:-$PROJECT_ROOT/configs/h200/a2_qwen3vl8b_full_4gpu.yaml}"' in launcher
+    train = (root / "scripts/h200/train_a2_a5.sh").read_text(encoding="utf-8")
+    launch = (root / "scripts/h200/launch_4gpu.sh").read_text(encoding="utf-8")
+    for text in (train, launch):
+        assert "a2_qwen3vl8b_fullprefix256_4gpu.yaml" in text
+        assert "a5_meta_ttt_k8_fullprefix256_4gpu.yaml" in text
+    for removed in (
+        "configs/h200/a2_qwen3vl8b_full_4gpu.yaml",
+        "configs/h200/a2_qwen3vl8b_full_4gpu_120g.yaml",
+        "configs/h200/a5_meta_ttt_k8_4gpu.yaml",
+        "scripts/h200/launch_qwen3vl8b_ttt_a2_full4.sh",
+        "scripts/h200/launch_qwen3vl8b_ttt_a5_k8_full4.sh",
+        "scripts/h200/train_a2_allsvcbench_4epoch.sh",
+    ):
+        assert not (root / removed).exists()
 
 
 def test_production_video_pixel_bounds_use_model_arguments_and_keep_tokens_dynamic() -> None:
@@ -659,7 +661,7 @@ def test_long_interval_decoder_seeks_targets_without_retaining_all_frames(
                 yield _Frame(index)
 
     monkeypatch.setattr("ttt_svcbench_qwen.production_runtime.av.open", lambda _path: _Container())
-    spec = CurrentChunkSpec(
+    spec = SupportChunkSpec(
         chunk_id="long-support",
         video_path=path,
         start_time=0.0,
@@ -700,7 +702,7 @@ def test_query_prefix_allows_256_frames_without_relaxing_support_limit(
     assert targets[-1] == 663.0
     assert all(value <= query.query_time for value in targets)
     with pytest.raises(ValueError, match="Support chunks permit"):
-        CurrentChunkSpec("support", path, 0.0, 8.0, 256, 8.0)
+        SupportChunkSpec("support", path, 0.0, 8.0, 256, 8.0)
 
 
 def test_query_uniform_indices_match_llamafactory_523f801_reference() -> None:
@@ -767,7 +769,6 @@ def test_grouped_query_decode_matches_legacy_frames_with_at_most_sixteen_seeks(
         maximum_frames=256,
         query_time=663.0,
         sampling_fps=2.0,
-        decode_strategy="grouped_seek",
         decode_max_groups=16,
     )
     targets = _uniform_target_times(query, query.sampling_fps)
@@ -802,7 +803,6 @@ def test_grouped_query_decode_falls_back_to_one_streaming_pass(
         32.0,
         64,
         32.0,
-        decode_strategy="grouped_seek",
     )
     calls: list[str] = []
     targets = [float(index) * 32.0 / 63.0 for index in range(64)]
@@ -844,7 +844,7 @@ def test_short_interval_decoder_streams_once_instead_of_seeking_every_target(
     calls: list[str] = []
 
     def decode(name: str):
-        def inner(_spec: CurrentChunkSpec, targets: list[float]):
+        def inner(_spec: SupportChunkSpec, targets: list[float]):
             calls.append(name)
             frames = [torch.zeros((3, 2, 3), dtype=torch.uint8) for _ in targets]
             return frames, list(targets)
@@ -859,8 +859,8 @@ def test_short_interval_decoder_streams_once_instead_of_seeking_every_target(
         "ttt_svcbench_qwen.production_runtime._decode_targets_with_seek",
         decode("seek"),
     )
-    short = CurrentChunkSpec("short", path, 10.0, 18.0, 16, 20.0)
-    long = CurrentChunkSpec("long", path, 10.0, 42.0, 8, 50.0)
+    short = SupportChunkSpec("short", path, 10.0, 18.0, 16, 20.0)
+    long = SupportChunkSpec("long", path, 10.0, 42.0, 8, 50.0)
 
     short_frames, _ = _decode_uniform_interval(short, sample_fps=2.0)
     long_frames, _ = _decode_uniform_interval(long, sample_fps=2.0)
@@ -905,7 +905,9 @@ def test_training_yaml_expands_required_environment_and_keeps_a5_fresh(
     monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
     monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
 
-    native, extension = load_training_yaml(root / "configs/h200/a5_meta_ttt_k8_4gpu.yaml")
+    native, extension = load_training_yaml(
+        root / "configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml"
+    )
 
     assert native["resume_from_checkpoint"] is None
     assert native["output_dir"] == "/tmp/output"
@@ -914,7 +916,7 @@ def test_training_yaml_expands_required_environment_and_keeps_a5_fresh(
 
     monkeypatch.delenv("A2_CHECKPOINT")
     with pytest.raises(ValueError, match="unresolved environment variables"):
-        load_training_yaml(root / "configs/h200/a5_meta_ttt_k8_4gpu.yaml")
+        load_training_yaml(root / "configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml")
 
 
 def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoint(
@@ -926,10 +928,13 @@ def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoi
         "dataset_manifest": "manifest.json",
         "support_prefetch_depth": 2,
         "support_decode_coalesce": True,
+        "support_materialization": "dataloader_episode",
         "state_query_visual_mode": "recent_chunk",
         "state_query_max_frames": 16,
         "answer_query_visual_mode": "causal_prefix",
         "answer_query_max_frames": 256,
+        "state_query_cache_mode": "inherit",
+        "answer_query_cache_mode": "disabled",
         "preprocess_cache_mode": "read_write",
         "preprocess_cache_miss_policy": "decode",
         "preprocess_cache_root_env": "TTT_PREPROCESS_CACHE_ROOT",
@@ -1128,6 +1133,36 @@ def test_a2_controlled_wrapper_clips_only_at_the_final_ga_boundary() -> None:
     ]
 
 
+def test_a2_compute_loss_sanitizes_middle_ga_microbatch_without_dropping_backward() -> None:
+    parameter = nn.Parameter(torch.tensor(1.0))
+    factors = iter((1.0, float("nan"), 2.0))
+
+    class _Step:
+        def __call__(self, _model: nn.Module, _inputs: object) -> torch.Tensor:
+            return parameter * next(factors)
+
+    gradient_controller = OuterGradientController(
+        load_config().outer_gradient_control,
+        expected_groups=("qwen",),
+    )
+    owner = SimpleNamespace(
+        ttt_runtime=SimpleNamespace(
+            stage=ProductionStage.A2,
+            stage_a_loss_step=_Step(),
+            gradient_controller=gradient_controller,
+        )
+    )
+    backward_count = 0
+    for _ in range(3):
+        loss = TTTQwenTrainerMixin.compute_loss(owner, nn.Linear(1, 1), {})
+        assert torch.isfinite(loss)
+        loss.backward()
+        backward_count += 1
+
+    assert backward_count == 3
+    assert parameter.grad is not None
+
+
 def test_a5_segment_controller_clips_after_all_backward_calls_before_step() -> None:
     events: list[str] = []
 
@@ -1162,8 +1197,8 @@ def test_a5_segment_controller_clips_after_all_backward_calls_before_step() -> N
         gradient_controller=_GradientController(),  # type: ignore[arg-type]
     )
 
-    controller.backward(torch.tensor(1.0))
-    controller.backward(torch.tensor(2.0))
+    controller.backward(torch.tensor(1.0, requires_grad=True))
+    controller.backward(torch.tensor(2.0, requires_grad=True))
     controller.finalize()
 
     assert events == [
@@ -1174,6 +1209,93 @@ def test_a5_segment_controller_clips_after_all_backward_calls_before_step() -> N
         "clip",
         "step",
     ]
+
+
+def test_a5_nonfinite_segment_preserves_backward_parity_and_skips_episode_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ttt_svcbench_qwen.outer_gradient_control.version", lambda _name: "0.18.8")
+    parameter = nn.Parameter(torch.tensor(1.0))
+    parameter.grad = torch.zeros_like(parameter)
+    optimizer = torch.optim.SGD(
+        [{"params": [parameter], "lr": 1.0e-4, "group_name": "predictor"}]
+    )
+
+    class _Zero:
+        def __init__(self) -> None:
+            self.optimizer = optimizer
+            self.averaged_gradients = {0: [parameter.grad]}
+            self.params_in_partition = [[parameter]]
+            self.real_dp_process_group = [None]
+            self.loss_scale = 1.0
+            self.partition_gradients = True
+            self.clip_grad = 0.0
+
+        @staticmethod
+        def get_grad_norm_direct(
+            gradients: list[torch.Tensor], _params: object
+        ) -> torch.Tensor:
+            return torch.stack(
+                [gradient.double().square().sum() for gradient in gradients]
+            ).sum().sqrt()
+
+        def has_overflow(self, *, partition_gradients: bool) -> bool:
+            assert partition_gradients
+            return not bool(torch.isfinite(parameter.grad).all())
+
+    zero = _Zero()
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.optimizer = zero
+            self.boundaries: list[bool] = []
+            self.backward_calls = 0
+            self.step_calls = 0
+            self.scheduler_steps = 0
+
+        def set_gradient_accumulation_boundary(self, *, is_boundary: bool) -> None:
+            self.boundaries.append(is_boundary)
+
+        def backward(self, loss: torch.Tensor, **kwargs: object) -> None:
+            loss.backward(**kwargs)
+            self.backward_calls += 1
+
+        def step(self) -> None:
+            self.step_calls += 1
+            if not zero.has_overflow(partition_gradients=True):
+                optimizer.step()
+                self.scheduler_steps += 1
+
+    engine = _Engine()
+    gradient_controller = OuterGradientController(
+        load_config().outer_gradient_control,
+        expected_groups=("predictor",),
+    )
+    controller = SegmentBackwardController(
+        SimpleNamespace(
+            distributed_type="DistributedType.DEEPSPEED",
+            deepspeed_engine_wrapped=SimpleNamespace(engine=engine),
+        ),
+        nn.Linear(1, 1),
+        expected_count=3,
+        gradient_controller=gradient_controller,
+    )
+    before = parameter.detach().clone()
+
+    controller.backward(parameter * 1.0)
+    controller.backward(parameter * float("nan"))
+    controller.backward(parameter * 2.0)
+    with pytest.warns(RuntimeWarning, match="A5 backward 1"):
+        controller.finalize()
+
+    assert engine.boundaries == [False, False, True]
+    assert engine.backward_calls == 3
+    assert engine.step_calls == 1
+    assert engine.scheduler_steps == 0
+    assert torch.equal(parameter.detach(), before)
+    assert gradient_controller.last_audit is not None
+    assert gradient_controller.last_audit.skipped_update_count == 1
+    assert gradient_controller.last_audit.nonfinite_loss_sources == ("A5 backward 1",)
 
 
 def test_atomic_final_checkpoint_validation_requires_model_and_resume_state(
@@ -1311,10 +1433,14 @@ def test_central_outer_optimizer_has_exact_stage_groups(
             initialize_from_a2_checkpoint="a2-final",
             support_prefetch_depth=2,
             support_decode_coalesce=True,
+            support_materialization="segment_double_buffer",
+            segment_prefetch_depth=1,
             state_query_visual_mode="recent_chunk",
             state_query_max_frames=16,
             answer_query_visual_mode="causal_prefix",
             answer_query_max_frames=256,
+            state_query_cache_mode="inherit",
+            answer_query_cache_mode="disabled",
             preprocess_cache_mode="read_write",
             preprocess_cache_miss_policy="decode",
             preprocess_cache_root_env="TTT_PREPROCESS_CACHE_ROOT",

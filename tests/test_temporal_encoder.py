@@ -5,28 +5,22 @@ from pathlib import Path
 
 import pytest
 import torch
-from torch import Tensor, nn
+from torch import Tensor
 
+from tests.support import parameter_count
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.qwen_adapter import MergedVideoMetadata
 from ttt_svcbench_qwen.state_encoder import (
-    StateEncoders,
     TemporalCache,
     TemporalEncoderOutput,
     TemporalEventEncoder,
-    build_state_encoders,
     build_temporal_encoder,
-    temporal_encoder_parameter_count,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 EXACT_PARAMETER_COUNT = 48_438_272
 HIDDEN_DIM = 768
 QUERY_DIM = 512
-
-
-def parameter_count(module: nn.Module) -> int:
-    return sum(parameter.numel() for parameter in module.parameters())
 
 
 def make_metadata(time_count: int, height: int = 1, width: int = 1) -> MergedVideoMetadata:
@@ -179,7 +173,7 @@ def test_meta_topology_and_exact_parameter_count() -> None:
     with torch.device("meta"):
         module = build_temporal_encoder(config)
 
-    assert temporal_encoder_parameter_count(module) == EXACT_PARAMETER_COUNT
+    assert parameter_count(module) == EXACT_PARAMETER_COUNT
     assert parameter_count(module.spatial_pool) == 5_911_040
     assert len(module.layers) == 6
     assert [parameter_count(layer) for layer in module.layers] == [7_087_872] * 6
@@ -708,16 +702,12 @@ def test_float16_forward_backward_and_dtype_guards_are_finite(
         )
 
 
-def test_builders_return_registered_spatial_and_temporal_components() -> None:
+def test_temporal_builder_returns_registered_component() -> None:
     config = load_config()
     with torch.device("meta"):
-        encoders = build_state_encoders(config)
+        temporal = build_temporal_encoder(config)
 
-    assert isinstance(encoders, StateEncoders)
-    assert isinstance(encoders.temporal, TemporalEventEncoder)
-    assert temporal_encoder_parameter_count(encoders.temporal) == EXACT_PARAMETER_COUNT
-    assert set(dict(encoders.named_children())) == {"spatial", "temporal"}
+    assert isinstance(temporal, TemporalEventEncoder)
+    assert parameter_count(temporal) == EXACT_PARAMETER_COUNT
     with pytest.raises(ValueError, match="[Cc]onfig"):
         build_temporal_encoder()
-    with pytest.raises(ValueError, match="[Cc]onfig"):
-        build_state_encoders()

@@ -11,6 +11,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from tests.support import parameter_count
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.qwen_adapter import MergedVideoMetadata
 from ttt_svcbench_qwen.state_encoder import (
@@ -19,12 +20,10 @@ from ttt_svcbench_qwen.state_encoder import (
     SpatialEncoderOutput,
     SpatialObjectEncoder,
     SpatialSlotRuntimeState,
-    StateEncoders,
     TemporalEventEncoder,
     build_spatial_encoder,
-    build_state_encoders,
+    build_temporal_encoder,
     restore_merged_grid,
-    spatial_encoder_parameter_count,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,10 +39,6 @@ VisualInputs = tuple[
     Tensor,
     tuple[str, ...],
 ]
-
-
-def parameter_count(module: nn.Module) -> int:
-    return sum(parameter.numel() for parameter in module.parameters())
 
 
 def storage_pointer(tensor: Tensor) -> int:
@@ -137,7 +132,7 @@ def test_meta_structure_and_parameter_budget_are_exact() -> None:
 
     assert all(parameter.device.type == "meta" for parameter in encoder.parameters())
     assert parameter_count(encoder) == EXACT_PARAMETER_COUNT
-    assert spatial_encoder_parameter_count(encoder) == EXACT_PARAMETER_COUNT
+    assert parameter_count(encoder) == EXACT_PARAMETER_COUNT
     assert parameter_count(encoder.input_norm) == 2 * 4096 == 8_192
     assert parameter_count(encoder.input_projection) == 4096 * HIDDEN_DIM + HIDDEN_DIM
     assert parameter_count(encoder.query_projection) == QUERY_DIM * HIDDEN_DIM + HIDDEN_DIM
@@ -1043,16 +1038,16 @@ def test_mask_device_mismatch_fails_on_cuda() -> None:
         )
 
 
-def test_spatial_and_joint_builders_require_config_and_p7_builder_is_implemented() -> None:
+def test_spatial_and_temporal_builders_require_config() -> None:
     with pytest.raises((TypeError, ValueError), match="config|ProjectConfig"):
         build_spatial_encoder()  # type: ignore[call-arg]
     with pytest.raises((TypeError, ValueError), match="config|ProjectConfig"):
-        build_state_encoders()  # type: ignore[call-arg]
+        build_temporal_encoder()  # type: ignore[call-arg]
     with torch.device("meta"):
-        encoders = build_state_encoders(load_config())
-    assert isinstance(encoders, StateEncoders)
-    assert isinstance(encoders.spatial, SpatialObjectEncoder)
-    assert isinstance(encoders.temporal, TemporalEventEncoder)
+        spatial = build_spatial_encoder(load_config())
+        temporal = build_temporal_encoder(load_config())
+    assert isinstance(spatial, SpatialObjectEncoder)
+    assert isinstance(temporal, TemporalEventEncoder)
 
     source = (ROOT / "src" / "ttt_svcbench_qwen" / "state_encoder.py").read_text(encoding="utf-8")
     assert "torch.optim" not in source

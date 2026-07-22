@@ -178,11 +178,6 @@ def main() -> int:
     )
     parser.add_argument("--answer-query-max-frames", type=int, default=256)
     parser.add_argument("--query-sample-fps", type=float, default=2.0)
-    parser.add_argument(
-        "--query-decode-strategy",
-        choices=("legacy_seek", "grouped_seek"),
-        default="grouped_seek",
-    )
     parser.add_argument("--query-decode-max-groups", type=int, default=16)
     parser.add_argument("--runtime-trace", type=Path, default=None)
     parser.add_argument("--require-measured-runtime", action="store_true")
@@ -206,13 +201,13 @@ def main() -> int:
         dtype=args.dtype,
         visual_batch_size=args.visual_batch_size,
         cache_mode=args.cache_mode,
-        loss_mode=balance.mode.value,
+        loss_mode="ema_answer_ref",
         loss_group_weight=balance.group_weight,
         loss_scale_min=balance.scale_min,
         loss_scale_max=balance.scale_max,
         loss_epsilon=balance.epsilon,
         gpu_model=args.gpu_model,
-        query_decode_strategy=args.query_decode_strategy,
+        query_decode_strategy="grouped_seek",
         query_decode_max_groups=args.query_decode_max_groups,
         state_query_visual_mode=args.state_query_visual_mode,
         state_query_max_frames=args.state_query_max_frames,
