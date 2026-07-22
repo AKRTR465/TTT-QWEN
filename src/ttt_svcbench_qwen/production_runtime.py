@@ -157,7 +157,7 @@ from ttt_svcbench_qwen.trainer import (
     StageASupervisionBatch,
     StageATrainingBatch,
 )
-from ttt_svcbench_qwen.video_preprocessing import QwenVideoPreprocessor
+from ttt_svcbench_qwen.video_preprocessing import QwenVideoPreprocessor, av_frame_timestamp
 
 _ANSWER_INSTRUCTION = (
     "The video chunk ends at the question time. Answer the question using the structured "
@@ -3334,7 +3334,7 @@ def _decode_coalesced_intervals(
             except (OSError, ValueError, av.error.FFmpegError):
                 pass
         for frame in container.decode(stream):
-            timestamp = _av_timestamp(frame)
+            timestamp = av_frame_timestamp(frame)
             if timestamp < min_start - 1.0e-9:
                 continue
             if timestamp > max_end + 1.0e-9:
@@ -3581,7 +3581,7 @@ def _decode_nearest_target_group(
     decoded = container.decode(stream)
     try:
         for frame in decoded:
-            timestamp = _av_timestamp(frame)
+            timestamp = av_frame_timestamp(frame)
             if timestamp < start_time - 1.0e-9:
                 continue
             if timestamp > end_time + 1.0e-9:
@@ -3678,7 +3678,7 @@ def _decode_nearest_seek_target(
     decoded = container.decode(stream)
     try:
         for frame in decoded:
-            timestamp = _av_timestamp(frame)
+            timestamp = av_frame_timestamp(frame)
             if timestamp < start_time - 1.0e-9:
                 continue
             if timestamp > end_time + 1.0e-9:
@@ -3721,7 +3721,7 @@ def _decode_targets_streaming(
                 # Decoding from the beginning is slower but remains bounded in memory.
                 pass
         for frame in container.decode(stream):
-            timestamp = _av_timestamp(frame)
+            timestamp = av_frame_timestamp(frame)
             if timestamp < spec.start_time - 1.0e-9:
                 continue
             if timestamp > spec.end_time + 1.0e-9:
@@ -3750,14 +3750,6 @@ def _decode_targets_streaming(
 
 def _rgb_frame_tensor(frame: Any) -> Tensor:
     return torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1).contiguous()
-
-
-def _av_timestamp(frame: av.VideoFrame) -> float:
-    if frame.time is not None:
-        return float(frame.time)
-    if frame.pts is None or frame.time_base is None:
-        raise ValueError("decoded video frame has no auditable timestamp")
-    return float(frame.pts * frame.time_base)
 
 
 def _resize_to_pixel_budget(

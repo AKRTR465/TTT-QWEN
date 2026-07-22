@@ -24,6 +24,7 @@ from ttt_svcbench_qwen.config import (
 )
 from ttt_svcbench_qwen.identity_bank import CandidateIdentity, ConfirmedIdentity
 from ttt_svcbench_qwen.observation_heads import E1SoftOutput, E2SoftOutput, O1SoftOutput
+from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
 
 if TYPE_CHECKING:
     from ttt_svcbench_qwen.query_encoder import Operator
@@ -2098,11 +2099,6 @@ def clone_retrieval_history_record(record: RetrievalHistoryRecord) -> RetrievalH
     return _clone_retrieval_record(record)
 
 
-def semantic_projector_parameter_count(module: SemanticProjector | StructuredStateBank) -> int:
-    projector = module.semantic_projector if isinstance(module, StructuredStateBank) else module
-    return sum(parameter.numel() for parameter in projector.parameters())
-
-
 def _validate_last_metadata(timestamp: float, position_id: int, name: str) -> None:
     fresh = timestamp == -1.0 and position_id == -1
     committed = math.isfinite(timestamp) and timestamp >= 0.0 and position_id >= 0
@@ -2277,23 +2273,13 @@ def _validate_state_bank_view_records(view: StateBankView) -> None:
             raise ValueError("StateBankView cloned record IDs must be unique within each owner")
     _assert_tensor_groups_isolated(tuple(groups), "StateBankView cloned records")
     if view.embeddings.numel() > 0:
-        embedding_storage = _tensor_storage_key(view.embeddings)
+        embedding_storage = tensor_storage_key(view.embeddings)
         if any(
-            tensor.numel() > 0 and _tensor_storage_key(tensor) == embedding_storage
+            tensor.numel() > 0 and tensor_storage_key(tensor) == embedding_storage
             for group in groups
             for tensor in group
         ):
             raise ValueError("StateBankView tensors and cloned records must not share storage")
-
-
-def _tensor_storage_key(tensor: Tensor) -> tuple[str, int | None, int]:
-    if tensor.device.type == "meta":
-        return ("meta", None, id(tensor))
-    return (
-        tensor.device.type,
-        tensor.device.index,
-        int(tensor.untyped_storage().data_ptr()),
-    )
 
 
 def _assert_tensor_groups_isolated(groups: Sequence[tuple[Tensor, ...]], name: str) -> None:
@@ -2303,7 +2289,7 @@ def _assert_tensor_groups_isolated(groups: Sequence[tuple[Tensor, ...]], name: s
         for tensor in group:
             if tensor.numel() == 0:
                 continue
-            group_keys.add(_tensor_storage_key(tensor))
+            group_keys.add(tensor_storage_key(tensor))
         if seen.intersection(group_keys):
             raise ValueError(f"{name} must not share mutable tensor storage")
         seen.update(group_keys)

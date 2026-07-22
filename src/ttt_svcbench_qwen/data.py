@@ -16,9 +16,18 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Literal, cast
+from typing import cast
 
 from sklearn.model_selection import GroupKFold  # type: ignore[import-untyped]
+
+from ttt_svcbench_qwen.json_contract import (
+    float_value,
+    integer_value,
+    mapping_value,
+    number_value,
+    object_value,
+    string_value,
+)
 
 RUNTIME_ALLOWLIST = frozenset({"video", "question", "query_time", "explicit_time_values"})
 RUNTIME_DENYLIST = frozenset(
@@ -112,28 +121,6 @@ class RuntimeQueryInput:
 
 
 @dataclass(frozen=True, slots=True)
-class RuntimeSample:
-    identity: SampleIdentity
-    model_input: RuntimeQueryInput
-
-    def __post_init__(self) -> None:
-        runtime_identity = (
-            self.model_input.query_id,
-            self.model_input.query_index,
-            self.model_input.video_id,
-            self.model_input.trajectory_id,
-        )
-        expected = (
-            self.identity.query_id,
-            self.identity.query_index,
-            self.identity.video_id,
-            self.identity.trajectory_id,
-        )
-        if runtime_identity != expected:
-            raise ValueError("runtime Query identity must match the dataset sample")
-
-
-@dataclass(frozen=True, slots=True)
 class OccurrenceAnnotations:
     points: tuple[float, ...]
     starts: tuple[float, ...]
@@ -182,23 +169,6 @@ class SVCBenchRecord:
         if not math.isfinite(self.query_time) or self.query_time < 0.0 or not self.question:
             raise ValueError("record query_time/question is invalid")
 
-    def runtime_sample(self, video_root: Path) -> RuntimeSample:
-        video_path = video_root / self.source_dataset / Path(self.relative_video_path)
-        return RuntimeSample(
-            identity=self.identity,
-            model_input=RuntimeQueryInput(
-                video_id=self.identity.video_id,
-                trajectory_id=self.identity.trajectory_id,
-                query_id=self.identity.query_id,
-                query_index=self.identity.query_index,
-                video=video_path,
-                question=self.question,
-                query_time=self.query_time,
-                explicit_time_values=extract_explicit_time_values(self.question),
-            ),
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class LoadedAnnotations:
     records: tuple[SVCBenchRecord, ...]
@@ -218,60 +188,6 @@ class LoadedAnnotations:
             raise ValueError(
                 "official clean annotations cannot be used for training or calibration"
             )
-
-
-class SVCBenchDataset:
-    """Map-style dataset whose public samples contain no supervision fields."""
-
-    def __init__(self, annotations: LoadedAnnotations, video_root: str | Path) -> None:
-        self._annotations = annotations
-        self._video_root = Path(video_root)
-
-    @property
-    def annotations(self) -> LoadedAnnotations:
-        return self._annotations
-
-    def __len__(self) -> int:
-        return len(self._annotations.records)
-
-    def __getitem__(self, index: int) -> RuntimeSample:
-        return self._annotations.records[index].runtime_sample(self._video_root)
-
-    def supervision_for(
-        self, index: int, *, consumer: Literal["trainer", "evaluator"]
-    ) -> SupervisionLabels:
-        if consumer == "trainer" and self._annotations.purpose is not DatasetPurpose.TRAINING:
-            raise PermissionError("trainer supervision is available only for a training dataset")
-        if (
-            consumer == "evaluator"
-            and self._annotations.purpose is not DatasetPurpose.OFFICIAL_CLEAN_EVALUATION
-        ):
-            raise PermissionError(
-                "evaluator supervision requires the frozen official evaluation purpose"
-            )
-        return self._annotations.records[index].labels
-
-
-@dataclass(frozen=True, slots=True)
-class RuntimeBatch:
-    queries: tuple[RuntimeQueryInput, ...]
-
-    def __post_init__(self) -> None:
-        if not self.queries:
-            raise ValueError("RuntimeBatch requires at least one typed Query")
-        identities = tuple(
-            (query.video_id, query.trajectory_id, query.query_id, query.query_index)
-            for query in self.queries
-        )
-        if len(set(identities)) != len(identities):
-            raise ValueError("RuntimeBatch Query identities must be unique")
-
-
-class SVCBenchCollator:
-    def __call__(self, samples: Sequence[RuntimeSample]) -> RuntimeBatch:
-        if not samples:
-            raise ValueError("cannot collate an empty sample sequence")
-        return RuntimeBatch(tuple(sample.model_input for sample in samples))
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,17 +358,15 @@ def _jsonl_lines(text: str) -> tuple[tuple[int, str], ...]:
 
 def _parse_json_object(line: str, line_number: int) -> dict[str, object]:
     raw = cast(object, json.loads(line))
-    if not isinstance(raw, dict) or not all(isinstance(key, str) for key in raw):
-        raise ValueError(f"JSONL line {line_number} must contain an object with string keys")
-    return cast(dict[str, object], raw)
+    return object_value(raw, f"JSONL line {line_number}")
 
 
 def _parse_flat_row(row: Mapping[str, object], row_index: int) -> SVCBenchRecord:
-    trajectory_id = _string(row, "id")
-    source_dataset = _string(row, "source_dataset")
-    relative_video_path = _string(row, "video_path")
-    query_index = _integer(row, "query_index")
-    query_id = _string(row, "q_id")
+    trajectory_id = string_value(row, "id")
+    source_dataset = string_value(row, "source_dataset")
+    relative_video_path = string_value(row, "video_path")
+    query_index = integer_value(row, "query_index")
+    query_id = string_value(row, "q_id")
     return SVCBenchRecord(
         identity=SampleIdentity(
             query_id=query_id,
@@ -462,23 +376,23 @@ def _parse_flat_row(row: Mapping[str, object], row_index: int) -> SVCBenchRecord
         ),
         source_dataset=source_dataset,
         relative_video_path=relative_video_path,
-        question=_string(row, "question"),
-        query_time=_number(row, "query_time"),
+        question=string_value(row, "question"),
+        query_time=float_value(row, "query_time"),
         labels=SupervisionLabels(
             answer=_optional_string(row, "answer"),
-            count=_integer(row, "count"),
+            count=integer_value(row, "count"),
             occurrence_times=OccurrenceAnnotations((), (), ()),
-            counting_type=_string(row, "counting_type"),
-            counting_subtype=_string(row, "counting_subtype"),
+            counting_type=string_value(row, "counting_type"),
+            counting_subtype=string_value(row, "counting_subtype"),
         ),
     )
 
 
 def _parse_grouped_row(row: Mapping[str, object], row_index: int) -> tuple[SVCBenchRecord, ...]:
-    trajectory_id = _string(row, "id")
-    source_dataset = _string(row, "source_dataset")
-    relative_video_path = _string(row, "video_path")
-    query_points = _mapping(row, "query_points")
+    trajectory_id = string_value(row, "id")
+    source_dataset = string_value(row, "source_dataset")
+    relative_video_path = string_value(row, "video_path")
+    query_points = mapping_value(row, "query_points")
     times = _number_sequence(query_points, "time")
     counts = _integer_sequence(query_points, "count")
     if len(times) != len(counts) or not times:
@@ -495,14 +409,14 @@ def _parse_grouped_row(row: Mapping[str, object], row_index: int) -> tuple[SVCBe
             ),
             source_dataset=source_dataset,
             relative_video_path=relative_video_path,
-            question=_string(row, "question"),
+            question=string_value(row, "question"),
             query_time=query_time,
             labels=SupervisionLabels(
                 answer=_optional_string(row, "answer"),
                 count=counts[query_index],
                 occurrence_times=occurrence_times,
-                counting_type=_string(row, "counting_type"),
-                counting_subtype=_string(row, "counting_subtype"),
+                counting_type=string_value(row, "counting_type"),
+                counting_subtype=string_value(row, "counting_subtype"),
             ),
         )
         for query_index, query_time in enumerate(times)
@@ -520,13 +434,6 @@ def _assert_manifest_coverage(
         raise ValueError("GroupKFold validation folds do not cover every query exactly once")
 
 
-def _string(row: Mapping[str, object], key: str) -> str:
-    value = row.get(key)
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{key} must be a non-empty string")
-    return value
-
-
 def _optional_string(row: Mapping[str, object], key: str) -> str | None:
     value = row.get(key)
     if value is None:
@@ -534,27 +441,6 @@ def _optional_string(row: Mapping[str, object], key: str) -> str | None:
     if not isinstance(value, str):
         raise ValueError(f"{key} must be a string or null")
     return value
-
-
-def _number(row: Mapping[str, object], key: str) -> float:
-    value = row.get(key)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{key} must be numeric")
-    return float(value)
-
-
-def _integer(row: Mapping[str, object], key: str) -> int:
-    value = row.get(key)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{key} must be an integer")
-    return value
-
-
-def _mapping(row: Mapping[str, object], key: str) -> Mapping[str, object]:
-    value = row.get(key)
-    if not isinstance(value, dict) or not all(isinstance(item, str) for item in value):
-        raise ValueError(f"{key} must be an object with string keys")
-    return cast(dict[str, object], value)
 
 
 def _number_sequence(row: Mapping[str, object], key: str) -> tuple[float, ...]:
@@ -590,9 +476,7 @@ def _integer_sequence(row: Mapping[str, object], key: str) -> tuple[int, ...]:
 
 
 def _coerce_number(value: object, key: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{key} entries must be numeric")
-    return float(value)
+    return number_value(value, f"{key} entries")
 
 
 def _coerce_integer(value: object, key: str) -> int:

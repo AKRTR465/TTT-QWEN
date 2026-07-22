@@ -12,7 +12,6 @@ from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.production_runtime import SupportChunkSpec, VideoChunkMaterializer
 from ttt_svcbench_qwen.video_preprocessing import (
     QwenVideoPreprocessor,
-    build_demo_video,
     causal_right_cut,
     chunk_causal_cut,
     decode_video_causally,
@@ -39,7 +38,7 @@ def _write_tiny_video(path: Path) -> None:
 
 def test_real_qwen_processor_demo_contract() -> None:
     processor = QwenVideoPreprocessor(load_config())
-    demo = build_demo_video()
+    demo = torch.zeros((1, 16, 3, 224, 224), dtype=torch.uint8)
     processed = processor.process(demo)
 
     assert demo.shape == (1, 16, 3, 224, 224)

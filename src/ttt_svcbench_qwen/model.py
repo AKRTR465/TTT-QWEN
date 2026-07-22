@@ -673,32 +673,6 @@ class StateAudit:
 
 
 @dataclass(frozen=True, slots=True)
-class NumberAgreementMetrics:
-    """Reader-owned integer agreement, computed independently of answer quality."""
-
-    comparable_rows: int
-    matched_rows: int
-    mismatched_rows: int
-    missing_rows: int
-
-    def __post_init__(self) -> None:
-        values = (
-            self.comparable_rows,
-            self.matched_rows,
-            self.mismatched_rows,
-            self.missing_rows,
-        )
-        if any(type(value) is not int or value < 0 for value in values):
-            raise ValueError("number-agreement counts must be non-negative integers")
-        if self.matched_rows + self.mismatched_rows + self.missing_rows != self.comparable_rows:
-            raise ValueError("number-agreement row counts must add up")
-
-    @property
-    def accuracy(self) -> float | None:
-        return None if self.comparable_rows == 0 else self.matched_rows / self.comparable_rows
-
-
-@dataclass(frozen=True, slots=True)
 class StateTTTModelOutput:
     answer_logits: Tensor
     qwen_output: QwenPrefillOutput
@@ -1282,61 +1256,24 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             raise
 
 
-def build_model(
-    config: ProjectConfig | None = None,
-    *,
-    components: ModelComponents | None = None,
-    feature_flags: ModelFeatureFlags | None = None,
-) -> StateTTTModel:
-    """Build the P13 composition container from explicit dependencies."""
-
-    if config is None:
-        raise ValueError("build_model requires a validated ProjectConfig")
-    if components is None:
-        raise ValueError("build_model requires explicit ModelComponents")
-    return StateTTTModel(config, components, feature_flags or ModelFeatureFlags())
-
-
-def evaluate_number_agreement(
-    reader_results: Sequence[ReaderResult],
-    predicted_numbers: Sequence[int | None],
-) -> NumberAgreementMetrics:
-    """Compare externally parsed answer integers without changing Reader results."""
-
-    results = tuple(reader_results)
-    predictions = tuple(predicted_numbers)
-    if len(results) != len(predictions):
-        raise ValueError("Reader results and predicted numbers must have equal batch size")
-    matched = mismatched = missing = comparable = 0
-    for result, predicted in zip(results, predictions, strict=True):
-        exact = result.exact_count
-        if exact is None:
-            if predicted is not None and type(predicted) is not int:
-                raise TypeError("predicted numbers must contain int or None")
-            continue
-        if type(exact) is not int:
-            raise TypeError("Reader exact_count must be int or None")
-        comparable += 1
-        if predicted is None:
-            missing += 1
-        elif type(predicted) is not int:
-            raise TypeError("predicted numbers must contain int or None")
-        elif predicted == exact:
-            matched += 1
-        else:
-            mismatched += 1
-    return NumberAgreementMetrics(comparable, matched, mismatched, missing)
-
-
 def assert_training_number_agreement(
     reader_results: Sequence[ReaderResult],
     target_numbers: Sequence[int | None],
 ) -> None:
     """Block final-expression supervision whose integer target disagrees with Reader."""
 
-    metrics = evaluate_number_agreement(reader_results, target_numbers)
-    if metrics.mismatched_rows or metrics.missing_rows:
-        raise ValueError("answer supervision number must equal the authoritative Reader number")
+    results = tuple(reader_results)
+    targets = tuple(target_numbers)
+    if len(results) != len(targets):
+        raise ValueError("Reader results and target numbers must have equal batch size")
+    for result, target in zip(results, targets, strict=True):
+        exact = result.exact_count
+        if exact is not None and type(exact) is not int:
+            raise TypeError("Reader exact_count must be int or None")
+        if target is not None and type(target) is not int:
+            raise TypeError("target numbers must contain int or None")
+        if exact is not None and target != exact:
+            raise ValueError("answer supervision number must equal the authoritative Reader number")
 
 
 def _validate_answer_provenance(

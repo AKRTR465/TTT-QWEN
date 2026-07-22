@@ -369,23 +369,6 @@ class RetrieverOutput:
             raise ValueError("Retriever audit counts must align to output counts")
 
 
-@dataclass(frozen=True, slots=True)
-class RetrievalQualityMetrics:
-    true_positive_count: int
-    selected_denominator: int
-    relevant_denominator: int
-    precision: float | None
-    recall: float | None
-    empty_retrieval_count: int
-    query_denominator: int
-    empty_retrieval_rate: float | None
-    unsupported_count: int
-    invalid_count: int
-    total_query_count: int
-    unsupported_rate: float | None
-    invalid_rate: float | None
-
-
 class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
     """Zero-parameter exact scorer; soft scores retain q_target gradients."""
 
@@ -640,65 +623,6 @@ def build_state_retriever(config: ProjectConfig | None = None) -> EmbeddingState
     if config is None:
         raise ValueError("build_state_retriever requires a validated ProjectConfig")
     return EmbeddingStateRetriever(config.retriever)
-
-
-def evaluate_retrieval_quality(
-    selected_record_ids: Sequence[Sequence[str]],
-    relevant_record_ids: Sequence[Sequence[str]],
-    statuses: Sequence[RetrievalStatus],
-) -> RetrievalQualityMetrics:
-    """Compute status-aware offline metrics; GT IDs never enter Retriever runtime."""
-
-    selected_rows = tuple(tuple(row) for row in selected_record_ids)
-    relevant_rows = tuple(tuple(row) for row in relevant_record_ids)
-    normalized_statuses = tuple(statuses)
-    if len({len(selected_rows), len(relevant_rows), len(normalized_statuses)}) != 1:
-        raise ValueError("selected, relevant, and status retrieval rows must have equal length")
-    if any(not isinstance(status, RetrievalStatus) for status in normalized_statuses):
-        raise ValueError("retrieval quality statuses must contain RetrievalStatus values")
-    true_positive = selected_total = relevant_total = empty = 0
-    unsupported = invalid = 0
-    for selected, relevant, status in zip(
-        selected_rows,
-        relevant_rows,
-        normalized_statuses,
-        strict=True,
-    ):
-        if any(not record_id for record_id in selected + relevant):
-            raise ValueError("retrieval quality IDs must be non-empty strings")
-        if len(set(selected)) != len(selected) or len(set(relevant)) != len(relevant):
-            raise ValueError("retrieval quality rows cannot contain duplicate IDs")
-        if (status is RetrievalStatus.OK) != bool(selected):
-            raise ValueError("only retrieval status OK may contain selected record IDs")
-        selected_set = set(selected)
-        relevant_set = set(relevant)
-        true_positive += len(selected_set & relevant_set)
-        selected_total += len(selected_set)
-        relevant_total += len(relevant_set)
-        if status is RetrievalStatus.UNSUPPORTED:
-            unsupported += 1
-            continue
-        if status is RetrievalStatus.INVALID:
-            invalid += 1
-            continue
-        empty += int(status is RetrievalStatus.EMPTY)
-    query_denominator = len(normalized_statuses) - unsupported - invalid
-    total_query_count = len(normalized_statuses)
-    return RetrievalQualityMetrics(
-        true_positive_count=true_positive,
-        selected_denominator=selected_total,
-        relevant_denominator=relevant_total,
-        precision=true_positive / selected_total if selected_total else None,
-        recall=true_positive / relevant_total if relevant_total else None,
-        empty_retrieval_count=empty,
-        query_denominator=query_denominator,
-        empty_retrieval_rate=empty / query_denominator if query_denominator else None,
-        unsupported_count=unsupported,
-        invalid_count=invalid,
-        total_query_count=total_query_count,
-        unsupported_rate=(unsupported / total_query_count if total_query_count else None),
-        invalid_rate=invalid / total_query_count if total_query_count else None,
-    )
 
 
 def _validate_retriever_config(config: RetrieverConfig) -> None:

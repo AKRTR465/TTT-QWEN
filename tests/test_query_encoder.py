@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import Tensor, nn
 
+from tests.support import parameter_count
 from ttt_svcbench_qwen.config import QueryEncoderConfig, load_config
 from ttt_svcbench_qwen.data import (
     RUNTIME_DENYLIST,
@@ -30,9 +31,6 @@ from ttt_svcbench_qwen.query_encoder import (
     TimeWindowResolver,
     build_query_encoder,
     embed_question_tokens,
-    operator_router_parameter_count,
-    query_embedding_parameter_count,
-    time_resolver_parameter_count,
 )
 from ttt_svcbench_qwen.query_tokens import QuestionTokenBatch, QuestionTokenSpan
 from ttt_svcbench_qwen.state_bank import E1EventKind, E2EventKind, HeadType
@@ -211,7 +209,7 @@ def test_sinusoidal_positions_make_token_order_observable_without_adding_paramet
     reversed_order = encoder(embeddings.flip(1), padding_mask)
 
     assert not torch.allclose(original.q_target, reversed_order.q_target)
-    assert query_embedding_parameter_count(encoder) == query_embedding_parameter_count(
+    assert parameter_count(encoder) == parameter_count(
         QueryEmbeddingEncoder(make_tiny_query_config())
     )
 
@@ -326,8 +324,8 @@ def test_query_embedding_parameter_budget_is_exact_on_meta_device() -> None:
     with torch.device("meta"):
         encoder = QueryEmbeddingEncoder(load_config().query_encoder)
 
-    assert query_embedding_parameter_count(encoder) == 36_026_112
-    assert query_embedding_parameter_count(encoder) / 1_000_000 == pytest.approx(
+    assert parameter_count(encoder) == 36_026_112
+    assert parameter_count(encoder) / 1_000_000 == pytest.approx(
         36.03,
         abs=0.005,
     )
@@ -367,7 +365,7 @@ def test_operator_router_covers_all_nine_classes_and_head_mapping() -> None:
     assert torch.allclose(output.logits, scaled.logits)
     assert torch.equal(output.confidence, torch.softmax(output.logits, dim=-1).max(dim=-1).values)
     assert router.temperature.item() > 0.0
-    assert operator_router_parameter_count(router) == 4_609
+    assert parameter_count(router) == 4_609
 
     low_confidence = router(torch.zeros(1, 512), apply_confidence_gate=True)
     assert low_confidence.hard_operators == (Operator.UNSUPPORTED,)
@@ -409,7 +407,7 @@ def test_time_network_shapes_masks_parameter_count_and_gradients() -> None:
     assert resolver.mode_classifier[0].weight.grad is not None
     assert resolver.span_start.weight.grad is not None
     assert resolver.span_end.weight.grad is not None
-    assert time_resolver_parameter_count(resolver) == 133_894
+    assert parameter_count(resolver) == 133_894
 
 
 def test_default_now_and_history_windows_follow_operator_semantics() -> None:

@@ -13,6 +13,7 @@ import torch
 from torch import Tensor, nn
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from tests.support import parameter_count
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.identity_bank import CandidateIdentity, ConfirmedIdentity
 from ttt_svcbench_qwen.query_encoder import (
@@ -42,7 +43,6 @@ from ttt_svcbench_qwen.state_reader import (
     build_state_resampler,
     decode_number_token_ids,
     serialize_number_token_ids,
-    state_resampler_parameter_count,
 )
 from ttt_svcbench_qwen.state_retriever import (
     RetrievalFilterAudit,
@@ -473,7 +473,7 @@ def test_meta_topology_and_exact_state_resampler_parameter_count(
     assert module.q_state.shape == (16, 512)
     assert module.empty_record_embedding.shape == (512,)
     assert len(module.layers) == 3
-    assert state_resampler_parameter_count(module) == EXACT_RESAMPLER_PARAMETERS
+    assert parameter_count(module) == EXACT_RESAMPLER_PARAMETERS
     assert sum(parameter.numel() for parameter in module.parameters()) == (
         EXACT_RESAMPLER_PARAMETERS
     )

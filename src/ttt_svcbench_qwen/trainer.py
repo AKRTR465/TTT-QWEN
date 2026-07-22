@@ -7,9 +7,8 @@ Forbidden: Inner SGD, transient runtime checkpoints, or label leakage into model
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
-from typing import Protocol, cast
+from typing import Protocol
 
 import torch
 from torch import Tensor
@@ -35,6 +34,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     StageATargetBatch,
 )
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
+from ttt_svcbench_qwen.training_context import query_activation_context
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,7 +315,7 @@ class StageAEpisodeRunner:
                 with torch.no_grad():
                     observed = self.model.observe_chunk(request, lifecycle)
             else:
-                with self._query_activation_context():
+                with query_activation_context(self.query_activation_offload):
                     observed = self.model.observe_chunk(request, lifecycle)
             observations.append(observed)
             runtime = observed.runtime_state
@@ -345,7 +345,7 @@ class StageAEpisodeRunner:
             rope_indexer=answer_inputs.rope_indexer,
             qwen_kwargs=answer_inputs.qwen_kwargs,
         )
-        with self._query_activation_context():
+        with query_activation_context(self.query_activation_offload):
             output = self.model.prefill_answer(
                 self.model.prepare_answer(answer_request, lifecycle),
                 lifecycle,
@@ -412,12 +412,4 @@ class StageAEpisodeRunner:
             retrieval=retrieval_output,
             metrics=metrics,
             failure_cases=failure_cases,
-        )
-
-    def _query_activation_context(self) -> AbstractContextManager[object]:
-        if not self.query_activation_offload or not torch.cuda.is_available():
-            return nullcontext()
-        return cast(
-            AbstractContextManager[object],
-            torch.autograd.graph.save_on_cpu(pin_memory=True),
         )

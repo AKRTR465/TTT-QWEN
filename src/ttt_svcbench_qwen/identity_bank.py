@@ -19,6 +19,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from ttt_svcbench_qwen.config import ProjectConfig
+from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
 
 if TYPE_CHECKING:
     from ttt_svcbench_qwen.observation_heads import O2SoftOutput
@@ -493,16 +494,6 @@ class IdentityRuntimeMetrics:
     candidate_low_confidence_pruned_count: int
     match_conflict_count: int
     signal_conflict_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class IdentityQualityMetrics:
-    duplicate_excess_count: int
-    duplicate_denominator: int
-    duplicate_rate: float
-    missed_new_count: int
-    ground_truth_identity_denominator: int
-    missed_new_identity_rate: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -1577,40 +1568,6 @@ def build_identity_bank(config: ProjectConfig | None = None) -> IdentityBank:
     return IdentityBank(config)
 
 
-def evaluate_identity_quality(
-    ground_truth_entity_ids: Sequence[str],
-    predicted_identity_ids: Sequence[str | None],
-) -> IdentityQualityMetrics:
-    """Compute trajectory-end quality outside runtime; labels never enter IdentityBank."""
-
-    if len(ground_truth_entity_ids) != len(predicted_identity_ids):
-        raise ValueError("ground truth and prediction sequences must have equal length")
-    if any(not entity_id for entity_id in ground_truth_entity_ids):
-        raise ValueError("ground-truth entity IDs must be non-empty")
-    grouped: dict[str, set[str]] = {}
-    for ground_truth, predicted in zip(
-        ground_truth_entity_ids, predicted_identity_ids, strict=True
-    ):
-        grouped.setdefault(ground_truth, set())
-        if predicted is not None:
-            if not predicted:
-                raise ValueError("predicted identity IDs cannot be empty strings")
-            grouped[ground_truth].add(predicted)
-    duplicate_excess = sum(max(len(predictions) - 1, 0) for predictions in grouped.values())
-    mapped_confirmed = sum(len(predictions) for predictions in grouped.values())
-    duplicate_denominator = max(mapped_confirmed, 1)
-    missed = sum(not predictions for predictions in grouped.values())
-    ground_truth_denominator = max(len(grouped), 1)
-    return IdentityQualityMetrics(
-        duplicate_excess_count=duplicate_excess,
-        duplicate_denominator=duplicate_denominator,
-        duplicate_rate=duplicate_excess / duplicate_denominator,
-        missed_new_count=missed,
-        ground_truth_identity_denominator=ground_truth_denominator,
-        missed_new_identity_rate=missed / ground_truth_denominator,
-    )
-
-
 def _empty_confirmed_chunk(capacity: int) -> ConfirmedChunk:
     if type(capacity) is not int or capacity <= 0:
         raise ValueError("Confirmed capacity must be positive")
@@ -1944,12 +1901,6 @@ def _dtype_name(dtype: torch.dtype) -> str:
     return mapping[dtype]
 
 
-def _storage_key(tensor: Tensor) -> tuple[str, int | None]:
-    if tensor.device.type == "meta":
-        return (str(tensor.device), None)
-    return (str(tensor.device), tensor.untyped_storage().data_ptr())
-
-
 def _assert_runtime_storage_isolated(state: IdentityBankRuntimeState) -> None:
     tensors: list[Tensor] = []
     tensors.extend(candidate.identity_prototype for candidate in state.candidates)
@@ -1967,6 +1918,6 @@ def _assert_runtime_storage_isolated(state: IdentityBankRuntimeState) -> None:
             )
         )
     tensors.extend(entry.identity_prototype for entry in state.hot_cache)
-    keys = [_storage_key(tensor) for tensor in tensors if tensor.device.type != "meta"]
+    keys = [tensor_storage_key(tensor) for tensor in tensors if tensor.device.type != "meta"]
     if len(keys) != len(set(keys)):
         raise ValueError("Identity Bank runtime tensors must not share storage")

@@ -12,8 +12,6 @@ from ttt_svcbench_qwen.data import (
     DatasetSource,
     LoadedAnnotations,
     RuntimeQueryInput,
-    SVCBenchCollator,
-    SVCBenchDataset,
     assert_runtime_payload_safe,
     create_group_kfold_manifest,
     extract_explicit_time_values,
@@ -56,19 +54,26 @@ def test_grouped_and_flat_official_schemas_parse_to_query_point_records() -> Non
     assert flat.records[1].labels.count == 4
 
 
-def test_dataset_collator_trainer_and_inference_keep_labels_out_of_runtime_payloads() -> None:
-    dataset = SVCBenchDataset(load_fixture("grouped.jsonl"), FIXTURES / "videos")
-    sample = dataset[0]
-    batch = SVCBenchCollator()([dataset[0], dataset[1]])
-    payload = sample.model_input.as_payload()
+def test_annotation_projection_and_inference_keep_labels_out_of_runtime_payloads() -> None:
+    annotations = load_fixture("grouped.jsonl")
+    record = annotations.records[0]
+    runtime = RuntimeQueryInput(
+        video_id=record.identity.video_id,
+        trajectory_id=record.identity.trajectory_id,
+        query_id=record.identity.query_id,
+        query_index=record.identity.query_index,
+        video=FIXTURES / "videos" / record.source_dataset / record.relative_video_path,
+        question=record.question,
+        query_time=record.query_time,
+        explicit_time_values=extract_explicit_time_values(record.question),
+    )
+    payload = runtime.as_payload()
 
     assert set(payload) == RUNTIME_ALLOWLIST
     assert not (set(payload) & RUNTIME_DENYLIST)
-    assert batch.queries == (dataset[0].model_input, dataset[1].model_input)
+    assert runtime.query_id == record.identity.query_id
     assert_inference_runtime_payload(payload)
-    assert dataset.supervision_for(0, consumer="evaluator").count == 2
-    with pytest.raises(PermissionError, match="training dataset"):
-        dataset.supervision_for(0, consumer="trainer")
+    assert annotations.records[0].labels.count == 2
 
     for denied_field in sorted(RUNTIME_DENYLIST):
         poisoned = {**payload, denied_field: "forbidden"}

@@ -1096,12 +1096,6 @@ def build_state_resampler(config: ProjectConfig | None = None) -> StateResampler
     return StateResampler(config.state_resampler)
 
 
-def state_resampler_parameter_count(module: StateResampler) -> int:
-    """Return the exact P12 learned-parameter count (14,722,048 for v5)."""
-
-    return sum(parameter.numel() for parameter in module.parameters())
-
-
 def build_state_reader(
     config: ProjectConfig | None = None,
     tokenizer: NumberTokenizerProtocol | None = None,

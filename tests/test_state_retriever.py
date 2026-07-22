@@ -27,7 +27,6 @@ from ttt_svcbench_qwen.state_retriever import (
     RetrievalReason,
     RetrievalStatus,
     build_state_retriever,
-    evaluate_retrieval_quality,
 )
 
 SEMANTIC_DIM = 512
@@ -288,25 +287,6 @@ def test_retriever_rejects_aggregate_or_malformed_inputs(
             history,
             _query(torch.full((1, SEMANTIC_DIM), float("nan")), (Operator.O1_SNAP,)),
         )
-
-
-def test_retrieval_quality_metrics_remain_offline_and_status_aware() -> None:
-    metrics = evaluate_retrieval_quality(
-        (("r1", "r2"), (), (), ()),
-        (("r2", "r3"), ("r4",), (), ()),
-        (
-            RetrievalStatus.OK,
-            RetrievalStatus.EMPTY,
-            RetrievalStatus.UNSUPPORTED,
-            RetrievalStatus.INVALID,
-        ),
-    )
-
-    assert metrics.precision == 0.5
-    assert metrics.recall == pytest.approx(1.0 / 3.0)
-    assert metrics.empty_retrieval_rate == 0.5
-    assert metrics.unsupported_count == 1
-    assert metrics.invalid_count == 1
 
 
 def test_build_retriever_validates_frozen_config() -> None:

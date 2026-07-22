@@ -7,17 +7,15 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from tests.support import parameter_count, tensor_count
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.fast_ttt import (
     FastTTTAdapter,
     FastTTTForwardAudit,
     FastWeightsState,
-    adapter_parameter_count,
     build_fast_ttt_adapter,
     collect_fast_parameters,
-    online_parameter_count,
     reanchor_fast_state,
-    slow_parameter_count,
 )
 from ttt_svcbench_qwen.qwen_adapter import QwenVideoFeatureBoundary
 
@@ -45,8 +43,8 @@ def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> N
     assert adapter.p_out.bias is not None
     assert adapter.w0_1.shape == adapter.w0_2.shape == (768, 768)
     assert set(adapter._modules) == {"rms_norm", "p_in", "p_out"}
-    assert adapter_parameter_count(adapter) == 7_480_064
-    assert slow_parameter_count(adapter) == 6_300_416
+    assert parameter_count(adapter) == 7_480_064
+    assert tensor_count(adapter.collect_slow_parameters()) == 6_300_416
     assert (
         sum(parameter.numel() for parameter in adapter.collect_meta_fast_parameters()) == 1_179_648
     )
@@ -240,8 +238,8 @@ def test_parameter_collection_is_stable_exact_and_rejects_boundary_drift() -> No
     assert groups.online_fast[0] is state.w_t_1
     assert groups.online_fast[1] is state.w_t_2
     assert groups.slow == adapter.collect_slow_parameters()
-    assert online_parameter_count(state) == 2 * 768 * 768 == 1_179_648
-    assert slow_parameter_count(adapter) == 6_300_416
+    assert tensor_count(collect_fast_parameters(state)) == 2 * 768 * 768 == 1_179_648
+    assert tensor_count(adapter.collect_slow_parameters()) == 6_300_416
     assert not ({id(parameter) for parameter in groups.online_fast} & {id(p) for p in groups.slow})
     adapter.assert_online_parameter_boundary(groups.online_fast, state)
 

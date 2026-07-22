@@ -21,6 +21,7 @@ from ttt_svcbench_qwen.config import (
     TemporalEncoderConfig,
 )
 from ttt_svcbench_qwen.qwen_adapter import MergedVideoMetadata
+from ttt_svcbench_qwen.tensor_contracts import timestamps_match
 
 
 @dataclass(frozen=True, slots=True)
@@ -1773,7 +1774,7 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
                 dtype=cached_timestamps.dtype
             )
             cached_overlap = cached_timestamps[retain_main_count:]
-            if not _timestamps_match(overlap_timestamps, cached_overlap):
+            if not timestamps_match(overlap_timestamps, cached_overlap):
                 raise ValueError("overlap position timestamps must match cached source tubelets")
         elif first_position != cached_last + 1:
             raise ValueError("temporal position IDs cannot contain gaps")
@@ -1869,36 +1870,10 @@ def build_spatial_encoder(config: ProjectConfig | None = None) -> SpatialObjectE
     return SpatialObjectEncoder(config.spatial_encoder)
 
 
-def spatial_encoder_parameter_count(module: SpatialObjectEncoder) -> int:
-    return sum(parameter.numel() for parameter in module.parameters())
-
-
 def build_temporal_encoder(config: ProjectConfig | None = None) -> TemporalEventEncoder:
     if config is None:
         raise ValueError("build_temporal_encoder requires a validated ProjectConfig")
     return TemporalEventEncoder(config.temporal_encoder)
-
-
-def temporal_encoder_parameter_count(module: TemporalEventEncoder) -> int:
-    return sum(parameter.numel() for parameter in module.parameters())
-
-
-class StateEncoders(nn.Module):  # type: ignore[misc]
-    """Registered P6/P7 encoder pair without top-level model orchestration."""
-
-    def __init__(self, spatial: SpatialObjectEncoder, temporal: TemporalEventEncoder) -> None:
-        super().__init__()
-        self.spatial = spatial
-        self.temporal = temporal
-
-
-def build_state_encoders(config: ProjectConfig | None = None) -> StateEncoders:
-    if config is None:
-        raise ValueError("build_state_encoders requires a validated ProjectConfig")
-    return StateEncoders(
-        spatial=build_spatial_encoder(config),
-        temporal=build_temporal_encoder(config),
-    )
 
 
 def _validate_temporal_config(config: TemporalEncoderConfig) -> None:
@@ -1957,18 +1932,6 @@ def _temporal_sinusoidal_encoding(
     encoding[:, 0::2] = torch.sin(angles)
     encoding[:, 1::2] = torch.cos(angles[:, : encoding[:, 1::2].shape[1]])
     return encoding.to(dtype=dtype)
-
-
-def _timestamps_match(left: Tensor, right: Tensor) -> bool:
-    """Compare source-identical timestamps across legal FP32/FP64 handoffs."""
-
-    if left.shape != right.shape:
-        return False
-    left_64 = left.to(dtype=torch.float64)
-    right_64 = right.to(dtype=torch.float64)
-    scale = torch.maximum(left_64.abs(), right_64.abs()).clamp_min(1.0)
-    tolerance = 4.0 * torch.finfo(torch.float32).eps * scale
-    return bool(torch.all((left_64 - right_64).abs() <= tolerance))
 
 
 def _empty_temporal_cache(

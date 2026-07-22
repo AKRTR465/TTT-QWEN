@@ -174,65 +174,6 @@ class OuterGradientController:
         self.successful_update_count += 1
         return self._record(tuple(group_audits), skipped_nonfinite=False)
 
-    def apply_plain(self, optimizer: torch.optim.Optimizer) -> tuple[bool, OuterGradientAudit]:
-        """Reference path used by CPU tests and non-DeepSpeed diagnostics."""
-
-        groups = self._validate_param_groups(optimizer.param_groups)
-        self.attempted_update_count += 1
-        nonfinite = tuple(
-            sum(
-                int((~torch.isfinite(parameter.grad.detach())).sum().item())
-                for parameter in cast(list[torch.nn.Parameter], group["params"])
-                if parameter.grad is not None
-            )
-            for _, group in groups
-        )
-        if any(nonfinite):
-            self.skipped_update_count += 1
-            for _, group in groups:
-                for parameter in cast(list[torch.nn.Parameter], group["params"]):
-                    parameter.grad = None
-            nonfinite_audits = tuple(
-                self._nonfinite_group_audit(group, count)
-                for group, count in zip(groups, nonfinite, strict=True)
-            )
-            return False, self._record(nonfinite_audits, skipped_nonfinite=True)
-
-        group_audits: list[GroupGradientAudit] = []
-        for name, group in groups:
-            parameters = cast(list[torch.nn.Parameter], group["params"])
-            tensors = [
-                parameter.grad
-                for parameter in parameters
-                if parameter.grad is not None
-            ]
-            pre_norm = self._local_l2_norm(tensors)
-            max_norm = self._max_norm(name)
-            coefficient = self._clip_coefficient(pre_norm, max_norm)
-            for gradient in tensors:
-                gradient.mul_(coefficient)
-            elements = sum(value.numel() for value in tensors)
-            max_abs = max(
-                (float(value.detach().abs().max().item()) for value in tensors),
-                default=0.0,
-            )
-            group_audits.append(
-                GroupGradientAudit(
-                    name=name,
-                    learning_rate=float(group["lr"]),
-                    max_norm=max_norm,
-                    pre_clip_norm=pre_norm,
-                    post_clip_norm=pre_norm * coefficient,
-                    clip_coefficient=coefficient,
-                    rms=(pre_norm / math.sqrt(elements) if elements else 0.0),
-                    max_abs=max_abs,
-                    active_elements=elements,
-                    nonfinite_elements=0,
-                )
-            )
-        self.successful_update_count += 1
-        return True, self._record(tuple(group_audits), skipped_nonfinite=False)
-
     def _validate_param_groups(
         self, param_groups: list[dict[str, Any]]
     ) -> tuple[tuple[str, dict[str, Any]], ...]:
@@ -291,15 +232,6 @@ class OuterGradientController:
             active_elements=0,
             nonfinite_elements=count,
         )
-
-    @staticmethod
-    def _local_l2_norm(gradients: list[Tensor]) -> float:
-        if not gradients:
-            return 0.0
-        total = torch.zeros((), dtype=torch.float64, device=gradients[0].device)
-        for gradient in gradients:
-            total += gradient.detach().double().square().sum()
-        return float(total.sqrt().item())
 
     @staticmethod
     def _process_group(zero: Any, index: int) -> object | None:

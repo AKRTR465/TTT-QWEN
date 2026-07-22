@@ -32,6 +32,12 @@ from ttt_svcbench_qwen.data import (
     create_group_kfold_manifest,
     extract_explicit_time_values,
 )
+from ttt_svcbench_qwen.json_contract import (
+    integer_value,
+    number_value,
+    object_value,
+    string_value,
+)
 from ttt_svcbench_qwen.query_encoder import Operator, TimeWindowMode
 from ttt_svcbench_qwen.visual_cost import (
     EpochBoundaryCostEMA,
@@ -1181,17 +1187,17 @@ def load_production_episode_manifest(path: str | Path) -> ProductionEpisodeManif
         _task_count_pair(item) for item in _sequence_list(values, "task_query_counts")
     )
     return ProductionEpisodeManifest(
-        schema_version=_string_value(values, "schema_version"),
-        dataset_name=_string_value(values, "dataset_name"),
-        dataset_revision=_string_value(values, "dataset_revision"),
-        annotation_sha256=_string_value(values, "annotation_sha256"),
-        fold_index=_integer_value(values, "fold_index"),
-        seed=_integer_value(values, "seed"),
+        schema_version=string_value(values, "schema_version"),
+        dataset_name=string_value(values, "dataset_name"),
+        dataset_revision=string_value(values, "dataset_revision"),
+        annotation_sha256=string_value(values, "annotation_sha256"),
+        fold_index=integer_value(values, "fold_index"),
+        seed=integer_value(values, "seed"),
         train_fraction=_float_value(values, "train_fraction"),
-        group_key=_string_value(values, "group_key"),
+        group_key=string_value(values, "group_key"),
         maximum_query_span_seconds=_float_value(values, "maximum_query_span_seconds"),
-        minimum_query_points=_integer_value(values, "minimum_query_points"),
-        truncation_horizon=_integer_value(values, "truncation_horizon"),
+        minimum_query_points=integer_value(values, "minimum_query_points"),
+        truncation_horizon=integer_value(values, "truncation_horizon"),
         a2_queries=a2_queries,
         episodes=episodes,
         buckets=buckets,
@@ -1388,23 +1394,23 @@ def _normalize_label(value: str) -> str:
 
 
 def _parse_chunk(value: object) -> AdaptiveChunkSpec:
-    row = _object(value, "adaptive chunk")
+    row = object_value(value, "adaptive chunk")
     _require_exact_keys(
         row,
         {"role", "start_time", "end_time", "maximum_frames", "frame_sampling"},
         "adaptive chunk",
     )
     return AdaptiveChunkSpec(
-        role=ChunkRole(_string_value(row, "role")),
+        role=ChunkRole(string_value(row, "role")),
         start_time=_float_value(row, "start_time"),
         end_time=_float_value(row, "end_time"),
-        maximum_frames=_integer_value(row, "maximum_frames"),
-        frame_sampling=_string_value(row, "frame_sampling"),
+        maximum_frames=integer_value(row, "maximum_frames"),
+        frame_sampling=string_value(row, "frame_sampling"),
     )
 
 
 def _parse_runtime_query(value: object) -> RuntimeQueryInput:
-    row = _object(value, "runtime Query")
+    row = object_value(value, "runtime Query")
     _require_exact_keys(
         row,
         {
@@ -1422,33 +1428,33 @@ def _parse_runtime_query(value: object) -> RuntimeQueryInput:
     )
     explicit = _number_list(row, "explicit_time_values")
     return RuntimeQueryInput(
-        video_id=_string_value(row, "video_id"),
-        trajectory_id=_string_value(row, "trajectory_id"),
-        query_id=_string_value(row, "query_id"),
-        query_index=_integer_value(row, "query_index"),
-        video=Path(_string_value(row, "video")),
-        question=_string_value(row, "question"),
+        video_id=string_value(row, "video_id"),
+        trajectory_id=string_value(row, "trajectory_id"),
+        query_id=string_value(row, "query_id"),
+        query_index=integer_value(row, "query_index"),
+        video=Path(string_value(row, "video")),
+        question=string_value(row, "question"),
         query_time=_float_value(row, "query_time"),
         explicit_time_values=explicit,
-        episode_nonce=_integer_value(row, "episode_nonce"),
+        episode_nonce=integer_value(row, "episode_nonce"),
     )
 
 
 def _parse_answer_sidecar(value: object) -> AnswerSupervisionSidecar:
-    row = _object(value, "answer sidecar")
+    row = object_value(value, "answer sidecar")
     _require_exact_keys(row, {"query_id", "answer", "provenance"}, "answer sidecar")
     answer = row.get("answer")
     if answer is not None and not isinstance(answer, str):
         raise ValueError("answer sidecar answer must be string or null")
     return AnswerSupervisionSidecar(
-        query_id=_string_value(row, "query_id"),
+        query_id=string_value(row, "query_id"),
         answer=answer,
-        provenance=_string_value(row, "provenance"),
+        provenance=string_value(row, "provenance"),
     )
 
 
 def _parse_weak_sidecar(value: object) -> WeakQuerySidecar:
-    row = _object(value, "weak sidecar")
+    row = object_value(value, "weak sidecar")
     _require_exact_keys(
         row,
         {
@@ -1474,22 +1480,22 @@ def _parse_weak_sidecar(value: object) -> WeakQuerySidecar:
         )
     )
     return WeakQuerySidecar(
-        query_id=_string_value(row, "query_id"),
-        query_index=_integer_value(row, "query_index"),
+        query_id=string_value(row, "query_id"),
+        query_index=integer_value(row, "query_index"),
         query_time=_float_value(row, "query_time"),
-        count=_integer_value(row, "count"),
-        counting_type=_string_value(row, "counting_type"),
-        counting_subtype=_string_value(row, "counting_subtype"),
-        operator=_string_value(row, "operator"),
-        time_mode=_string_value(row, "time_mode"),
+        count=integer_value(row, "count"),
+        counting_type=string_value(row, "counting_type"),
+        counting_subtype=string_value(row, "counting_subtype"),
+        operator=string_value(row, "operator"),
+        time_mode=string_value(row, "time_mode"),
         occurrence_points=_number_list(row, "occurrence_points"),
         occurrence_intervals=intervals,
-        provenance=_string_value(row, "provenance"),
+        provenance=string_value(row, "provenance"),
     )
 
 
 def _parse_production_query(value: object) -> ProductionQueryRecord:
-    row = _object(value, "production Query")
+    row = object_value(value, "production Query")
     _require_exact_keys(row, {"runtime", "answer", "weak"}, "production Query")
     return ProductionQueryRecord(
         runtime=_parse_runtime_query(row["runtime"]),
@@ -1499,7 +1505,7 @@ def _parse_production_query(value: object) -> ProductionQueryRecord:
 
 
 def _parse_a2_query(value: object) -> A2QueryRecord:
-    row = _object(value, "A2 Query")
+    row = object_value(value, "A2 Query")
     _require_exact_keys(
         row,
         {
@@ -1515,19 +1521,19 @@ def _parse_a2_query(value: object) -> A2QueryRecord:
         "A2 Query",
     )
     return A2QueryRecord(
-        source_dataset=_string_value(row, "source_dataset"),
-        relative_video_path=_string_value(row, "relative_video_path"),
-        video_id=_string_value(row, "video_id"),
-        trajectory_id=_string_value(row, "trajectory_id"),
-        split=EpisodeSplit(_string_value(row, "split")),
-        task_class=_string_value(row, "task_class"),
+        source_dataset=string_value(row, "source_dataset"),
+        relative_video_path=string_value(row, "relative_video_path"),
+        video_id=string_value(row, "video_id"),
+        trajectory_id=string_value(row, "trajectory_id"),
+        split=EpisodeSplit(string_value(row, "split")),
+        task_class=string_value(row, "task_class"),
         query=_parse_production_query(row["query"]),
         sampling_weight=_float_value(row, "sampling_weight"),
     )
 
 
 def _parse_a5_episode(value: object) -> A5EpisodeRecord:
-    row = _object(value, "A5 episode")
+    row = object_value(value, "A5 episode")
     required = {
         "episode_id",
         "source_dataset",
@@ -1553,21 +1559,21 @@ def _parse_a5_episode(value: object) -> A5EpisodeRecord:
     if padding_source is not None and not isinstance(padding_source, str):
         raise ValueError("A5 padding source must be string or null")
     return A5EpisodeRecord(
-        episode_id=_string_value(row, "episode_id"),
-        source_dataset=_string_value(row, "source_dataset"),
-        relative_video_path=_string_value(row, "relative_video_path"),
-        video_id=_string_value(row, "video_id"),
-        trajectory_id=_string_value(row, "trajectory_id"),
-        split=EpisodeSplit(_string_value(row, "split")),
-        task_class=_string_value(row, "task_class"),
-        operator=_string_value(row, "operator"),
+        episode_id=string_value(row, "episode_id"),
+        source_dataset=string_value(row, "source_dataset"),
+        relative_video_path=string_value(row, "relative_video_path"),
+        video_id=string_value(row, "video_id"),
+        trajectory_id=string_value(row, "trajectory_id"),
+        split=EpisodeSplit(string_value(row, "split")),
+        task_class=string_value(row, "task_class"),
+        operator=string_value(row, "operator"),
         prewarm=_parse_chunk(row["prewarm"]),
         supports=tuple(_parse_chunk(item) for item in _object_list(row, "supports")),
         queries=tuple(_parse_production_query(item) for item in _object_list(row, "queries")),
-        support_count=_integer_value(row, "support_count"),
-        query_count=_integer_value(row, "query_count"),
-        truncation_horizon=_integer_value(row, "truncation_horizon"),
-        tbptt_segment_count=_integer_value(row, "tbptt_segment_count"),
+        support_count=integer_value(row, "support_count"),
+        query_count=integer_value(row, "query_count"),
+        truncation_horizon=integer_value(row, "truncation_horizon"),
+        tbptt_segment_count=integer_value(row, "tbptt_segment_count"),
         sampling_weight=_float_value(row, "sampling_weight"),
         loss_weight=_float_value(row, "loss_weight"),
         padding_source_episode_id=padding_source,
@@ -1575,7 +1581,7 @@ def _parse_a5_episode(value: object) -> A5EpisodeRecord:
 
 
 def _parse_segment_bucket(value: object) -> SegmentBucket:
-    row = _object(value, "segment bucket")
+    row = object_value(value, "segment bucket")
     _require_exact_keys(
         row,
         {"split", "tbptt_segment_count", "episode_ids", "loss_weights", "world_size"},
@@ -1587,16 +1593,16 @@ def _parse_segment_bucket(value: object) -> SegmentBucket:
     ):
         raise ValueError("segment bucket episode_ids must be non-empty strings")
     return SegmentBucket(
-        split=EpisodeSplit(_string_value(row, "split")),
-        tbptt_segment_count=_integer_value(row, "tbptt_segment_count"),
+        split=EpisodeSplit(string_value(row, "split")),
+        tbptt_segment_count=integer_value(row, "tbptt_segment_count"),
         episode_ids=tuple(episode_ids_raw),
         loss_weights=_number_list(row, "loss_weights"),
-        world_size=_integer_value(row, "world_size"),
+        world_size=integer_value(row, "world_size"),
     )
 
 
 def _parse_failure(value: object) -> EpisodeFailure:
-    row = _object(value, "episode failure")
+    row = object_value(value, "episode failure")
     _require_exact_keys(
         row,
         {"query_id", "video_id", "source_dataset", "query_time", "video_duration", "reason"},
@@ -1605,12 +1611,12 @@ def _parse_failure(value: object) -> EpisodeFailure:
     raw_duration = row.get("video_duration")
     duration = None if raw_duration is None else _number_value(raw_duration, "video_duration")
     return EpisodeFailure(
-        query_id=_string_value(row, "query_id"),
-        video_id=_string_value(row, "video_id"),
-        source_dataset=_string_value(row, "source_dataset"),
+        query_id=string_value(row, "query_id"),
+        video_id=string_value(row, "video_id"),
+        source_dataset=string_value(row, "source_dataset"),
         query_time=_float_value(row, "query_time"),
         video_duration=duration,
-        reason=_string_value(row, "reason"),
+        reason=string_value(row, "reason"),
     )
 
 
@@ -1630,12 +1636,6 @@ def _require_a5(record: ManifestRecord) -> A5EpisodeRecord:
     return record
 
 
-def _object(value: object, name: str) -> dict[str, object]:
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
-        raise ValueError(f"{name} must be an object with string keys")
-    return value
-
-
 def _require_exact_keys(row: Mapping[str, object], expected: set[str], name: str) -> None:
     actual = set(row)
     if actual != expected:
@@ -1645,24 +1645,8 @@ def _require_exact_keys(row: Mapping[str, object], expected: set[str], name: str
         )
 
 
-def _string_value(row: Mapping[str, object], key: str) -> str:
-    value = row.get(key)
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{key} must be a non-empty string")
-    return value
-
-
-def _integer_value(row: Mapping[str, object], key: str) -> int:
-    value = row.get(key)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{key} must be an integer")
-    return value
-
-
 def _number_value(value: object, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be numeric")
-    result = float(value)
+    result = number_value(value, name)
     if not math.isfinite(result):
         raise ValueError(f"{name} must be finite")
     return result

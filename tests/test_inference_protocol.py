@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import Tensor
 
+from tests.support import make_test_model as build_model
 from ttt_svcbench_qwen.config import AuditLevel, ProjectConfig, load_config
 from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter, FastWeightsState, build_fast_ttt_adapter
 from ttt_svcbench_qwen.identity_bank import IdentityBank, build_identity_bank
@@ -40,7 +41,6 @@ from ttt_svcbench_qwen.model import (
     StateTTTModel,
     TrajectoryRuntimeState,
     VisualStageOutput,
-    build_model,
 )
 from ttt_svcbench_qwen.observation_heads import (
     E1RuntimeState,

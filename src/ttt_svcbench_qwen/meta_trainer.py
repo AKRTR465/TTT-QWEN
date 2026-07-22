@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, fields, is_dataclass, replace
 from itertools import pairwise
 from typing import Protocol, cast
@@ -88,10 +88,12 @@ from ttt_svcbench_qwen.stage_a_targets import (
 )
 from ttt_svcbench_qwen.state_encoder import TemporalEncoderOutput
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
+from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
 from ttt_svcbench_qwen.trainer import (
     StageAEpisodeAnswerInputs,
     StageASupervisionBatch,
 )
+from ttt_svcbench_qwen.training_context import query_activation_context
 
 _SUPPORTED_TERMS = ("pred", "identity", "event")
 _CI_Z_95 = 1.959963984540054
@@ -306,7 +308,7 @@ class CausalOverlapTTTInputBuilder:
         snapshot_detached = all(
             not value.requires_grad and value.grad_fn is None for value in snapshot_tensors
         )
-        snapshot_isolated = len({_storage_key(value) for value in snapshot_tensors}) == len(
+        snapshot_isolated = len({tensor_storage_key(value) for value in snapshot_tensors}) == len(
             snapshot_tensors
         )
         hard_audit = output.state_audit
@@ -1242,7 +1244,7 @@ class MetaTTTEpisodeRunner:
                         with_grad=True,
                     )
                     prepared_queries[key] = prepared_query
-            with self._query_activation_context():
+            with query_activation_context(self.query_activation_offload):
                 observation, _ = self._observe(
                     query.chunk,
                     adapted,
@@ -1361,14 +1363,6 @@ class MetaTTTEpisodeRunner:
             audit=audit,
         )
 
-    def _query_activation_context(self) -> AbstractContextManager[object]:
-        if not self.query_activation_offload or not torch.cuda.is_available():
-            return nullcontext()
-        return cast(
-            AbstractContextManager[object],
-            torch.autograd.graph.save_on_cpu(pin_memory=True),
-        )
-
     def _validate_truncated_episode(self, episode: MetaTTTEpisode) -> None:
         stage = self.config.a5
         if episode.prewarm_chunk is None:
@@ -1387,7 +1381,7 @@ class MetaTTTEpisodeRunner:
         pairs = tuple(reanchor_fast_state(state) for state in trajectory.fast_states)
         trajectory.fast_states = tuple(state for state, _ in pairs)
         values = tuple(value for state in trajectory.fast_states for value in state.fast_parameters)
-        if len({_storage_key(value) for value in values}) != len(values):
+        if len({tensor_storage_key(value) for value in values}) != len(values):
             raise ValueError("re-anchored batched fast states must remain storage-isolated")
         return tuple(audit for _, audit in pairs)
 
@@ -1884,11 +1878,3 @@ def _collect_tensor_versions(
     elif is_dataclass(value) and not isinstance(value, type):
         for field in fields(value):
             _collect_tensor_versions(getattr(value, field.name), found, seen)
-
-
-def _storage_key(value: Tensor) -> tuple[str, int | None, int]:
-    return (
-        value.device.type,
-        value.device.index,
-        int(value.untyped_storage().data_ptr()),
-    )

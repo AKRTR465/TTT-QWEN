@@ -24,6 +24,7 @@ from ttt_svcbench_qwen.config import (
     ProjectConfig,
 )
 from ttt_svcbench_qwen.state_encoder import SpatialEncoderOutput, TemporalEncoderOutput
+from ttt_svcbench_qwen.tensor_contracts import timestamps_match
 
 
 @dataclass(frozen=True, slots=True)
@@ -832,7 +833,7 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
             if overlap_count > self.config.overlap_tubelets:
                 raise ValueError("E1 overlap exceeds the configured replay window")
             cached_overlap = state.timestamps[retain_count : retain_count + overlap_count]
-            if not _timestamps_match(current_timestamps[:overlap_count], cached_overlap):
+            if not timestamps_match(current_timestamps[:overlap_count], cached_overlap):
                 raise ValueError("E1 overlap timestamps must match cached positions")
         elif first != cached_last + 1:
             raise ValueError("E1 position IDs cannot contain gaps")
@@ -1066,7 +1067,7 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
             initial_hidden = state.checkpoint_hidden[predecessor_index]
             overlap_count = cached_last - first + 1
             cached_overlap = state.timestamps[retain_count : retain_count + overlap_count]
-            if not _timestamps_match(current_timestamps[:overlap_count], cached_overlap):
+            if not timestamps_match(current_timestamps[:overlap_count], cached_overlap):
                 raise ValueError("E2 overlap timestamps must match cached positions")
         elif first != cached_last + 1:
             raise ValueError("E2 position IDs cannot contain gaps")
@@ -1229,17 +1230,6 @@ def build_observation_heads(config: ProjectConfig | None = None) -> ObservationH
     if config is None:
         raise ValueError("build_observation_heads requires a validated ProjectConfig")
     return ObservationHeads(config)
-
-
-def observation_head_parameter_counts(module: ObservationHeads) -> dict[str, int]:
-    return {
-        name: sum(parameter.numel() for parameter in getattr(module, name).parameters())
-        for name in ("o1", "o2", "e1", "e2")
-    }
-
-
-def observation_heads_parameter_count(module: ObservationHeads) -> int:
-    return sum(parameter.numel() for parameter in module.parameters())
 
 
 def _require_float_shape(tensor: Tensor, last_dim: int, name: str) -> None:
@@ -1592,16 +1582,6 @@ def _clone_e2_state(state: E2RuntimeState, *, detach: bool) -> E2RuntimeState:
         total_seen=state.total_seen,
         differentiable=not detach,
     )
-
-
-def _timestamps_match(left: Tensor, right: Tensor) -> bool:
-    if left.shape != right.shape:
-        return False
-    left_64 = left.to(dtype=torch.float64)
-    right_64 = right.to(dtype=torch.float64)
-    scale = torch.maximum(left_64.abs(), right_64.abs()).clamp_min(1.0)
-    tolerance = 4.0 * torch.finfo(torch.float32).eps * scale
-    return bool(torch.all((left_64 - right_64).abs() <= tolerance))
 
 
 def _shares_storage(left: Tensor, right: Tensor) -> bool:

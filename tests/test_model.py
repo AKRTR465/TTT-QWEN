@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.support import make_test_model as build_model
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
@@ -25,8 +26,6 @@ from ttt_svcbench_qwen.model import (
     StateTTTModel,
     VisualStageOutput,
     assert_training_number_agreement,
-    build_model,
-    evaluate_number_agreement,
 )
 from ttt_svcbench_qwen.query_encoder import Operator
 from ttt_svcbench_qwen.state_bank import RetrievalHistoryView
@@ -331,14 +330,10 @@ def run_answer(
     return model.prefill_answer(model.prepare_answer(request, lifecycle), lifecycle)
 
 
-def test_build_model_validates_feature_dependencies_before_any_stage(
+def test_model_validates_feature_dependencies_before_any_stage(
     config: ProjectConfig,
 ) -> None:
     suite = make_suite()
-    with pytest.raises(ValueError, match="validated ProjectConfig"):
-        build_model(components=make_components(suite))
-    with pytest.raises(ValueError, match="explicit ModelComponents"):
-        build_model(config)
     with pytest.raises(ValueError, match="fast_adapter"):
         build_model(config, components=make_components(suite, fast_adapter=None))
     with pytest.raises(ValueError, match="reader"):
@@ -659,7 +654,7 @@ def test_qwen_kwargs_cannot_override_composer_or_native_visual_fields() -> None:
     assert suite.events == []
 
 
-def test_reader_number_agreement_is_independent_and_training_mismatch_is_blocked() -> None:
+def test_training_number_agreement_blocks_reader_mismatch_or_missing_target() -> None:
     results = (
         SimpleNamespace(exact_count=2),
         SimpleNamespace(exact_count=0),
@@ -667,13 +662,8 @@ def test_reader_number_agreement_is_independent_and_training_mismatch_is_blocked
         SimpleNamespace(exact_count=-3),
     )
 
-    metrics = evaluate_number_agreement(results, (2, 7, 999, None))
-
-    assert metrics.comparable_rows == 3
-    assert metrics.matched_rows == 1
-    assert metrics.mismatched_rows == 1
-    assert metrics.missing_rows == 1
-    assert metrics.accuracy == pytest.approx(1 / 3)
     with pytest.raises(ValueError, match="authoritative Reader"):
         assert_training_number_agreement(results, (2, 7, None, -3))
+    with pytest.raises(ValueError, match="authoritative Reader"):
+        assert_training_number_agreement(results, (2, 0, None, None))
     assert_training_number_agreement(results, (2, 0, None, -3))
