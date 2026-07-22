@@ -538,6 +538,7 @@ class OfficialWeakBalanceConfig(FrozenModel):
     """Formal EMA Answer-reference composition for the four official-weak terms."""
 
     group_weight: Probability
+    answer_reference_floor: PositiveFloat = 0.1
     scale_min: PositiveFloat
     scale_max: PositiveFloat
     epsilon: PositiveFloat
@@ -1551,7 +1552,12 @@ class ProjectConfig(FrozenModel):
             (
                 "loss.official_weak_balance.group_weight",
                 self.loss.official_weak_balance.group_weight,
-                0.3,
+                0.4,
+            ),
+            (
+                "loss.official_weak_balance.answer_reference_floor",
+                self.loss.official_weak_balance.answer_reference_floor,
+                0.1,
             ),
             (
                 "loss.official_weak_balance.scale_min",
@@ -2235,6 +2241,7 @@ def _normalize_project_schema(value: object) -> object:
         for key, item in _SCHEMA6_BALANCE.items()
         if key not in {"mode", "experimental"}
     }
+    normalized_loss["official_weak_balance"]["group_weight"] = 0.4
     optimizer_a2 = cast(dict[str, object], stage_a["optimizer"])
     optimizer_a5 = cast(dict[str, object], stage_c["optimizer"])
     for name in ("stage_a", "stage_b", "stage_c", "evaluation", "parameter_budget"):

@@ -6,6 +6,7 @@ import math
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from typing import cast
 
 import torch
 import torch.distributed as dist
@@ -30,7 +31,7 @@ _STAT_TERM_COUNT = 1 + _TERM_SLOT_COUNT
 _LOSS_STAT_VECTOR_LENGTH = 2 * _STAT_TERM_COUNT
 _GRAD_STAT_VECTOR_LENGTH = 2 * _TERM_SLOT_COUNT
 _STAT_VECTOR_LENGTH = _LOSS_STAT_VECTOR_LENGTH + _GRAD_STAT_VECTOR_LENGTH
-_BALANCE_CHECKPOINT_SCHEMA = 6
+_BALANCE_CHECKPOINT_SCHEMA = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +105,10 @@ class OfficialWeakBalanceAudit:
     auxiliary_to_answer_ratio: Tensor
     group_guard: Tensor
     group_guard_active: Tensor
+    group_guard_reference: Tensor
+    group_guard_reference_floored: Tensor
+    state_to_reference_ratio: Tensor
+    state_to_current_answer_ratio: Tensor
     ema_means: tuple[Tensor, ...] = ()
     ema_update_counts: tuple[Tensor, ...] = ()
     gradient_ema_rms: tuple[Tensor, ...] = ()
@@ -119,6 +124,10 @@ class OfficialWeakBalanceAudit:
             self.auxiliary_to_answer_ratio,
             self.group_guard,
             self.group_guard_active,
+            self.group_guard_reference,
+            self.group_guard_reference_floored,
+            self.state_to_reference_ratio,
+            self.state_to_current_answer_ratio,
             *self.ema_means,
             *self.ema_update_counts,
             *self.gradient_ema_rms,
@@ -128,6 +137,8 @@ class OfficialWeakBalanceAudit:
             raise ValueError("official-weak audit values must be detached scalar tensors")
         if self.group_guard_active.dtype != torch.bool:
             raise TypeError("official-weak group guard audit flag must be bool")
+        if self.group_guard_reference_floored.dtype != torch.bool:
+            raise TypeError("official-weak Answer-reference floor audit flag must be bool")
         if self.ema_means and len(self.ema_means) != _STAT_TERM_COUNT:
             raise ValueError("official-weak EMA means must include Answer plus four terms")
         if self.ema_update_counts and (len(self.ema_update_counts) != _STAT_TERM_COUNT):
@@ -189,6 +200,16 @@ class OfficialWeakBalanceAudit:
                 ("loss/aux_to_answer_ratio", _audit_float(self.auxiliary_to_answer_ratio)),
                 ("loss/group_guard", _audit_float(self.group_guard)),
                 ("loss/group_guard_active", _audit_float(self.group_guard_active)),
+                ("loss/group_guard_reference", _audit_float(self.group_guard_reference)),
+                (
+                    "loss/group_guard_reference_floored",
+                    _audit_float(self.group_guard_reference_floored),
+                ),
+                ("loss/state_to_reference_ratio", _audit_float(self.state_to_reference_ratio)),
+                (
+                    "loss/state_to_current_answer_ratio",
+                    _audit_float(self.state_to_current_answer_ratio),
+                ),
             )
         )
         if self.ema_means:
@@ -282,6 +303,147 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             torch.tensor(_BALANCE_CHECKPOINT_SCHEMA, dtype=torch.int64),
             persistent=True,
         )
+        self._assert_balance_state()
+
+    def _apply(
+        self,
+        fn: Callable[[Tensor], Tensor],
+        recurse: bool = True,
+    ) -> OfficialWeakOuterLossComposer:
+        """Move persistent EMA state without ever applying a lower floating dtype."""
+
+        snapshots = {
+            name: getattr(self, name).detach().clone().to(dtype=torch.float64)
+            for name in ("ema_values", "gradient_ema_values")
+        }
+        result = cast(
+            OfficialWeakOuterLossComposer,
+            super()._apply(fn, recurse=recurse),
+        )
+        for name, snapshot in snapshots.items():
+            transformed = getattr(self, name)
+            self._buffers[name] = snapshot.to(
+                device=transformed.device,
+                dtype=torch.float64,
+            )
+        self._assert_balance_state()
+        return result
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        prefix: str,
+        local_metadata: dict[str, object],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        """Reject quantized or stale balance state before PyTorch can silently cast it."""
+
+        expected = {
+            "ema_values": (torch.float64, (_STAT_TERM_COUNT,)),
+            "ema_valid": (torch.bool, (_STAT_TERM_COUNT,)),
+            "ema_update_counts": (torch.int64, (_STAT_TERM_COUNT,)),
+            "gradient_ema_values": (torch.float64, (_TERM_SLOT_COUNT,)),
+            "gradient_ema_valid": (torch.bool, (_TERM_SLOT_COUNT,)),
+            "gradient_ema_update_counts": (torch.int64, (_TERM_SLOT_COUNT,)),
+            "balance_schema_version": (torch.int64, ()),
+        }
+        validation_errors = 0
+        for name, (dtype, shape) in expected.items():
+            key = f"{prefix}{name}"
+            source = state_dict.get(key)
+            if source is None:
+                error_msgs.append(f'Missing required balance-state key "{key}".')
+                validation_errors += 1
+                continue
+            if source.dtype != dtype or tuple(source.shape) != shape:
+                error_msgs.append(
+                    f'Invalid balance-state tensor "{key}": expected {dtype} {shape}, '
+                    f"found {source.dtype} {tuple(source.shape)}."
+                )
+                validation_errors += 1
+        schema = state_dict.get(f"{prefix}balance_schema_version")
+        if (
+            schema is not None
+            and schema.dtype == torch.int64
+            and tuple(schema.shape) == ()
+            and int(schema.item()) != _BALANCE_CHECKPOINT_SCHEMA
+        ):
+            error_msgs.append(
+                "Incompatible official-weak balance checkpoint schema: expected "
+                f"{_BALANCE_CHECKPOINT_SCHEMA}, found {int(schema.item())}."
+            )
+            validation_errors += 1
+        if validation_errors:
+            return
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self._assert_balance_state()
+
+    def _assert_balance_state(self) -> None:
+        expected = (
+            (self.ema_values, torch.float64, (_STAT_TERM_COUNT,), "ema_values"),
+            (self.ema_valid, torch.bool, (_STAT_TERM_COUNT,), "ema_valid"),
+            (
+                self.ema_update_counts,
+                torch.int64,
+                (_STAT_TERM_COUNT,),
+                "ema_update_counts",
+            ),
+            (
+                self.gradient_ema_values,
+                torch.float64,
+                (_TERM_SLOT_COUNT,),
+                "gradient_ema_values",
+            ),
+            (
+                self.gradient_ema_valid,
+                torch.bool,
+                (_TERM_SLOT_COUNT,),
+                "gradient_ema_valid",
+            ),
+            (
+                self.gradient_ema_update_counts,
+                torch.int64,
+                (_TERM_SLOT_COUNT,),
+                "gradient_ema_update_counts",
+            ),
+            (
+                self.balance_schema_version,
+                torch.int64,
+                (),
+                "balance_schema_version",
+            ),
+        )
+        devices = {value.device for value, _dtype, _shape, _name in expected}
+        if len(devices) != 1:
+            raise RuntimeError("official-weak balance buffers must share one device")
+        for value, dtype, shape, name in expected:
+            if value.dtype != dtype or tuple(value.shape) != shape:
+                raise RuntimeError(
+                    f"official-weak {name} must remain {dtype} with shape {shape}"
+                )
+        if self.ema_values.device.type == "meta":
+            return
+        if not bool(torch.isfinite(self.ema_values).all()) or not bool(
+            torch.isfinite(self.gradient_ema_values).all()
+        ):
+            raise RuntimeError("official-weak EMA buffers must remain finite")
+        if bool(torch.any(self.ema_update_counts < 0)) or bool(
+            torch.any(self.gradient_ema_update_counts < 0)
+        ):
+            raise RuntimeError("official-weak EMA update counts must remain non-negative")
+        if int(self.balance_schema_version.item()) != _BALANCE_CHECKPOINT_SCHEMA:
+            raise RuntimeError("official-weak balance schema buffer is incompatible")
 
     def compose(
         self,
@@ -292,6 +454,7 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         gradient_anchors: Sequence[OfficialWeakGradientAnchors] | None = None,
         measure_gradients: bool = True,
     ) -> OfficialWeakBalancedBatch:
+        self._assert_balance_state()
         answer_items = tuple(answers)
         state_items = tuple(states)
         if not answer_items or len(answer_items) != len(state_items):
@@ -403,11 +566,19 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             torch.zeros_like(term_raw_means),
         )
         auxiliary_mean = aligned_means.sum() / float(_TERM_SLOT_COUNT)
+        prior_answer = torch.where(
+            self.ema_valid[0].to(device),
+            self.ema_values[0].to(device=device, dtype=torch.float64),
+            answer_mean.detach().to(dtype=torch.float64),
+        )
+        answer_reference_floor = float(self.config.answer_reference_floor)
+        group_guard_reference_floored = prior_answer < answer_reference_floor
+        group_guard_reference = prior_answer.clamp_min(answer_reference_floor)
         group_guard = torch.where(
             auxiliary_mean > 0.0,
             torch.minimum(
                 torch.ones_like(answer_mean),
-                answer_mean / auxiliary_mean.clamp_min(epsilon),
+                group_guard_reference / auxiliary_mean.clamp_min(epsilon),
             ),
             torch.ones_like(answer_mean),
         )
@@ -504,21 +675,20 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             )
         )
         weighted_auxiliary = weighted_factor * auxiliary_mean
-        ratio_value = torch.where(
-            answer_mean > epsilon,
-            weighted_auxiliary / answer_mean.clamp_min(epsilon),
-            torch.zeros_like(answer_mean),
-        )
+        current_answer_ratio = weighted_auxiliary / answer_mean.clamp_min(epsilon)
+        reference_ratio = weighted_auxiliary / group_guard_reference.clamp_min(epsilon)
         audit = OfficialWeakBalanceAudit(
             answer_global_mean=answer_mean.detach().clone(),
             answer_global_count=global_counts[0].detach().clone(),
             state_global_mean=weighted_auxiliary.detach().clone(),
             terms=term_metrics,
-            auxiliary_to_answer_ratio=ratio_value.clamp_max(float(self.config.group_weight))
-            .detach()
-            .clone(),
+            auxiliary_to_answer_ratio=current_answer_ratio.detach().clone(),
             group_guard=group_guard.detach().clone(),
             group_guard_active=(group_guard < 1.0).detach().clone(),
+            group_guard_reference=group_guard_reference.detach().clone(),
+            group_guard_reference_floored=group_guard_reference_floored.detach().clone(),
+            state_to_reference_ratio=reference_ratio.detach().clone(),
+            state_to_current_answer_ratio=current_answer_ratio.detach().clone(),
             ema_means=self._ema_means_for_audit(),
             ema_update_counts=tuple(value.detach().clone() for value in self.ema_update_counts),
             gradient_ema_rms=gradient_ema_rms,
@@ -622,6 +792,8 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         self.gradient_ema_values.zero_()
         self.gradient_ema_valid.zero_()
         self.gradient_ema_update_counts.zero_()
+        self.balance_schema_version.fill_(_BALANCE_CHECKPOINT_SCHEMA)
+        self._assert_balance_state()
 
     def _ema_means_for_audit(self) -> tuple[Tensor, ...]:
         values = torch.where(
