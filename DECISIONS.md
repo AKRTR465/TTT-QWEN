@@ -1,4 +1,4 @@
-# State-TTT v5 固定决策
+# State-TTT retrieval-history 固定决策
 
 ## 当前主线
 
@@ -24,7 +24,7 @@
 - 正式流程直接 A2→A5。
 - A2 全量解冻 Qwen、状态路径和 W0，冻结 Predictor，禁止 Inner SGD。
 - A5 固定 `pred + 0.5 identity + 0.5 event`，K=8 截断二阶并重锚 W0。
-- A3/A4 不作为生产训练阶段。
+- A1/A3/A4 与 full-graph Meta-TTT 已从生产实现和配置中删除。
 - graph anchor 只服务真实多卡动态分支，单卡不启用。
 - Outer checkpoint 完整保存模型/optimizer/scheduler/RNG，排除所有临时 runtime state。
 
@@ -47,6 +47,6 @@
 
 ## 验证声明
 
-- `formal_evaluation_enabled=false`，直至阈值在训练折或独立校准集冻结。
+- 阈值在训练折或独立校准集冻结前，不作正式评估声明；该策略不属于运行配置字段。
 - tiny/CPU 测试是工程证据，不是 8B 收敛、性能或科学收益证据。
 - 真实 8B/H200 结果必须记录模型 revision/hash、BF16、峰值显存、时延、吞吐和失败恢复。

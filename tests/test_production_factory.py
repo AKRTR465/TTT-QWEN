@@ -12,11 +12,7 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
-from ttt_svcbench_qwen.config import (
-    OfficialWeakBalanceConfig,
-    OfficialWeakBalanceMode,
-    load_config,
-)
+from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.llamafactory_trainer import (
     CheckpointPolicy,
     ProductionStage,
@@ -28,7 +24,6 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     _publish_epoch_two_four_checkpoints,
     _reset_a2_to_a5_balance,
     _validate_checkpoint_tree,
-    _validate_formal_balance,
     _validate_resume_balance_schema,
     make_production_outer_optimizer_factory,
     resolve_same_stage_resume,
@@ -153,21 +148,6 @@ def test_production_outer_checkpoint_owns_ema_balance_state() -> None:
     assert "official_weak_balancer.gradient_ema_valid" in keys
     assert "official_weak_balancer.gradient_ema_update_counts" in keys
     assert "official_weak_balancer.balance_schema_version" in keys
-
-
-def test_formal_entry_accepts_only_nonexperimental_ema_answer_ref() -> None:
-    _validate_formal_balance(load_config().loss.official_weak_balance)
-    experimental = OfficialWeakBalanceConfig(
-        mode=OfficialWeakBalanceMode.INSTANT_EQUAL,
-        experimental=True,
-        group_weight=0.3,
-        scale_min=0.1,
-        scale_max=10.0,
-        epsilon=1.0e-8,
-    )
-
-    with pytest.raises(ValueError, match="formal A2/A5 requires"):
-        _validate_formal_balance(experimental)
 
 
 def test_a2_to_a5_resets_loss_and_gradient_ema() -> None:

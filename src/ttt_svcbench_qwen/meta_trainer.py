@@ -20,10 +20,7 @@ from typing import Protocol, cast
 import torch
 from torch import Tensor, nn
 
-from ttt_svcbench_qwen.config import (
-    OfficialWeakBalanceMode,
-    ProjectConfig,
-)
+from ttt_svcbench_qwen.config import ProjectConfig
 from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.fast_ttt import (
     FastReanchorAudit,
@@ -1049,7 +1046,7 @@ class MetaTTTEpisodeRunner:
             (*self.model.parameters(), *self.predictor.parameters())
         )
         versions_before = tuple(parameter._version for parameter in tracked_parameters)
-        horizon = self.config.stage_c.truncation_horizon
+        horizon = self.config.a5.truncation_horizon
         support_count = len(episode.support_chunks)
         auxiliary_scale = float(self.config.loss.auxiliary_outer_weight) / support_count
         update_audits: list[InnerUpdateAudit] = []
@@ -1185,17 +1182,11 @@ class MetaTTTEpisodeRunner:
 
         query_runtime_snapshot = adapted.runtime
         balance_audit: OfficialWeakBalanceAudit | None = None
-        if (
-            self.config.loss.official_weak_balance.mode is not OfficialWeakBalanceMode.LEGACY_SUM
-            and (
-                all(query.supervision.official_weak for query in episode.query_points)
-                or bool(
-                    getattr(
-                        self.query_loss_builder,
-                        "streamed_balance_calibration",
-                        False,
-                    )
-                )
+        if all(query.supervision.official_weak for query in episode.query_points) or bool(
+            getattr(
+                self.query_loss_builder,
+                "streamed_balance_calibration",
+                False,
             )
         ):
             calibration: list[MetaQueryObjective] = []
@@ -1265,17 +1256,13 @@ class MetaTTTEpisodeRunner:
             immutable = observation_versions == _tensor_version_signature(observation)
             objective = self._query_objective(query, output, ())
             if balance_audit is not None:
-                if (
-                    self.config.loss.official_weak_balance.mode
-                    is OfficialWeakBalanceMode.EMA_ANSWER_REF
-                ):
-                    streamed_gradient_statistics.append(
-                        self.outer_composer.measure_streamed_gradients(
-                            cast(OfficialWeakStateLossOutput, objective.state),
-                            objective.gradient_anchors,
-                            balance_audit,
-                        )
+                streamed_gradient_statistics.append(
+                    self.outer_composer.measure_streamed_gradients(
+                        cast(OfficialWeakStateLossOutput, objective.state),
+                        objective.gradient_anchors,
+                        balance_audit,
                     )
+                )
                 balanced_outer = self.outer_composer.compose_one_from_audit(
                     objective.answer,
                     cast(OfficialWeakStateLossOutput, objective.state),
@@ -1311,11 +1298,7 @@ class MetaTTTEpisodeRunner:
             )
             del backward_loss, normalized_query_loss, objective, output, observation
 
-        if (
-            balance_audit is not None
-            and self.config.loss.official_weak_balance.mode
-            is OfficialWeakBalanceMode.EMA_ANSWER_REF
-        ):
+        if balance_audit is not None:
             balance_audit = self.outer_composer.commit_streamed_gradients(
                 tuple(streamed_gradient_statistics),
                 balance_audit,
@@ -1387,25 +1370,15 @@ class MetaTTTEpisodeRunner:
         )
 
     def _validate_truncated_episode(self, episode: MetaTTTEpisode) -> None:
-        stage = self.config.stage_c
-        if stage.active_variant.value != "a5":
-            raise ValueError("the truncated production entrypoint requires active A5")
-        if stage.a5_enabled_ttt_terms != _SUPPORTED_TERMS:
-            raise ValueError("A5 inner objective must be pred + identity + event")
-        if not stage.direct_from_stage_a or stage.meta_gradient_mode != "truncated_second_order":
-            raise ValueError("A5 production must transition directly from A2 in truncated mode")
-        if stage.maximum_support_chunks is not None or stage.support_chunk_schedule:
-            raise ValueError("A5 production cannot cap or enumerate Support counts")
-        if episode.prewarm_chunk is None or stage.prewarm_support_chunks != 1:
+        stage = self.config.a5
+        if episode.prewarm_chunk is None:
             raise ValueError("A5 production requires an explicit S0 no-update prewarm chunk")
-        if len(episode.query_points) < stage.minimum_query_points:
+        if len(episode.query_points) < 2:
             raise ValueError("A5 production requires multiple later Query points")
         if episode.seed != stage.seed:
             raise ValueError("A5 episode seed must equal the fixed Stage C seed")
         if self.config.fast_ttt.optimizer.momentum != 0.0:
             raise ValueError("truncated A5 currently requires stateless momentum=0 Inner SGD")
-        if stage.training_counterfactual_enabled:
-            raise ValueError("static-W0 counterfactuals are validation-only in production A5")
 
     @staticmethod
     def _reanchor_trajectory(
@@ -1592,13 +1565,7 @@ class MetaTTTEpisodeRunner:
             self.last_balance_audit = None
             return objectives
         if not all(official):
-            if (
-                self.config.loss.official_weak_balance.mode
-                is not OfficialWeakBalanceMode.LEGACY_SUM
-            ):
-                raise ValueError("balanced official-weak mode cannot mix dense Query losses")
-            self.last_balance_audit = None
-            return objectives
+            raise ValueError("official-weak balancing cannot mix dense Query losses")
         states = tuple(cast(OfficialWeakStateLossOutput, item.state) for item in objectives)
         balanced = (
             self.outer_composer.calibrate(

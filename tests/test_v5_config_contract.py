@@ -11,6 +11,13 @@ import yaml
 from pydantic import ValidationError
 
 from ttt_svcbench_qwen.config import (
+    _SCHEMA6_A2,
+    _SCHEMA6_A5,
+    _SCHEMA6_BALANCE,
+    _SCHEMA6_EVALUATION,
+    _SCHEMA6_INFERENCE,
+    _SCHEMA6_PARAMETER_BUDGET,
+    _SCHEMA6_STAGE_B,
     AuditLevel,
     CalibrationStatus,
     ProjectConfig,
@@ -27,35 +34,92 @@ def load_raw_config() -> dict[str, Any]:
     return raw
 
 
-def test_v6_yaml_passes_strong_validation_and_serializes_completely() -> None:
+def load_schema6_raw() -> dict[str, Any]:
+    raw = load_raw_config()
+    raw["config_schema_version"] = 6
+    raw["loss"]["official_weak_balance"] = copy.deepcopy(_SCHEMA6_BALANCE)
+    raw["stage_a"] = copy.deepcopy(_SCHEMA6_A2)
+    raw["stage_b"] = copy.deepcopy(_SCHEMA6_STAGE_B)
+    raw["stage_c"] = copy.deepcopy(_SCHEMA6_A5)
+    raw["inference"] = copy.deepcopy(_SCHEMA6_INFERENCE)
+    raw["evaluation"] = copy.deepcopy(_SCHEMA6_EVALUATION)
+    raw["parameter_budget"] = copy.deepcopy(_SCHEMA6_PARAMETER_BUDGET)
+    del raw["a2"]
+    del raw["a5"]
+    return raw
+
+
+def test_schema7_yaml_passes_strong_validation_and_serializes_completely() -> None:
     config = load_config(CONFIG_PATH)
     serialized = json.loads(config.model_dump_json())
 
     assert serialized["spec_version"] == (
         "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history"
     )
-    assert serialized["config_schema_version"] == 6
+    assert serialized["config_schema_version"] == 7
     assert serialized["model"]["revision"] == "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
     assert set(serialized) == set(ProjectConfig.model_fields)
 
 
-def test_v5_project_config_accepts_explicit_instant_equal_experiment() -> None:
-    raw = load_raw_config()
-    raw["loss"]["official_weak_balance"]["mode"] = "instant_equal"
-    raw["loss"]["official_weak_balance"]["experimental"] = True
-    raw["loss"]["official_weak_balance"]["scale_min"] = 0.1
-    raw["loss"]["official_weak_balance"]["scale_max"] = 10.0
-
+def test_formal_schema6_normalizes_once_to_schema7() -> None:
+    raw = load_schema6_raw()
     config = ProjectConfig.model_validate(raw)
+    serialized = config.model_dump(mode="json")
 
-    assert config.loss.official_weak_balance.mode == "instant_equal"
+    assert serialized["config_schema_version"] == 7
+    assert "stage_a" not in serialized and "stage_b" not in serialized
+    assert "stage_c" not in serialized and "evaluation" not in serialized
+    assert "parameter_budget" not in serialized
+    assert set(serialized["loss"]["official_weak_balance"]) == {
+        "group_weight",
+        "scale_min",
+        "scale_max",
+        "epsilon",
+        "ema_beta",
+        "grad_ema_beta",
+        "grad_scale_min",
+        "grad_scale_max",
+    }
 
 
-def test_non_ema_modes_require_explicit_experimental_flag() -> None:
+@pytest.mark.parametrize("mode", ["instant_equal", "legacy_sum"])
+def test_schema6_experimental_loss_modes_fail_closed(mode: str) -> None:
+    raw = load_schema6_raw()
+    raw["loss"]["official_weak_balance"]["mode"] = mode
+    raw["loss"]["official_weak_balance"]["experimental"] = True
+
+    with pytest.raises(ValidationError, match="formal ema_answer_ref"):
+        ProjectConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("stage_a", "variant"), "a1"),
+        (("stage_c", "active_variant"), "a4"),
+        (("stage_c", "a5_enabled_ttt_terms"), ["pred", "identity"]),
+        (("loss", "official_weak_balance", "experimental"), True),
+    ],
+)
+def test_schema6_nonproduction_variants_fail_closed(
+    path: tuple[str, ...],
+    value: object,
+) -> None:
+    raw = load_schema6_raw()
+    target: dict[str, Any] = raw
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+
+    with pytest.raises(ValidationError, match="schema 6"):
+        ProjectConfig.model_validate(raw)
+
+
+def test_schema7_rejects_removed_loss_switches_and_unknown_fields() -> None:
     raw = load_raw_config()
-    raw["loss"]["official_weak_balance"]["mode"] = "legacy_sum"
+    raw["loss"]["official_weak_balance"]["mode"] = "ema_answer_ref"
 
-    with pytest.raises(ValidationError, match="require explicit"):
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         ProjectConfig.model_validate(raw)
 
 
@@ -578,8 +642,6 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "answer_causal_shift": True,
         "answer_ignore_index": -100,
         "official_weak_balance": {
-            "mode": "ema_answer_ref",
-            "experimental": False,
             "group_weight": 0.3,
             "scale_min": 0.001,
             "scale_max": 20.0,
@@ -604,95 +666,15 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "nonfinite_policy": "skip_update",
         "audit_steps": 32,
     }
-    assert config.stage_a.model_dump() == {
-        "variant": "a2",
-        "inner_sgd_enabled": False,
-        "fast_adapter_mode": "static_w0_no_inner_sgd",
-        "qwen_strategy": "full_unfreeze_qwen3_vl_8b",
-        "qwen_parameter_allowlist": (),
-        "trainable_components": (
-            "qwen_vit",
-            "qwen_main_merger",
-            "qwen_deepstack_mergers",
-            "qwen_decoder_36",
-            "fast_adapter_w0",
-            "query_encoder",
-            "spatial_encoder",
-            "temporal_encoder",
-            "observation_heads",
-            "state_bank",
-            "resampler",
-        ),
-        "predictor_trainable": False,
-        "epochs": 8,
-        "per_device_train_batch_size": 1,
-        "gradient_accumulation_steps": 4,
-        "world_size": 4,
-        "global_batch_size": 16,
-        "loss_terms": ("state", "answer"),
-        "supervision_provenance": "official_weak",
-        "load_best_model_at_end": False,
-        "balanced_task_sampling": True,
-        "synthetic_engineering_gate_only": False,
-        "seed": 42,
+    assert config.a2.model_dump() == {
         "optimizer": {
-            "name": "adamw",
             "qwen_learning_rate": 1.0e-5,
             "state_learning_rate": 1.0e-4,
             "w0_learning_rate": 1.0e-4,
-            "weight_decay": 0.01,
-            "betas": (0.9, 0.999),
-            "epsilon": 1.0e-8,
-        },
-        "checkpoint": {
-            "format": "full_model_optimizer_scheduler_rng_v1",
-            "trainable_only": False,
-            "include_optimizer": True,
-            "include_scheduler": True,
-            "include_rng": True,
-            "save_full_model": True,
-            "save_runtime_state": False,
-            "save_every_epochs": 2,
-            "selection_policy": "final_epoch",
         },
     }
-    assert config.stage_b.model_dump() == {
-        "variant": "a3",
-        "support_chunks": 1,
-        "minimum_query_points": 1,
-        "enabled_ttt_terms": ("pred",),
-        "inner_sgd_enabled": True,
-        "update_effect": "next_chunk_only",
-        "auxiliary_outer_weight": 0.1,
-        "reset_per_episode": True,
-        "compare_before_after": True,
-        "meta_gradient_mode": "meta_full_second_order",
-        "reuse_strategy": "causal_replay_isolated_prefill",
-        "synthetic_engineering_gate_only": True,
-        "seed": 42,
-    }
-    assert config.stage_c.model_dump() == {
-        "active_variant": "a5",
-        "variants": ("a4", "a5"),
-        "a4_enabled_ttt_terms": ("pred", "identity"),
-        "a5_enabled_ttt_terms": ("pred", "identity", "event"),
-        "support_chunk_schedule": (),
-        "maximum_support_chunks": None,
-        "minimum_query_points": 2,
-        "multi_query_enabled": True,
-        "detach_overlap_snapshots": True,
-        "detach_runtime_between_chunks": True,
-        "update_effect": "next_chunk_only",
-        "reuse_strategy": "causal_replay_isolated_prefill",
-        "direct_from_stage_a": True,
-        "meta_gradient_mode": "truncated_second_order",
+    assert config.a5.model_dump() == {
         "truncation_horizon": 8,
-        "reanchor_to_w0": True,
-        "segment_auxiliary_backward": True,
-        "training_counterfactual_enabled": False,
-        "prewarm_support_chunks": 1,
-        "outer_step_scope": "episode",
-        "synthetic_engineering_gate_only": False,
         "seed": 42,
         "optimizer": {
             "state_learning_rate": 5.0e-5,
@@ -700,76 +682,18 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
             "predictor_learning_rate": 5.0e-5,
         },
     }
-    assert config.inference.model_dump() == {
-        "reset_per_video": True,
-        "update_effect": "next_chunk_only",
-        "prefill_once": True,
-        "decode_state_immutable": True,
-        "release_on_exception": True,
-        "audit_level": AuditLevel.BOUNDARY,
-        "repeat_query_policy": "explicit_new_or_retry",
-        "record_skip_reasons": True,
-        "synthetic_engineering_gate_only": True,
-    }
+    assert config.inference.model_dump() == {"audit_level": AuditLevel.BOUNDARY}
 
 
-def test_stage_c_production_path_enters_a5_directly_and_keeps_a4_unreachable() -> None:
-    raw_a5 = load_raw_config()
-    config_a5 = ProjectConfig.model_validate(raw_a5)
-    assert config_a5.stage_c.active_variant.value == "a5"
-    assert config_a5.stage_c.enabled_ttt_terms == ("pred", "identity", "event")
-
-    raw_a4 = copy.deepcopy(raw_a5)
-    raw_a4["stage_c"]["active_variant"] = "a4"
-    with pytest.raises(ValidationError, match="direct Stage A transition must enter A5"):
-        ProjectConfig.model_validate(raw_a4)
-
-
-def test_v5_parameter_budget_matches_architecture_rounding() -> None:
-    budget = load_config().parameter_budget
-    component_total = sum(
-        (
-            budget.fast_ttt_adapter_millions,
-            budget.spatial_encoder_millions,
-            budget.temporal_encoder_millions,
-            budget.query_encoder_millions,
-            budget.o1_millions,
-            budget.o2_millions,
-            budget.e1_millions,
-            budget.e2_millions,
-            budget.semantic_projector_millions,
-            budget.predictor_millions,
-            budget.state_resampler_millions,
-            budget.router_resolver_empty_millions,
-        )
-    )
-
-    assert budget.spatial_encoder_millions == 24.81536
-    assert budget.temporal_encoder_millions == 48.438272
-    assert (
-        budget.o1_millions,
-        budget.o2_millions,
-        budget.e1_millions,
-        budget.e2_millions,
-    ) == (2.632710, 2.499843, 9.717252, 7.293449)
-    assert budget.semantic_projector_millions == 1.316864
-    assert budget.new_modules_total_millions == 157.443750
-    assert (
-        abs(component_total - budget.new_modules_total_millions)
-        <= budget.rounding_tolerance_millions
-    )
-    assert budget.online_fast_matrices_millions == 1.179648
-
-
-def test_uncalibrated_thresholds_block_formal_evaluation() -> None:
+def test_schema7_exposes_only_direct_a2_a5_training_contracts() -> None:
     config = load_config()
-    assert config.evaluation.formal_evaluation_enabled is False
-    assert config.retriever.threshold_status is CalibrationStatus.BOOTSTRAP_CALIBRATION_REQUIRED
 
-    raw = load_raw_config()
-    raw["evaluation"]["formal_evaluation_enabled"] = True
-    with pytest.raises(ValidationError, match="formal evaluation requires every threshold"):
-        ProjectConfig.model_validate(raw)
+    assert config.a2.optimizer.qwen_learning_rate == pytest.approx(1.0e-5)
+    assert config.a5.truncation_horizon == 8
+    assert config.a5.seed == 42
+    assert not hasattr(config, "stage_a")
+    assert not hasattr(config, "stage_b")
+    assert not hasattr(config, "stage_c")
 
 
 Mutation = Callable[[dict[str, Any]], None]
@@ -827,10 +751,6 @@ def set_nested(*path_and_value: object) -> Mutation:
         (
             set_nested("spatial_encoder", "overflow_policy", "replace_low_confidence"),
             "spatial_encoder.overflow_policy",
-        ),
-        (
-            set_nested("parameter_budget", "spatial_encoder_millions", 24.88),
-            "parameter budget|spatial encoder budget",
         ),
         (
             set_nested("temporal_encoder", "position_encoding", "learned_absolute"),
@@ -1033,22 +953,6 @@ def set_nested(*path_and_value: object) -> Mutation:
             set_nested("state_bank", "event_kind_provenance", "ground_truth_label"),
             "state_bank.event_kind_provenance",
         ),
-        (
-            set_nested("parameter_budget", "temporal_encoder_millions", 48.49),
-            "parameter budget components|temporal encoder budget",
-        ),
-        (
-            set_nested("parameter_budget", "o1_millions", 2.63),
-            "parameter budget components|O1 budget",
-        ),
-        (
-            set_nested("parameter_budget", "semantic_projector_millions", 1.32),
-            "parameter budget components|Semantic Projector budget",
-        ),
-        (
-            set_nested("parameter_budget", "new_modules_total_millions", 156.75536),
-            "parameter budget components",
-        ),
         (set_nested("state_resampler", "num_queries", 8), "num_queries must be 16"),
         (
             set_nested("state_resampler", "layer_norm_eps", 1.0e-6),
@@ -1178,46 +1082,12 @@ def set_nested(*path_and_value: object) -> Mutation:
             "loss.answer_ignore_index",
         ),
         (
-            set_nested("stage_a", "inner_sgd_enabled", True),
-            "stage_a.inner_sgd_enabled",
+            set_nested("a2", "optimizer", "qwen_learning_rate", 2.0e-5),
+            "a2.optimizer.qwen_learning_rate",
         ),
-        (
-            set_nested("stage_a", "fast_adapter_mode", "disabled"),
-            "stage_a.fast_adapter_mode",
-        ),
-        (
-            set_nested("stage_a", "checkpoint", "save_runtime_state", True),
-            "stage_a.checkpoint.save_runtime_state",
-        ),
-        (set_nested("stage_b", "support_chunks", 2), "stage_b.support_chunks"),
-        (
-            set_nested("stage_b", "enabled_ttt_terms", ["pred", "identity"]),
-            "stage_b.enabled_ttt_terms",
-        ),
-        (
-            set_nested("stage_b", "meta_gradient_mode", "first_order"),
-            "stage_b.meta_gradient_mode",
-        ),
-        (
-            set_nested("stage_c", "support_chunk_schedule", [1, 2, 4]),
-            "stage_c.support_chunk_schedule",
-        ),
-        (
-            set_nested("stage_c", "active_variant", "a3"),
-            "stage_c.active_variant",
-        ),
-        (
-            set_nested("stage_c", "a5_enabled_ttt_terms", ["pred", "event"]),
-            "stage_c.a5_enabled_ttt_terms",
-        ),
-        (
-            set_nested("inference", "decode_state_immutable", False),
-            "inference.decode_state_immutable",
-        ),
-        (
-            set_nested("inference", "repeat_query_policy", "implicit_retry"),
-            "inference.repeat_query_policy",
-        ),
+        (set_nested("a5", "truncation_horizon", 4), "a5.truncation_horizon"),
+        (set_nested("a5", "seed", 41), "a5.seed"),
+        (set_nested("inference", "audit_level", "full"), "inference.audit_level"),
         (set_nested("fast_ttt", "optimizer", "momentum", 0.9), "momentum must be 0.0"),
         (
             set_nested(

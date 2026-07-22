@@ -1,4 +1,4 @@
-"""Load and validate the frozen v5 project configuration.
+"""Load and validate the frozen retrieval-history project configuration.
 
 Inputs: UTF-8 YAML plus environment-variable *names* for model, data, cache, and outputs.
 Outputs: an immutable, fully validated :class:`ProjectConfig` and environment summaries.
@@ -19,7 +19,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SPEC_VERSION = "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history"
-CONFIG_SCHEMA_VERSION = 6
+CONFIG_SCHEMA_VERSION = 7
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -534,19 +534,9 @@ class PredictorConfig(FrozenModel):
     parameter_count: PositiveInt
 
 
-class OfficialWeakBalanceMode(StrEnum):
-    """Composition policy for labeled official-weak outer losses."""
-
-    LEGACY_SUM = "legacy_sum"
-    INSTANT_EQUAL = "instant_equal"
-    EMA_ANSWER_REF = "ema_answer_ref"
-
-
 class OfficialWeakBalanceConfig(FrozenModel):
-    """Answer-dominant composition for the four official-weak terms."""
+    """Formal EMA Answer-reference composition for the four official-weak terms."""
 
-    mode: OfficialWeakBalanceMode
-    experimental: bool
     group_weight: Probability
     scale_min: PositiveFloat
     scale_max: PositiveFloat
@@ -562,13 +552,6 @@ class OfficialWeakBalanceConfig(FrozenModel):
             raise ValueError("official-weak scale_min cannot exceed scale_max")
         if self.grad_scale_min > self.grad_scale_max:
             raise ValueError("official-weak grad_scale_min cannot exceed grad_scale_max")
-        if self.mode is OfficialWeakBalanceMode.EMA_ANSWER_REF:
-            if self.experimental:
-                raise ValueError("formal ema_answer_ref requires experimental=false")
-        elif not self.experimental:
-            raise ValueError(
-                "instant_equal/legacy_sum require explicit official_weak_balance.experimental=true"
-            )
         return self
 
 
@@ -613,111 +596,17 @@ class OuterGradientControlConfig(FrozenModel):
     audit_steps: PositiveInt
 
 
-class StageAVariant(StrEnum):
-    """P15 ablations that are legal before any Meta-TTT episode."""
-
-    A1 = "a1"
-    A2 = "a2"
-
-
-class StageAOptimizerConfig(FrozenModel):
-    name: str
+class A2OptimizerConfig(FrozenModel):
     qwen_learning_rate: PositiveFloat
     state_learning_rate: PositiveFloat
     w0_learning_rate: PositiveFloat
-    weight_decay: NonNegativeFloat
-    betas: tuple[Probability, Probability]
-    epsilon: PositiveFloat
 
 
-class StageACheckpointConfig(FrozenModel):
-    format: str
-    trainable_only: bool
-    include_optimizer: bool
-    include_scheduler: bool
-    include_rng: bool
-    save_full_model: bool
-    save_runtime_state: bool
-    save_every_epochs: PositiveInt
-    selection_policy: str
+class A2TrainingConfig(FrozenModel):
+    optimizer: A2OptimizerConfig
 
 
-class StageATrainingConfig(FrozenModel):
-    """Production full-unfreeze A2 before the direct A5 transition."""
-
-    variant: StageAVariant
-    inner_sgd_enabled: bool
-    fast_adapter_mode: str
-    qwen_strategy: str
-    qwen_parameter_allowlist: tuple[str, ...]
-    trainable_components: tuple[str, ...]
-    predictor_trainable: bool
-    epochs: PositiveInt
-    per_device_train_batch_size: PositiveInt
-    gradient_accumulation_steps: PositiveInt
-    world_size: PositiveInt
-    global_batch_size: PositiveInt
-    loss_terms: tuple[str, ...]
-    supervision_provenance: str
-    load_best_model_at_end: bool
-    balanced_task_sampling: bool
-    synthetic_engineering_gate_only: bool
-    seed: NonNegativeInt
-    optimizer: StageAOptimizerConfig
-    checkpoint: StageACheckpointConfig
-
-    @model_validator(mode="after")  # type: ignore[untyped-decorator]
-    def validate_production_a2(self) -> Self:
-        if self.variant is not StageAVariant.A2:
-            raise ValueError("stage_a.variant must be a2 in the production path")
-        if self.inner_sgd_enabled:
-            raise ValueError("stage_a.inner_sgd_enabled must be false during A2")
-        if self.qwen_strategy != "full_unfreeze_qwen3_vl_8b":
-            raise ValueError("production A2 must fully unfreeze Qwen3-VL-8B")
-        if self.predictor_trainable:
-            raise ValueError("Predictor remains frozen during A2")
-        if self.epochs != 8 or self.load_best_model_at_end:
-            raise ValueError("production A2 uses eight epochs and the final checkpoint")
-        if self.global_batch_size != (
-            self.per_device_train_batch_size * self.gradient_accumulation_steps * self.world_size
-        ):
-            raise ValueError("A2 global batch must equal per-device batch * GA * world size")
-        if self.loss_terms != ("state", "answer"):
-            raise ValueError("A2 loss must contain only state and answer")
-        if self.supervision_provenance != "official_weak":
-            raise ValueError("production A2 requires official_weak state supervision")
-        if self.synthetic_engineering_gate_only:
-            raise ValueError("production A2 cannot be marked synthetic-only")
-        return self
-
-
-class MetaTTTVariant(StrEnum):
-    """Explicit P16/P17 Meta-TTT ablations; never selected implicitly."""
-
-    A3 = "a3"
-    A4 = "a4"
-    A5 = "a5"
-
-
-class StageBTrainingConfig(FrozenModel):
-    """Single-Support, prediction-only Meta-TTT engineering contract."""
-
-    variant: MetaTTTVariant
-    support_chunks: PositiveInt
-    minimum_query_points: PositiveInt
-    enabled_ttt_terms: tuple[str, ...]
-    inner_sgd_enabled: bool
-    update_effect: str
-    auxiliary_outer_weight: NonNegativeFloat
-    reset_per_episode: bool
-    compare_before_after: bool
-    meta_gradient_mode: str
-    reuse_strategy: str
-    synthetic_engineering_gate_only: bool
-    seed: NonNegativeInt
-
-
-class StageCOptimizerConfig(FrozenModel):
+class A5OptimizerConfig(FrozenModel):
     """Non-Qwen A5 parameter-group learning rates owned by State-TTT."""
 
     state_learning_rate: PositiveFloat
@@ -725,105 +614,22 @@ class StageCOptimizerConfig(FrozenModel):
     predictor_learning_rate: PositiveFloat
 
 
-class StageCTrainingConfig(FrozenModel):
-    """Direct A5 contract with unbounded numeric state and bounded meta gradients."""
+class A5TrainingConfig(FrozenModel):
+    """Direct A5 contract with K-step truncation and one episode seed."""
 
-    active_variant: MetaTTTVariant
-    variants: tuple[MetaTTTVariant, ...]
-    a4_enabled_ttt_terms: tuple[str, ...]
-    a5_enabled_ttt_terms: tuple[str, ...]
-    support_chunk_schedule: tuple[PositiveInt, ...]
-    maximum_support_chunks: PositiveInt | None
-    minimum_query_points: PositiveInt
-    multi_query_enabled: bool
-    detach_overlap_snapshots: bool
-    detach_runtime_between_chunks: bool
-    update_effect: str
-    reuse_strategy: str
-    direct_from_stage_a: bool
-    meta_gradient_mode: str
     truncation_horizon: PositiveInt
-    reanchor_to_w0: bool
-    segment_auxiliary_backward: bool
-    training_counterfactual_enabled: bool
-    prewarm_support_chunks: NonNegativeInt
-    outer_step_scope: str
-    synthetic_engineering_gate_only: bool
     seed: NonNegativeInt
-    optimizer: StageCOptimizerConfig
-
-    @model_validator(mode="after")  # type: ignore[untyped-decorator]
-    def validate_incremental_variants(self) -> Self:
-        if self.variants != (MetaTTTVariant.A4, MetaTTTVariant.A5):
-            raise ValueError("stage_c.variants must be exactly ('a4', 'a5')")
-        if self.active_variant not in self.variants:
-            raise ValueError("stage_c.active_variant must select a4 or a5")
-        if self.a4_enabled_ttt_terms != ("pred", "identity"):
-            raise ValueError("stage_c.a4_enabled_ttt_terms must contain only pred and identity")
-        if self.a5_enabled_ttt_terms != (*self.a4_enabled_ttt_terms, "event"):
-            raise ValueError("stage_c.a5_enabled_ttt_terms must differ from A4 only by event")
-        if self.direct_from_stage_a and self.active_variant is not MetaTTTVariant.A5:
-            raise ValueError("direct Stage A transition must enter A5")
-        if self.meta_gradient_mode != "truncated_second_order":
-            raise ValueError("Stage C production mode must use truncated_second_order")
-        if self.maximum_support_chunks is not None:
-            raise ValueError("Stage C production must not cap the numeric Support stream")
-        if not self.reanchor_to_w0 or not self.segment_auxiliary_backward:
-            raise ValueError("truncated Stage C requires segment backward and W0 re-anchoring")
-        if self.prewarm_support_chunks != 1:
-            raise ValueError("Stage C requires exactly one no-update prewarm chunk")
-        if self.outer_step_scope != "episode":
-            raise ValueError("Stage C outer optimizer scope must be one complete episode")
-        return self
-
-    @property
-    def enabled_ttt_terms(self) -> tuple[str, ...]:
-        return (
-            self.a4_enabled_ttt_terms
-            if self.active_variant is MetaTTTVariant.A4
-            else self.a5_enabled_ttt_terms
-        )
+    optimizer: A5OptimizerConfig
 
 
 class InferenceRuntimeConfig(FrozenModel):
-    """Managed per-video lifecycle and immutable-generation contract."""
+    """Production inference audit cost selected at the process boundary."""
 
-    reset_per_video: bool
-    update_effect: str
-    prefill_once: bool
-    decode_state_immutable: bool
-    release_on_exception: bool
     audit_level: AuditLevel
-    repeat_query_policy: str
-    record_skip_reasons: bool
-    synthetic_engineering_gate_only: bool
-
-
-class EvaluationConfig(FrozenModel):
-    formal_evaluation_enabled: bool
-    official_clean_tuning_forbidden: bool
-
-
-class ParameterBudgetConfig(FrozenModel):
-    fast_ttt_adapter_millions: PositiveFloat
-    online_fast_matrices_millions: PositiveFloat
-    spatial_encoder_millions: PositiveFloat
-    temporal_encoder_millions: PositiveFloat
-    query_encoder_millions: PositiveFloat
-    o1_millions: PositiveFloat
-    o2_millions: PositiveFloat
-    e1_millions: PositiveFloat
-    e2_millions: PositiveFloat
-    semantic_projector_millions: PositiveFloat
-    predictor_millions: PositiveFloat
-    state_resampler_millions: PositiveFloat
-    router_resolver_empty_millions: PositiveFloat
-    new_modules_total_millions: PositiveFloat
-    rounding_tolerance_millions: PositiveFloat
 
 
 class ProjectConfig(FrozenModel):
-    """Complete v5 configuration with cross-component contract validation."""
+    """Schema-7 production configuration with cross-component contract validation."""
 
     spec_version: str
     config_schema_version: int
@@ -846,15 +652,17 @@ class ProjectConfig(FrozenModel):
     predictor: PredictorConfig
     loss: LossConfig
     outer_gradient_control: OuterGradientControlConfig
-    stage_a: StageATrainingConfig
-    stage_b: StageBTrainingConfig
-    stage_c: StageCTrainingConfig
+    a2: A2TrainingConfig
+    a5: A5TrainingConfig
     inference: InferenceRuntimeConfig
-    evaluation: EvaluationConfig
-    parameter_budget: ParameterBudgetConfig
+
+    @model_validator(mode="before")  # type: ignore[untyped-decorator]
+    @classmethod
+    def normalize_schema_six(cls, value: object) -> object:
+        return _normalize_project_schema(value)
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
-    def validate_v5_contract(self) -> Self:
+    def validate_production_contract(self) -> Self:
         checks: tuple[tuple[str, object, object], ...] = (
             ("spec_version", self.spec_version, SPEC_VERSION),
             ("config_schema_version", self.config_schema_version, CONFIG_SCHEMA_VERSION),
@@ -1748,22 +1556,12 @@ class ProjectConfig(FrozenModel):
             (
                 "loss.official_weak_balance.scale_min",
                 self.loss.official_weak_balance.scale_min,
-                (
-                    0.001
-                    if self.loss.official_weak_balance.mode
-                    is OfficialWeakBalanceMode.EMA_ANSWER_REF
-                    else 0.1
-                ),
+                0.001,
             ),
             (
                 "loss.official_weak_balance.scale_max",
                 self.loss.official_weak_balance.scale_max,
-                (
-                    20.0
-                    if self.loss.official_weak_balance.mode
-                    is OfficialWeakBalanceMode.EMA_ANSWER_REF
-                    else 10.0
-                ),
+                20.0,
             ),
             (
                 "loss.official_weak_balance.epsilon",
@@ -1836,255 +1634,39 @@ class ProjectConfig(FrozenModel):
                 OuterNonfinitePolicy.SKIP_UPDATE,
             ),
             ("outer_gradient_control.audit_steps", self.outer_gradient_control.audit_steps, 32),
-            ("stage_a.variant", self.stage_a.variant, StageAVariant.A2),
-            ("stage_a.inner_sgd_enabled", self.stage_a.inner_sgd_enabled, False),
             (
-                "stage_a.fast_adapter_mode",
-                self.stage_a.fast_adapter_mode,
-                "static_w0_no_inner_sgd",
-            ),
-            (
-                "stage_a.qwen_strategy",
-                self.stage_a.qwen_strategy,
-                "full_unfreeze_qwen3_vl_8b",
-            ),
-            ("stage_a.qwen_parameter_allowlist", self.stage_a.qwen_parameter_allowlist, ()),
-            (
-                "stage_a.trainable_components",
-                self.stage_a.trainable_components,
-                (
-                    "qwen_vit",
-                    "qwen_main_merger",
-                    "qwen_deepstack_mergers",
-                    "qwen_decoder_36",
-                    "fast_adapter_w0",
-                    "query_encoder",
-                    "spatial_encoder",
-                    "temporal_encoder",
-                    "observation_heads",
-                    "state_bank",
-                    "resampler",
-                ),
-            ),
-            ("stage_a.predictor_trainable", self.stage_a.predictor_trainable, False),
-            ("stage_a.epochs", self.stage_a.epochs, 8),
-            (
-                "stage_a.per_device_train_batch_size",
-                self.stage_a.per_device_train_batch_size,
-                1,
-            ),
-            (
-                "stage_a.gradient_accumulation_steps",
-                self.stage_a.gradient_accumulation_steps,
-                4,
-            ),
-            ("stage_a.world_size", self.stage_a.world_size, 4),
-            ("stage_a.global_batch_size", self.stage_a.global_batch_size, 16),
-            ("stage_a.loss_terms", self.stage_a.loss_terms, ("state", "answer")),
-            (
-                "stage_a.supervision_provenance",
-                self.stage_a.supervision_provenance,
-                "official_weak",
-            ),
-            (
-                "stage_a.load_best_model_at_end",
-                self.stage_a.load_best_model_at_end,
-                False,
-            ),
-            ("stage_a.balanced_task_sampling", self.stage_a.balanced_task_sampling, True),
-            (
-                "stage_a.synthetic_engineering_gate_only",
-                self.stage_a.synthetic_engineering_gate_only,
-                False,
-            ),
-            ("stage_a.seed", self.stage_a.seed, 42),
-            ("stage_a.optimizer.name", self.stage_a.optimizer.name, "adamw"),
-            (
-                "stage_a.optimizer.qwen_learning_rate",
-                self.stage_a.optimizer.qwen_learning_rate,
+                "a2.optimizer.qwen_learning_rate",
+                self.a2.optimizer.qwen_learning_rate,
                 1.0e-5,
             ),
             (
-                "stage_a.optimizer.state_learning_rate",
-                self.stage_a.optimizer.state_learning_rate,
+                "a2.optimizer.state_learning_rate",
+                self.a2.optimizer.state_learning_rate,
                 1.0e-4,
             ),
             (
-                "stage_a.optimizer.w0_learning_rate",
-                self.stage_a.optimizer.w0_learning_rate,
+                "a2.optimizer.w0_learning_rate",
+                self.a2.optimizer.w0_learning_rate,
                 1.0e-4,
             ),
-            ("stage_a.optimizer.weight_decay", self.stage_a.optimizer.weight_decay, 0.01),
-            ("stage_a.optimizer.betas", self.stage_a.optimizer.betas, (0.9, 0.999)),
-            ("stage_a.optimizer.epsilon", self.stage_a.optimizer.epsilon, 1.0e-8),
+            ("a5.truncation_horizon", self.a5.truncation_horizon, 8),
+            ("a5.seed", self.a5.seed, 42),
             (
-                "stage_a.checkpoint.format",
-                self.stage_a.checkpoint.format,
-                "full_model_optimizer_scheduler_rng_v1",
-            ),
-            ("stage_a.checkpoint.trainable_only", self.stage_a.checkpoint.trainable_only, False),
-            (
-                "stage_a.checkpoint.include_optimizer",
-                self.stage_a.checkpoint.include_optimizer,
-                True,
-            ),
-            (
-                "stage_a.checkpoint.include_scheduler",
-                self.stage_a.checkpoint.include_scheduler,
-                True,
-            ),
-            ("stage_a.checkpoint.include_rng", self.stage_a.checkpoint.include_rng, True),
-            ("stage_a.checkpoint.save_full_model", self.stage_a.checkpoint.save_full_model, True),
-            (
-                "stage_a.checkpoint.save_runtime_state",
-                self.stage_a.checkpoint.save_runtime_state,
-                False,
-            ),
-            (
-                "stage_a.checkpoint.save_every_epochs",
-                self.stage_a.checkpoint.save_every_epochs,
-                2,
-            ),
-            (
-                "stage_a.checkpoint.selection_policy",
-                self.stage_a.checkpoint.selection_policy,
-                "final_epoch",
-            ),
-            ("stage_b.variant", self.stage_b.variant, MetaTTTVariant.A3),
-            ("stage_b.support_chunks", self.stage_b.support_chunks, 1),
-            ("stage_b.minimum_query_points", self.stage_b.minimum_query_points, 1),
-            ("stage_b.enabled_ttt_terms", self.stage_b.enabled_ttt_terms, ("pred",)),
-            ("stage_b.inner_sgd_enabled", self.stage_b.inner_sgd_enabled, True),
-            ("stage_b.update_effect", self.stage_b.update_effect, "next_chunk_only"),
-            (
-                "stage_b.auxiliary_outer_weight",
-                self.stage_b.auxiliary_outer_weight,
-                0.1,
-            ),
-            ("stage_b.reset_per_episode", self.stage_b.reset_per_episode, True),
-            ("stage_b.compare_before_after", self.stage_b.compare_before_after, True),
-            (
-                "stage_b.meta_gradient_mode",
-                self.stage_b.meta_gradient_mode,
-                "meta_full_second_order",
-            ),
-            (
-                "stage_b.reuse_strategy",
-                self.stage_b.reuse_strategy,
-                "causal_replay_isolated_prefill",
-            ),
-            (
-                "stage_b.synthetic_engineering_gate_only",
-                self.stage_b.synthetic_engineering_gate_only,
-                True,
-            ),
-            ("stage_b.seed", self.stage_b.seed, 42),
-            (
-                "stage_c.variants",
-                self.stage_c.variants,
-                (MetaTTTVariant.A4, MetaTTTVariant.A5),
-            ),
-            (
-                "stage_c.a4_enabled_ttt_terms",
-                self.stage_c.a4_enabled_ttt_terms,
-                ("pred", "identity"),
-            ),
-            (
-                "stage_c.a5_enabled_ttt_terms",
-                self.stage_c.a5_enabled_ttt_terms,
-                ("pred", "identity", "event"),
-            ),
-            (
-                "stage_c.support_chunk_schedule",
-                self.stage_c.support_chunk_schedule,
-                (),
-            ),
-            ("stage_c.maximum_support_chunks", self.stage_c.maximum_support_chunks, None),
-            ("stage_c.minimum_query_points", self.stage_c.minimum_query_points, 2),
-            ("stage_c.multi_query_enabled", self.stage_c.multi_query_enabled, True),
-            (
-                "stage_c.detach_overlap_snapshots",
-                self.stage_c.detach_overlap_snapshots,
-                True,
-            ),
-            (
-                "stage_c.detach_runtime_between_chunks",
-                self.stage_c.detach_runtime_between_chunks,
-                True,
-            ),
-            ("stage_c.update_effect", self.stage_c.update_effect, "next_chunk_only"),
-            (
-                "stage_c.reuse_strategy",
-                self.stage_c.reuse_strategy,
-                "causal_replay_isolated_prefill",
-            ),
-            ("stage_c.direct_from_stage_a", self.stage_c.direct_from_stage_a, True),
-            (
-                "stage_c.meta_gradient_mode",
-                self.stage_c.meta_gradient_mode,
-                "truncated_second_order",
-            ),
-            ("stage_c.truncation_horizon", self.stage_c.truncation_horizon, 8),
-            ("stage_c.reanchor_to_w0", self.stage_c.reanchor_to_w0, True),
-            (
-                "stage_c.segment_auxiliary_backward",
-                self.stage_c.segment_auxiliary_backward,
-                True,
-            ),
-            (
-                "stage_c.training_counterfactual_enabled",
-                self.stage_c.training_counterfactual_enabled,
-                False,
-            ),
-            ("stage_c.prewarm_support_chunks", self.stage_c.prewarm_support_chunks, 1),
-            ("stage_c.outer_step_scope", self.stage_c.outer_step_scope, "episode"),
-            (
-                "stage_c.synthetic_engineering_gate_only",
-                self.stage_c.synthetic_engineering_gate_only,
-                False,
-            ),
-            ("stage_c.seed", self.stage_c.seed, 42),
-            (
-                "stage_c.optimizer.state_learning_rate",
-                self.stage_c.optimizer.state_learning_rate,
+                "a5.optimizer.state_learning_rate",
+                self.a5.optimizer.state_learning_rate,
                 5.0e-5,
             ),
             (
-                "stage_c.optimizer.w0_learning_rate",
-                self.stage_c.optimizer.w0_learning_rate,
+                "a5.optimizer.w0_learning_rate",
+                self.a5.optimizer.w0_learning_rate,
                 5.0e-5,
             ),
             (
-                "stage_c.optimizer.predictor_learning_rate",
-                self.stage_c.optimizer.predictor_learning_rate,
+                "a5.optimizer.predictor_learning_rate",
+                self.a5.optimizer.predictor_learning_rate,
                 5.0e-5,
             ),
-            ("inference.reset_per_video", self.inference.reset_per_video, True),
-            ("inference.update_effect", self.inference.update_effect, "next_chunk_only"),
-            ("inference.prefill_once", self.inference.prefill_once, True),
-            (
-                "inference.decode_state_immutable",
-                self.inference.decode_state_immutable,
-                True,
-            ),
-            ("inference.release_on_exception", self.inference.release_on_exception, True),
             ("inference.audit_level", self.inference.audit_level, AuditLevel.BOUNDARY),
-            (
-                "inference.repeat_query_policy",
-                self.inference.repeat_query_policy,
-                "explicit_new_or_retry",
-            ),
-            ("inference.record_skip_reasons", self.inference.record_skip_reasons, True),
-            (
-                "inference.synthetic_engineering_gate_only",
-                self.inference.synthetic_engineering_gate_only,
-                True,
-            ),
-            (
-                "evaluation.official_clean_tuning_forbidden",
-                self.evaluation.official_clean_tuning_forbidden,
-                True,
-            ),
         )
         for path, actual, expected in checks:
             if actual != expected:
@@ -2094,8 +1676,6 @@ class ProjectConfig(FrozenModel):
         self._validate_video_preprocessing_contract()
         self._validate_head_contracts()
         self._validate_state_and_query_contracts()
-        self._validate_calibration_gate()
-        self._validate_parameter_budget()
         return self
 
     def _validate_video_preprocessing_contract(self) -> None:
@@ -2459,68 +2039,221 @@ class ProjectConfig(FrozenModel):
         if self.spatial_encoder.active_slots > self.spatial_encoder.max_active_slots:
             raise ValueError("spatial_encoder.active_slots cannot exceed max_active_slots")
 
-    def _validate_calibration_gate(self) -> None:
-        statuses = (
-            self.observation_heads.o1.threshold_status,
-            self.observation_heads.o2.threshold_status,
-            self.observation_heads.e1.threshold_status,
-            self.observation_heads.e2.threshold_status,
-            self.operator_router.threshold_status,
-            self.time_resolver.threshold_status,
-            self.retriever.threshold_status,
-        )
-        if self.evaluation.formal_evaluation_enabled and any(
-            status is not CalibrationStatus.CALIBRATED for status in statuses
-        ):
-            raise ValueError("formal evaluation requires every threshold status to be calibrated")
 
-    def _validate_parameter_budget(self) -> None:
-        budget = self.parameter_budget
-        components = (
-            budget.fast_ttt_adapter_millions,
-            budget.spatial_encoder_millions,
-            budget.temporal_encoder_millions,
-            budget.query_encoder_millions,
-            budget.o1_millions,
-            budget.o2_millions,
-            budget.e1_millions,
-            budget.e2_millions,
-            budget.semantic_projector_millions,
-            budget.predictor_millions,
-            budget.state_resampler_millions,
-            budget.router_resolver_empty_millions,
+_SCHEMA6_A2 = {
+    "variant": "a2",
+    "inner_sgd_enabled": False,
+    "fast_adapter_mode": "static_w0_no_inner_sgd",
+    "qwen_strategy": "full_unfreeze_qwen3_vl_8b",
+    "qwen_parameter_allowlist": [],
+    "trainable_components": [
+        "qwen_vit",
+        "qwen_main_merger",
+        "qwen_deepstack_mergers",
+        "qwen_decoder_36",
+        "fast_adapter_w0",
+        "query_encoder",
+        "spatial_encoder",
+        "temporal_encoder",
+        "observation_heads",
+        "state_bank",
+        "resampler",
+    ],
+    "predictor_trainable": False,
+    "epochs": 8,
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "world_size": 4,
+    "global_batch_size": 16,
+    "loss_terms": ["state", "answer"],
+    "supervision_provenance": "official_weak",
+    "load_best_model_at_end": False,
+    "balanced_task_sampling": True,
+    "synthetic_engineering_gate_only": False,
+    "seed": 42,
+    "optimizer": {
+        "name": "adamw",
+        "qwen_learning_rate": 1.0e-5,
+        "state_learning_rate": 1.0e-4,
+        "w0_learning_rate": 1.0e-4,
+        "weight_decay": 0.01,
+        "betas": [0.9, 0.999],
+        "epsilon": 1.0e-8,
+    },
+    "checkpoint": {
+        "format": "full_model_optimizer_scheduler_rng_v1",
+        "trainable_only": False,
+        "include_optimizer": True,
+        "include_scheduler": True,
+        "include_rng": True,
+        "save_full_model": True,
+        "save_runtime_state": False,
+        "save_every_epochs": 2,
+        "selection_policy": "final_epoch",
+    },
+}
+_SCHEMA6_STAGE_B = {
+    "variant": "a3",
+    "support_chunks": 1,
+    "minimum_query_points": 1,
+    "enabled_ttt_terms": ["pred"],
+    "inner_sgd_enabled": True,
+    "update_effect": "next_chunk_only",
+    "auxiliary_outer_weight": 0.1,
+    "reset_per_episode": True,
+    "compare_before_after": True,
+    "meta_gradient_mode": "meta_full_second_order",
+    "reuse_strategy": "causal_replay_isolated_prefill",
+    "synthetic_engineering_gate_only": True,
+    "seed": 42,
+}
+_SCHEMA6_A5 = {
+    "active_variant": "a5",
+    "variants": ["a4", "a5"],
+    "a4_enabled_ttt_terms": ["pred", "identity"],
+    "a5_enabled_ttt_terms": ["pred", "identity", "event"],
+    "support_chunk_schedule": [],
+    "maximum_support_chunks": None,
+    "minimum_query_points": 2,
+    "multi_query_enabled": True,
+    "detach_overlap_snapshots": True,
+    "detach_runtime_between_chunks": True,
+    "update_effect": "next_chunk_only",
+    "reuse_strategy": "causal_replay_isolated_prefill",
+    "direct_from_stage_a": True,
+    "meta_gradient_mode": "truncated_second_order",
+    "truncation_horizon": 8,
+    "reanchor_to_w0": True,
+    "segment_auxiliary_backward": True,
+    "training_counterfactual_enabled": False,
+    "prewarm_support_chunks": 1,
+    "outer_step_scope": "episode",
+    "synthetic_engineering_gate_only": False,
+    "seed": 42,
+    "optimizer": {
+        "state_learning_rate": 5.0e-5,
+        "w0_learning_rate": 5.0e-5,
+        "predictor_learning_rate": 5.0e-5,
+    },
+}
+_SCHEMA6_INFERENCE = {
+    "reset_per_video": True,
+    "update_effect": "next_chunk_only",
+    "prefill_once": True,
+    "decode_state_immutable": True,
+    "release_on_exception": True,
+    "audit_level": "boundary",
+    "repeat_query_policy": "explicit_new_or_retry",
+    "record_skip_reasons": True,
+    "synthetic_engineering_gate_only": True,
+}
+_SCHEMA6_EVALUATION = {
+    "formal_evaluation_enabled": False,
+    "official_clean_tuning_forbidden": True,
+}
+_SCHEMA6_PARAMETER_BUDGET = {
+    "fast_ttt_adapter_millions": 7.48,
+    "online_fast_matrices_millions": 1.179648,
+    "spatial_encoder_millions": 24.81536,
+    "temporal_encoder_millions": 48.438272,
+    "query_encoder_millions": 36.03,
+    "o1_millions": 2.63271,
+    "o2_millions": 2.499843,
+    "e1_millions": 9.717252,
+    "e2_millions": 7.293449,
+    "semantic_projector_millions": 1.316864,
+    "predictor_millions": 2.36,
+    "state_resampler_millions": 14.72,
+    "router_resolver_empty_millions": 0.14,
+    "new_modules_total_millions": 157.44375,
+    "rounding_tolerance_millions": 0.02,
+}
+_SCHEMA6_BALANCE = {
+    "mode": "ema_answer_ref",
+    "experimental": False,
+    "group_weight": 0.3,
+    "scale_min": 0.001,
+    "scale_max": 20.0,
+    "epsilon": 1.0e-8,
+    "ema_beta": 0.99,
+    "grad_ema_beta": 0.99,
+    "grad_scale_min": 0.1,
+    "grad_scale_max": 10.0,
+}
+
+
+def _plain_schema_value(value: object) -> object:
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, dict):
+        return {key: _plain_schema_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_schema_value(item) for item in value]
+    return value
+
+
+def _require_schema6_block(raw: dict[str, object], name: str, expected: object) -> object:
+    if name not in raw:
+        raise ValueError(f"schema 6 requires the current formal {name} block")
+    actual = _plain_schema_value(raw[name])
+    if actual != expected:
+        raise ValueError(f"schema 6 {name} is not the current formal production value")
+    return actual
+
+
+def _normalize_project_schema(value: object) -> object:
+    if not isinstance(value, dict):
+        return value
+    schema = value.get("config_schema_version")
+    if schema == CONFIG_SCHEMA_VERSION:
+        return value
+    if schema != 6:
+        raise ValueError("config_schema_version must be 7 or the strict formal schema 6")
+
+    raw = dict(value)
+    stage_a = cast(dict[str, object], _require_schema6_block(raw, "stage_a", _SCHEMA6_A2))
+    _require_schema6_block(raw, "stage_b", _SCHEMA6_STAGE_B)
+    stage_c = cast(dict[str, object], _require_schema6_block(raw, "stage_c", _SCHEMA6_A5))
+    inference = cast(
+        dict[str, object],
+        _require_schema6_block(raw, "inference", _SCHEMA6_INFERENCE),
+    )
+    _require_schema6_block(raw, "evaluation", _SCHEMA6_EVALUATION)
+    _require_schema6_block(raw, "parameter_budget", _SCHEMA6_PARAMETER_BUDGET)
+    loss = raw.get("loss")
+    if not isinstance(loss, dict):
+        raise ValueError("schema 6 loss must be a mapping")
+    balance = _plain_schema_value(loss.get("official_weak_balance"))
+    if balance != _SCHEMA6_BALANCE:
+        raise ValueError(
+            "schema 6 official_weak_balance must be formal ema_answer_ref with experimental=false"
         )
-        if (
-            abs(sum(components) - budget.new_modules_total_millions)
-            > budget.rounding_tolerance_millions
-        ):
-            raise ValueError(
-                "parameter budget components exceed the architecture rounding tolerance"
-            )
-        exact_fast_millions = self.fast_ttt.online_parameter_count / 1_000_000
-        if abs(exact_fast_millions - budget.online_fast_matrices_millions) > 1.0e-9:
-            raise ValueError("online fast parameter budget must use the exact matrix count")
-        exact_spatial_millions = 24_815_360 / 1_000_000
-        if abs(exact_spatial_millions - budget.spatial_encoder_millions) > 1.0e-9:
-            raise ValueError("spatial encoder budget must use the exact P6 parameter count")
-        exact_temporal_millions = self.temporal_encoder.parameter_count / 1_000_000
-        if abs(exact_temporal_millions - budget.temporal_encoder_millions) > 1.0e-9:
-            raise ValueError("temporal encoder budget must use the exact P7 parameter count")
-        exact_head_budgets = (
-            (self.observation_heads.o1.parameter_count, budget.o1_millions, "O1"),
-            (self.observation_heads.o2.parameter_count, budget.o2_millions, "O2"),
-            (self.observation_heads.e1.parameter_count, budget.e1_millions, "E1"),
-            (self.observation_heads.e2.parameter_count, budget.e2_millions, "E2"),
-        )
-        for parameter_count, millions, name in exact_head_budgets:
-            if abs(parameter_count / 1_000_000 - millions) > 1.0e-9:
-                raise ValueError(f"{name} budget must use the exact P8 parameter count")
-        exact_projector_millions = self.state_bank.semantic_projector.parameter_count / 1_000_000
-        if abs(exact_projector_millions - budget.semantic_projector_millions) > 1.0e-9:
-            raise ValueError("Semantic Projector budget must use the exact P9 parameter count")
-        exact_total_millions = 157_443_750 / 1_000_000
-        if abs(exact_total_millions - budget.new_modules_total_millions) > 1.0e-9:
-            raise ValueError("new module budget must use the frozen P9 component total")
+
+    normalized_loss = dict(loss)
+    normalized_loss["official_weak_balance"] = {
+        key: item
+        for key, item in _SCHEMA6_BALANCE.items()
+        if key not in {"mode", "experimental"}
+    }
+    optimizer_a2 = cast(dict[str, object], stage_a["optimizer"])
+    optimizer_a5 = cast(dict[str, object], stage_c["optimizer"])
+    for name in ("stage_a", "stage_b", "stage_c", "evaluation", "parameter_budget"):
+        raw.pop(name)
+    raw["config_schema_version"] = CONFIG_SCHEMA_VERSION
+    raw["loss"] = normalized_loss
+    raw["a2"] = {
+        "optimizer": {
+            key: optimizer_a2[key]
+            for key in ("qwen_learning_rate", "state_learning_rate", "w0_learning_rate")
+        }
+    }
+    raw["a5"] = {
+        "truncation_horizon": stage_c["truncation_horizon"],
+        "seed": stage_c["seed"],
+        "optimizer": optimizer_a5,
+    }
+    raw["inference"] = {"audit_level": inference["audit_level"]}
+    return raw
 
 
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:
@@ -2548,7 +2281,7 @@ def environment_summary() -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Validate and print the frozen v5 configuration")
+    parser = argparse.ArgumentParser(description="Validate and print the schema-7 configuration")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     args = parser.parse_args(argv)
     print(load_config(args.config).model_dump_json(indent=2))

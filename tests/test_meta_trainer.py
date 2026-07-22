@@ -679,7 +679,7 @@ def _episode(
         )
         for index in range(query_count)
     )
-    return MetaTTTEpisode(owner, supports, queries, config.stage_c.seed)
+    return MetaTTTEpisode(owner, supports, queries, config.a5.seed)
 
 
 def _truncated_episode(
@@ -1033,23 +1033,15 @@ def test_sequential_multi_query_backward_matches_one_shot_mean() -> None:
     assert torch.allclose(streamed.grad, expected, atol=1.0e-12, rtol=1.0e-12)
 
 
-def test_truncated_a5_instant_equal_composes_all_queries_once(
+def test_truncated_a5_ema_balance_composes_all_queries_once(
     config: ProjectConfig,
 ) -> None:
-    raw = config.model_dump(mode="json")
-    raw["loss"]["official_weak_balance"]["mode"] = "instant_equal"
-    raw["loss"]["official_weak_balance"]["experimental"] = True
-    raw["loss"]["official_weak_balance"]["scale_min"] = 0.1
-    raw["loss"]["official_weak_balance"]["scale_max"] = 10.0
-    instant_config = ProjectConfig.model_validate(raw)
     runner, _, _, _ = _system(
-        instant_config,
+        config,
         query_loss_builder=_TinyOfficialWeakQueryLossBuilder(),
     )
 
-    output = runner.run_truncated(
-        _truncated_episode(instant_config, support_count=1, query_count=2)
-    )
+    output = runner.run_truncated(_truncated_episode(config, support_count=1, query_count=2))
 
     assert runner.last_balance_audit is not None
     assert runner.last_balance_audit.auxiliary_to_answer_ratio <= 0.3

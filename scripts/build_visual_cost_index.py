@@ -206,7 +206,7 @@ def main() -> int:
         dtype=args.dtype,
         visual_batch_size=args.visual_batch_size,
         cache_mode=args.cache_mode,
-        loss_mode=balance.mode.value,
+        loss_mode="ema_answer_ref",
         loss_group_weight=balance.group_weight,
         loss_scale_min=balance.scale_min,
         loss_scale_max=balance.scale_max,

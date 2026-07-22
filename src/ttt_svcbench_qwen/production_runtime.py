@@ -1996,7 +1996,7 @@ class ProductionEpisodeMaterializer:
             prewarm_chunk=prewarm,
             support_chunks=supports,
             query_points=tuple(queries),
-            seed=self.config.stage_c.seed,
+            seed=self.config.a5.seed,
         )
 
     def _meta_chunk(
@@ -2408,7 +2408,7 @@ def build_runtime(
     if stage is ProductionStage.A5 and config.support_materialization == "segment_double_buffer":
         support_prefetch_depth = (
             1 + config.segment_prefetch_depth
-        ) * project.stage_c.truncation_horizon
+        ) * project.a5.truncation_horizon
     support_decode_coalesce = config.support_decode_coalesce
     fast = build_fast_ttt_adapter(project)
     qwen = Qwen3VLAdapter(

@@ -32,10 +32,6 @@ import transformers
 from safetensors import safe_open
 from torch import Tensor, nn
 
-from ttt_svcbench_qwen.config import (
-    OfficialWeakBalanceConfig,
-    OfficialWeakBalanceMode,
-)
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
     A5EpisodeRecord,
@@ -473,10 +469,10 @@ class TTTQwenTrainerMixin:
             raise ValueError("A5 episode loss weight must be one or deterministic-padding zero")
         runner = cast(MetaTTTEpisodeRunner, self.ttt_runtime.meta_runner)
         expected_segments = math.ceil(
-            len(episode.support_chunks) / runner.config.stage_c.truncation_horizon
+            len(episode.support_chunks) / runner.config.a5.truncation_horizon
         )
         expected_backwards = expected_segments + len(episode.query_points) - 1
-        horizon = runner.config.stage_c.truncation_horizon
+        horizon = runner.config.a5.truncation_horizon
         segment_lengths = tuple(
             min(horizon, len(episode.support_chunks) - start)
             for start in range(0, len(episode.support_chunks), horizon)
@@ -610,7 +606,6 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("usage: python -m ttt_svcbench_qwen.llamafactory_trainer CONFIG.yaml")
     started = time.monotonic()
     backbone = load_llamafactory_backbone(arguments[0])
-    _validate_formal_balance(backbone.project_config.loss.official_weak_balance)
     unfreeze_audit = fully_unfreeze_qwen(backbone.model, backbone.project_config)
     configured_stage = ProductionStage(backbone.ttt_config.stage)
     if getattr(backbone.training_args, "resume_from_checkpoint", None) is not None:
@@ -660,7 +655,7 @@ def main(argv: list[str] | None = None) -> int:
             dtype=str(parameter.dtype).removeprefix("torch."),
             visual_batch_size=backbone.ttt_config.support_visual_batch_size,
             cache_mode=backbone.ttt_config.preprocess_cache_mode,
-            loss_mode=balance.mode.value,
+            loss_mode="ema_answer_ref",
             loss_group_weight=balance.group_weight,
             loss_scale_min=balance.scale_min,
             loss_scale_max=balance.scale_max,
@@ -1125,13 +1120,13 @@ def make_production_outer_optimizer_factory(
     qwen_ids = {id(parameter) for parameter in backbone.model.parameters()}
     training_args = cast(Any, backbone.training_args)
     if stage is ProductionStage.A2:
-        qwen_lr = backbone.project_config.stage_a.optimizer.qwen_learning_rate
-        state_lr = backbone.project_config.stage_a.optimizer.state_learning_rate
-        w0_lr = backbone.project_config.stage_a.optimizer.w0_learning_rate
+        qwen_lr = backbone.project_config.a2.optimizer.qwen_learning_rate
+        state_lr = backbone.project_config.a2.optimizer.state_learning_rate
+        w0_lr = backbone.project_config.a2.optimizer.w0_learning_rate
         predictor_lr = state_lr
     else:
         qwen_lr = float(training_args.learning_rate)
-        optimizer = backbone.project_config.stage_c.optimizer
+        optimizer = backbone.project_config.a5.optimizer
         state_lr = optimizer.state_learning_rate
         w0_lr = optimizer.w0_learning_rate
         predictor_lr = optimizer.predictor_learning_rate
@@ -1264,13 +1259,6 @@ def make_production_outer_optimizer_factory(
         return optimizer
 
     return factory
-
-
-def _validate_formal_balance(config: OfficialWeakBalanceConfig) -> None:
-    if config.mode is not OfficialWeakBalanceMode.EMA_ANSWER_REF or config.experimental:
-        raise ValueError(
-            "formal A2/A5 requires official_weak_balance mode=ema_answer_ref and experimental=false"
-        )
 
 
 def _reset_a2_to_a5_balance(model: nn.Module) -> None:
