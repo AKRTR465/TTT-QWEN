@@ -57,6 +57,7 @@ from ttt_svcbench_qwen.observation_heads import (
     ObservationOutputs,
     StreamReplayAudit,
 )
+from ttt_svcbench_qwen.query_encoder import Operator
 from ttt_svcbench_qwen.stage_a_runtime import StageAWriteAudit
 from ttt_svcbench_qwen.stage_a_targets import (
     AnswerTargetLabels,
@@ -66,7 +67,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     StageATargetBatch,
     TargetProvenance,
 )
-from ttt_svcbench_qwen.state_bank import HeadType, build_state_bank
+from ttt_svcbench_qwen.state_bank import HeadType, RetrievalHistoryView, build_state_bank
 from ttt_svcbench_qwen.state_encoder import TemporalCache, TemporalEncoderOutput
 from ttt_svcbench_qwen.trainer import StageAEpisodeAnswerInputs, StageASupervisionBatch
 
@@ -206,7 +207,10 @@ class _QueryStage(nn.Module):
         if inference or not isinstance(query_input, RuntimeQueryInput):
             raise ValueError("tiny query stage requires a training RuntimeQueryInput")
         self.calls += 1
-        return SimpleNamespace(q_target=torch.zeros((1, 512)))
+        return SimpleNamespace(
+            q_target=torch.zeros((1, 512)),
+            hard_operators=(Operator.O1_SNAP,),
+        )
 
 
 class _SpatialStage:
@@ -393,36 +397,19 @@ class _BankWriter:
 
 
 class _Retriever:
-    def retrieve_query(
+    def __call__(
         self,
         _state_bank: object,
-        states: Sequence[object],
+        history: RetrievalHistoryView,
         _query: object,
         *,
         video_ids: Sequence[str],
         trajectory_ids: Sequence[str],
     ) -> object:
-        if len(states) != len(video_ids) or len(states) != len(trajectory_ids):
+        versions = history.bank_versions
+        if len(versions) != len(video_ids) or len(versions) != len(trajectory_ids):
             raise ValueError("tiny retrieval ownership mismatch")
-        versions = tuple(state.version for state in states)
         return SimpleNamespace(audit=versions, versions=versions)
-
-    def retrieve_query_history(
-        self,
-        state_bank: object,
-        states: Sequence[object],
-        query: object,
-        *,
-        video_ids: Sequence[str],
-        trajectory_ids: Sequence[str],
-    ) -> object:
-        return self.retrieve_query(
-            state_bank,
-            states,
-            query,
-            video_ids=video_ids,
-            trajectory_ids=trajectory_ids,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,7 +617,7 @@ def _system(
             spatial_encoder=_SpatialStage(),
             temporal_encoder=_TemporalStage(),
             observation_heads=_ObservationStage(),
-            state_bank=object(),
+            state_bank=build_state_bank(config),
             bank_writer=_BankWriter(),
             retriever=_Retriever(),
             reader=reader,

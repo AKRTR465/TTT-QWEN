@@ -34,8 +34,16 @@ from ttt_svcbench_qwen.observation_heads import (
     E2RuntimeState,
     ObservationOutputs,
 )
-from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput, detach_query_encoder_output
-from ttt_svcbench_qwen.state_bank import StateBankRuntimeState, StructuredStateBank
+from ttt_svcbench_qwen.query_encoder import (
+    OPERATOR_TO_HEAD_TYPE,
+    QueryEncoderOutput,
+    detach_query_encoder_output,
+)
+from ttt_svcbench_qwen.state_bank import (
+    RetrievalHistoryView,
+    StateBankRuntimeState,
+    StructuredStateBank,
+)
 from ttt_svcbench_qwen.state_encoder import (
     SpatialEncoderOutput,
     SpatialSlotRuntimeState,
@@ -568,7 +576,7 @@ class ObservationChunkOutput:
     observations: ObservationOutputs | None
     runtime_state: BatchRuntimeState
     bank_states: tuple[StateBankRuntimeState, ...]
-    retrieval_bank_states: tuple[StateBankRuntimeState, ...]
+    retrieval_history: RetrievalHistoryView | None
     state_audit: object | None
     soft_intermediates: SoftIntermediates
     lifecycle: LifecycleAudit
@@ -791,20 +799,10 @@ class BankWriter(Protocol):
 
 
 class RetrieverStage(Protocol):
-    def retrieve_query(
+    def __call__(
         self,
         state_bank: StructuredStateBank,
-        states: Sequence[StateBankRuntimeState],
-        query: QueryEncoderOutput,
-        *,
-        video_ids: Sequence[str],
-        trajectory_ids: Sequence[str],
-    ) -> RetrieverOutput: ...
-
-    def retrieve_query_history(
-        self,
-        state_bank: StructuredStateBank,
-        states: Sequence[StateBankRuntimeState],
+        history: RetrievalHistoryView,
         query: QueryEncoderOutput,
         *,
         video_ids: Sequence[str],
@@ -1063,10 +1061,17 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             soft.commit_guard.claim(request.owner)
             runtime_state = request.runtime_state
             bank_states = request.bank_states
-            retrieval_bank_states = tuple(request.bank_states)
+            retrieval_history: RetrievalHistoryView | None = None
             bank_audit: object | None = None
             soft_write: object | None = None
             if self.feature_flags.bank_enabled:
+                state_bank = self.components.require_state_bank()
+                if self.feature_flags.reader_enabled or self.feature_flags.state_tokens_enabled:
+                    heads = tuple(
+                        OPERATOR_TO_HEAD_TYPE[operator]
+                        for operator in soft.query.hard_operators
+                    )
+                    retrieval_history = state_bank.retrieval_view(bank_states, heads)
                 writer = self.components.require_bank_writer()
                 assert soft.observations is not None
                 assert soft.spatial is not None
@@ -1097,7 +1102,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
                 observations=soft.observations,
                 runtime_state=runtime_state,
                 bank_states=bank_states,
-                retrieval_bank_states=retrieval_bank_states,
+                retrieval_history=retrieval_history,
                 state_audit=bank_audit,
                 soft_intermediates=SoftIntermediates(
                     adapted_visual=soft.visual.value,
@@ -1127,9 +1132,12 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
         resampler_output: StateResamplerOutput | None = None
         if self.feature_flags.reader_enabled or self.feature_flags.state_tokens_enabled:
             retriever = self.components.require_retriever()
-            retrieval = retriever.retrieve_query_history(
+            history = observation.retrieval_history
+            if not isinstance(history, RetrievalHistoryView):
+                raise TypeError("answer preparation requires a write-before retrieval history")
+            retrieval = retriever(
                 self.components.require_state_bank(),
-                observation.retrieval_bank_states,
+                history,
                 observation.query,
                 video_ids=request.owner.video_ids,
                 trajectory_ids=request.owner.trajectory_ids,

@@ -362,17 +362,25 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
     )
 
     retriever = build_state_retriever(load_config())
-    pre_write_retrieval = retriever.retrieve_query_history(
-        state_bank,
+    pre_write_view = state_bank.retrieval_view(
         runtime.state_bank_states,
+        tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in query.hard_operators),
+    )
+    pre_write_retrieval = retriever(
+        state_bank,
+        pre_write_view,
         query,
         video_ids=owner.video_ids,
         trajectory_ids=owner.trajectory_ids,
     )
     assert pre_write_retrieval.n_state.tolist() == [0, 0, 0, 0]
-    history_retrieval = retriever.retrieve_query_history(
-        state_bank,
+    history_view = state_bank.retrieval_view(
         result.bank_states,
+        tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in query.hard_operators),
+    )
+    history_retrieval = retriever(
+        state_bank,
+        history_view,
         query,
         video_ids=owner.video_ids,
         trajectory_ids=owner.trajectory_ids,

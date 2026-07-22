@@ -187,7 +187,10 @@ class _FakeSuite:
     @staticmethod
     def query(_query_input: object, *, inference: bool) -> object:
         assert inference
-        return SimpleNamespace(q_target=torch.zeros((1, 512)))
+        return SimpleNamespace(
+            q_target=torch.zeros((1, 512)),
+            hard_operators=(Operator.O1_SNAP,),
+        )
 
     def fast(
         self,
@@ -253,16 +256,13 @@ class _FakeSuite:
             audit=("bank_version", bank.version),
         )
 
-    def retrieve_query(self, *_args: object, **_kwargs: object) -> object:
+    def __call__(self, *_args: object, **_kwargs: object) -> object:
         result = _reader_result(self.status)
         return SimpleNamespace(
             selected_record_ids=(result.selected_record_ids,),
             status=(self.status.value,),
             audit=("retrieval", self.status.value),
         )
-
-    def retrieve_query_history(self, *_args: object, **_kwargs: object) -> object:
-        return self.retrieve_query(*_args, **_kwargs)
 
     def read(self, _retrieval: object) -> tuple[ReaderResult, ...]:
         return (_reader_result(self.status),)
