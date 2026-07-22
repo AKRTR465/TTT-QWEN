@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
+from types import SimpleNamespace
 
 import torch
 from torch import Tensor
@@ -392,6 +393,42 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
     assert len(reader_results) == 4
     assert all(isinstance(value, ReaderResult) for value in reader_results)
     assert tuple(value.operator for value in reader_results) == query.hard_operators
+
+
+def test_stage_a_soft_write_masks_carried_slots_without_new_temporal_positions() -> None:
+    owner = RuntimeOwner(("video",), ("trajectory",))
+    slots = torch.randn((1, 2, 768), requires_grad=True)
+    hidden = torch.zeros((1, 1, 768), requires_grad=True)
+    query = torch.randn((1, 512))
+    spatial = _spatial(owner, slots)
+    temporal_mask = torch.zeros((1, 1), dtype=torch.bool)
+    temporal = TemporalEncoderOutput(
+        hidden=hidden,
+        timestamps=torch.full((1, 1), -1.0, dtype=torch.float64),
+        position_ids=torch.full((1, 1), -1, dtype=torch.int64),
+        valid_mask=temporal_mask,
+        cache=_cache(owner, hidden, query),
+    )
+    slot_mask = torch.zeros_like(spatial.slot_valid_mask)
+    observations = SimpleNamespace(
+        o1=SimpleNamespace(valid_mask=slot_mask),
+        o2=SimpleNamespace(valid_mask=slot_mask.clone()),
+        e1=SimpleNamespace(valid_mask=temporal_mask),
+        e2=SimpleNamespace(valid_mask=temporal_mask.clone()),
+    )
+    writer = StageABankWriter(
+        build_state_bank(load_config()),
+        build_identity_bank(load_config()),
+    )
+
+    soft = writer._project_soft(spatial, temporal, observations)  # type: ignore[arg-type]
+
+    assert not bool(soft.o1_present_mask.any().item())
+    assert not bool(soft.o2_present_mask.any().item())
+    assert torch.count_nonzero(soft.o1_semantics) == 0
+    assert torch.count_nonzero(soft.o2_semantics) == 0
+    assert torch.count_nonzero(soft.o1_sources) == 0
+    assert torch.count_nonzero(soft.o2_sources) == 0
 
 
 def test_o2_history_is_written_only_when_candidates_promote() -> None:

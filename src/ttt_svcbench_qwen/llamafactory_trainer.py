@@ -76,6 +76,11 @@ class ProductionStage(StrEnum):
     A5 = "a5"
 
 
+class CheckpointPolicy(StrEnum):
+    ATOMIC_FINAL_ONLY = "atomic_final_only"
+    EPOCH_2_AND_EPOCH_4 = "epoch_2_and_epoch_4"
+
+
 class StageALossStep(Protocol):
     def __call__(self, model: nn.Module, inputs: Mapping[str, object]) -> Tensor: ...
 
@@ -750,6 +755,11 @@ def main(argv: list[str] | None = None) -> int:
     skip_final_checkpoint = raw_skip_final == "1"
     if skip_final_checkpoint and smoke_max_steps is None:
         raise ValueError("final checkpoint may be skipped only for an explicit max-step smoke")
+    checkpoint_policy = _checkpoint_policy_from_environment()
+    if skip_final_checkpoint and checkpoint_policy is not CheckpointPolicy.ATOMIC_FINAL_ONLY:
+        raise ValueError("a smoke run cannot retain epoch checkpoints")
+    if checkpoint_policy is CheckpointPolicy.EPOCH_2_AND_EPOCH_4:
+        _validate_epoch_two_four_training_arguments(training_args)
     trainer = cast(Any, build_production_trainer(backbone, runtime_raw))
     output_dir = Path(str(training_args.output_dir))
     artifact_root = Path(os.environ.get("RUN_ROOT", str(output_dir)))
@@ -789,6 +799,39 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
         return 0
+    if checkpoint_policy is CheckpointPolicy.EPOCH_2_AND_EPOCH_4:
+        trainer.accelerator.wait_for_everyone()
+        epoch_checkpoints: dict[int, Path] = {}
+        if trainer.is_world_process_zero():
+            epoch_checkpoints = _publish_epoch_two_four_checkpoints(output_dir)
+        trainer.accelerator.wait_for_everyone()
+        trainer.save_state()
+        trainer.log_metrics("train", result.metrics)
+        trainer.save_metrics("train", result.metrics)
+        if trainer.is_world_process_zero():
+            epoch_two_checkpoint = epoch_checkpoints[2]
+            epoch_four_checkpoint = epoch_checkpoints[4]
+            _write_json(
+                artifact_root / "run_summary.json",
+                {
+                    "status": "completed",
+                    "stage": runtime_raw.stage.value,
+                    "global_step": int(trainer.state.global_step),
+                    "elapsed_seconds": time.monotonic() - started,
+                    "metrics": result.metrics,
+                    "checkpoint_policy": checkpoint_policy.value,
+                    "epoch_checkpoints": {
+                        "2": str(epoch_two_checkpoint),
+                        "4": str(epoch_four_checkpoint),
+                    },
+                    "final_checkpoint": str(epoch_four_checkpoint),
+                    "resume_state": str(epoch_four_checkpoint),
+                    "resumed_from": (
+                        None if same_stage_resume is None else str(same_stage_resume)
+                    ),
+                },
+            )
+        return 0
     final_checkpoint = output_dir / "final-checkpoint"
     incomplete_checkpoint = output_dir / ".final-checkpoint.incomplete"
     if trainer.is_world_process_zero() and (
@@ -820,13 +863,125 @@ def main(argv: list[str] | None = None) -> int:
                 "global_step": int(trainer.state.global_step),
                 "elapsed_seconds": time.monotonic() - started,
                 "metrics": result.metrics,
-                "checkpoint_policy": "atomic_final_only",
+                "checkpoint_policy": checkpoint_policy.value,
                 "final_checkpoint": str(final_checkpoint),
                 "resume_state": str(final_checkpoint / "resume_state"),
                 "resumed_from": (None if same_stage_resume is None else str(same_stage_resume)),
             },
         )
     return 0
+
+
+def _checkpoint_policy_from_environment() -> CheckpointPolicy:
+    raw = os.environ.get("TTT_CHECKPOINT_POLICY", CheckpointPolicy.ATOMIC_FINAL_ONLY.value)
+    try:
+        return CheckpointPolicy(raw)
+    except ValueError as error:
+        choices = ", ".join(policy.value for policy in CheckpointPolicy)
+        raise ValueError(f"TTT_CHECKPOINT_POLICY must be one of: {choices}") from error
+
+
+def _validate_epoch_two_four_training_arguments(training_args: object) -> None:
+    arguments = cast(Any, training_args)
+    epochs = float(arguments.num_train_epochs)
+    strategy_raw = arguments.save_strategy
+    strategy = getattr(strategy_raw, "value", str(strategy_raw))
+    save_steps = float(arguments.save_steps)
+    save_total_limit = int(arguments.save_total_limit)
+    if not math.isclose(epochs, 4.0):
+        raise ValueError("epoch_2_and_epoch_4 checkpoint policy requires num_train_epochs=4")
+    if strategy != "steps" or not math.isclose(save_steps, 0.5):
+        raise ValueError(
+            "epoch_2_and_epoch_4 checkpoint policy requires save_strategy=steps and "
+            "save_steps=0.5"
+        )
+    if save_total_limit < 2:
+        raise ValueError("epoch_2_and_epoch_4 checkpoint policy requires save_total_limit>=2")
+
+
+def _standard_checkpoint_progress(checkpoint: Path) -> tuple[int, int, float]:
+    trainer_state = checkpoint / "trainer_state.json"
+    if not trainer_state.is_file():
+        raise RuntimeError(f"standard checkpoint is missing trainer_state.json: {checkpoint}")
+    raw = cast(object, json.loads(trainer_state.read_text(encoding="utf-8")))
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"standard checkpoint has invalid trainer_state.json: {checkpoint}")
+    try:
+        global_step = int(raw["global_step"])
+        max_steps = int(raw["max_steps"])
+        epoch = float(raw["epoch"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"standard checkpoint has invalid progress metadata: {checkpoint}"
+        ) from error
+    if global_step <= 0 or max_steps <= 0 or global_step > max_steps or not math.isfinite(epoch):
+        raise RuntimeError(f"standard checkpoint has impossible progress metadata: {checkpoint}")
+    return global_step, max_steps, epoch
+
+
+def _validate_standard_resume_checkpoint(checkpoint: Path) -> None:
+    model_candidates = (
+        checkpoint / "model.safetensors",
+        checkpoint / "model.safetensors.index.json",
+        checkpoint / "pytorch_model.bin",
+        checkpoint / "pytorch_model.bin.index.json",
+    )
+    if not any(path.is_file() and path.stat().st_size > 0 for path in model_candidates):
+        raise RuntimeError(f"standard checkpoint has no model weights: {checkpoint}")
+    if not (checkpoint / "scheduler.pt").is_file():
+        raise RuntimeError(f"standard checkpoint is missing scheduler.pt: {checkpoint}")
+    optimizer_state_present = (checkpoint / "optimizer.pt").is_file() or any(
+        child.is_dir() and child.name.startswith("global_step") for child in checkpoint.iterdir()
+    )
+    if not optimizer_state_present:
+        raise RuntimeError(f"standard checkpoint has no optimizer state: {checkpoint}")
+
+
+def _publish_epoch_two_four_checkpoints(output_dir: Path) -> dict[int, Path]:
+    """Publish exactly two resumable checkpoints at the 2/4-epoch boundaries."""
+
+    candidates = tuple(sorted(path for path in output_dir.glob("checkpoint-*") if path.is_dir()))
+    if len(candidates) != 2:
+        raise RuntimeError(
+            "epoch_2_and_epoch_4 checkpoint policy expected exactly two scheduled checkpoints, "
+            f"found {len(candidates)}"
+        )
+    progress = {path: _standard_checkpoint_progress(path) for path in candidates}
+    max_steps_values = {item[1] for item in progress.values()}
+    if len(max_steps_values) != 1:
+        raise RuntimeError("scheduled checkpoints disagree on max_steps")
+    max_steps = next(iter(max_steps_values))
+    target_steps = {2: math.ceil(max_steps * 0.5), 4: max_steps}
+    selected: dict[int, Path] = {}
+    for epoch_number, target_step in target_steps.items():
+        matches = [path for path, item in progress.items() if item[0] == target_step]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"expected one checkpoint at epoch {epoch_number} step {target_step}, "
+                f"found {len(matches)}"
+            )
+        source = matches[0]
+        observed_epoch = progress[source][2]
+        if not math.isclose(observed_epoch, float(epoch_number), abs_tol=0.01):
+            raise RuntimeError(
+                f"checkpoint {source} reports epoch={observed_epoch}, expected {epoch_number}"
+            )
+        _validate_standard_resume_checkpoint(source)
+        selected[epoch_number] = source
+
+    destinations = {
+        epoch_number: output_dir / f"epoch-{epoch_number}-checkpoint"
+        for epoch_number in (2, 4)
+    }
+    for destination in destinations.values():
+        if destination.exists():
+            raise FileExistsError(f"refusing to overwrite checkpoint: {destination}")
+    published: dict[int, Path] = {}
+    for epoch_number, destination in destinations.items():
+        source = selected[epoch_number]
+        source.rename(destination)
+        published[epoch_number] = destination
+    return published
 
 
 def _validate_checkpoint_tree(checkpoint: Path) -> None:

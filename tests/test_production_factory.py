@@ -18,11 +18,14 @@ from ttt_svcbench_qwen.config import (
     load_config,
 )
 from ttt_svcbench_qwen.llamafactory_trainer import (
+    CheckpointPolicy,
     ProductionStage,
     ProductionTrainerRuntime,
     SegmentBackwardController,
     TTTQwenTrainerMixin,
+    _checkpoint_policy_from_environment,
     _ControlledDeepSpeedEngineWrapper,
+    _publish_epoch_two_four_checkpoints,
     _reset_a2_to_a5_balance,
     _validate_checkpoint_tree,
     _validate_formal_balance,
@@ -1188,6 +1191,55 @@ def test_atomic_final_checkpoint_validation_requires_model_and_resume_state(
     (resume / "random_states_0.pkl").unlink()
     with pytest.raises(RuntimeError, match="resume state"):
         _validate_checkpoint_tree(checkpoint)
+
+
+def _write_standard_checkpoint(
+    checkpoint: Path,
+    *,
+    global_step: int,
+    max_steps: int,
+    epoch: float,
+) -> None:
+    checkpoint.mkdir()
+    save_file({"weight": torch.ones(1)}, str(checkpoint / "model.safetensors"))
+    (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
+    (checkpoint / "scheduler.pt").write_bytes(b"scheduler")
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps({"global_step": global_step, "max_steps": max_steps, "epoch": epoch}),
+        encoding="utf-8",
+    )
+
+
+def test_epoch_two_four_checkpoint_policy_publishes_two_resumable_checkpoints(
+    tmp_path: Path,
+) -> None:
+    _write_standard_checkpoint(
+        tmp_path / "checkpoint-464", global_step=464, max_steps=928, epoch=2.0
+    )
+    _write_standard_checkpoint(
+        tmp_path / "checkpoint-928", global_step=928, max_steps=928, epoch=4.0
+    )
+
+    published = _publish_epoch_two_four_checkpoints(tmp_path)
+
+    assert published == {
+        2: tmp_path / "epoch-2-checkpoint",
+        4: tmp_path / "epoch-4-checkpoint",
+    }
+    assert all(path.is_dir() for path in published.values())
+    assert not tuple(tmp_path.glob("checkpoint-*"))
+
+
+def test_checkpoint_policy_environment_defaults_and_rejects_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TTT_CHECKPOINT_POLICY", raising=False)
+    assert _checkpoint_policy_from_environment() is CheckpointPolicy.ATOMIC_FINAL_ONLY
+    monkeypatch.setenv("TTT_CHECKPOINT_POLICY", "epoch_2_and_epoch_4")
+    assert _checkpoint_policy_from_environment() is CheckpointPolicy.EPOCH_2_AND_EPOCH_4
+    monkeypatch.setenv("TTT_CHECKPOINT_POLICY", "unknown")
+    with pytest.raises(ValueError, match="TTT_CHECKPOINT_POLICY"):
+        _checkpoint_policy_from_environment()
 
 
 @pytest.mark.parametrize(

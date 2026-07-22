@@ -197,6 +197,7 @@ payload = {
     "runtime_factory": "ttt_svcbench_qwen.production_runtime:build_runtime",
     "initialize_from_a2": os.environ.get("A2_CHECKPOINT"),
     "same_stage_resume_from": os.environ.get("TTT_RESUME_CHECKPOINT"),
+    "checkpoint_policy": os.environ.get("TTT_CHECKPOINT_POLICY", "atomic_final_only"),
     "progress_command": f"tail -f {os.environ['RUN_ROOT']}/train.log",
     "launcher_log": os.environ.get("LOG_FILE"),
     "video_root": os.environ["SVCBENCH_VIDEO_ROOT"],

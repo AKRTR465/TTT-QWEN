@@ -11,6 +11,7 @@ PLAY_ROOT="/mnt/shared-storage-user/mineru2-shared/niujunbo/play"
 PROJECT_ROOT="${TTT_PROJECT_ROOT:-$PLAY_ROOT/projects/ttt_qwen}"
 VENV="${TTT_H200_VENV:-$PROJECT_ROOT/.venv-h200-py312-torch28}"
 PYTHON="$VENV/bin/python"
+export PYTHONPATH="$PROJECT_ROOT/src:$PLAY_ROOT/LLaMA-Factory/src${PYTHONPATH:+:$PYTHONPATH}"
 MODEL="${MODEL:-$PLAY_ROOT/model/Qwen3-VL-8B-Instruct}"
 MANIFEST="${1:-${SVCBENCH_DATASET_MANIFEST:-$PROJECT_ROOT/runs/0719_215434_prepare_svcbench_k8/dataset_manifest.json}}"
 OUTPUT="${2:-${VISUAL_COST_INDEX:-$PROJECT_ROOT/artifacts/a2_trainsplit_state16_answer256_ema_cost_index.json}}"
@@ -48,11 +49,11 @@ exec "$PYTHON" scripts/build_visual_cost_index.py \
   --stage a2 \
   --output "$OUTPUT" \
   --project-config configs/model_state_ttt_8b.yaml \
-  --model-revision "${MODEL_REVISION:-$MODEL@main}" \
+  --model-revision "${MODEL_REVISION:-$MODEL@unknown-revision}" \
   --processor "$PROCESSOR_CLASS" \
   --minimum-pixels 256 \
   --maximum-pixels 131072 \
-  --dtype bfloat16 \
+  --dtype float32 \
   --visual-batch-size 1 \
   --cache-mode readonly \
   --gpu-model "$GPU_MODEL" \

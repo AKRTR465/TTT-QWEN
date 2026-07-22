@@ -444,7 +444,11 @@ class StageABankWriter:
         temporal: TemporalEncoderOutput,
         observations: ObservationOutputs,
     ) -> StageASoftWriteOutput:
-        slot_mask = spatial.slot_valid_mask
+        if not torch.equal(observations.o1.valid_mask, observations.o2.valid_mask):
+            raise ValueError("Stage A O1/O2 masks must match")
+        slot_mask = observations.o1.valid_mask
+        if bool(torch.any(slot_mask & ~spatial.slot_valid_mask).item()):
+            raise ValueError("Stage A observation slots must be a subset of spatial slots")
         slot_count = slot_mask.sum(dim=1, keepdim=True).clamp_min(1)
         o1_source = (spatial.slots * slot_mask.unsqueeze(-1).to(dtype=spatial.slots.dtype)).sum(
             dim=1
@@ -468,10 +472,6 @@ class StageABankWriter:
         e2 = self.state_bank.project(temporal.hidden, HeadType.E2)
         e1 = torch.where(time_mask.unsqueeze(-1), e1, 0.0)
         e2 = torch.where(time_mask.unsqueeze(-1), e2, 0.0)
-        if not torch.equal(slot_mask, observations.o1.valid_mask) or not torch.equal(
-            slot_mask, observations.o2.valid_mask
-        ):
-            raise ValueError("Stage A spatial sources must align with O1/O2 masks")
         if not torch.equal(time_mask, observations.e1.valid_mask) or not torch.equal(
             time_mask, observations.e2.valid_mask
         ):
