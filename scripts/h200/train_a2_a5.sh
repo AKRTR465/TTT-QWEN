@@ -145,6 +145,7 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
   for forwarded_name in \
     TTT_SMOKE_MAX_STEPS \
     TTT_SKIP_FINAL_CHECKPOINT \
+    TTT_CHECKPOINT_POLICY \
     TTT_SMOKE_SHORTEST_FIRST \
     TTT_RUN_TIMEOUT_SECONDS \
     TTT_A2_PROGRESS_TRACE \
