@@ -29,6 +29,12 @@ RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/runs/$RUN_ID}"
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs/$RUN_ID}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/experiment.log}"
 VISUAL_COST_INDEX="${VISUAL_COST_INDEX:-$PROJECT_ROOT/artifacts/a2_state16_answer256_ema_visual_cost_index.json}"
+TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"
+if [[ "$TTT_SMOKE_SHORTEST_FIRST" != "0" && "$TTT_SMOKE_SHORTEST_FIRST" != "1" ]]; then
+  echo "TTT_SMOKE_SHORTEST_FIRST must be 0 or 1, got: $TTT_SMOKE_SHORTEST_FIRST" >&2
+  exit 2
+fi
+export TTT_SMOKE_SHORTEST_FIRST
 
 if [[ "$(id -un)" != "$EXPECTED_USER" ]]; then
   echo "refusing to benchmark as $(id -un); expected $EXPECTED_USER" >&2
@@ -42,6 +48,7 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
     MODEL="$MODEL" DATASET_DIR="$DATASET_DIR" DATASET_NAME="$DATASET_NAME"
     RUN_ID="$RUN_ID" SESSION="$SESSION" RUN_ROOT="$RUN_ROOT"
     LOG_DIR="$LOG_DIR" LOG_FILE="$LOG_FILE" VISUAL_COST_INDEX="$VISUAL_COST_INDEX"
+    TTT_SMOKE_SHORTEST_FIRST="$TTT_SMOKE_SHORTEST_FIRST"
     bash "$PROJECT_ROOT/scripts/h200/benchmark_fullprefix256_8step.sh" "$MODE"
   )
   command+=("$@")
@@ -96,7 +103,7 @@ if [[ "$MODE" == "baseline" ]]; then
 else
   export RUN_IN_TMUX=1 RUN_ID RUN_ROOT LOG_DIR LOG_FILE MODEL DATASET_DIR DATASET_NAME
   export TTT_SKIP_ENV_SETUP=1 TTT_SMOKE_MAX_STEPS=8 TTT_SKIP_FINAL_CHECKPOINT=0
-  export TTT_SMOKE_SHORTEST_FIRST=1 TTT_DATALOADER_TRACE=1
+  export TTT_DATALOADER_TRACE=1
   set +e
   bash "$PROJECT_ROOT/scripts/h200/train_fullprefix256.sh" "$MODE" "$@"
   STATUS="$?"

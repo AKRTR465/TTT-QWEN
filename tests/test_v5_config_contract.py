@@ -72,6 +72,7 @@ def test_formal_schema6_normalizes_once_to_schema7() -> None:
     assert "parameter_budget" not in serialized
     assert set(serialized["loss"]["official_weak_balance"]) == {
         "group_weight",
+        "answer_reference_floor",
         "scale_min",
         "scale_max",
         "epsilon",
@@ -642,7 +643,8 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
         "answer_causal_shift": True,
         "answer_ignore_index": -100,
         "official_weak_balance": {
-            "group_weight": 0.3,
+            "group_weight": 0.4,
+            "answer_reference_floor": 0.1,
             "scale_min": 0.001,
             "scale_max": 20.0,
             "epsilon": 1.0e-8,

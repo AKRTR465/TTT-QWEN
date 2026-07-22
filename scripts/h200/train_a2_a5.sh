@@ -13,7 +13,8 @@ SVCBENCH_DATASET_ROOT, SVCBENCH_DATASET_MANIFEST, RUN_ID, SESSION,
 CUDA_VISIBLE_DEVICES, TTT_RESUME_CHECKPOINT, TTT_H200_VENV, TTT_PREPROCESS_CACHE_ROOT,
 TTT_DATALOADER_TRACE. The outer invocation starts a detached tmux;
 set RUN_IN_TMUX=1 only when already running inside the intended tmux pane. One-step validation may
-set TTT_SMOKE_MAX_STEPS=1, TTT_SKIP_FINAL_CHECKPOINT=1, and TTT_SMOKE_SHORTEST_FIRST=1.
+set TTT_SMOKE_MAX_STEPS=1 and TTT_SKIP_FINAL_CHECKPOINT=1. Shortest-first sampling is disabled by
+default; set TTT_SMOKE_SHORTEST_FIRST=1 explicitly only for a deliberately lightweight smoke test.
 EOF
   exit 2
 }
@@ -41,6 +42,12 @@ H200_TORCHVISION_VERSION="0.23.0+cu128"
 H200_TORCHAUDIO_VERSION="2.8.0+cu128"
 PYTORCH_INDEX_URL="${TTT_PYTORCH_INDEX_URL:-http://pypi.i.h.pjlab.org.cn/brain/dev/+simple}"
 PYPI_INDEX_URL="${TTT_PYPI_INDEX_URL:-http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/}"
+TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"
+if [[ "$TTT_SMOKE_SHORTEST_FIRST" != "0" && "$TTT_SMOKE_SHORTEST_FIRST" != "1" ]]; then
+  echo "TTT_SMOKE_SHORTEST_FIRST must be 0 or 1, got: $TTT_SMOKE_SHORTEST_FIRST" >&2
+  exit 2
+fi
+export TTT_SMOKE_SHORTEST_FIRST
 
 if [[ "$(id -un)" != "$EXPECTED_USER" ]]; then
   echo "refusing to train as $(id -un); expected $EXPECTED_USER" >&2

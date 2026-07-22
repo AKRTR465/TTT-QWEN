@@ -175,7 +175,146 @@ def test_ema_answer_reference_persists_and_missing_term_keeps_history() -> None:
     assert torch.equal(restored.ema_values, composer.ema_values)
     assert torch.equal(restored.ema_update_counts, composer.ema_update_counts)
     assert torch.equal(restored.gradient_ema_values, composer.gradient_ema_values)
-    assert int(restored.balance_schema_version.item()) == 6
+    assert int(restored.balance_schema_version.item()) == 7
+
+
+def test_ema_buffers_remain_float64_across_parent_dtype_conversions() -> None:
+    composer = OfficialWeakOuterLossComposer(
+        OfficialWeakBalanceConfig(
+            group_weight=0.3,
+            scale_min=0.001,
+            scale_max=20.0,
+            epsilon=1.0e-8,
+        )
+    )
+    composer.ema_values.copy_(torch.linspace(0.123456789, 0.523456789, 5))
+    composer.gradient_ema_values.copy_(torch.linspace(0.234567891, 0.534567891, 4))
+    expected_loss = composer.ema_values.clone()
+    expected_gradient = composer.gradient_ema_values.clone()
+    owner = torch.nn.Module()
+    owner.weight = torch.nn.Parameter(torch.ones(1, dtype=torch.float32))
+    owner.composer = composer
+
+    owner.to(dtype=torch.bfloat16)
+    assert owner.weight.dtype == torch.bfloat16
+    assert composer.ema_values.dtype == torch.float64
+    assert composer.gradient_ema_values.dtype == torch.float64
+    assert torch.equal(composer.ema_values, expected_loss)
+    assert torch.equal(composer.gradient_ema_values, expected_gradient)
+    if torch.cuda.is_available():
+        owner.cuda()
+        assert composer.ema_values.device.type == "cuda"
+        assert composer.ema_values.dtype == torch.float64
+        owner.cpu()
+        assert torch.equal(composer.ema_values, expected_loss)
+    owner.to(dtype=torch.float32)
+
+    assert owner.weight.dtype == torch.float32
+    assert composer.ema_values.dtype == torch.float64
+    assert composer.gradient_ema_values.dtype == torch.float64
+    assert torch.equal(composer.ema_values, expected_loss)
+    assert torch.equal(composer.gradient_ema_values, expected_gradient)
+
+
+def test_float64_ema_updates_below_bfloat16_resolution_do_not_plateau() -> None:
+    composer = OfficialWeakOuterLossComposer(
+        OfficialWeakBalanceConfig(
+            group_weight=0.3,
+            scale_min=0.001,
+            scale_max=20.0,
+            epsilon=1.0e-8,
+            ema_beta=0.99,
+        )
+    ).to(dtype=torch.bfloat16)
+    valid = torch.ones(5, dtype=torch.bool)
+    composer._update_ema(torch.ones(5, dtype=torch.float64), valid)
+    first = composer.ema_values.clone()
+    composer._update_ema(torch.full((5,), 1.001, dtype=torch.float64), valid)
+
+    assert composer.ema_values.dtype == torch.float64
+    assert torch.all(composer.ema_values > first)
+    assert torch.all(composer.ema_values < 1.001)
+
+
+def test_checkpoint_load_rejects_quantized_or_stale_balance_state() -> None:
+    composer = OfficialWeakOuterLossComposer(
+        OfficialWeakBalanceConfig(
+            group_weight=0.3,
+            scale_min=0.001,
+            scale_max=20.0,
+            epsilon=1.0e-8,
+        )
+    )
+    quantized = composer.state_dict()
+    quantized["ema_values"] = quantized["ema_values"].to(torch.bfloat16)
+    with pytest.raises(RuntimeError, match="expected torch.float64"):
+        composer.load_state_dict(quantized, strict=True)
+
+    stale = composer.state_dict()
+    stale["balance_schema_version"] = torch.tensor(6, dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="expected 7"):
+        composer.load_state_dict(stale, strict=True)
+
+    wrong_shape = composer.state_dict()
+    wrong_shape["gradient_ema_values"] = torch.zeros(5, dtype=torch.float64)
+    with pytest.raises(RuntimeError, match="expected torch.float64.*found"):
+        composer.load_state_dict(wrong_shape, strict=True)
+
+
+def test_group_guard_uses_previous_answer_ema_and_reports_unclamped_current_ratio() -> None:
+    composer = OfficialWeakOuterLossComposer(
+        OfficialWeakBalanceConfig(
+            group_weight=0.4,
+            answer_reference_floor=0.1,
+            scale_min=0.001,
+            scale_max=20.0,
+            epsilon=1.0e-8,
+        )
+    )
+    first_anchors = _anchors()
+    composer.compose(
+        (_answer(torch.tensor(1.0, requires_grad=True)),),
+        (_gradient_connected_state(first_anchors, (1.0, 1.0, 1.0, 1.0)),),
+        gradient_anchors=(first_anchors,),
+    )
+    second_anchors = _anchors()
+    second = composer.compose(
+        (_answer(torch.tensor(1.0e-6, requires_grad=True)),),
+        (_gradient_connected_state(second_anchors, (1.0, 1.0, 1.0, 1.0)),),
+        gradient_anchors=(second_anchors,),
+    )
+
+    assert second.audit is not None
+    assert second.audit.group_guard_reference == pytest.approx(1.0)
+    assert not bool(second.audit.group_guard_reference_floored)
+    assert second.audit.group_guard == pytest.approx(1.0)
+    assert second.audit.state_global_mean == pytest.approx(0.4)
+    assert float(second.audit.state_to_reference_ratio) <= 0.4 + 1.0e-6
+    assert second.audit.state_to_current_answer_ratio > 100_000
+    assert second.audit.auxiliary_to_answer_ratio > 100_000
+
+
+def test_group_guard_reference_applies_configured_floor_on_cold_start() -> None:
+    composer = OfficialWeakOuterLossComposer(
+        OfficialWeakBalanceConfig(
+            group_weight=0.4,
+            answer_reference_floor=0.1,
+            scale_min=0.001,
+            scale_max=20.0,
+            epsilon=1.0e-8,
+        )
+    )
+    anchors = _anchors()
+    output = composer.compose(
+        (_answer(torch.tensor(0.01, requires_grad=True)),),
+        (_gradient_connected_state(anchors, (1.0, 1.0, 1.0, 1.0)),),
+        gradient_anchors=(anchors,),
+    )
+
+    assert output.audit is not None
+    assert output.audit.group_guard_reference == pytest.approx(0.1)
+    assert bool(output.audit.group_guard_reference_floored)
+    assert output.audit.state_to_reference_ratio <= 0.4 + 1.0e-6
 
 
 def test_gradient_ema_uses_previous_step_and_balances_activation_rms() -> None:
@@ -291,7 +430,7 @@ def test_old_ema_checkpoint_cannot_silently_load_into_schema_six() -> None:
         "ema_update_counts": torch.zeros(5, dtype=torch.int64),
     }
 
-    with pytest.raises(RuntimeError, match="Missing key"):
+    with pytest.raises(RuntimeError, match="Missing required balance-state key"):
         composer.load_state_dict(old_state, strict=True)
 
 

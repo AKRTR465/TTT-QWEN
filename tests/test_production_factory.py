@@ -19,6 +19,7 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     ProductionTrainerRuntime,
     SegmentBackwardController,
     TTTQwenTrainerMixin,
+    _A2AuditAccumulator,
     _checkpoint_policy_from_environment,
     _ControlledDeepSpeedEngineWrapper,
     _publish_epoch_two_four_checkpoints,
@@ -29,7 +30,11 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     resolve_same_stage_resume,
 )
 from ttt_svcbench_qwen.outer_gradient_control import OuterGradientController
-from ttt_svcbench_qwen.outer_loss_balance import OfficialWeakOuterLossComposer
+from ttt_svcbench_qwen.outer_loss_balance import (
+    OfficialWeakBalanceAudit,
+    OfficialWeakOuterLossComposer,
+    OfficialWeakTermBalanceMetrics,
+)
 from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
     LlamaFactoryCheckoutAudit,
@@ -55,6 +60,7 @@ from ttt_svcbench_qwen.production_runtime import (
     _uniform_target_times,
     _video_pixel_bounds,
 )
+from ttt_svcbench_qwen.stage_a_targets import OfficialWeakLossAudit
 
 
 class _OuterToy(nn.Module):
@@ -106,6 +112,26 @@ class _QwenOwnerToy(nn.Module):
         self.visual.deepstack_merger_list = nn.ModuleList([nn.Linear(2, 2)])
         self.language_model = nn.Module()
         self.language_model.layers = nn.ModuleList([nn.Linear(2, 2) for _ in range(36)])
+
+
+def _checkpoint_balance_state(
+    *,
+    schema: int = 7,
+    ema_dtype: torch.dtype = torch.float64,
+) -> dict[str, torch.Tensor]:
+    return {
+        "official_weak_balancer.ema_values": torch.zeros(5, dtype=ema_dtype),
+        "official_weak_balancer.ema_valid": torch.zeros(5, dtype=torch.bool),
+        "official_weak_balancer.ema_update_counts": torch.zeros(5, dtype=torch.int64),
+        "official_weak_balancer.gradient_ema_values": torch.zeros(4, dtype=torch.float64),
+        "official_weak_balancer.gradient_ema_valid": torch.zeros(4, dtype=torch.bool),
+        "official_weak_balancer.gradient_ema_update_counts": torch.zeros(
+            4, dtype=torch.int64
+        ),
+        "official_weak_balancer.balance_schema_version": torch.tensor(
+            schema, dtype=torch.int64
+        ),
+    }
 
 
 def test_outer_checkpoint_loader_accepts_only_exact_safetensors(tmp_path: Path) -> None:
@@ -168,7 +194,7 @@ def test_a2_to_a5_resets_loss_and_gradient_ema() -> None:
     assert not bool(balancer.gradient_ema_valid.any())
     assert not bool(balancer.ema_update_counts.any())
     assert not bool(balancer.gradient_ema_update_counts.any())
-    assert int(balancer.balance_schema_version.item()) == 6
+    assert int(balancer.balance_schema_version.item()) == 7
 
 
 def test_same_stage_resume_rejects_old_balance_schema(tmp_path: Path) -> None:
@@ -178,14 +204,119 @@ def test_same_stage_resume_rejects_old_balance_schema(tmp_path: Path) -> None:
         {"official_weak_balancer.ema_values": torch.zeros(5)},
         checkpoint / "model.safetensors",
     )
-    with pytest.raises(ValueError, match="predates"):
+    with pytest.raises(ValueError, match="missing required tensor"):
+        _validate_resume_balance_schema(checkpoint)
+
+    save_file(_checkpoint_balance_state(schema=6), checkpoint / "model.safetensors")
+    with pytest.raises(ValueError, match="requires schema 7"):
         _validate_resume_balance_schema(checkpoint)
 
     save_file(
-        {"official_weak_balancer.balance_schema_version": torch.tensor(6)},
+        _checkpoint_balance_state(ema_dtype=torch.bfloat16),
         checkpoint / "model.safetensors",
     )
+    with pytest.raises(ValueError, match="must be torch.float64"):
+        _validate_resume_balance_schema(checkpoint)
+
+    save_file(_checkpoint_balance_state(), checkpoint / "model.safetensors")
     _validate_resume_balance_schema(checkpoint)
+
+
+def test_balance_schema_validator_reads_all_sharded_safetensors(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint-2"
+    checkpoint.mkdir()
+    state = _checkpoint_balance_state()
+    keys = tuple(state)
+    first_keys = keys[:3]
+    second_keys = keys[3:]
+    first_name = "model-00001-of-00002.safetensors"
+    second_name = "model-00002-of-00002.safetensors"
+    save_file({key: state[key] for key in first_keys}, checkpoint / first_name)
+    save_file({key: state[key] for key in second_keys}, checkpoint / second_name)
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    **{key: first_name for key in first_keys},
+                    **{key: second_name for key in second_keys},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _validate_resume_balance_schema(checkpoint)
+
+
+def test_a2_audit_accumulator_aggregates_all_microbatches_and_flushes() -> None:
+    accumulator = _A2AuditAccumulator()
+    for index, answer in enumerate((1.0, 3.0, 5.0, 7.0)):
+        terms = tuple(
+            OfficialWeakTermBalanceMetrics(
+                name=name,
+                raw_global_mean=torch.tensor(answer + term_index, dtype=torch.float64),
+                scale=torch.tensor(1.0 + term_index, dtype=torch.float64),
+                aligned_global_mean=torch.tensor(answer + term_index, dtype=torch.float64),
+                weighted_global_mean=torch.tensor(0.01 * answer, dtype=torch.float64),
+                global_valid_count=torch.tensor(
+                    0.0 if name == "retrieval" and index % 2 == 0 else 1.0,
+                    dtype=torch.float64,
+                ),
+                scale_clamped=torch.tensor(index % 2 == 0),
+                loss_scale=torch.tensor(1.0, dtype=torch.float64),
+                gradient_scale=torch.tensor(1.0, dtype=torch.float64),
+                raw_gradient_rms=torch.tensor(answer, dtype=torch.float64),
+                ema_gradient_rms=torch.tensor(answer + 0.5, dtype=torch.float64),
+            )
+            for term_index, name in enumerate(("task", "operator", "retrieval", "time"))
+        )
+        balance = OfficialWeakBalanceAudit(
+            answer_global_mean=torch.tensor(answer, dtype=torch.float64),
+            answer_global_count=torch.tensor(1.0, dtype=torch.float64),
+            state_global_mean=torch.tensor(0.1 * answer, dtype=torch.float64),
+            terms=terms,
+            auxiliary_to_answer_ratio=torch.tensor(0.1, dtype=torch.float64),
+            group_guard=torch.tensor(0.8 + 0.05 * index, dtype=torch.float64),
+            group_guard_active=torch.tensor(index < 2),
+            group_guard_reference=torch.tensor(2.0, dtype=torch.float64),
+            group_guard_reference_floored=torch.tensor(index == 0),
+            state_to_reference_ratio=torch.tensor(0.1, dtype=torch.float64),
+            state_to_current_answer_ratio=torch.tensor(0.1, dtype=torch.float64),
+            ema_means=tuple(
+                torch.tensor(answer + offset, dtype=torch.float64) for offset in range(5)
+            ),
+            ema_update_counts=tuple(torch.tensor(index + 1) for _ in range(5)),
+            gradient_ema_rms=tuple(
+                torch.tensor(answer + offset, dtype=torch.float64) for offset in range(4)
+            ),
+            gradient_ema_update_counts=tuple(
+                torch.tensor(index + 1) for _ in range(4)
+            ),
+        )
+        weak = OfficialWeakLossAudit(
+            labels_joined_after_forward=True,
+            runtime_payload_reused_for_labels=False,
+            identity_target_fabricated=False,
+            unique_retrieval_id_fabricated=False,
+            future_occurrences_ignored=0,
+            retrieval_bag_sizes=(1,),
+            retrieval_valid_bag_rows=1,
+        )
+        accumulator.add(balance, weak)
+
+    metrics = accumulator.flush()
+
+    assert metrics["loss/ga_microbatch_count"] == 4.0
+    assert metrics["loss/answer"] == pytest.approx(4.0)
+    assert metrics["loss/state"] == pytest.approx(0.4)
+    assert metrics["loss/raw/task"] == pytest.approx(4.0)
+    assert metrics["loss/global_valid_count/retrieval"] == 2.0
+    assert metrics["loss/group_guard_active"] == pytest.approx(0.5)
+    assert metrics["loss/group_guard_reference_floored"] == pytest.approx(0.25)
+    assert metrics["loss/ema/answer"] == pytest.approx(7.0)
+    assert metrics["loss/ema_updates/answer"] == 4.0
+    assert metrics["retrieval/valid_bag_rows"] == 4.0
+    assert accumulator.flush() == {}
 
 
 def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
@@ -597,6 +728,19 @@ def test_h200_entries_default_to_fullprefix256_profiles() -> None:
         "scripts/h200/train_a2_allsvcbench_4epoch.sh",
     ):
         assert not (root / removed).exists()
+
+
+def test_h200_training_entries_disable_shortest_first_by_default() -> None:
+    root = Path(__file__).parents[1]
+    train = (root / "scripts/h200/train_a2_a5.sh").read_text(encoding="utf-8")
+    benchmark = (root / "scripts/h200/benchmark_fullprefix256_8step.sh").read_text(
+        encoding="utf-8"
+    )
+
+    default_assignment = 'TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"'
+    assert default_assignment in train
+    assert default_assignment in benchmark
+    assert "export TTT_SMOKE_SHORTEST_FIRST=1" not in benchmark
 
 
 def test_production_video_pixel_bounds_use_model_arguments_and_keep_tokens_dynamic() -> None:

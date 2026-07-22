@@ -49,7 +49,10 @@ from ttt_svcbench_qwen.outer_gradient_control import (
     OuterGradientController,
     sanitize_scalar_loss,
 )
-from ttt_svcbench_qwen.outer_loss_balance import OfficialWeakOuterLossComposer
+from ttt_svcbench_qwen.outer_loss_balance import (
+    OfficialWeakBalanceAudit,
+    OfficialWeakOuterLossComposer,
+)
 from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
     OuterCheckpointAudit,
@@ -64,6 +67,7 @@ from ttt_svcbench_qwen.runtime_metrics import (
     trace_cuda_phase,
     trace_event,
 )
+from ttt_svcbench_qwen.stage_a_targets import OfficialWeakLossAudit
 from ttt_svcbench_qwen.visual_cost import (
     VisualCostRecord,
     make_visual_cost_fingerprint,
@@ -322,6 +326,187 @@ class _LazyGradientAccumulationGroup(Sequence[object]):
             )
 
 
+class _A2AuditAccumulator:
+    """Aggregate detached A2 audits across every microbatch since the last Trainer log."""
+
+    def __init__(self) -> None:
+        self._balance: list[OfficialWeakBalanceAudit] = []
+        self._weak: list[OfficialWeakLossAudit] = []
+
+    def add(
+        self,
+        balance: OfficialWeakBalanceAudit,
+        weak: OfficialWeakLossAudit,
+    ) -> None:
+        if not isinstance(balance, OfficialWeakBalanceAudit) or not isinstance(
+            weak, OfficialWeakLossAudit
+        ):
+            raise TypeError("A2 audit accumulator requires typed balance and weak audits")
+        self._balance.append(balance)
+        self._weak.append(weak)
+
+    def flush(self) -> dict[str, float]:
+        if not self._balance:
+            if self._weak:
+                raise RuntimeError("A2 weak audits drifted from balance audits")
+            return {}
+        if len(self._balance) != len(self._weak):
+            raise RuntimeError("A2 balance and weak audit counts drifted")
+        balances = tuple(self._balance)
+        weak = tuple(self._weak)
+        self._balance.clear()
+        self._weak.clear()
+
+        metrics: dict[str, float] = {
+            "loss/ga_microbatch_count": float(len(balances)),
+        }
+        answer = _weighted_audit_mean(
+            tuple(
+                (audit.answer_global_mean, audit.answer_global_count)
+                for audit in balances
+            )
+        )
+        state = _audit_mean(tuple(audit.state_global_mean for audit in balances))
+        if answer is not None:
+            metrics["loss/answer"] = answer
+        if state is not None:
+            metrics["loss/state"] = state
+        if answer is not None and state is not None:
+            metrics["loss/outer_total"] = answer + state
+
+        for term_index, name in enumerate(("task", "operator", "retrieval", "time")):
+            terms = tuple(audit.terms[term_index] for audit in balances)
+            count = sum(float(term.global_valid_count.item()) for term in terms)
+            metrics[f"loss/global_valid_count/{name}"] = count
+            metrics[f"grad_balance/global_valid_count/{name}"] = count
+            raw = _weighted_audit_mean(
+                tuple((term.raw_global_mean, term.global_valid_count) for term in terms)
+            )
+            _set_optional_metric(metrics, f"loss/raw/{name}", raw)
+            for key, values in (
+                (f"loss/scale/{name}", tuple(term.scale for term in terms)),
+                (
+                    f"loss/aligned/{name}",
+                    tuple(term.aligned_global_mean for term in terms),
+                ),
+                (
+                    f"loss/weighted/{name}",
+                    tuple(term.weighted_global_mean for term in terms),
+                ),
+                (
+                    f"grad_balance/raw_rms/{name}",
+                    tuple(term.raw_gradient_rms for term in terms),
+                ),
+                (
+                    f"grad_balance/ema_rms/{name}",
+                    tuple(term.ema_gradient_rms for term in terms),
+                ),
+                (
+                    f"grad_balance/loss_scale/{name}",
+                    tuple(term.loss_scale for term in terms),
+                ),
+                (
+                    f"grad_balance/grad_scale/{name}",
+                    tuple(term.gradient_scale for term in terms),
+                ),
+                (f"grad_balance/final_scale/{name}", tuple(term.scale for term in terms)),
+            ):
+                _set_optional_metric(metrics, key, _audit_mean(values))
+            active_terms = tuple(
+                term for term in terms if float(term.global_valid_count.item()) > 0
+            )
+            clamp_rate = (
+                sum(float(term.scale_clamped.item()) for term in active_terms)
+                / float(len(active_terms))
+                if active_terms
+                else 0.0
+            )
+            metrics[f"loss/scale_clamped/{name}"] = clamp_rate
+            metrics[f"grad_balance/scale_clamped/{name}"] = clamp_rate
+
+        for key, values in (
+            (
+                "loss/aux_to_answer_ratio",
+                tuple(audit.auxiliary_to_answer_ratio for audit in balances),
+            ),
+            ("loss/group_guard", tuple(audit.group_guard for audit in balances)),
+            (
+                "loss/group_guard_active",
+                tuple(audit.group_guard_active for audit in balances),
+            ),
+            (
+                "loss/group_guard_reference",
+                tuple(audit.group_guard_reference for audit in balances),
+            ),
+            (
+                "loss/group_guard_reference_floored",
+                tuple(audit.group_guard_reference_floored for audit in balances),
+            ),
+            (
+                "loss/state_to_reference_ratio",
+                tuple(audit.state_to_reference_ratio for audit in balances),
+            ),
+            (
+                "loss/state_to_current_answer_ratio",
+                tuple(audit.state_to_current_answer_ratio for audit in balances),
+            ),
+        ):
+            value = _audit_mean(values)
+            if value is not None:
+                metrics[key] = value
+
+        last = balances[-1]
+        for name, mean, updates in zip(
+            ("answer", "task", "operator", "retrieval", "time"),
+            last.ema_means,
+            last.ema_update_counts,
+            strict=True,
+        ):
+            value = _audit_scalar(mean)
+            if value is not None:
+                metrics[f"loss/ema/{name}"] = value
+            metrics[f"loss/ema_updates/{name}"] = float(updates.item())
+        for name, updates in zip(
+            ("task", "operator", "retrieval", "time"),
+            last.gradient_ema_update_counts,
+            strict=True,
+        ):
+            metrics[f"grad_balance/ema_updates/{name}"] = float(updates.item())
+
+        for audit in weak:
+            for name, value in audit.metrics():
+                metrics[name] = metrics.get(name, 0.0) + float(value)
+        return metrics
+
+
+def _audit_scalar(value: Tensor) -> float | None:
+    result = float(value.item())
+    return result if math.isfinite(result) else None
+
+
+def _audit_mean(values: Sequence[Tensor]) -> float | None:
+    finite = tuple(value for value in (_audit_scalar(item) for item in values) if value is not None)
+    return sum(finite) / float(len(finite)) if finite else None
+
+
+def _weighted_audit_mean(values: Sequence[tuple[Tensor, Tensor]]) -> float | None:
+    numerator = 0.0
+    denominator = 0.0
+    for value, weight in values:
+        scalar = _audit_scalar(value)
+        count = float(weight.item())
+        if scalar is None or not math.isfinite(count) or count <= 0.0:
+            continue
+        numerator += scalar * count
+        denominator += count
+    return numerator / denominator if denominator > 0.0 else None
+
+
+def _set_optional_metric(metrics: dict[str, float], name: str, value: float | None) -> None:
+    if value is not None:
+        metrics[name] = value
+
+
 class TTTQwenTrainerMixin:
     """Mixin dynamically combined with remote ``CustomSeq2SeqTrainer``."""
 
@@ -334,6 +519,7 @@ class TTTQwenTrainerMixin:
         self.ttt_runtime = ttt_runtime
         self.last_meta_output: TruncatedMetaTTTEpisodeOutput | None = None
         self.last_semantic_projector_grad_norm: float | None = None
+        self._a2_audit_accumulator = _A2AuditAccumulator()
         super().__init__(*args, **kwargs)
 
     def _install_a2_deepspeed_gradient_control(self) -> None:
@@ -399,23 +585,16 @@ class TTTQwenTrainerMixin:
 
     def log(self, logs: dict[str, float], *args: object, **kwargs: object) -> None:
         enriched = dict(logs)
-        audit: object | None
         if self.ttt_runtime.stage is ProductionStage.A2:
-            audit = getattr(self.ttt_runtime.stage_a_loss_step, "last_balance_audit", None)
+            enriched.update(self._a2_audit_accumulator.flush())
         else:
             audit = getattr(self.ttt_runtime.meta_runner, "last_balance_audit", None)
-        metrics = getattr(audit, "metrics", None)
-        if callable(metrics):
-            for name, value in metrics():
-                if value is not None:
-                    enriched[name] = float(value)
-        if self.ttt_runtime.stage is ProductionStage.A2:
-            weak_audit = getattr(self.ttt_runtime.stage_a_loss_step, "last_weak_audit", None)
-            weak_metrics = getattr(weak_audit, "metrics", None)
-            if callable(weak_metrics):
-                for name, value in weak_metrics():
-                    enriched[name] = float(value)
-        elif self.last_meta_output is not None:
+            metrics = getattr(audit, "metrics", None)
+            if callable(metrics):
+                for name, value in metrics():
+                    if value is not None:
+                        enriched[name] = float(value)
+        if self.ttt_runtime.stage is ProductionStage.A5 and self.last_meta_output is not None:
             retrieval_metrics: dict[str, float] = {}
             for query in self.last_meta_output.audit.queries:
                 for name, value in query.metrics.metrics:
@@ -469,6 +648,21 @@ class TTTQwenTrainerMixin:
             marker = getattr(self.ttt_runtime.stage_a_loss_step, "mark_backward_returned", None)
             if callable(marker):
                 marker()
+            balance_audit = getattr(
+                self.ttt_runtime.stage_a_loss_step,
+                "last_balance_audit",
+                None,
+            )
+            weak_audit = getattr(
+                self.ttt_runtime.stage_a_loss_step,
+                "last_weak_audit",
+                None,
+            )
+            if not isinstance(balance_audit, OfficialWeakBalanceAudit) or not isinstance(
+                weak_audit, OfficialWeakLossAudit
+            ):
+                raise RuntimeError("formal A2 step did not publish typed loss audits")
+            self._a2_audit_accumulator.add(balance_audit, weak_audit)
             self.last_semantic_projector_grad_norm = _semantic_projector_gradient_norm(model)
             self._observe_runtime_cost(inputs, time.perf_counter() - step_started)
             return result
@@ -702,6 +896,7 @@ def main(argv: list[str] | None = None) -> int:
         checkpoint = backbone.ttt_config.initialize_from_a2_checkpoint
         if checkpoint is None:
             raise RuntimeError("validated A5 config lost initialize_from_a2_checkpoint")
+        _validate_resume_balance_schema(Path(checkpoint).expanduser().resolve())
         checkpoint_audit = initialize_outer_model_from_a2(runtime_raw.model, checkpoint)
         _reset_a2_to_a5_balance(runtime_raw.model)
     expected_gradient_groups = (
@@ -1069,28 +1264,55 @@ def resolve_same_stage_resume(
 
 
 def _validate_resume_balance_schema(checkpoint: Path) -> None:
-    key = "official_weak_balancer.balance_schema_version"
+    expected = {
+        "official_weak_balancer.ema_values": (torch.float64, (5,)),
+        "official_weak_balancer.ema_valid": (torch.bool, (5,)),
+        "official_weak_balancer.ema_update_counts": (torch.int64, (5,)),
+        "official_weak_balancer.gradient_ema_values": (torch.float64, (4,)),
+        "official_weak_balancer.gradient_ema_valid": (torch.bool, (4,)),
+        "official_weak_balancer.gradient_ema_update_counts": (torch.int64, (4,)),
+        "official_weak_balancer.balance_schema_version": (torch.int64, ()),
+    }
     single = checkpoint / "model.safetensors"
     index = checkpoint / "model.safetensors.index.json"
-    source: Path
     if single.is_file():
-        source = single
+        sources = {key: single for key in expected}
     elif index.is_file():
         raw = cast(object, json.loads(index.read_text(encoding="utf-8")))
         weight_map = raw.get("weight_map") if isinstance(raw, dict) else None
-        if not isinstance(weight_map, dict) or not isinstance(weight_map.get(key), str):
-            raise ValueError("resume checkpoint predates ema_answer_ref schema 6")
-        source = checkpoint / cast(str, weight_map[key])
+        if not isinstance(weight_map, dict):
+            raise ValueError("balance checkpoint index has no weight_map")
+        sources = {}
+        for key in expected:
+            shard = weight_map.get(key)
+            if not isinstance(shard, str):
+                raise ValueError(f"balance checkpoint is missing required tensor: {key}")
+            sources[key] = checkpoint / shard
     else:
-        raise ValueError("same-stage resume requires schema-6 safetensors weights")
-    if not source.is_file():
-        raise FileNotFoundError("resume balance-schema shard is missing")
-    with safe_open(source, framework="pt", device="cpu") as reader:
-        if key not in set(reader.keys()):
-            raise ValueError("resume checkpoint predates ema_answer_ref schema 6")
-        value = reader.get_tensor(key)
-    if value.numel() != 1 or int(value.item()) != 6:
-        raise ValueError("resume checkpoint has incompatible ema_answer_ref schema")
+        raise ValueError("formal balance checkpoint requires safetensors weights")
+    tensors: dict[str, Tensor] = {}
+    for source in set(sources.values()):
+        if not source.is_file():
+            raise FileNotFoundError(f"balance checkpoint shard is missing: {source}")
+        keys = tuple(key for key, path in sources.items() if path == source)
+        with safe_open(source, framework="pt", device="cpu") as reader:
+            available = set(reader.keys())
+            for key in keys:
+                if key not in available:
+                    raise ValueError(f"balance checkpoint is missing required tensor: {key}")
+                tensors[key] = reader.get_tensor(key)
+    for key, (dtype, shape) in expected.items():
+        value = tensors[key]
+        if value.dtype != dtype or tuple(value.shape) != shape:
+            raise ValueError(
+                f"balance checkpoint tensor {key} must be {dtype} {shape}; "
+                f"found {value.dtype} {tuple(value.shape)}"
+            )
+    schema = tensors["official_weak_balancer.balance_schema_version"]
+    if int(schema.item()) != 7:
+        raise ValueError(
+            "balance checkpoint has incompatible schema; formal training requires schema 7"
+        )
 
 
 def _audit_outer_parameters(
