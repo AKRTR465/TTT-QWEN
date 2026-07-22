@@ -424,20 +424,6 @@ def _a2_visual_length_key(
     return frame_budget, pixel_rate, encoded_bytes_per_second or file_bytes
 
 
-def _sidecar_nonnegative_int(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    integer = int(value)
-    return integer if integer >= 0 else None
-
-
-def _sidecar_nonnegative_float(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    number = float(value)
-    return number if math.isfinite(number) and number >= 0.0 else None
-
-
 @lru_cache(maxsize=1_024)
 def _video_decode_rate(path: str) -> tuple[int, int]:
     """Probe one local video header for rank-straggler-aware A2 bucketing."""

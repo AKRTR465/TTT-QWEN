@@ -82,30 +82,6 @@ class O1SoftOutput:
                 raise ValueError("O1 soft_count cannot exceed the valid slot count")
 
     @property
-    def object_probability(self) -> Tensor:
-        return self.probabilities[..., 0]
-
-    @property
-    def target_probability(self) -> Tensor:
-        return self.probabilities[..., 1]
-
-    @property
-    def visible_probability(self) -> Tensor:
-        return self.probabilities[..., 2]
-
-    @property
-    def enter_probability(self) -> Tensor:
-        return self.probabilities[..., 3]
-
-    @property
-    def exit_probability(self) -> Tensor:
-        return self.probabilities[..., 4]
-
-    @property
-    def confidence_probability(self) -> Tensor:
-        return self.probabilities[..., 5]
-
-    @property
     def count_prediction(self) -> Tensor:
         return self.soft_count
 
@@ -166,16 +142,6 @@ class O2SoftOutput:
                     rtol=0.0,
                 ):
                     raise ValueError("valid O2 identities must have unit L2 norm")
-
-    @property
-    def score(self) -> Tensor:
-        """Compatibility alias for raw novelty/match-confidence logits."""
-
-        return self.score_logits
-
-    @property
-    def diagnostic_local_novelty_sum(self) -> Tensor:
-        return (self.score_probabilities[..., 0] * self.valid_mask).sum(dim=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,10 +288,6 @@ class E1SoftOutput:
             )
         _validate_count_prediction(self.count_prediction, self.logits, "E1")
         _assert_e1_state_storage_isolated(self.next_states)
-
-    @property
-    def diagnostic_local_completion_sum(self) -> Tensor:
-        return (self.probabilities[..., 1] * self.valid_mask).sum(dim=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -496,10 +458,6 @@ class E2SoftOutput:
             ):
                 raise ValueError("valid E2 phase probabilities must sum to one")
         _assert_e2_state_storage_isolated(self.next_states)
-
-    @property
-    def diagnostic_local_completion_sum(self) -> Tensor:
-        return (self.event_probabilities[..., 3] * self.valid_mask).sum(dim=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -824,15 +782,6 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
             count_prediction=self.count_head(torch.stack(count_features, dim=0)),
         )
 
-    def reset_state(
-        self,
-        video_id: str,
-        trajectory_id: str,
-        query_signature: Tensor,
-    ) -> E1RuntimeState:
-        _validate_reset_signature(self, video_id, trajectory_id, query_signature, "E1")
-        return self._empty_state(video_id, trajectory_id, query_signature)
-
     def _empty_state(
         self,
         video_id: str,
@@ -1062,15 +1011,6 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
             audit=audit,
             count_prediction=self.count_head(torch.stack(count_features, dim=0)),
         )
-
-    def reset_state(
-        self,
-        video_id: str,
-        trajectory_id: str,
-        query_signature: Tensor,
-    ) -> E2RuntimeState:
-        _validate_reset_signature(self, video_id, trajectory_id, query_signature, "E2")
-        return self._empty_state(video_id, trajectory_id, query_signature)
 
     def _empty_state(
         self,
@@ -1554,24 +1494,6 @@ def _validate_query_signatures(
         raise ValueError(f"{name} query_signatures must match inputs as floating [B, 512]")
     if signatures.device.type != "meta" and not bool(torch.isfinite(signatures).all()):
         raise ValueError(f"{name} query_signatures must be finite")
-
-
-def _validate_reset_signature(
-    module: nn.Module,
-    video_id: str,
-    trajectory_id: str,
-    query_signature: Tensor,
-    name: str,
-) -> None:
-    if not video_id or not trajectory_id:
-        raise ValueError(f"{name} reset requires non-empty owner identifiers")
-    if query_signature.shape != (512,) or not torch.is_floating_point(query_signature):
-        raise ValueError(f"{name} reset query signature must be floating [512]")
-    parameter = next(module.parameters())
-    if query_signature.dtype != parameter.dtype or query_signature.device != parameter.device:
-        raise ValueError(f"{name} reset signature must share module dtype/device")
-    if query_signature.device.type != "meta" and not bool(torch.isfinite(query_signature).all()):
-        raise ValueError(f"{name} reset signature must be finite")
 
 
 def _normalize_e1_states(

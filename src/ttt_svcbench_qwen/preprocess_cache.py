@@ -297,10 +297,6 @@ class PreprocessCache:
             if "metadata_temporary" in locals() and metadata_temporary.exists():
                 metadata_temporary.unlink()
 
-    def clear_memory(self) -> None:
-        self._memory.clear()
-        self._memory_sizes.clear()
-
     def stats(self) -> dict[str, object]:
         return {
             "enabled": self.enabled,

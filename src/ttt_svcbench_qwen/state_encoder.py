@@ -1599,16 +1599,6 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
             hidden_dim=self.config.hidden_dim,
         )
 
-    @staticmethod
-    def pack_cache(states: Sequence[TemporalCache]) -> TemporalCache:
-        return TemporalCache.pack(states)
-
-    @staticmethod
-    def split_cache(cache: TemporalCache) -> tuple[TemporalCache, ...]:
-        if not isinstance(cache, TemporalCache):
-            raise TypeError("split_cache requires a TemporalCache")
-        return cache.split()
-
     def _validate_inputs(
         self,
         adapted_embeddings: Tensor,

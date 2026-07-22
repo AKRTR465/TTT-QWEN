@@ -192,19 +192,6 @@ class StateResamplerOutput:
         ):
             raise ValueError("selected attention mass must be one for hits and zero for empty rows")
 
-    @property
-    def h_state(self) -> Tensor:
-        """Architecture-name alias for ``hidden_states``."""
-
-        return self.hidden_states
-
-    @property
-    def r_t(self) -> Tensor:
-        """Architecture-name alias for ``state_tokens``."""
-
-        return self.state_tokens
-
-
 @dataclass(frozen=True, slots=True)
 class ReaderResult:
     status: ReaderStatus

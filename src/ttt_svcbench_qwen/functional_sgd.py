@@ -168,13 +168,6 @@ class FunctionalSGDResult:
         if self.optimizer_state.attempted_update_count != expected_attempts:
             raise ValueError("optimizer attempts must equal accepted updates plus skips")
 
-    @property
-    def differentiable_update(self) -> bool:
-        """Compatibility view; ``gradient_mode`` is the authoritative record."""
-
-        return self.gradient_mode is GradientMode.META_FULL_SECOND_ORDER
-
-
 def initialize_optimizer_state(config: InnerSGDConfig) -> OptimizerRuntimeState:
     """Create empty runtime counters from the frozen stateless-SGD config."""
 

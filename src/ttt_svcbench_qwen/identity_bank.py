@@ -390,10 +390,6 @@ class IdentityBankRuntimeState:
         return sum(chunk.size for chunk in self.confirmed_chunks)
 
     @property
-    def candidate_overflow(self) -> int:
-        return self.candidate_overflow_count
-
-    @property
     def audit(self) -> tuple[IdentityBankAuditEntry, ...]:
         return self.audit_log
 
@@ -463,12 +459,6 @@ class IdentityUpdateResult:
     identity_state: IdentityBankRuntimeState
     state_bank_state: StateBankRuntimeState
     decisions: tuple[IdentityObservationDecision, ...]
-
-    @property
-    def assignments(self) -> tuple[IdentityObservationDecision, ...]:
-        """Compatibility alias for downstream orchestration terminology."""
-
-        return self.decisions
 
 
 @dataclass(frozen=True, slots=True)

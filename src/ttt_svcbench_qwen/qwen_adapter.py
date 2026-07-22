@@ -200,13 +200,6 @@ class QwenVisualOutput:
     def packed_main_visual_embeddings(self) -> Tensor:
         return self.main_visual_embeddings[self.visual_valid_mask]
 
-    def packed_deepstack_feature(self, index: int) -> Tensor:
-        return self.deepstack_features[index]
-
-    def padded_deepstack_feature(self, index: int) -> Tensor:
-        splits = torch.split(self.deepstack_features[index], self.metadata.token_counts)
-        return pad_sequence(splits, batch_first=True)
-
     def split_main_visual_embeddings(self) -> tuple[Tensor, ...]:
         return tuple(torch.split(self.packed_main_visual_embeddings(), self.metadata.token_counts))
 
@@ -529,11 +522,6 @@ class QwenVideoFeatureBoundary(nn.Module):  # type: ignore[misc]
         self.adapter_enabled = adapter_enabled
         self.last_output: QwenVisualOutput | None = None
         self.last_prepared: PreparedVideoFeatures | None = None
-
-    def set_adapter_enabled(self, enabled: bool) -> None:
-        if enabled and self.adapter is None:
-            raise ValueError("cannot enable a missing adapter module")
-        self.adapter_enabled = enabled
 
     def intercept_features(
         self,

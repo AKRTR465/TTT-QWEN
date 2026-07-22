@@ -490,7 +490,6 @@ def test_o2_zero_identity_fallback_and_raw_score_logits(heads: ObservationHeads)
             output.score_probabilities[mask],
             torch.sigmoid(torch.tensor([[-2.0, 3.0], [-2.0, 3.0]])),
         )
-        assert output.score is output.score_logits
     finally:
         with torch.no_grad():
             decoder.identity_projection.weight.copy_(saved["identity_weight"])

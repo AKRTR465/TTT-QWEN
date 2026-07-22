@@ -393,10 +393,6 @@ class QueryEncoderOutput:
         return self.route.logits
 
     @property
-    def operator_confidence(self) -> Tensor:
-        return self.route.confidence
-
-    @property
     def padding_mask(self) -> Tensor:
         return self.embeddings.padding_mask
 

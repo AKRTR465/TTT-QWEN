@@ -565,10 +565,6 @@ class ProductionVisualAudit:
             raise ValueError("production visual input must contain only the current chunk")
 
     @property
-    def prepared_video_feature_count(self) -> int:
-        return 1
-
-    @property
     def history_feature_set_count(self) -> int:
         return self.token.history_feature_set_count
 
@@ -577,19 +573,8 @@ class ProductionVisualAudit:
         return self.chunk.spec.observation_role
 
     @property
-    def selected_frame_count(self) -> int:
-        if isinstance(self.chunk, PreparedVisualCPU):
-            return self.chunk.frame_count
-        return int(self.chunk.frames.shape[0])
-
-    @property
     def visual_token_count(self) -> int:
         return sum(self.token.merged_token_counts)
-
-    @property
-    def timestamp_range(self) -> tuple[float, float]:
-        timestamps = self.chunk.frame_timestamps
-        return float(timestamps[0].item()), float(timestamps[-1].item())
 
     @property
     def video_grid_thw(self) -> tuple[int, int, int]:

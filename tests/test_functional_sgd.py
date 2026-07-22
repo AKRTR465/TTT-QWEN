@@ -311,7 +311,6 @@ def test_meta_update_keeps_full_outer_gradient_to_w0(
 
     assert result.did_update
     assert result.gradient_mode is GradientMode.META_FULL_SECOND_ORDER
-    assert result.differentiable_update is True
     assert result.fast_state.w_t_1.is_leaf is False
     assert result.fast_state.w_t_2.is_leaf is False
     expected = 1.0 - 2.0 * optimizer_config.learning_rate
