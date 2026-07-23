@@ -460,6 +460,7 @@ class RetrieverConfig(FrozenModel):
     aggregate_time_policy: str
     atomic_window_boundary: str
     metrics_policy: str
+    score_chunk_size: PositiveInt
     top_k: PositiveInt | None
     ann_enabled: bool
 
@@ -2237,9 +2238,7 @@ def _normalize_project_schema(value: object) -> object:
 
     normalized_loss = dict(loss)
     normalized_loss["official_weak_balance"] = {
-        key: item
-        for key, item in _SCHEMA6_BALANCE.items()
-        if key not in {"mode", "experimental"}
+        key: item for key, item in _SCHEMA6_BALANCE.items() if key not in {"mode", "experimental"}
     }
     normalized_loss["official_weak_balance"]["group_weight"] = 0.4
     optimizer_a2 = cast(dict[str, object], stage_a["optimizer"])

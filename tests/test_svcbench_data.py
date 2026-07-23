@@ -131,6 +131,7 @@ def test_runtime_time_fields_reject_non_finite_and_negative_values(bad_value: fl
             (bad_value,),
         )
 
+
 def test_group_kfold_keeps_all_query_points_from_each_video_together(tmp_path: Path) -> None:
     rows = []
     for video_index in range(6):

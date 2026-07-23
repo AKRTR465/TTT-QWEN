@@ -169,6 +169,7 @@ class SVCBenchRecord:
         if not math.isfinite(self.query_time) or self.query_time < 0.0 or not self.question:
             raise ValueError("record query_time/question is invalid")
 
+
 @dataclass(frozen=True, slots=True)
 class LoadedAnnotations:
     records: tuple[SVCBenchRecord, ...]

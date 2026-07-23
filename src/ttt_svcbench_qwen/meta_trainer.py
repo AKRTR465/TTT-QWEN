@@ -1194,7 +1194,7 @@ class MetaTTTEpisodeRunner:
             calibration: list[MetaQueryObjective] = []
             calibration_queries: dict[tuple[int, str, str], PreparedQueryOutput] = {}
             for query_index, query in enumerate(episode.query_points):
-                adapted.runtime = query_runtime_snapshot
+                adapted.runtime = _fork_retrieval_runtime(query_runtime_snapshot)
                 lifecycle = PrefillLifecycle(episode.owner)
                 calibration_prepared_query: PreparedQueryOutput | None = None
                 if self.query_encoder_reuse:
@@ -1231,7 +1231,7 @@ class MetaTTTEpisodeRunner:
         query_loss_detached = final_segment_loss.detach().new_zeros(())
         query_count = len(episode.query_points)
         for query_index, query in enumerate(episode.query_points):
-            adapted.runtime = query_runtime_snapshot
+            adapted.runtime = _fork_retrieval_runtime(query_runtime_snapshot)
             query_lifecycle = PrefillLifecycle(episode.owner)
             prepared_query: PreparedQueryOutput | None = None
             if self.query_encoder_reuse:
@@ -1824,6 +1824,17 @@ def _contains_grad_tensor(value: object, seen: set[int] | None = None) -> bool:
             _contains_grad_tensor(getattr(value, field.name), active) for field in fields(value)
         )
     return False
+
+
+def _fork_retrieval_runtime(runtime: BatchRuntimeState) -> BatchRuntimeState:
+    """Isolate mutable retrieval rings while retaining functional Bank/FSM state."""
+
+    return BatchRuntimeState(
+        tuple(
+            replace(row, retrieval_history=history.fork())
+            for row, history in zip(runtime.rows, runtime.retrieval_histories, strict=True)
+        )
+    )
 
 
 def _contains_tensor(value: object, seen: set[int] | None = None) -> bool:

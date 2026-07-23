@@ -401,12 +401,17 @@ def _retrieval(
         selected_records=tuple(selected_records),
         candidate_record_ids=tuple(candidate_ids),
         candidate_records=tuple(candidate_snapshots),
+        candidate_head_types=tuple(
+            tuple(record.head_type if record is not None else None for record in row)
+            for row in candidate_snapshots
+        ),
         state_embeddings=embeddings,
         scores=scores,
         present_mask=present_mask,
         record_valid_mask=record_valid_mask,
         retrieval_eligible_mask=retrieval_eligible_mask,
         causal_mask=present_mask.clone(),
+        predicted_head_mask=present_mask.clone(),
         selected_mask=selected_mask,
         status=normalized_statuses,
         reason=normalized_reasons,
@@ -659,6 +664,44 @@ def test_resampler_packs_only_noncontiguous_selected_subset_when_n_state_exceeds
     torch.testing.assert_close(
         full_output.cross_attention_weights,
         selected_output.cross_attention_weights,
+    )
+
+
+def test_resampler_packs_tensor_only_retrieval_candidate_axis(
+    resampler: StateResampler,
+) -> None:
+    records = []
+    for sequence in range(6):
+        record_id = f"retrieval-{sequence:08d}"
+        original = _confirmed_record(sequence)
+        assert isinstance(original.payload, ConfirmedIdentity)
+        records.append(
+            replace(
+                original,
+                record_id=record_id,
+                payload=replace(original.payload, semantic_record_id=record_id),
+            )
+        )
+    candidates = tuple(records)
+    selected = (candidates[1], candidates[4])
+    eager = _retrieval((selected,), candidate_rows=(candidates,))
+    lazy = replace(
+        eager,
+        candidate_record_ids=((None,) * len(candidates),),
+        candidate_records=((None,) * len(candidates),),
+        candidate_head_types=((None,) * len(candidates),),
+    )
+    q_target = torch.randn(1, SEMANTIC_DIM)
+
+    eager_output = resampler(q_target, eager)
+    lazy_output = resampler(q_target, lazy)
+
+    assert lazy_output.selected_record_ids == eager_output.selected_record_ids
+    torch.testing.assert_close(lazy_output.hidden_states, eager_output.hidden_states)
+    torch.testing.assert_close(lazy_output.state_tokens, eager_output.state_tokens)
+    torch.testing.assert_close(
+        lazy_output.cross_attention_weights,
+        eager_output.cross_attention_weights,
     )
 
 
@@ -1256,6 +1299,7 @@ def test_retriever_snapshot_rejects_typed_payload_replacement(
 
     with pytest.raises(ValueError, match="selected typed records.*candidate snapshot"):
         replace(retrieval, selected_records=((replacement,),))
+
 
 def test_number_tokens_are_reader_owned_gt_substitution_is_detected_and_result_is_frozen(
     reader: DeterministicStateReader,

@@ -81,6 +81,8 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     runtime_trace_mode: Literal["off", "cuda"] = "off"
     runtime_trace_dir: str | None = Field(default=None, min_length=1)
     segment_prefetch_depth: Literal[0, 1] = 0
+    semantic_projector_delta_audit_steps: int = Field(default=0, ge=0)
+    operator_diagnostics_interval: int = Field(default=10, gt=0)
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
     def validate_stage_checkpoint(self) -> Self:
@@ -127,9 +129,7 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
         """Return the explicit role-specific cache policy."""
 
         mode = (
-            self.state_query_cache_mode
-            if role == "state_query"
-            else self.answer_query_cache_mode
+            self.state_query_cache_mode if role == "state_query" else self.answer_query_cache_mode
         )
         return mode == "inherit"
 
@@ -139,9 +139,7 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             "state_query",
             "answer_query",
         )
-        return frozenset(
-            role for role in roles if self.query_cache_enabled(role)
-        )
+        return frozenset(role for role in roles if self.query_cache_enabled(role))
 
 
 @dataclass(frozen=True, slots=True)

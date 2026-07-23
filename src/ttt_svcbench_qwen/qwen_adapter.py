@@ -795,6 +795,7 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
             had_instance_method = "get_video_features" in vars(owner)
             original_instance_method = vars(owner).get("get_video_features")
             original = owner.get_video_features
+
             def intercepted(
                 pixel_values_videos: Tensor,
                 video_grid_thw: Tensor | None = None,

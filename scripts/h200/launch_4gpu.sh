@@ -26,8 +26,8 @@ if [[ ! -x "$PYTHON" ]]; then
   echo "project Python is missing; run scripts/h200/train_a2_a5.sh first" >&2
   exit 1
 fi
-: "${SVCBENCH_DATASET_MANIFEST:?set SVCBENCH_DATASET_MANIFEST to dataset_manifest.json}"
 : "${SVCBENCH_VIDEO_ROOT:?set SVCBENCH_VIDEO_ROOT to the converted SVCBench dataset root}"
+: "${SVCBENCH_DATASET_MANIFEST:?set SVCBENCH_DATASET_MANIFEST to dataset_manifest.json}"
 if [[ ! -f "$SVCBENCH_DATASET_MANIFEST" ]]; then
   echo "dataset manifest not found: $SVCBENCH_DATASET_MANIFEST" >&2
   exit 1

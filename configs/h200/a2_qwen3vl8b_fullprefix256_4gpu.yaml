@@ -86,3 +86,5 @@ ttt_qwen:
   runtime_trace_mode: "off"
   runtime_trace_dir: null
   segment_prefetch_depth: 0
+  semantic_projector_delta_audit_steps: 0
+  operator_diagnostics_interval: 10

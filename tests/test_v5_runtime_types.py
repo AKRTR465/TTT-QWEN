@@ -318,12 +318,14 @@ def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
         selected_records=((record,),),
         candidate_record_ids=(("record-1",),),
         candidate_records=((record,),),
+        candidate_head_types=((HeadType.O1,),),
         state_embeddings=semantic.reshape(1, 1, 512),
         scores=torch.tensor([[0.5]]),
         present_mask=torch.tensor([[True]]),
         record_valid_mask=torch.tensor([[True]]),
         retrieval_eligible_mask=torch.tensor([[True]]),
         causal_mask=torch.tensor([[True]]),
+        predicted_head_mask=torch.tensor([[True]]),
         selected_mask=torch.tensor([[True]]),
         status=(RetrievalStatus.OK,),
         reason=(RetrievalReason.MATCHED,),
@@ -478,9 +480,7 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
         TrajectoryRuntimeState(**{**values, "identity_bank": mismatched_identities})
 
     with pytest.raises(ValueError, match="Identity Bank release"):
-        TrajectoryRuntimeState(
-            **{**values, "identity_bank": identity_operator.release(identities)}
-        )
+        TrajectoryRuntimeState(**{**values, "identity_bank": identity_operator.release(identities)})
 
     mismatched_e1 = E1RuntimeState(
         video_id="video-a",

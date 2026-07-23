@@ -49,10 +49,7 @@ def select_loader_profile(trials: Sequence[LoaderTrial]) -> tuple[int, int]:
     candidate = by_profile.get((4, 1))
     if candidate is None:
         return baseline.profile
-    wait_improved = (
-        candidate.ga_group_wait_p95_seconds
-        <= 0.80 * baseline.ga_group_wait_p95_seconds
-    )
+    wait_improved = candidate.ga_group_wait_p95_seconds <= 0.80 * baseline.ga_group_wait_p95_seconds
     support_read_safe = candidate.support_read_p95_seconds <= max(
         1.0e-9, 1.10 * baseline.support_read_p95_seconds
     )

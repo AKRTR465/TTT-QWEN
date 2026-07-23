@@ -29,9 +29,8 @@ remove_unused_columns: false
 
 output_dir: $OUTPUT_DIR
 logging_steps: 1
-save_strategy: steps
-save_steps: 0.5
-save_total_limit: 2
+save_strategy: "no"
+save_total_limit: 1
 save_only_model: false
 overwrite_output_dir: false
 report_to: none
@@ -42,7 +41,7 @@ gradient_accumulation_steps: 4
 learning_rate: 1.0e-5
 num_train_epochs: 4.0
 lr_scheduler_type: cosine
-warmup_ratio: 0.03
+warmup_ratio: 0.0
 weight_decay: 0.01
 max_grad_norm: 0.0
 optim: adamw_torch
@@ -59,7 +58,6 @@ ttt_qwen:
   stage: a2
   project_config: configs/model_state_ttt_8b.yaml
   dataset_manifest: $SVCBENCH_DATASET_MANIFEST
-  visual_cost_index: $VISUAL_COST_INDEX
   support_prefetch_depth: 2
   support_decode_coalesce: true
   support_materialization: dataloader_episode
@@ -79,11 +77,15 @@ ttt_qwen:
   preprocess_cache_mode: readonly
   preprocess_cache_miss_policy: error
   preprocess_cache_root_env: TTT_PREPROCESS_CACHE_ROOT
-  preprocess_cache_max_gb: 800
+  preprocess_cache_max_gb: 200
   preprocess_cache_dtype: float32
+  # The fixed acceptance manifest is a subset of the production train split.
+  # Keep the exact measured token costs, but do not require every selected row
+  # to have a prior full-training runtime observation before the test can start.
   visual_cost_mode: exact_tokens
-  runtime_trace_mode: cuda
-  runtime_trace_dir: $RUN_ROOT/runtime_trace
+  visual_cost_index: $VISUAL_COST_INDEX
+  runtime_trace_mode: "off"
+  runtime_trace_dir: null
   segment_prefetch_depth: 0
-  semantic_projector_delta_audit_steps: 0
-  operator_diagnostics_interval: 10
+  semantic_projector_delta_audit_steps: 32
+  operator_diagnostics_interval: 1

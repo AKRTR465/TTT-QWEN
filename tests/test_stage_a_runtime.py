@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from collections.abc import Sequence
 from dataclasses import replace
 from types import SimpleNamespace
@@ -39,7 +40,12 @@ from ttt_svcbench_qwen.stage_a_runtime import (
     StageASoftWriteOutput,
     StageAWriteAudit,
 )
-from ttt_svcbench_qwen.state_bank import HeadType, build_state_bank
+from ttt_svcbench_qwen.state_bank import (
+    RETRIEVAL_HEAD_ORDER,
+    HeadType,
+    build_state_bank,
+    tensorized_retrieval_view,
+)
 from ttt_svcbench_qwen.state_encoder import (
     SpatialEncoderOutput,
     SpatialSlotRuntimeState,
@@ -306,6 +312,10 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
     state_bank = build_state_bank(load_config())
     writer = StageABankWriter(state_bank, build_identity_bank(load_config()))
     runtime = writer.reset(owner)
+    pre_write_view = tensorized_retrieval_view(
+        runtime.retrieval_histories,
+        guard_current_version=False,
+    )
     result = writer(
         observations,
         spatial,
@@ -363,10 +373,6 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
     )
 
     retriever = build_state_retriever(load_config())
-    pre_write_view = state_bank.retrieval_view(
-        runtime.state_bank_states,
-        tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in query.hard_operators),
-    )
     pre_write_retrieval = retriever(
         state_bank,
         pre_write_view,
@@ -375,10 +381,7 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
         trajectory_ids=owner.trajectory_ids,
     )
     assert pre_write_retrieval.n_state.tolist() == [0, 0, 0, 0]
-    history_view = state_bank.retrieval_view(
-        result.bank_states,
-        tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in query.hard_operators),
-    )
+    history_view = tensorized_retrieval_view(result.runtime_state.retrieval_histories)
     history_retrieval = retriever(
         state_bank,
         history_view,
@@ -386,12 +389,15 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
         video_ids=owner.video_ids,
         trajectory_ids=owner.trajectory_ids,
     )
-    assert history_retrieval.n_state.tolist() == [1, 0, 1, 1]
+    assert history_retrieval.n_state.tolist() == [
+        history.count for history in result.runtime_state.retrieval_histories
+    ]
     assert all(
-        not record.semantic_source.requires_grad and record.semantic_source.grad_fn is None
-        for state in result.bank_states
-        for record in state.retrieval_history
+        set(history_view.head_codes[row][history_view.present_mask[row]].tolist())
+        == set(range(4))
+        for row in range(len(result.bank_states))
     )
+    assert not history_view.sources.requires_grad and history_view.sources.grad_fn is None
     reader_results = DeterministicStateReader(_NumberTokenizer()).read_bank(
         state_bank,
         result.bank_states,
@@ -447,7 +453,7 @@ def test_stage_a_soft_write_masks_carried_slots_without_new_temporal_positions()
         nonfinite.validate_commit_boundary()
 
 
-def test_o2_history_is_written_only_when_candidates_promote() -> None:
+def test_all_head_history_is_written_before_o2_candidates_promote() -> None:
     torch.manual_seed(20260720)
     owner = RuntimeOwner(
         ("video-o1", "video-o2", "video-e1", "video-e2"),
@@ -477,7 +483,14 @@ def test_o2_history_is_written_only_when_candidates_promote() -> None:
         inference=False,
     )
     first = writer(observations, spatial, temporal, query, request)
-    assert first.bank_states[1].retrieval_history == ()
+    first_view = tensorized_retrieval_view(first.runtime_state.retrieval_histories)
+    first_o2_count = int(
+        (
+            first_view.present_mask[1]
+            & (first_view.head_codes[1] == RETRIEVAL_HEAD_ORDER.index(HeadType.O2))
+        ).sum()
+    )
+    assert first_o2_count == 2
     assert all(
         decision.status is IdentityDecisionStatus.CANDIDATE_CREATED
         for decision in first.audit.identity_decisions[1]
@@ -522,15 +535,29 @@ def test_o2_history_is_written_only_when_candidates_promote() -> None:
         decision.status is IdentityDecisionStatus.PROMOTED
         for decision in second.audit.identity_decisions[1]
     )
-    o2_history = second.bank_states[1].retrieval_history
-    assert len(o2_history) == 2
-    assert all(record.head_type is HeadType.O2 for record in o2_history)
-    assert all(record.lifecycle_id is not None for record in o2_history)
-    assert all(record.retrieval_eligible for record in o2_history)
+    second_view = tensorized_retrieval_view(second.runtime_state.retrieval_histories)
+    o2_history_count = int(
+        (
+            second_view.present_mask[1]
+            & (second_view.head_codes[1] == RETRIEVAL_HEAD_ORDER.index(HeadType.O2))
+        ).sum()
+    )
+    assert o2_history_count == 4
+    assert bool(
+        torch.all(
+            second_view.sequence_ids[1][
+                second_view.present_mask[1]
+                & (second_view.head_codes[1] == RETRIEVAL_HEAD_ORDER.index(HeadType.O2))
+            ]
+            >= 0
+        )
+    )
     assert [len(second.bank_states[index].records) for index in (0, 2, 3)] == [1, 1, 1]
-    assert [
-        len(second.bank_states[index].retrieval_history) for index in (0, 2, 3)
-    ] == [2, 2, 2]
+    assert [second.runtime_state.retrieval_histories[index].count for index in (0, 2, 3)] == [
+        10,
+        10,
+        10,
+    ]
 
 
 def test_stage_a_runtime_has_no_fast_or_optimizer_state() -> None:
@@ -538,3 +565,10 @@ def test_stage_a_runtime_has_no_fast_or_optimizer_state() -> None:
     writer = StageABankWriter(build_state_bank(load_config()), build_identity_bank(load_config()))
     runtime = writer.reset(owner)
     assert all(row.fast_weights is None and row.optimizer is None for row in runtime.rows)
+
+
+def test_tensor_ring_chunk_write_has_no_per_slot_python_materialization() -> None:
+    source = inspect.getsource(StageABankWriter._append_all_head_retrieval_history_tensorized)
+    assert ".item(" not in source
+    assert ".tolist(" not in source
+    assert source.count("append_many(") == 1

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 import torch
@@ -35,7 +35,7 @@ from ttt_svcbench_qwen.query_encoder import (
     QueryEncoderOutput,
     TimeWindowMode,
 )
-from ttt_svcbench_qwen.state_bank import HeadType
+from ttt_svcbench_qwen.state_bank import RETRIEVAL_HEAD_ORDER, HeadType
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
 
 
@@ -551,7 +551,10 @@ class StageATargetBuilder:
                 continue
             relevant = labels.relevant_record_ids[row]
             assert relevant is not None
-            candidates = retrieval.candidate_record_ids[row]
+            candidates = tuple(
+                retrieval.candidate_record_id(row, column)
+                for column in range(retrieval.scores.shape[1])
+            )
             present_ids = tuple(
                 record_id
                 for column, record_id in enumerate(candidates)
@@ -872,6 +875,132 @@ class OfficialWeakLossTerm:
 
 
 @dataclass(frozen=True, slots=True)
+class OperatorDiagnosticAudit:
+    """Additive 8-target x 9-prediction Router diagnostics."""
+
+    raw_confusion: tuple[int, ...]
+    effective_confusion: tuple[int, ...]
+    class_loss_sums: tuple[float, ...]
+    class_support: tuple[int, ...]
+    confidence_sum: float
+    entropy_sum: float
+    temperature_sum: float
+    temperature_count: int
+
+    @classmethod
+    def empty(cls) -> OperatorDiagnosticAudit:
+        return cls((0,) * 72, (0,) * 72, (0.0,) * 8, (0,) * 8, 0.0, 0.0, 0.0, 0)
+
+    def __post_init__(self) -> None:
+        if len(self.raw_confusion) != 72 or len(self.effective_confusion) != 72:
+            raise ValueError("Operator confusion audits must be flattened 8x9 matrices")
+        if len(self.class_loss_sums) != 8 or len(self.class_support) != 8:
+            raise ValueError("Operator class audits must contain eight official classes")
+        integer_values = (
+            *self.raw_confusion,
+            *self.effective_confusion,
+            *self.class_support,
+            self.temperature_count,
+        )
+        if any(type(value) is not int or value < 0 for value in integer_values):
+            raise ValueError("Operator diagnostic counts must be non-negative integers")
+        floating_values = (
+            *self.class_loss_sums,
+            self.confidence_sum,
+            self.entropy_sum,
+            self.temperature_sum,
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in floating_values):
+            raise ValueError("Operator diagnostic sums must be finite and non-negative")
+        row_count = sum(self.class_support)
+        if sum(self.raw_confusion) != row_count or sum(self.effective_confusion) != row_count:
+            raise ValueError("Operator confusion totals must equal official class support")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskDiagnosticAudit:
+    """Additive Task subloss, count-error, and dense-label diagnostics."""
+
+    count_loss_sums: tuple[float, ...]
+    count_abs_error_sums: tuple[float, ...]
+    count_rows: tuple[int, ...]
+    component_loss_sums: tuple[float, ...]
+    component_rows: tuple[int, ...]
+    o1_loss_sums: tuple[float, ...]
+    o1_rows: tuple[int, ...]
+    channel_positive_counts: tuple[int, ...]
+    channel_negative_counts: tuple[int, ...]
+    channel_masked_counts: tuple[int, ...]
+    channel_true_positive_counts: tuple[int, ...]
+    channel_false_positive_counts: tuple[int, ...]
+    channel_false_negative_counts: tuple[int, ...]
+    e1_representable_occurrences: int
+    e1_unrepresentable_occurrences: int
+
+    @classmethod
+    def empty(cls) -> TaskDiagnosticAudit:
+        return cls(
+            (0.0,) * 4,
+            (0.0,) * 4,
+            (0,) * 4,
+            (0.0,) * 3,
+            (0,) * 3,
+            (0.0,) * 2,
+            (0,) * 2,
+            (0,) * 7,
+            (0,) * 7,
+            (0,) * 7,
+            (0,) * 7,
+            (0,) * 7,
+            (0,) * 7,
+            0,
+            0,
+        )
+
+    def __post_init__(self) -> None:
+        expected_lengths = (
+            (self.count_loss_sums, 4),
+            (self.count_abs_error_sums, 4),
+            (self.count_rows, 4),
+            (self.component_loss_sums, 3),
+            (self.component_rows, 3),
+            (self.o1_loss_sums, 2),
+            (self.o1_rows, 2),
+            (self.channel_positive_counts, 7),
+            (self.channel_negative_counts, 7),
+            (self.channel_masked_counts, 7),
+            (self.channel_true_positive_counts, 7),
+            (self.channel_false_positive_counts, 7),
+            (self.channel_false_negative_counts, 7),
+        )
+        if any(len(values) != width for values, width in expected_lengths):
+            raise ValueError("Task diagnostic vector width drifted")
+        float_values = (
+            *self.count_loss_sums,
+            *self.count_abs_error_sums,
+            *self.component_loss_sums,
+            *self.o1_loss_sums,
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in float_values):
+            raise ValueError("Task diagnostic loss/error sums must be finite and non-negative")
+        count_values = (
+            *self.count_rows,
+            *self.component_rows,
+            *self.o1_rows,
+            *self.channel_positive_counts,
+            *self.channel_negative_counts,
+            *self.channel_masked_counts,
+            *self.channel_true_positive_counts,
+            *self.channel_false_positive_counts,
+            *self.channel_false_negative_counts,
+            self.e1_representable_occurrences,
+            self.e1_unrepresentable_occurrences,
+        )
+        if any(type(value) is not int or value < 0 for value in count_values):
+            raise ValueError("Task diagnostic counts must be non-negative integers")
+
+
+@dataclass(frozen=True, slots=True)
 class OfficialWeakLossAudit:
     labels_joined_after_forward: bool
     runtime_payload_reused_for_labels: bool
@@ -883,13 +1012,31 @@ class OfficialWeakLossAudit:
     retrieval_positive_counts: tuple[int, ...] = ()
     retrieval_negative_counts: tuple[int, ...] = ()
     retrieval_wrong_operator_rows: int = 0
+    retrieval_target_head_candidate_rows: int = 0
+    retrieval_no_target_head_candidate_rows: int = 0
     retrieval_no_candidate_rows: int = 0
     retrieval_no_positive_rows: int = 0
     retrieval_all_positive_rows: int = 0
     retrieval_valid_bag_rows: int = 0
+    retrieval_rescued_from_wrong_route_rows: int = 0
+    retrieval_legacy_valid_bag_rows: int = 0
+    retrieval_invalid_excluded_count: int = 0
+    retrieval_ineligible_excluded_count: int = 0
+    retrieval_causal_excluded_count: int = 0
+    retrieval_candidate_total: int | None = None
+    retrieval_positive_total: int | None = None
+    retrieval_negative_total: int | None = None
     annotation_count_mismatch: int = 0
+    operator_diagnostics: OperatorDiagnosticAudit = field(
+        default_factory=OperatorDiagnosticAudit.empty
+    )
+    task_diagnostics: TaskDiagnosticAudit = field(default_factory=TaskDiagnosticAudit.empty)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.operator_diagnostics, OperatorDiagnosticAudit):
+            raise TypeError("official weak audit requires typed Operator diagnostics")
+        if not isinstance(self.task_diagnostics, TaskDiagnosticAudit):
+            raise TypeError("official weak audit requires typed Task diagnostics")
         if not self.labels_joined_after_forward:
             raise ValueError("official weak labels must be joined only after forward")
         if (
@@ -904,10 +1051,17 @@ class OfficialWeakLossAudit:
             raise ValueError("official weak audit counts must be non-negative")
         counts = (
             self.retrieval_wrong_operator_rows,
+            self.retrieval_target_head_candidate_rows,
+            self.retrieval_no_target_head_candidate_rows,
             self.retrieval_no_candidate_rows,
             self.retrieval_no_positive_rows,
             self.retrieval_all_positive_rows,
             self.retrieval_valid_bag_rows,
+            self.retrieval_rescued_from_wrong_route_rows,
+            self.retrieval_legacy_valid_bag_rows,
+            self.retrieval_invalid_excluded_count,
+            self.retrieval_ineligible_excluded_count,
+            self.retrieval_causal_excluded_count,
             self.annotation_count_mismatch,
         )
         if any(type(value) is not int or value < 0 for value in counts):
@@ -922,19 +1076,77 @@ class OfficialWeakLossAudit:
         non_empty_lengths = {len(values) for values in aligned if values}
         if len(non_empty_lengths) > 1:
             raise ValueError("official weak retrieval count vectors must align")
+        optional_totals = (
+            self.retrieval_candidate_total,
+            self.retrieval_positive_total,
+            self.retrieval_negative_total,
+        )
+        if any(
+            value is not None and (type(value) is not int or value < 0) for value in optional_totals
+        ):
+            raise ValueError("official weak retrieval global totals must be non-negative")
 
     def metrics(self) -> tuple[tuple[str, float], ...]:
         """Expose bag-validity counts to A2/A5 training logs."""
 
         return (
             ("retrieval/wrong_operator_rows", float(self.retrieval_wrong_operator_rows)),
+            (
+                "retrieval/target_head_candidate_rows",
+                float(self.retrieval_target_head_candidate_rows),
+            ),
+            (
+                "retrieval/no_target_head_candidate_rows",
+                float(self.retrieval_no_target_head_candidate_rows),
+            ),
             ("retrieval/no_candidate_rows", float(self.retrieval_no_candidate_rows)),
             ("retrieval/no_positive_rows", float(self.retrieval_no_positive_rows)),
             ("retrieval/all_positive_rows", float(self.retrieval_all_positive_rows)),
             ("retrieval/valid_bag_rows", float(self.retrieval_valid_bag_rows)),
-            ("retrieval/candidate_count", float(sum(self.retrieval_candidate_counts))),
-            ("retrieval/positive_count", float(sum(self.retrieval_positive_counts))),
-            ("retrieval/negative_count", float(sum(self.retrieval_negative_counts))),
+            (
+                "retrieval/rescued_from_wrong_route_rows",
+                float(self.retrieval_rescued_from_wrong_route_rows),
+            ),
+            (
+                "retrieval/legacy_valid_bag_rows",
+                float(self.retrieval_legacy_valid_bag_rows),
+            ),
+            (
+                "retrieval/invalid_excluded_count",
+                float(self.retrieval_invalid_excluded_count),
+            ),
+            (
+                "retrieval/ineligible_excluded_count",
+                float(self.retrieval_ineligible_excluded_count),
+            ),
+            (
+                "retrieval/causal_excluded_count",
+                float(self.retrieval_causal_excluded_count),
+            ),
+            (
+                "retrieval/candidate_count",
+                float(
+                    sum(self.retrieval_candidate_counts)
+                    if self.retrieval_candidate_total is None
+                    else self.retrieval_candidate_total
+                ),
+            ),
+            (
+                "retrieval/positive_count",
+                float(
+                    sum(self.retrieval_positive_counts)
+                    if self.retrieval_positive_total is None
+                    else self.retrieval_positive_total
+                ),
+            ),
+            (
+                "retrieval/negative_count",
+                float(
+                    sum(self.retrieval_negative_counts)
+                    if self.retrieval_negative_total is None
+                    else self.retrieval_negative_total
+                ),
+            ),
             ("task/annotation_count_mismatch", float(self.annotation_count_mismatch)),
         )
 
@@ -1018,22 +1230,67 @@ class OfficialWeakTargetBuilder:
         positive_counts: list[int] = []
         negative_counts: list[int] = []
         retrieval_status_counts = {
-            "wrong_operator": 0,
             "no_candidate": 0,
             "no_positive": 0,
             "all_positive": 0,
             "valid_bag": 0,
         }
+        retrieval_wrong_operator_rows = 0
+        retrieval_target_head_candidate_rows = 0
+        retrieval_no_target_head_candidate_rows = 0
+        retrieval_rescued_from_wrong_route_rows = 0
+        retrieval_legacy_valid_bag_rows = 0
+        retrieval_invalid_excluded_count = 0
+        retrieval_ineligible_excluded_count = 0
+        retrieval_causal_excluded_count = 0
         annotation_count_mismatch = 0
+        raw_operator_confusion = [0] * 72
+        effective_operator_confusion = [0] * 72
+        operator_loss_sums = [0.0] * 8
+        operator_support = [0] * 8
+        operator_confidence_sum = 0.0
+        operator_entropy_sum = 0.0
+        operator_temperature_sum = 0.0
+        operator_temperature_count = 0
+        task_count_loss_sums = [0.0] * 4
+        task_count_abs_error_sums = [0.0] * 4
+        task_count_rows = [0] * 4
+        task_component_loss_sums = [0.0] * 3
+        task_component_rows = [0] * 3
+        task_o1_loss_sums = [0.0] * 2
+        task_o1_rows = [0] * 2
+        task_channel_positive = [0] * 7
+        task_channel_negative = [0] * 7
+        task_channel_masked = [0] * 7
+        task_channel_tp = [0] * 7
+        task_channel_fp = [0] * 7
+        task_channel_fn = [0] * 7
+        e1_representable_occurrences = 0
+        e1_unrepresentable_occurrences = 0
 
         for row, label in enumerate(labels):
             operator_index = OPERATORS.index(label.operator)
             operator_target = torch.tensor(
                 [operator_index], dtype=torch.int64, device=query.route.logits.device
             )
-            operator_losses.append(
-                F.cross_entropy(query.route.logits[row : row + 1].float(), operator_target)
+            row_operator_loss = F.cross_entropy(
+                query.route.logits[row : row + 1].float(), operator_target
             )
+            operator_losses.append(row_operator_loss)
+            raw_index = int(query.route.raw_indices[row].detach().item())
+            effective_index = OPERATORS.index(query.hard_operators[row])
+            raw_operator_confusion[operator_index * 9 + raw_index] += 1
+            effective_operator_confusion[operator_index * 9 + effective_index] += 1
+            operator_support[operator_index] += 1
+            operator_loss_sums[operator_index] += float(row_operator_loss.detach().item())
+            operator_confidence_sum += float(query.route.confidence[row].detach().item())
+            probabilities = torch.softmax(query.route.logits[row].detach().float(), dim=-1)
+            operator_entropy_sum += float(
+                (-(probabilities * probabilities.clamp_min(1.0e-12).log()).sum()).item()
+            )
+            if query.route.temperature is not None:
+                operator_temperature_sum += float(query.route.temperature.detach().item())
+                operator_temperature_count += 1
 
             mode_index = TIME_MODES.index(label.time_mode)
             mode_target = torch.tensor(
@@ -1070,17 +1327,61 @@ class OfficialWeakTargetBuilder:
                 )
             time_losses.append(row_time)
 
-            task_losses.append(_official_weak_task_loss(observations, row, label))
+            task_result = _official_weak_task_result(observations, row, label)
+            task_losses.append(task_result.loss)
+            family = task_result.family_index
+            task_count_loss_sums[family] += float(task_result.count_loss.detach().item())
+            task_count_abs_error_sums[family] += task_result.count_abs_error
+            task_count_rows[family] += 1
+            if task_result.component_index is not None and task_result.component_loss is not None:
+                component = task_result.component_index
+                task_component_loss_sums[component] += float(
+                    task_result.component_loss.detach().item()
+                )
+                task_component_rows[component] += 1
+            if task_result.phase_loss is not None:
+                task_component_loss_sums[2] += float(task_result.phase_loss.detach().item())
+                task_component_rows[2] += 1
+            if task_result.o1_subtype_index is not None:
+                subtype = task_result.o1_subtype_index
+                task_o1_loss_sums[subtype] += float(task_result.loss.detach().item())
+                task_o1_rows[subtype] += 1
+            for target, source in (
+                (task_channel_positive, task_result.channel_positive_counts),
+                (task_channel_negative, task_result.channel_negative_counts),
+                (task_channel_masked, task_result.channel_masked_counts),
+                (task_channel_tp, task_result.channel_true_positive_counts),
+                (task_channel_fp, task_result.channel_false_positive_counts),
+                (task_channel_fn, task_result.channel_false_negative_counts),
+            ):
+                for index, value in enumerate(source):
+                    target[index] += value
+            e1_representable_occurrences += task_result.e1_representable_occurrences
+            e1_unrepresentable_occurrences += task_result.e1_unrepresentable_occurrences
             annotation_count_mismatch += int(_official_count_mismatch(label))
-            retrieval_loss, positives, candidates, negatives, retrieval_status = (
-                _official_weak_retrieval_loss(retrieval, row, label)
-            )
+            retrieval_result = _official_weak_retrieval_loss(retrieval, row, label)
+            retrieval_loss = retrieval_result.loss
+            positives = retrieval_result.positive_count
+            candidates = retrieval_result.candidate_count
+            negatives = retrieval_result.negative_count
             bag_size = positives
             bag_sizes.append(bag_size)
             candidate_counts.append(candidates)
             positive_counts.append(positives)
             negative_counts.append(negatives)
-            retrieval_status_counts[retrieval_status] += 1
+            retrieval_status_counts[retrieval_result.status] += 1
+            retrieval_wrong_operator_rows += int(retrieval_result.wrong_operator)
+            retrieval_target_head_candidate_rows += int(
+                retrieval_result.target_head_present_count > 0
+            )
+            retrieval_no_target_head_candidate_rows += int(
+                retrieval_result.target_head_present_count == 0
+            )
+            retrieval_rescued_from_wrong_route_rows += int(retrieval_result.rescued_wrong_route)
+            retrieval_legacy_valid_bag_rows += int(retrieval_result.legacy_valid_bag)
+            retrieval_invalid_excluded_count += retrieval_result.invalid_excluded_count
+            retrieval_ineligible_excluded_count += retrieval_result.ineligible_excluded_count
+            retrieval_causal_excluded_count += retrieval_result.causal_excluded_count
             if retrieval_loss is not None:
                 retrieval_losses.append(retrieval_loss)
             future_ignored += sum(point > label.query_time for point in label.occurrence_points)
@@ -1088,6 +1389,125 @@ class OfficialWeakTargetBuilder:
                 start > label.query_time or end > label.query_time
                 for start, end in label.occurrence_intervals
             )
+
+        audit_device = query.route.logits.device
+        operator_integer_values = _distributed_sum_integers(
+            (
+                *raw_operator_confusion,
+                *effective_operator_confusion,
+                *operator_support,
+                operator_temperature_count,
+            ),
+            audit_device,
+        )
+        raw_operator_confusion = list(operator_integer_values[:72])
+        effective_operator_confusion = list(operator_integer_values[72:144])
+        operator_support = list(operator_integer_values[144:152])
+        operator_temperature_count = operator_integer_values[152]
+        operator_float_values = _distributed_sum_floats(
+            (
+                *operator_loss_sums,
+                operator_confidence_sum,
+                operator_entropy_sum,
+                operator_temperature_sum,
+            ),
+            audit_device,
+        )
+        operator_loss_sums = list(operator_float_values[:8])
+        (
+            operator_confidence_sum,
+            operator_entropy_sum,
+            operator_temperature_sum,
+        ) = operator_float_values[8:]
+
+        task_integer_values = _distributed_sum_integers(
+            (
+                *task_count_rows,
+                *task_component_rows,
+                *task_o1_rows,
+                *task_channel_positive,
+                *task_channel_negative,
+                *task_channel_masked,
+                *task_channel_tp,
+                *task_channel_fp,
+                *task_channel_fn,
+                e1_representable_occurrences,
+                e1_unrepresentable_occurrences,
+            ),
+            audit_device,
+        )
+        offset = 0
+
+        def take_ints(width: int) -> list[int]:
+            nonlocal offset
+            values = list(task_integer_values[offset : offset + width])
+            offset += width
+            return values
+
+        task_count_rows = take_ints(4)
+        task_component_rows = take_ints(3)
+        task_o1_rows = take_ints(2)
+        task_channel_positive = take_ints(7)
+        task_channel_negative = take_ints(7)
+        task_channel_masked = take_ints(7)
+        task_channel_tp = take_ints(7)
+        task_channel_fp = take_ints(7)
+        task_channel_fn = take_ints(7)
+        e1_representable_occurrences, e1_unrepresentable_occurrences = take_ints(2)
+
+        task_float_values = _distributed_sum_floats(
+            (
+                *task_count_loss_sums,
+                *task_count_abs_error_sums,
+                *task_component_loss_sums,
+                *task_o1_loss_sums,
+            ),
+            audit_device,
+        )
+        task_count_loss_sums = list(task_float_values[:4])
+        task_count_abs_error_sums = list(task_float_values[4:8])
+        task_component_loss_sums = list(task_float_values[8:11])
+        task_o1_loss_sums = list(task_float_values[11:13])
+
+        retrieval_global_values = _distributed_sum_integers(
+            (
+                retrieval_wrong_operator_rows,
+                retrieval_target_head_candidate_rows,
+                retrieval_no_target_head_candidate_rows,
+                retrieval_status_counts["no_candidate"],
+                retrieval_status_counts["no_positive"],
+                retrieval_status_counts["all_positive"],
+                retrieval_status_counts["valid_bag"],
+                retrieval_rescued_from_wrong_route_rows,
+                retrieval_legacy_valid_bag_rows,
+                retrieval_invalid_excluded_count,
+                retrieval_ineligible_excluded_count,
+                retrieval_causal_excluded_count,
+                sum(candidate_counts),
+                sum(positive_counts),
+                sum(negative_counts),
+                annotation_count_mismatch,
+            ),
+            audit_device,
+        )
+        (
+            retrieval_wrong_operator_rows,
+            retrieval_target_head_candidate_rows,
+            retrieval_no_target_head_candidate_rows,
+            retrieval_status_counts["no_candidate"],
+            retrieval_status_counts["no_positive"],
+            retrieval_status_counts["all_positive"],
+            retrieval_status_counts["valid_bag"],
+            retrieval_rescued_from_wrong_route_rows,
+            retrieval_legacy_valid_bag_rows,
+            retrieval_invalid_excluded_count,
+            retrieval_ineligible_excluded_count,
+            retrieval_causal_excluded_count,
+            retrieval_candidate_total,
+            retrieval_positive_total,
+            retrieval_negative_total,
+            annotation_count_mismatch,
+        ) = retrieval_global_values
 
         task = _official_weak_term(task_losses, anchor)
         operator = _official_weak_term(operator_losses, anchor)
@@ -1110,52 +1530,154 @@ class OfficialWeakTargetBuilder:
                 retrieval_candidate_counts=tuple(candidate_counts),
                 retrieval_positive_counts=tuple(positive_counts),
                 retrieval_negative_counts=tuple(negative_counts),
-                retrieval_wrong_operator_rows=retrieval_status_counts["wrong_operator"],
+                retrieval_wrong_operator_rows=retrieval_wrong_operator_rows,
+                retrieval_target_head_candidate_rows=retrieval_target_head_candidate_rows,
+                retrieval_no_target_head_candidate_rows=(retrieval_no_target_head_candidate_rows),
                 retrieval_no_candidate_rows=retrieval_status_counts["no_candidate"],
                 retrieval_no_positive_rows=retrieval_status_counts["no_positive"],
                 retrieval_all_positive_rows=retrieval_status_counts["all_positive"],
                 retrieval_valid_bag_rows=retrieval_status_counts["valid_bag"],
+                retrieval_rescued_from_wrong_route_rows=(retrieval_rescued_from_wrong_route_rows),
+                retrieval_legacy_valid_bag_rows=retrieval_legacy_valid_bag_rows,
+                retrieval_invalid_excluded_count=retrieval_invalid_excluded_count,
+                retrieval_ineligible_excluded_count=retrieval_ineligible_excluded_count,
+                retrieval_causal_excluded_count=retrieval_causal_excluded_count,
+                retrieval_candidate_total=retrieval_candidate_total,
+                retrieval_positive_total=retrieval_positive_total,
+                retrieval_negative_total=retrieval_negative_total,
                 annotation_count_mismatch=annotation_count_mismatch,
+                operator_diagnostics=OperatorDiagnosticAudit(
+                    raw_confusion=tuple(raw_operator_confusion),
+                    effective_confusion=tuple(effective_operator_confusion),
+                    class_loss_sums=tuple(operator_loss_sums),
+                    class_support=tuple(operator_support),
+                    confidence_sum=operator_confidence_sum,
+                    entropy_sum=operator_entropy_sum,
+                    temperature_sum=operator_temperature_sum,
+                    temperature_count=operator_temperature_count,
+                ),
+                task_diagnostics=TaskDiagnosticAudit(
+                    count_loss_sums=tuple(task_count_loss_sums),
+                    count_abs_error_sums=tuple(task_count_abs_error_sums),
+                    count_rows=tuple(task_count_rows),
+                    component_loss_sums=tuple(task_component_loss_sums),
+                    component_rows=tuple(task_component_rows),
+                    o1_loss_sums=tuple(task_o1_loss_sums),
+                    o1_rows=tuple(task_o1_rows),
+                    channel_positive_counts=tuple(task_channel_positive),
+                    channel_negative_counts=tuple(task_channel_negative),
+                    channel_masked_counts=tuple(task_channel_masked),
+                    channel_true_positive_counts=tuple(task_channel_tp),
+                    channel_false_positive_counts=tuple(task_channel_fp),
+                    channel_false_negative_counts=tuple(task_channel_fn),
+                    e1_representable_occurrences=e1_representable_occurrences,
+                    e1_unrepresentable_occurrences=e1_unrepresentable_occurrences,
+                ),
             ),
         )
 
 
-def _official_weak_task_loss(
+@dataclass(frozen=True, slots=True)
+class _TaskLossResult:
+    loss: Tensor
+    family_index: int
+    count_loss: Tensor
+    count_abs_error: float
+    component_index: int | None = None
+    component_loss: Tensor | None = None
+    phase_loss: Tensor | None = None
+    o1_subtype_index: int | None = None
+    channel_positive_counts: tuple[int, ...] = (0,) * 7
+    channel_negative_counts: tuple[int, ...] = (0,) * 7
+    channel_masked_counts: tuple[int, ...] = (0,) * 7
+    channel_true_positive_counts: tuple[int, ...] = (0,) * 7
+    channel_false_positive_counts: tuple[int, ...] = (0,) * 7
+    channel_false_negative_counts: tuple[int, ...] = (0,) * 7
+    e1_representable_occurrences: int = 0
+    e1_unrepresentable_occurrences: int = 0
+
+
+def _official_weak_task_result(
     observations: ObservationOutputs,
     row: int,
     label: OfficialWeakSupervision,
-) -> Tensor:
+) -> _TaskLossResult:
     target_count = torch.tensor(
         float(label.count), dtype=torch.float32, device=observations.o1.logits.device
     )
     if label.operator in (Operator.O1_SNAP, Operator.O1_DELTA):
-        return _robust_count_loss(observations.o1.count_prediction[row], target_count)
+        prediction = observations.o1.count_prediction[row]
+        count_loss = _robust_count_loss(prediction, target_count)
+        return _TaskLossResult(
+            loss=count_loss,
+            family_index=0,
+            count_loss=count_loss,
+            count_abs_error=float((prediction.detach().float() - target_count).abs().item()),
+            o1_subtype_index=(0 if label.operator is Operator.O1_SNAP else 1),
+        )
     if label.operator in (Operator.O2_UNIQUE, Operator.O2_GAIN):
-        return _robust_count_loss(observations.o2.count_prediction[row], target_count)
+        prediction = observations.o2.count_prediction[row]
+        count_loss = _robust_count_loss(prediction, target_count)
+        return _TaskLossResult(
+            loss=count_loss,
+            family_index=1,
+            count_loss=count_loss,
+            count_abs_error=float((prediction.detach().float() - target_count).abs().item()),
+        )
     if label.operator in (Operator.E1_ACTION, Operator.E1_TRANSIT):
         valid = observations.e1.valid_mask[row]
-        count_loss = _robust_count_loss(observations.e1.count_prediction[row], target_count)
+        prediction = observations.e1.count_prediction[row]
+        count_loss = _robust_count_loss(prediction, target_count)
         if not bool(valid.any().item()):
             dense = observations.e1.logits[row].float().sum() * 0.0
-            return (dense + count_loss) / 2.0
+            return _TaskLossResult(
+                loss=(dense + count_loss) / 2.0,
+                family_index=2,
+                count_loss=count_loss,
+                count_abs_error=float((prediction.detach().float() - target_count).abs().item()),
+                component_index=0,
+                component_loss=dense,
+            )
         logits = observations.e1.logits[row][valid].float()
         timestamps = observations.e1.timestamps[row][valid]
-        targets = torch.zeros_like(logits)
-        for point in label.occurrence_points:
-            if point > label.query_time:
-                continue
-            index = _voronoi_timestamp_index(timestamps, point)
-            if index is not None:
-                targets[index] = 1.0
-        dense = F.binary_cross_entropy_with_logits(logits, targets)
-        return (dense + count_loss) / 2.0
+        targets, channel_mask, representable, unrepresentable = _build_e1_fsm_targets(
+            timestamps,
+            label.occurrence_points,
+            label.query_time,
+        )
+        dense, stats = _balanced_dense_bce(logits, targets, channel_mask)
+        return _TaskLossResult(
+            loss=(dense + count_loss) / 2.0,
+            family_index=2,
+            count_loss=count_loss,
+            count_abs_error=float((prediction.detach().float() - target_count).abs().item()),
+            component_index=0,
+            component_loss=dense,
+            channel_positive_counts=(*stats.positive_counts, 0, 0, 0, 0),
+            channel_negative_counts=(*stats.negative_counts, 0, 0, 0, 0),
+            channel_masked_counts=(*stats.masked_counts, 0, 0, 0, 0),
+            channel_true_positive_counts=(*stats.true_positive_counts, 0, 0, 0, 0),
+            channel_false_positive_counts=(*stats.false_positive_counts, 0, 0, 0, 0),
+            channel_false_negative_counts=(*stats.false_negative_counts, 0, 0, 0, 0),
+            e1_representable_occurrences=representable,
+            e1_unrepresentable_occurrences=unrepresentable,
+        )
     if label.operator in (Operator.E2_PERIODIC, Operator.E2_EPISODE):
         valid = observations.e2.valid_mask[row]
-        count_loss = _robust_count_loss(observations.e2.count_prediction[row], target_count)
+        prediction = observations.e2.count_prediction[row]
+        count_loss = _robust_count_loss(prediction, target_count)
         if not bool(valid.any().item()):
             dense_zero = observations.e2.event_logits[row].float().sum() * 0.0
             phase_zero = observations.e2.phase_logits[row].float().sum() * 0.0
-            return (dense_zero + phase_zero + count_loss) / 3.0
+            return _TaskLossResult(
+                loss=(dense_zero + phase_zero + count_loss) / 3.0,
+                family_index=3,
+                count_loss=count_loss,
+                count_abs_error=float((prediction.detach().float() - target_count).abs().item()),
+                component_index=1,
+                component_loss=dense_zero,
+                phase_loss=phase_zero,
+            )
         event_logits = observations.e2.event_logits[row][valid].float()
         phase_logits = observations.e2.phase_logits[row][valid].float()
         timestamps = observations.e2.timestamps[row][valid]
@@ -1184,49 +1706,283 @@ def _official_weak_task_loss(
                     phase_targets[end_index] = 3
                     completed = timestamps > end
                     phase_targets[completed] = 3
-        dense = F.binary_cross_entropy_with_logits(event_logits, event_targets)
+        dense, stats = _balanced_dense_bce(
+            event_logits,
+            event_targets,
+            torch.ones_like(event_targets, dtype=torch.bool),
+        )
         phase = F.cross_entropy(phase_logits, phase_targets)
-        return (dense + phase + count_loss) / 3.0
+        return _TaskLossResult(
+            loss=(dense + phase + count_loss) / 3.0,
+            family_index=3,
+            count_loss=count_loss,
+            count_abs_error=float((prediction.detach().float() - target_count).abs().item()),
+            component_index=1,
+            component_loss=dense,
+            phase_loss=phase,
+            channel_positive_counts=(0, 0, 0, *stats.positive_counts),
+            channel_negative_counts=(0, 0, 0, *stats.negative_counts),
+            channel_masked_counts=(0, 0, 0, *stats.masked_counts),
+            channel_true_positive_counts=(0, 0, 0, *stats.true_positive_counts),
+            channel_false_positive_counts=(0, 0, 0, *stats.false_positive_counts),
+            channel_false_negative_counts=(0, 0, 0, *stats.false_negative_counts),
+        )
     raise ValueError(f"unsupported official weak operator: {label.operator}")
+
+
+@dataclass(frozen=True, slots=True)
+class _DenseBCEStats:
+    positive_counts: tuple[int, ...]
+    negative_counts: tuple[int, ...]
+    masked_counts: tuple[int, ...]
+    true_positive_counts: tuple[int, ...]
+    false_positive_counts: tuple[int, ...]
+    false_negative_counts: tuple[int, ...]
+
+
+def _balanced_dense_bce(
+    logits: Tensor,
+    targets: Tensor,
+    supervision_mask: Tensor,
+) -> tuple[Tensor, _DenseBCEStats]:
+    if logits.ndim != 2 or targets.shape != logits.shape:
+        raise ValueError("balanced dense BCE requires aligned [T, C] logits and targets")
+    if supervision_mask.shape != logits.shape or supervision_mask.dtype != torch.bool:
+        raise ValueError("balanced dense BCE supervision mask must be bool [T, C]")
+    channel_losses: list[Tensor] = []
+    positive_counts: list[int] = []
+    negative_counts: list[int] = []
+    masked_counts: list[int] = []
+    true_positive_counts: list[int] = []
+    false_positive_counts: list[int] = []
+    false_negative_counts: list[int] = []
+    for channel in range(logits.shape[1]):
+        mask = supervision_mask[:, channel]
+        channel_logits = logits[:, channel][mask]
+        channel_targets = targets[:, channel][mask]
+        positive = channel_targets >= 0.5
+        negative = ~positive
+        positive_count = int(positive.sum().item())
+        negative_count = int(negative.sum().item())
+        positive_counts.append(positive_count)
+        negative_counts.append(negative_count)
+        masked_counts.append(int((~mask).sum().item()))
+        if channel_logits.numel():
+            losses = F.binary_cross_entropy_with_logits(
+                channel_logits,
+                channel_targets,
+                reduction="none",
+            )
+            if positive_count and negative_count:
+                channel_losses.append(0.5 * losses[positive].mean() + 0.5 * losses[negative].mean())
+            else:
+                channel_losses.append(losses.mean())
+            predicted = channel_logits.detach() >= 0.0
+            true_positive_counts.append(int((predicted & positive).sum().item()))
+            false_positive_counts.append(int((predicted & negative).sum().item()))
+            false_negative_counts.append(int((~predicted & positive).sum().item()))
+        else:
+            true_positive_counts.append(0)
+            false_positive_counts.append(0)
+            false_negative_counts.append(0)
+    loss = torch.stack(channel_losses).mean() if channel_losses else logits.sum() * 0.0
+    return loss, _DenseBCEStats(
+        positive_counts=tuple(positive_counts),
+        negative_counts=tuple(negative_counts),
+        masked_counts=tuple(masked_counts),
+        true_positive_counts=tuple(true_positive_counts),
+        false_positive_counts=tuple(false_positive_counts),
+        false_negative_counts=tuple(false_negative_counts),
+    )
+
+
+def _build_e1_fsm_targets(
+    timestamps: Tensor,
+    occurrence_points: Sequence[float],
+    query_time: float,
+) -> tuple[Tensor, Tensor, int, int]:
+    """Build onset then completion+transition targets that the hard FSM can realize."""
+
+    targets = torch.zeros((timestamps.shape[0], 3), dtype=torch.float32, device=timestamps.device)
+    supervision_mask = torch.ones_like(targets, dtype=torch.bool)
+    claimed_positions: set[int] = set()
+    representable = 0
+    unrepresentable = 0
+    for point in sorted(point for point in occurrence_points if point <= query_time):
+        completion_index = _voronoi_timestamp_index(timestamps, point)
+        if completion_index is None:
+            continue
+        onset_index = completion_index - 1
+        if onset_index < 0:
+            supervision_mask[completion_index] = False
+            unrepresentable += 1
+            continue
+        if onset_index in claimed_positions or completion_index in claimed_positions:
+            supervision_mask[onset_index, 0] = False
+            supervision_mask[completion_index, 1:] = False
+            unrepresentable += 1
+            continue
+        targets[onset_index, 0] = 1.0
+        targets[completion_index, 1:] = 1.0
+        claimed_positions.update((onset_index, completion_index))
+        representable += 1
+    return targets, supervision_mask, representable, unrepresentable
+
+
+@dataclass(frozen=True, slots=True)
+class _RetrievalLossResult:
+    loss: Tensor | None
+    positive_count: int
+    candidate_count: int
+    negative_count: int
+    status: str
+    wrong_operator: bool
+    rescued_wrong_route: bool
+    legacy_valid_bag: bool
+    target_head_present_count: int
+    invalid_excluded_count: int
+    ineligible_excluded_count: int
+    causal_excluded_count: int
 
 
 def _official_weak_retrieval_loss(
     retrieval: RetrieverOutput,
     row: int,
     label: OfficialWeakSupervision,
-) -> tuple[Tensor | None, int, int, int, str]:
+) -> _RetrievalLossResult:
+    wrong_operator = retrieval.hard_operators[row] is not label.operator
+    target_head = OPERATOR_TO_HEAD_TYPE[label.operator]
+    if target_head is None:
+        raise ValueError("official weak Retrieval requires a supported target head")
+    _, head_codes, _, timestamps, time_ranges = retrieval.require_tensor_metadata()
+    head_mask = (
+        head_codes[row] == RETRIEVAL_HEAD_ORDER.index(target_head)
+    ) & retrieval.present_mask[row]
+    record_end = torch.where(
+        timestamps[row] >= 0.0,
+        timestamps[row],
+        time_ranges[row, :, 1],
+    )
+    official_causal = retrieval.present_mask[row] & (record_end <= label.query_time)
+    invalid_excluded = int((head_mask & ~retrieval.record_valid_mask[row]).sum().item())
+    valid_head = head_mask & retrieval.record_valid_mask[row]
+    ineligible_excluded = int((valid_head & ~retrieval.retrieval_eligible_mask[row]).sum().item())
+    eligible_head = valid_head & retrieval.retrieval_eligible_mask[row]
+    causal_excluded = int((eligible_head & ~official_causal).sum().item())
+    candidate_mask = eligible_head & official_causal
+    present_columns = torch.nonzero(candidate_mask, as_tuple=False).flatten()
+    candidate_count = int(present_columns.numel())
+    legacy_valid = _legacy_retrieval_bag_is_valid(retrieval, row, label)
+    target_head_present_count = int(head_mask.sum().item())
+    if not candidate_count:
+        return _RetrievalLossResult(
+            loss=None,
+            positive_count=0,
+            candidate_count=0,
+            negative_count=0,
+            status="no_candidate",
+            wrong_operator=wrong_operator,
+            rescued_wrong_route=False,
+            legacy_valid_bag=legacy_valid,
+            target_head_present_count=target_head_present_count,
+            invalid_excluded_count=invalid_excluded,
+            ineligible_excluded_count=ineligible_excluded,
+            causal_excluded_count=causal_excluded,
+        )
+    positive_mask = _retrieval_occurrence_mask(retrieval, row, label) & candidate_mask
+    positive_columns = torch.nonzero(positive_mask, as_tuple=False).flatten()
+    positive_count = int(positive_columns.numel())
+    if not positive_count:
+        return _RetrievalLossResult(
+            loss=None,
+            positive_count=0,
+            candidate_count=candidate_count,
+            negative_count=candidate_count,
+            status="no_positive",
+            wrong_operator=wrong_operator,
+            rescued_wrong_route=False,
+            legacy_valid_bag=legacy_valid,
+            target_head_present_count=target_head_present_count,
+            invalid_excluded_count=invalid_excluded,
+            ineligible_excluded_count=ineligible_excluded,
+            causal_excluded_count=causal_excluded,
+        )
+    negative_count = candidate_count - positive_count
+    if negative_count == 0:
+        return _RetrievalLossResult(
+            loss=None,
+            positive_count=positive_count,
+            candidate_count=candidate_count,
+            negative_count=0,
+            status="all_positive",
+            wrong_operator=wrong_operator,
+            rescued_wrong_route=False,
+            legacy_valid_bag=legacy_valid,
+            target_head_present_count=target_head_present_count,
+            invalid_excluded_count=invalid_excluded,
+            ineligible_excluded_count=ineligible_excluded,
+            causal_excluded_count=causal_excluded,
+        )
+    all_logits = retrieval.scores[row].index_select(0, present_columns).float()
+    positive_logits = retrieval.scores[row].index_select(0, positive_columns).float()
+    loss = torch.logsumexp(all_logits, dim=0) - torch.logsumexp(positive_logits, dim=0)
+    return _RetrievalLossResult(
+        loss=loss,
+        positive_count=positive_count,
+        candidate_count=candidate_count,
+        negative_count=negative_count,
+        status="valid_bag",
+        wrong_operator=wrong_operator,
+        rescued_wrong_route=wrong_operator,
+        legacy_valid_bag=legacy_valid,
+        target_head_present_count=target_head_present_count,
+        invalid_excluded_count=invalid_excluded,
+        ineligible_excluded_count=ineligible_excluded,
+        causal_excluded_count=causal_excluded,
+    )
+
+
+def _legacy_retrieval_bag_is_valid(
+    retrieval: RetrieverOutput,
+    row: int,
+    label: OfficialWeakSupervision,
+) -> bool:
     if retrieval.hard_operators[row] is not label.operator:
-        return None, 0, 0, 0, "wrong_operator"
-    candidate_mask = (
+        return False
+    mask = (
         retrieval.present_mask[row]
+        & retrieval.predicted_head_mask[row]
         & retrieval.record_valid_mask[row]
         & retrieval.retrieval_eligible_mask[row]
         & retrieval.causal_mask[row]
     )
-    present_columns = torch.nonzero(candidate_mask, as_tuple=False).flatten()
-    candidate_count = int(present_columns.numel())
-    if not candidate_count:
-        return None, 0, 0, 0, "no_candidate"
-    positive_columns: list[int] = []
-    for column_tensor in present_columns:
-        column = int(column_tensor.item())
-        record = retrieval.candidate_records[row][column]
-        if record is None:
-            raise ValueError("present Retriever candidate is missing its typed record")
-        if _record_matches_causal_occurrence(record, label):
-            positive_columns.append(column)
-    if not positive_columns:
-        return None, 0, candidate_count, candidate_count, "no_positive"
-    negative_count = candidate_count - len(positive_columns)
-    if negative_count == 0:
-        return None, len(positive_columns), candidate_count, 0, "all_positive"
-    all_logits = retrieval.scores[row].index_select(0, present_columns).float()
-    positive_index = torch.tensor(
-        positive_columns, dtype=torch.int64, device=retrieval.scores.device
-    )
-    positive_logits = retrieval.scores[row].index_select(0, positive_index).float()
-    loss = torch.logsumexp(all_logits, dim=0) - torch.logsumexp(positive_logits, dim=0)
-    return loss, len(positive_columns), candidate_count, negative_count, "valid_bag"
+    positives = int((_retrieval_occurrence_mask(retrieval, row, label) & mask).sum().item())
+    count = int(mask.sum().item())
+    return bool(positives > 0 and positives < count)
+
+
+def _retrieval_occurrence_mask(
+    retrieval: RetrieverOutput,
+    row: int,
+    label: OfficialWeakSupervision,
+) -> Tensor:
+    _, _, _, candidate_timestamps, candidate_time_ranges = retrieval.require_tensor_metadata()
+    timestamps = candidate_timestamps[row]
+    ranges = candidate_time_ranges[row]
+    is_point = timestamps >= 0.0
+    matched = torch.zeros_like(retrieval.present_mask[row])
+    for point in label.occurrence_points:
+        if point > label.query_time:
+            continue
+        matched |= is_point & ((timestamps - point).abs() <= 0.5)
+        matched |= ~is_point & (ranges[:, 0] <= point) & (point <= ranges[:, 1])
+    for start, end in label.occurrence_intervals:
+        if start > label.query_time:
+            continue
+        causal_end = min(end, label.query_time)
+        matched |= is_point & (timestamps >= start) & (timestamps <= causal_end)
+        matched |= ~is_point & (ranges[:, 0] <= causal_end) & (start <= ranges[:, 1])
+    return matched & retrieval.present_mask[row]
 
 
 def _record_matches_causal_occurrence(
@@ -1303,6 +2059,26 @@ def _official_weak_term(losses: Sequence[Tensor], anchor: Tensor) -> OfficialWea
     return OfficialWeakLossTerm(value=value, valid_rows=len(values))
 
 
+def _distributed_sum_integers(
+    values: Sequence[int],
+    device: torch.device,
+) -> tuple[int, ...]:
+    tensor = torch.tensor(tuple(values), dtype=torch.int64, device=device)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+    return tuple(int(value) for value in tensor.cpu().tolist())
+
+
+def _distributed_sum_floats(
+    values: Sequence[float],
+    device: torch.device,
+) -> tuple[float, ...]:
+    tensor = torch.tensor(tuple(values), dtype=torch.float64, device=device)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+    return tuple(float(value) for value in tensor.cpu().tolist())
+
+
 __all__ = [
     "E1TargetLabels",
     "E2TargetLabels",
@@ -1313,10 +2089,12 @@ __all__ = [
     "OfficialWeakTargetBuilder",
     "O1TargetLabels",
     "O2TargetLabels",
+    "OperatorDiagnosticAudit",
     "AnswerTargetLabels",
     "QueryTargetLabels",
     "RetrievalTargetLabels",
     "StageATargetBatch",
     "StageATargetBuilder",
     "TargetProvenance",
+    "TaskDiagnosticAudit",
 ]

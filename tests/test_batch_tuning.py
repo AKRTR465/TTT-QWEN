@@ -19,9 +19,12 @@ def test_a2_selects_largest_sequential_batch_with_five_percent_gain() -> None:
 
 
 def test_a5_requires_batch_two_to_pass_before_batch_four() -> None:
-    assert select_visual_batch_size(
-        "a5",
-        (_trial(1, 10.0), _trial(2, 9.8), _trial(4, 8.0)),
-    ) == 1
+    assert (
+        select_visual_batch_size(
+            "a5",
+            (_trial(1, 10.0), _trial(2, 9.8), _trial(4, 8.0)),
+        )
+        == 1
+    )
     with pytest.raises(ValueError, match="baseline"):
         select_visual_batch_size("a5", (_trial(1, 10.0, free=8.0),))

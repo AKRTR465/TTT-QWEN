@@ -53,7 +53,7 @@ from ttt_svcbench_qwen.model import (
     StateTTTModel,
     TrajectoryRuntimeState,
 )
-from ttt_svcbench_qwen.state_bank import StructuredStateBank
+from ttt_svcbench_qwen.state_bank import StructuredStateBank, TensorizedRetrievalHistory
 from ttt_svcbench_qwen.state_encoder import TemporalCache
 from ttt_svcbench_qwen.state_reader import ReaderResult
 
@@ -598,6 +598,14 @@ class PerVideoRuntimeManager:
                     hot_device=self.hot_device,
                     hot_cache_enabled=self.hot_cache_enabled,
                 ),
+                retrieval_history=TensorizedRetrievalHistory(
+                    video_id,
+                    trajectory_id,
+                    capacity_per_head=self.state_bank.config.retrieval_history_capacity_per_head,
+                    source_dim=self.state_bank.config.retrieval_history_source_dim,
+                    dtype=next(self.state_bank.semantic_projector.parameters()).dtype,
+                    device=next(self.state_bank.semantic_projector.parameters()).device,
+                ),
                 reader_audit=(),
                 released=False,
             )
@@ -873,6 +881,7 @@ class PerVideoRuntimeManager:
                         runtime_state=BatchRuntimeState((runtime,)),
                         bank_states=(runtime.state_bank,),
                         inference=True,
+                        retrieval_history_write_enabled=False,
                     ),
                     lifecycle,
                 )
@@ -908,6 +917,8 @@ class PerVideoRuntimeManager:
         before_snapshot = self._snapshot(runtime, content=True)
         released_bank = self.state_bank.release(runtime.state_bank)
         released_identity = self.identity_bank.release(runtime.identity_bank)
+        if runtime.retrieval_history is not None:
+            runtime.retrieval_history.release()
         owner = RuntimeOwner((runtime.video_id,), (runtime.trajectory_id,))
         released = TrajectoryRuntimeState(
             owner=owner,
@@ -923,6 +934,7 @@ class PerVideoRuntimeManager:
             e2_state=None,
             state_bank=released_bank,
             identity_bank=released_identity,
+            retrieval_history=runtime.retrieval_history,
             reader_audit=(),
             released=True,
         )
@@ -1079,6 +1091,7 @@ def runtime_boundary_stamp(state: TrajectoryRuntimeState) -> RuntimeBoundaryStam
         state.e2_state,
         state.state_bank,
         state.identity_bank,
+        state.retrieval_history,
         state.online_overlap_memory,
     )
     return RuntimeBoundaryStamp(
@@ -1341,16 +1354,18 @@ def _hard_state_stamp(state: TrajectoryRuntimeState) -> tuple[object, ...]:
         state.e2_state,
         state.state_bank,
         state.identity_bank,
+        state.retrieval_history,
         state.reader_audit,
         state.released,
     )
     return (
-        tuple(id(value) for value in values[3:9]),
+        tuple(id(value) for value in values[3:10]),
         state.state_bank.version,
         state.identity_bank.version,
+        None if state.retrieval_history is None else state.retrieval_history.version,
         _boundary_tensor_versions(values),
         values[:3],
-        values[9:],
+        values[10:],
     )
 
 
@@ -1436,6 +1451,27 @@ def _hash_value(digest: _Digest, value: object) -> None:
         if value.device.type != "meta":
             raw = value.detach().to(device="cpu").contiguous().view(torch.uint8)
             digest.update(raw.numpy().tobytes())
+        return
+    if isinstance(value, TensorizedRetrievalHistory):
+        for item in (
+            value.video_id,
+            value.trajectory_id,
+            value.capacity_per_head,
+            value.source_dim,
+            value.sources,
+            value.sequence_ids,
+            value.operator_codes,
+            value.timestamps,
+            value.time_ranges,
+            value.valid_mask,
+            value.eligible_mask,
+            value.sizes,
+            value.write_ptrs,
+            value.next_sequence,
+            value.version,
+            value.released,
+        ):
+            _hash_value(digest, item)
         return
     if value is None or isinstance(value, (str, int, float, bool, Path)):
         digest.update(repr(value).encode("utf-8"))
@@ -1707,9 +1743,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "history_feature_set_count": 0,
             "state_query_frame_count": int(state_materialized.frames.shape[0]),
             "answer_query_frame_count": int(answer_materialized.frames.shape[0]),
-            "state_query_visual_token_count": int(
-                state_materialized.pixel_values_videos.shape[0]
-            ),
+            "state_query_visual_token_count": int(state_materialized.pixel_values_videos.shape[0]),
             "answer_query_visual_token_count": int(
                 answer_materialized.pixel_values_videos.shape[0]
             ),

@@ -78,11 +78,15 @@ class PreprocessFingerprint:
             raise ValueError("preprocess fingerprint interval is invalid")
         if self.maximum_frames < 2 or self.sample_fps <= 0.0:
             raise ValueError("preprocess fingerprint frame settings are invalid")
-        if self.observation_role not in {
-            "support",
-            "state_query",
-            "answer_query",
-        } or not self.frame_sampling:
+        if (
+            self.observation_role
+            not in {
+                "support",
+                "state_query",
+                "answer_query",
+            }
+            or not self.frame_sampling
+        ):
             raise ValueError("preprocess fingerprint observation role/policy is invalid")
 
     def canonical_json(self) -> str:

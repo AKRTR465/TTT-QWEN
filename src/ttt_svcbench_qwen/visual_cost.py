@@ -136,9 +136,16 @@ class VisualCostRecord:
             raise ValueError("visual cost measurement_source is invalid")
 
     @property
-    def sort_key(self) -> tuple[float, int, int]:
+    def history_write_units(self) -> int:
+        support_tokens = self.visual_tokens[: self.support_count]
+        o2_proxy = sum(max(1, min(32, value // 256)) for value in support_tokens)
+        return self.support_count * 3 + o2_proxy
+
+    @property
+    def sort_key(self) -> tuple[float, int, int, int]:
         return (
             self.predicted_total_seconds,
+            self.history_write_units,
             self.total_visual_tokens,
             self.maximum_visual_tokens,
         )
@@ -167,18 +174,12 @@ class EpochBoundaryCostEMA:
             raise ValueError("runtime cost EMA epoch must advance monotonically")
         if epoch == self.epoch:
             return
-        local = {
-            key: (sum(values), len(values)) for key, values in self._pending.items()
-        }
+        local = {key: (sum(values), len(values)) for key, values in self._pending.items()}
         gathered: list[dict[str, tuple[float, int]]]
         if dist.is_available() and dist.is_initialized():
             gathered_objects: list[object] = [None] * dist.get_world_size()
             dist.all_gather_object(gathered_objects, local)
-            gathered = [
-                value
-                for value in gathered_objects
-                if isinstance(value, dict)
-            ]
+            gathered = [value for value in gathered_objects if isinstance(value, dict)]
         else:
             gathered = [local]
         merged: dict[str, tuple[float, int]] = {}
@@ -190,10 +191,9 @@ class EpochBoundaryCostEMA:
             for key, (total, count) in merged.items():
                 if count:
                     measured = total / count
-                    self._values[key] = (
-                        (1.0 - self.alpha) * self._values[key]
-                        + self.alpha * measured
-                    )
+                    self._values[key] = (1.0 - self.alpha) * self._values[
+                        key
+                    ] + self.alpha * measured
         if dist.is_available() and dist.is_initialized():
             payload: list[object] = [self._values if dist.get_rank() == 0 else None]
             dist.broadcast_object_list(payload, src=0)
@@ -294,9 +294,7 @@ def load_visual_cost_index(
             differing = sorted(
                 key for key in FINGERPRINT_FIELDS if fingerprint[key] != expected[key]
             )
-            raise ValueError(
-                "visual cost fingerprint mismatch: " + ", ".join(differing)
-            )
+            raise ValueError("visual cost fingerprint mismatch: " + ", ".join(differing))
     rows = raw["records"]
     if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
         raise ValueError("visual cost records must be a list")
@@ -306,9 +304,7 @@ def load_visual_cost_index(
         if record.record_id in result:
             raise ValueError(f"duplicate visual cost record: {record.record_id}")
         if require_runtime_measurements and record.measurement_source != "runtime_trace":
-            raise ValueError(
-                f"visual cost record lacks runtime measurement: {record.record_id}"
-            )
+            raise ValueError(f"visual cost record lacks runtime measurement: {record.record_id}")
         result[record.record_id] = record
     if not result:
         raise ValueError("visual cost index must contain at least one record")
@@ -330,27 +326,19 @@ def _parse_visual_cost_record(value: object) -> VisualCostRecord:
             query_count=_integer(value["query_count"], "query_count"),
             visual_tokens=_integer_tuple(value["visual_tokens"], "visual_tokens"),
             total_visual_tokens=_integer(value["total_visual_tokens"], "total_visual_tokens"),
-            maximum_visual_tokens=_integer(
-                value["maximum_visual_tokens"], "maximum_visual_tokens"
-            ),
+            maximum_visual_tokens=_integer(value["maximum_visual_tokens"], "maximum_visual_tokens"),
             query_frame_count=_integer(value["query_frame_count"], "query_frame_count"),
-            query_visual_tokens=_integer(
-                value["query_visual_tokens"], "query_visual_tokens"
-            ),
+            query_visual_tokens=_integer(value["query_visual_tokens"], "query_visual_tokens"),
             source_codec=_string(value["source_codec"], "source_codec"),
             source_width=_integer(value["source_width"], "source_width"),
             source_height=_integer(value["source_height"], "source_height"),
             keyframe_interval_seconds=_optional_number(
                 value["keyframe_interval_seconds"], "keyframe_interval_seconds"
             ),
-            support_cache_bytes=_integer(
-                value["support_cache_bytes"], "support_cache_bytes"
-            ),
+            support_cache_bytes=_integer(value["support_cache_bytes"], "support_cache_bytes"),
             decode_seconds=_number(value["decode_seconds"], "decode_seconds"),
             processor_seconds=_number(value["processor_seconds"], "processor_seconds"),
-            preparation_seconds=_number(
-                value["preparation_seconds"], "preparation_seconds"
-            ),
+            preparation_seconds=_number(value["preparation_seconds"], "preparation_seconds"),
             training_seconds=_number(value["training_seconds"], "training_seconds"),
             vit_seconds=_number(value["vit_seconds"], "vit_seconds"),
             query_seconds=_number(value["query_seconds"], "query_seconds"),
@@ -360,9 +348,7 @@ def _parse_visual_cost_record(value: object) -> VisualCostRecord:
             predicted_total_seconds=_number(
                 value["predicted_total_seconds"], "predicted_total_seconds"
             ),
-            measurement_source=_string(
-                value["measurement_source"], "measurement_source"
-            ),
+            measurement_source=_string(value["measurement_source"], "measurement_source"),
         )
     except KeyError as error:  # pragma: no cover - exact field set above
         raise ValueError("visual cost record is incomplete") from error

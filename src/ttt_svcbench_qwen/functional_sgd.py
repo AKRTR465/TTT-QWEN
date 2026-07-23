@@ -169,6 +169,7 @@ class FunctionalSGDResult:
         if self.optimizer_state.attempted_update_count != expected_attempts:
             raise ValueError("optimizer attempts must equal accepted updates plus skips")
 
+
 def initialize_optimizer_state(config: InnerSGDConfig) -> OptimizerRuntimeState:
     """Create empty runtime counters from the frozen stateless-SGD config."""
 

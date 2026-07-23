@@ -14,9 +14,7 @@ import torch
 from torch import Tensor
 
 from ttt_svcbench_qwen.identity_bank import (
-    ConfirmedIdentity,
     IdentityBank,
-    IdentityDecisionStatus,
     IdentityObservationDecision,
 )
 from ttt_svcbench_qwen.model import (
@@ -34,16 +32,19 @@ from ttt_svcbench_qwen.observation_heads import (
 from ttt_svcbench_qwen.query_encoder import (
     OPERATOR_TO_EVENT_KIND,
     OPERATOR_TO_HEAD_TYPE,
+    OPERATORS,
     Operator,
     QueryEncoderOutput,
 )
+from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase
 from ttt_svcbench_qwen.state_bank import (
+    RETRIEVAL_HEAD_ORDER,
     E1EventKind,
     E2EventKind,
     HeadType,
-    StateBankRuntimeState,
-    StateRecord,
+    RetrievalHistoryAppendBatch,
     StructuredStateBank,
+    TensorizedRetrievalHistory,
 )
 from ttt_svcbench_qwen.state_encoder import (
     SpatialEncoderOutput,
@@ -252,6 +253,14 @@ class StageABankWriter:
                     e2_state=None,
                     state_bank=bank,
                     identity_bank=identity,
+                    retrieval_history=TensorizedRetrievalHistory(
+                        video_id,
+                        trajectory_id,
+                        capacity_per_head=self.state_bank.config.retrieval_history_capacity_per_head,
+                        source_dim=self.state_bank.config.retrieval_history_source_dim,
+                        dtype=next(self.state_bank.semantic_projector.parameters()).dtype,
+                        device=next(self.state_bank.semantic_projector.parameters()).device,
+                    ),
                 )
                 for video_id, trajectory_id, bank, identity in zip(
                     owner.video_ids,
@@ -296,7 +305,18 @@ class StageABankWriter:
         skipped: list[int] = []
         for row, operator in enumerate(query.hard_operators):
             head = OPERATOR_TO_HEAD_TYPE[operator]
-            state = next_banks[row]
+            with trace_cuda_phase("retrieval_history_write"):
+                if not request.retrieval_history_write_enabled:
+                    state = next_banks[row]
+                else:
+                    history = runtime.rows[row].retrieval_history
+                    if history is None:
+                        raise RuntimeError("tensor retrieval backend requires an episode ring")
+                    self._append_all_head_retrieval_history_tensorized(
+                        history, observations, soft, row=row
+                    )
+                    state = next_banks[row]
+            next_banks[row] = state
             if head is HeadType.O1:
                 mask = observations.o1.valid_mask[row]
                 if not bool(mask.any().item()):
@@ -315,14 +335,6 @@ class StageABankWriter:
                     set_baseline=operator is Operator.O1_DELTA and not has_o1,
                     slot_overflow_count=int(spatial.active_slot_overflow_count[row].item()),
                 )
-                next_banks[row] = self.state_bank.append_retrieval_history(
-                    next_banks[row],
-                    head_type=head,
-                    operator=operator,
-                    semantic_source=soft.o1_sources[row],
-                    timestamp=None,
-                    time_range=_time_range(observations.o1.timestamps[row], mask),
-                )
             elif head is HeadType.O2:
                 result = self.identity_bank.update_row(
                     next_identities[row],
@@ -336,23 +348,6 @@ class StageABankWriter:
                 next_identities[row] = result.identity_state
                 next_banks[row] = result.state_bank_state
                 identity_decisions[row] = result.decisions
-                for decision in result.decisions:
-                    if decision.status is not IdentityDecisionStatus.PROMOTED:
-                        continue
-                    if decision.identity_id is None:
-                        raise ValueError("promoted O2 decision requires an identity ID")
-                    confirmed = _confirmed_record(next_banks[row], decision.identity_id)
-                    payload = cast(ConfirmedIdentity, confirmed.payload)
-                    point = payload.first_seen == payload.last_seen
-                    next_banks[row] = self.state_bank.append_retrieval_history(
-                        next_banks[row],
-                        head_type=head,
-                        operator=operator,
-                        semantic_source=soft.o2_sources[row, decision.slot_index],
-                        timestamp=payload.first_seen if point else None,
-                        time_range=None if point else (payload.first_seen, payload.last_seen),
-                        lifecycle_id=payload.identity_id,
-                    )
             elif head is HeadType.E1:
                 event_kind = OPERATOR_TO_EVENT_KIND[operator]
                 if not isinstance(event_kind, E1EventKind):
@@ -364,16 +359,6 @@ class StageABankWriter:
                     event_kind=event_kind,
                     row=row,
                 )
-                mask = observations.e1.valid_mask[row]
-                if bool(mask.any().item()):
-                    next_banks[row] = self.state_bank.append_retrieval_history(
-                        next_banks[row],
-                        head_type=head,
-                        operator=operator,
-                        semantic_source=soft.e1_sources[row],
-                        timestamp=None,
-                        time_range=_time_range(observations.e1.timestamps[row], mask),
-                    )
             elif head is HeadType.E2:
                 event_kind = OPERATOR_TO_EVENT_KIND[operator]
                 if not isinstance(event_kind, E2EventKind):
@@ -385,16 +370,6 @@ class StageABankWriter:
                     event_kind=event_kind,
                     row=row,
                 )
-                mask = observations.e2.valid_mask[row]
-                if bool(mask.any().item()):
-                    next_banks[row] = self.state_bank.append_retrieval_history(
-                        next_banks[row],
-                        head_type=head,
-                        operator=operator,
-                        semantic_source=soft.e2_sources[row],
-                        timestamp=None,
-                        time_range=_time_range(observations.e2.timestamps[row], mask),
-                    )
             else:
                 skipped.append(row)
 
@@ -439,6 +414,102 @@ class StageABankWriter:
             bank_states=tuple(next_banks),
             audit=audit,
             soft_write=soft,
+        )
+
+    def _append_all_head_retrieval_history_tensorized(
+        self,
+        history: TensorizedRetrievalHistory,
+        observations: ObservationOutputs,
+        soft: StageASoftWriteOutput,
+        *,
+        row: int,
+    ) -> None:
+        """Collect O1/all-O2/E1/E2 once and issue a single vectorized ring write."""
+
+        device = soft.o1_sources.device
+        o1_present = soft.o1_present_mask[row : row + 1]
+        o2_present = soft.o2_present_mask[row]
+        e1_present = soft.e1_present_mask[row].any().reshape(1)
+        e2_present = soft.e2_present_mask[row].any().reshape(1)
+        present = torch.cat((o1_present, o2_present, e1_present, e2_present))
+        sources = torch.cat(
+            (
+                soft.o1_sources[row : row + 1],
+                soft.o2_sources[row],
+                soft.e1_sources[row : row + 1],
+                soft.e2_sources[row : row + 1],
+            ),
+            dim=0,
+        )
+        o2_width = soft.o2_sources.shape[1]
+        head_codes = torch.cat(
+            (
+                torch.full(
+                    (1,), RETRIEVAL_HEAD_ORDER.index(HeadType.O1), dtype=torch.int64, device=device
+                ),
+                torch.full(
+                    (o2_width,),
+                    RETRIEVAL_HEAD_ORDER.index(HeadType.O2),
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                torch.full(
+                    (1,), RETRIEVAL_HEAD_ORDER.index(HeadType.E1), dtype=torch.int64, device=device
+                ),
+                torch.full(
+                    (1,), RETRIEVAL_HEAD_ORDER.index(HeadType.E2), dtype=torch.int64, device=device
+                ),
+            )
+        )
+        operator_codes = torch.cat(
+            (
+                torch.full(
+                    (1,), OPERATORS.index(Operator.O1_SNAP), dtype=torch.int64, device=device
+                ),
+                torch.full(
+                    (o2_width,),
+                    OPERATORS.index(Operator.O2_UNIQUE),
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                torch.full(
+                    (1,), OPERATORS.index(Operator.E1_ACTION), dtype=torch.int64, device=device
+                ),
+                torch.full(
+                    (1,), OPERATORS.index(Operator.E2_EPISODE), dtype=torch.int64, device=device
+                ),
+            )
+        )
+        timestamps = torch.cat(
+            (
+                torch.full((1,), -1.0, dtype=torch.float64, device=device),
+                observations.o2.timestamps[row].to(dtype=torch.float64),
+                torch.full((2,), -1.0, dtype=torch.float64, device=device),
+            )
+        )
+        time_ranges = torch.full((o2_width + 3, 2), -1.0, dtype=torch.float64, device=device)
+        time_ranges[0] = _time_range_tensor(
+            observations.o1.timestamps[row], observations.o1.valid_mask[row]
+        )
+        time_ranges[o2_width + 1] = _time_range_tensor(
+            observations.e1.timestamps[row], observations.e1.valid_mask[row]
+        )
+        time_ranges[o2_width + 2] = _time_range_tensor(
+            observations.e2.timestamps[row], observations.e2.valid_mask[row]
+        )
+        indices = torch.nonzero(present, as_tuple=False).flatten()
+        count = indices.numel()
+        valid = torch.ones((count,), dtype=torch.bool, device=device)
+        history.append_many(
+            RetrievalHistoryAppendBatch(
+                sources=sources.index_select(0, indices),
+                head_codes=head_codes.index_select(0, indices),
+                operator_codes=operator_codes.index_select(0, indices),
+                timestamps=timestamps.index_select(0, indices),
+                time_ranges=time_ranges.index_select(0, indices),
+                valid_mask=valid,
+                eligible_mask=valid.clone(),
+            )
         )
 
     def _project_soft(
@@ -495,21 +566,8 @@ class StageABankWriter:
         )
 
 
-def _time_range(timestamps: Tensor, mask: Tensor) -> tuple[float, float]:
-    selected = timestamps[mask]
-    if not selected.numel():
-        raise ValueError("retrieval history requires at least one valid timestamp")
-    return float(selected.min().item()), float(selected.max().item())
-
-
-def _confirmed_record(state: StateBankRuntimeState, identity_id: str) -> StateRecord:
-    matches = [
-        record
-        for record in state.records
-        if isinstance(record.payload, ConfirmedIdentity)
-        and record.payload.identity_id == identity_id
-        and record.valid
-    ]
-    if len(matches) != 1:
-        raise ValueError("promoted identity must map to one valid Confirmed StateRecord")
-    return matches[0]
+def _time_range_tensor(timestamps: Tensor, mask: Tensor) -> Tensor:
+    selected = timestamps.masked_fill(~mask, float("inf"))
+    start = selected.min().to(dtype=torch.float64)
+    end = timestamps.masked_fill(~mask, float("-inf")).max().to(dtype=torch.float64)
+    return torch.stack((start, end))

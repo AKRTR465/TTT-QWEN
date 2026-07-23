@@ -429,9 +429,7 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             raise RuntimeError("official-weak balance buffers must share one device")
         for value, dtype, shape, name in expected:
             if value.dtype != dtype or tuple(value.shape) != shape:
-                raise RuntimeError(
-                    f"official-weak {name} must remain {dtype} with shape {shape}"
-                )
+                raise RuntimeError(f"official-weak {name} must remain {dtype} with shape {shape}")
         if self.ema_values.device.type == "meta":
             return
         if not bool(torch.isfinite(self.ema_values).all()) or not bool(
@@ -530,9 +528,7 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         loss_valid = global_counts > 0.0
         gradient_valid = global_gradient_counts > 0.0
         loss_update_valid = loss_valid & torch.isfinite(global_sums)
-        gradient_update_valid = gradient_valid & torch.isfinite(
-            global_gradient_squares
-        )
+        gradient_update_valid = gradient_valid & torch.isfinite(global_gradient_squares)
         nan = torch.full((), float("nan"), dtype=torch.float64, device=device)
         current_means = torch.where(
             loss_valid,
@@ -617,9 +613,7 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         if self.training:
             self._update_ema(current_means, loss_update_valid)
             if measure_gradients:
-                self._update_gradient_ema(
-                    current_gradient_rms, gradient_update_valid
-                )
+                self._update_gradient_ema(current_gradient_rms, gradient_update_valid)
         gradient_ema_rms = self._gradient_ema_for_audit()
         term_gradient_ema_rms = torch.stack(gradient_ema_rms)
         weighted_factor = float(self.config.group_weight) * group_guard

@@ -532,6 +532,7 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
     assert config.retriever.aggregate_time_policy == "causal_availability_only_window_in_reader"
     assert config.retriever.atomic_window_boundary == "closed"
     assert config.retriever.metrics_policy == "offline_ground_truth_runtime_label_free"
+    assert config.retriever.score_chunk_size == 256
     assert config.retriever.top_k is None
     assert config.retriever.ann_enabled is False
     assert config.state_resampler.num_queries == 16

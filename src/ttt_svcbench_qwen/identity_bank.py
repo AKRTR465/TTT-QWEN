@@ -234,6 +234,7 @@ class HotCacheEntry:
         if self.identity_prototype.requires_grad or self.identity_prototype.grad_fn is not None:
             raise ValueError("Hot Cache prototypes must be detached")
 
+
 @dataclass(frozen=True, slots=True)
 class IdentityBankAuditEntry:
     action: str

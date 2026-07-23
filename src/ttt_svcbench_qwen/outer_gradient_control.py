@@ -45,6 +45,16 @@ class OuterGradientAudit:
     nonfinite_loss_sources: tuple[str, ...]
     groups: tuple[GroupGradientAudit, ...]
 
+    def group(self, name: str) -> GroupGradientAudit:
+        """Return one named optimizer-group audit or fail closed on topology drift."""
+
+        matches = tuple(group for group in self.groups if group.name == name)
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Outer gradient audit requires exactly one {name!r} group; found {len(matches)}"
+            )
+        return matches[0]
+
     def metrics(self) -> tuple[tuple[str, float], ...]:
         values: list[tuple[str, float]] = [
             ("outer_grad/attempted_updates", float(self.attempted_update_count)),
@@ -145,9 +155,7 @@ class OuterGradientController:
             )
 
         self.attempted_update_count += 1
-        loss_nonfinite, local_loss_nonfinite = self._synchronize_loss_nonfinite(
-            zero, averaged
-        )
+        loss_nonfinite, local_loss_nonfinite = self._synchronize_loss_nonfinite(zero, averaged)
         if loss_nonfinite:
             self._inject_loss_overflow(averaged)
         group_nonfinite = tuple(
@@ -168,9 +176,7 @@ class OuterGradientController:
             sources: tuple[str, ...] = ()
             if loss_nonfinite:
                 sources = (
-                    self._materialize_loss_sources()
-                    if local_loss_nonfinite
-                    else ("remote_rank",)
+                    self._materialize_loss_sources() if local_loss_nonfinite else ("remote_rank",)
                 )
                 warnings.warn(
                     "nonfinite Outer loss detected; DeepSpeed overflow will skip the complete "
@@ -260,9 +266,7 @@ class OuterGradientController:
             attempted_update_count=self.attempted_update_count,
             successful_update_count=self.successful_update_count,
             skipped_update_count=self.skipped_update_count,
-            within_initial_audit_window=(
-                self.successful_update_count <= self.config.audit_steps
-            ),
+            within_initial_audit_window=(self.successful_update_count <= self.config.audit_steps),
             skipped_nonfinite=skipped_nonfinite,
             skipped_nonfinite_loss=skipped_nonfinite_loss,
             nonfinite_loss_sources=nonfinite_loss_sources,
@@ -273,9 +277,7 @@ class OuterGradientController:
         self._loss_nonfinite_sources.clear()
         return audit
 
-    def _synchronize_loss_nonfinite(
-        self, zero: Any, averaged: object
-    ) -> tuple[bool, bool]:
+    def _synchronize_loss_nonfinite(self, zero: Any, averaged: object) -> tuple[bool, bool]:
         device = self._collective_device(zero, averaged)
         flag = torch.zeros((), dtype=torch.int64, device=device)
         if self._loss_nonfinite is not None:
@@ -292,9 +294,7 @@ class OuterGradientController:
     def _materialize_loss_sources(self) -> tuple[str, ...]:
         sources = tuple(
             sorted(
-                source
-                for source, flag in self._loss_nonfinite_sources.items()
-                if bool(flag.item())
+                source for source, flag in self._loss_nonfinite_sources.items() if bool(flag.item())
             )
         )
         if not sources:
@@ -324,9 +324,7 @@ class OuterGradientController:
         )
 
     @staticmethod
-    def _nonfinite_group_audit(
-        group: tuple[str, dict[str, Any]], count: int
-    ) -> GroupGradientAudit:
+    def _nonfinite_group_audit(group: tuple[str, dict[str, Any]], count: int) -> GroupGradientAudit:
         name, values = group
         return GroupGradientAudit(
             name=name,

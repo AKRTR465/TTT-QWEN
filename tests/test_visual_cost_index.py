@@ -88,7 +88,7 @@ def test_visual_cost_schema4_loads_measured_records_and_fingerprint(tmp_path: Pa
         require_runtime_measurements=True,
     )
 
-    assert loaded["q1"].sort_key == (0.93, 96, 48)
+    assert loaded["q1"].sort_key == (0.93, loaded["q1"].history_write_units, 96, 48)
     changed = dict(fingerprint, visual_batch_size=2)
     with pytest.raises(ValueError, match="visual_batch_size"):
         load_visual_cost_index(path, expected_fingerprint=changed)

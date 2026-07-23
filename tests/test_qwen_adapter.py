@@ -909,6 +909,7 @@ def test_video_interception_scope_rejects_reentry_but_allows_multiple_native_cal
     assert "get_video_features" not in vars(owner)
     assert wrapper._hook_active is False
 
+
 def test_hook_and_capture_are_restored_after_upstream_failure() -> None:
     model = make_tiny_hf_model()
     owner = model.model
