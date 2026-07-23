@@ -20,7 +20,6 @@ from ttt_svcbench_qwen.config import CalibrationStatus, ProjectConfig, Retriever
 from ttt_svcbench_qwen.query_encoder import (
     OPERATOR_TO_HEAD_TYPE,
     OPERATORS,
-    HeadType,
     Operator,
     QueryEncoderOutput,
     TimeResolution,
@@ -30,6 +29,7 @@ from ttt_svcbench_qwen.query_encoder import (
 from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase
 from ttt_svcbench_qwen.state_bank import (
     RETRIEVAL_HEAD_ORDER,
+    HeadType,
     RetrievalHistoryRecord,
     RetrievalHistoryView,
     StateRecord,
@@ -144,20 +144,40 @@ class RetrieverOutput:
     candidate_time_ranges: Tensor | None = None
     candidate_lifecycle_ids: tuple[tuple[str | None, ...], ...] = ()
 
+    def require_tensor_metadata(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Return materialized candidate metadata or fail closed at the runtime boundary."""
+
+        sequence_ids = self.candidate_sequence_ids
+        head_codes = self.candidate_head_codes
+        operator_codes = self.candidate_operator_codes
+        timestamps = self.candidate_timestamps
+        time_ranges = self.candidate_time_ranges
+        if not isinstance(sequence_ids, Tensor):
+            raise RuntimeError("RetrieverOutput candidate_sequence_ids are unavailable")
+        if not isinstance(head_codes, Tensor):
+            raise RuntimeError("RetrieverOutput candidate_head_codes are unavailable")
+        if not isinstance(operator_codes, Tensor):
+            raise RuntimeError("RetrieverOutput candidate_operator_codes are unavailable")
+        if not isinstance(timestamps, Tensor):
+            raise RuntimeError("RetrieverOutput candidate_timestamps are unavailable")
+        if not isinstance(time_ranges, Tensor):
+            raise RuntimeError("RetrieverOutput candidate_time_ranges are unavailable")
+        return sequence_ids, head_codes, operator_codes, timestamps, time_ranges
+
     def candidate_record_id(self, row: int, column: int) -> str | None:
         value = self.candidate_record_ids[row][column]
         if value is not None:
             return value
-        assert self.candidate_sequence_ids is not None
-        sequence_id = int(self.candidate_sequence_ids[row, column].item())
+        sequence_ids, _, _, _, _ = self.require_tensor_metadata()
+        sequence_id = int(sequence_ids[row, column].item())
         return f"retrieval-{sequence_id:08d}" if sequence_id >= 0 else None
 
     def candidate_head_type(self, row: int, column: int) -> HeadType | None:
         value = self.candidate_head_types[row][column]
         if value is not None:
             return value
-        assert self.candidate_head_codes is not None
-        code = int(self.candidate_head_codes[row, column].item())
+        _, head_codes, _, _, _ = self.require_tensor_metadata()
+        code = int(head_codes[row, column].item())
         return RETRIEVAL_HEAD_ORDER[code] if 0 <= code < len(RETRIEVAL_HEAD_ORDER) else None
 
     def __post_init__(self) -> None:
@@ -236,28 +256,22 @@ class RetrieverOutput:
             object.__setattr__(self, "candidate_operator_codes", operator_codes)
             object.__setattr__(self, "candidate_timestamps", timestamps)
             object.__setattr__(self, "candidate_time_ranges", time_ranges)
-        assert self.candidate_sequence_ids is not None
-        assert self.candidate_head_codes is not None
-        assert self.candidate_operator_codes is not None
-        assert self.candidate_timestamps is not None
-        assert self.candidate_time_ranges is not None
-        integer_metadata = (
-            self.candidate_sequence_ids,
-            self.candidate_head_codes,
-            self.candidate_operator_codes,
+        sequence_ids, head_codes, operator_codes, timestamps, time_ranges = (
+            self.require_tensor_metadata()
         )
+        integer_metadata = (sequence_ids, head_codes, operator_codes)
         if any(value.shape != shape or value.dtype != torch.int64 for value in integer_metadata):
             raise ValueError("Retriever candidate integer metadata must be int64 [B, N_s]")
         if (
-            self.candidate_timestamps.shape != shape
-            or self.candidate_timestamps.dtype != torch.float64
-            or self.candidate_time_ranges.shape != (*shape, 2)
-            or self.candidate_time_ranges.dtype != torch.float64
+            timestamps.shape != shape
+            or timestamps.dtype != torch.float64
+            or time_ranges.shape != (*shape, 2)
+            or time_ranges.dtype != torch.float64
         ):
             raise ValueError("Retriever candidate time metadata is invalid")
         if any(
             value.device != self.scores.device
-            for value in (*integer_metadata, self.candidate_timestamps, self.candidate_time_ranges)
+            for value in (*integer_metadata, timestamps, time_ranges)
         ):
             raise ValueError("Retriever candidate tensor metadata must share the score device")
         metadata = (
@@ -344,6 +358,7 @@ class RetrieverOutput:
             self._validate_row(row)
 
     def _validate_row(self, row: int) -> None:
+        sequence_ids, head_codes, _, _, _ = self.require_tensor_metadata()
         n_state = int(self.n_state[row].item())
         n_retrieved = int(self.n_retrieved[row].item())
         ids = self.selected_record_ids[row]
@@ -381,8 +396,8 @@ class RetrieverOutput:
         )
         if tensor_only:
             present = self.present_mask[row]
-            sequences = self.candidate_sequence_ids[row]
-            heads = self.candidate_head_codes[row]
+            sequences = sequence_ids[row]
+            heads = head_codes[row]
             if bool(torch.any(sequences[present] < 0)) or bool(
                 torch.any((heads[present] < 0) | (heads[present] >= len(RETRIEVAL_HEAD_ORDER)))
             ):
@@ -574,6 +589,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
         resolutions = _normalize_resolutions(time_resolutions, batch_size)
         query_video_ids = _normalize_owner_ids(video_ids, batch_size, "video_ids")
         query_trajectory_ids = _normalize_owner_ids(trajectory_ids, batch_size, "trajectory_ids")
+        sequence_ids, head_codes, operator_codes = history.require_tensor_metadata()
         selected_mask = torch.zeros_like(history.present_mask)
         predicted_head_mask = _predicted_head_mask(history, operators)
         statuses: list[RetrievalStatus] = []
@@ -637,9 +653,9 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
             bank_video_ids=history.video_ids,
             bank_trajectory_ids=history.trajectory_ids,
             bank_versions=history.bank_versions,
-            candidate_sequence_ids=history.sequence_ids.detach().clone(),
-            candidate_head_codes=history.head_codes.detach().clone(),
-            candidate_operator_codes=history.operator_codes.detach().clone(),
+            candidate_sequence_ids=sequence_ids.detach().clone(),
+            candidate_head_codes=head_codes.detach().clone(),
+            candidate_operator_codes=operator_codes.detach().clone(),
             candidate_timestamps=history.timestamps.detach().clone(),
             candidate_time_ranges=history.time_ranges.detach().clone(),
             candidate_lifecycle_ids=history.lifecycle_ids,
@@ -716,6 +732,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
                 query_rejected=True,
             )
 
+        sequence_ids, head_codes, _ = state_view.require_tensor_metadata()
         present = state_view.present_mask[row]
         predicted = predicted_head_mask[row]
         valid = state_view.record_valid_mask[row]
@@ -729,7 +746,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
         if resolution.window.start_time is not None:
             start = state_view.timestamps.new_tensor(resolution.window.start_time)
             end = state_view.timestamps.new_tensor(resolution.window.end_time)
-            atomic = state_view.head_codes[row] == RETRIEVAL_HEAD_ORDER.index(HeadType.O2)
+            atomic = head_codes[row] == RETRIEVAL_HEAD_ORDER.index(HeadType.O2)
             timestamp_overlap = (state_view.timestamps[row] >= start) & (
                 state_view.timestamps[row] <= end
             )
@@ -761,7 +778,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
         ordered = torch.nonzero(chosen, as_tuple=False).flatten()
         if ordered.numel():
             id_order = torch.argsort(
-                state_view.sequence_ids[row].index_select(0, ordered), stable=True
+                sequence_ids[row].index_select(0, ordered), stable=True
             )
             ordered = ordered.index_select(0, id_order)
             score_order = torch.argsort(
@@ -948,6 +965,7 @@ def _project_history_sources(
 ) -> Tensor:
     """Recreate trainable keys without reconnecting detached Support encoders."""
 
+    _, head_codes, _ = view.require_tensor_metadata()
     width = view.sources.shape[1]
     rows: list[Tensor] = []
     for row in range(view.sources.shape[0]):
@@ -959,7 +977,7 @@ def _project_history_sources(
                 projected_chunks.append(
                     state_bank.project_codes(
                         view.sources[row, start:end],
-                        view.head_codes[row, start:end],
+                        head_codes[row, start:end],
                     )
                 )
             projected = torch.cat(projected_chunks, dim=0)
@@ -999,12 +1017,13 @@ def _predicted_head_mask(
     view: RetrievalHistoryView,
     operators: Sequence[Operator],
 ) -> Tensor:
+    _, head_codes, _ = view.require_tensor_metadata()
     mask = torch.zeros_like(view.present_mask)
     for row, operator in enumerate(operators):
         expected = OPERATOR_TO_HEAD_TYPE[operator]
         if expected is None:
             continue
-        mask[row] = view.head_codes[row] == RETRIEVAL_HEAD_ORDER.index(expected)
+        mask[row] = head_codes[row] == RETRIEVAL_HEAD_ORDER.index(expected)
     return mask & view.present_mask
 
 
@@ -1047,9 +1066,10 @@ def _intersects_window(record: RetrievalCandidate, window: TimeWindow) -> bool:
 
 
 def _required_record_id(view: RetrievalHistoryView, row: int, column: int) -> str:
+    sequence_ids, _, _ = view.require_tensor_metadata()
     record_id = view.record_ids[row][column]
     if record_id is None:
-        sequence_id = int(view.sequence_ids[row, column].item())
+        sequence_id = int(sequence_ids[row, column].item())
         if sequence_id >= 0:
             record_id = f"retrieval-{sequence_id:08d}"
     if not isinstance(record_id, str) or not record_id:
@@ -1069,9 +1089,10 @@ def _materialize_history_record(
 ) -> RetrievalHistoryRecord:
     from ttt_svcbench_qwen.query_encoder import OPERATORS
 
+    _, head_codes, operator_codes = view.require_tensor_metadata()
     head = view.head_types[row][column]
     if head is None:
-        head_code = int(view.head_codes[row, column].item())
+        head_code = int(head_codes[row, column].item())
         head = (
             RETRIEVAL_HEAD_ORDER[head_code]
             if 0 <= head_code < len(RETRIEVAL_HEAD_ORDER)
@@ -1080,7 +1101,7 @@ def _materialize_history_record(
     record_id = _required_record_id(view, row, column)
     if head is None:
         raise ValueError("selected retrieval columns require tensor metadata")
-    operator_code = int(view.operator_codes[row, column].item())
+    operator_code = int(operator_codes[row, column].item())
     if not 0 <= operator_code < len(OPERATORS):
         raise ValueError("selected retrieval operator code is invalid")
     timestamp_value = float(view.timestamps[row, column].item())

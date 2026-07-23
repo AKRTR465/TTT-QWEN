@@ -1864,16 +1864,14 @@ def _official_weak_retrieval_loss(
     target_head = OPERATOR_TO_HEAD_TYPE[label.operator]
     if target_head is None:
         raise ValueError("official weak Retrieval requires a supported target head")
-    assert retrieval.candidate_head_codes is not None
-    assert retrieval.candidate_timestamps is not None
-    assert retrieval.candidate_time_ranges is not None
+    _, head_codes, _, timestamps, time_ranges = retrieval.require_tensor_metadata()
     head_mask = (
-        retrieval.candidate_head_codes[row] == RETRIEVAL_HEAD_ORDER.index(target_head)
+        head_codes[row] == RETRIEVAL_HEAD_ORDER.index(target_head)
     ) & retrieval.present_mask[row]
     record_end = torch.where(
-        retrieval.candidate_timestamps[row] >= 0.0,
-        retrieval.candidate_timestamps[row],
-        retrieval.candidate_time_ranges[row, :, 1],
+        timestamps[row] >= 0.0,
+        timestamps[row],
+        time_ranges[row, :, 1],
     )
     official_causal = retrieval.present_mask[row] & (record_end <= label.query_time)
     invalid_excluded = int((head_mask & ~retrieval.record_valid_mask[row]).sum().item())
@@ -1885,53 +1883,72 @@ def _official_weak_retrieval_loss(
     present_columns = torch.nonzero(candidate_mask, as_tuple=False).flatten()
     candidate_count = int(present_columns.numel())
     legacy_valid = _legacy_retrieval_bag_is_valid(retrieval, row, label)
-    common = {
-        "legacy_valid_bag": legacy_valid,
-        "target_head_present_count": int(head_mask.sum().item()),
-        "invalid_excluded_count": invalid_excluded,
-        "ineligible_excluded_count": ineligible_excluded,
-        "causal_excluded_count": causal_excluded,
-    }
+    target_head_present_count = int(head_mask.sum().item())
     if not candidate_count:
-        return _RetrievalLossResult(None, 0, 0, 0, "no_candidate", wrong_operator, False, **common)
+        return _RetrievalLossResult(
+            loss=None,
+            positive_count=0,
+            candidate_count=0,
+            negative_count=0,
+            status="no_candidate",
+            wrong_operator=wrong_operator,
+            rescued_wrong_route=False,
+            legacy_valid_bag=legacy_valid,
+            target_head_present_count=target_head_present_count,
+            invalid_excluded_count=invalid_excluded,
+            ineligible_excluded_count=ineligible_excluded,
+            causal_excluded_count=causal_excluded,
+        )
     positive_mask = _retrieval_occurrence_mask(retrieval, row, label) & candidate_mask
     positive_columns = torch.nonzero(positive_mask, as_tuple=False).flatten()
     positive_count = int(positive_columns.numel())
     if not positive_count:
         return _RetrievalLossResult(
-            None,
-            0,
-            candidate_count,
-            candidate_count,
-            "no_positive",
-            wrong_operator,
-            False,
-            **common,
+            loss=None,
+            positive_count=0,
+            candidate_count=candidate_count,
+            negative_count=candidate_count,
+            status="no_positive",
+            wrong_operator=wrong_operator,
+            rescued_wrong_route=False,
+            legacy_valid_bag=legacy_valid,
+            target_head_present_count=target_head_present_count,
+            invalid_excluded_count=invalid_excluded,
+            ineligible_excluded_count=ineligible_excluded,
+            causal_excluded_count=causal_excluded,
         )
     negative_count = candidate_count - positive_count
     if negative_count == 0:
         return _RetrievalLossResult(
-            None,
-            positive_count,
-            candidate_count,
-            0,
-            "all_positive",
-            wrong_operator,
-            False,
-            **common,
+            loss=None,
+            positive_count=positive_count,
+            candidate_count=candidate_count,
+            negative_count=0,
+            status="all_positive",
+            wrong_operator=wrong_operator,
+            rescued_wrong_route=False,
+            legacy_valid_bag=legacy_valid,
+            target_head_present_count=target_head_present_count,
+            invalid_excluded_count=invalid_excluded,
+            ineligible_excluded_count=ineligible_excluded,
+            causal_excluded_count=causal_excluded,
         )
     all_logits = retrieval.scores[row].index_select(0, present_columns).float()
     positive_logits = retrieval.scores[row].index_select(0, positive_columns).float()
     loss = torch.logsumexp(all_logits, dim=0) - torch.logsumexp(positive_logits, dim=0)
     return _RetrievalLossResult(
-        loss,
-        positive_count,
-        candidate_count,
-        negative_count,
-        "valid_bag",
-        wrong_operator,
-        wrong_operator,
-        **common,
+        loss=loss,
+        positive_count=positive_count,
+        candidate_count=candidate_count,
+        negative_count=negative_count,
+        status="valid_bag",
+        wrong_operator=wrong_operator,
+        rescued_wrong_route=wrong_operator,
+        legacy_valid_bag=legacy_valid,
+        target_head_present_count=target_head_present_count,
+        invalid_excluded_count=invalid_excluded,
+        ineligible_excluded_count=ineligible_excluded,
+        causal_excluded_count=causal_excluded,
     )
 
 
@@ -1959,10 +1976,9 @@ def _retrieval_occurrence_mask(
     row: int,
     label: OfficialWeakSupervision,
 ) -> Tensor:
-    assert retrieval.candidate_timestamps is not None
-    assert retrieval.candidate_time_ranges is not None
-    timestamps = retrieval.candidate_timestamps[row]
-    ranges = retrieval.candidate_time_ranges[row]
+    _, _, _, candidate_timestamps, candidate_time_ranges = retrieval.require_tensor_metadata()
+    timestamps = candidate_timestamps[row]
+    ranges = candidate_time_ranges[row]
     is_point = timestamps >= 0.0
     matched = torch.zeros_like(retrieval.present_mask[row])
     for point in label.occurrence_points:

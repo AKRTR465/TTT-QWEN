@@ -836,6 +836,20 @@ class RetrievalHistoryView:
     operator_codes: Tensor | None = None
     ring_guards: tuple[tuple[TensorizedRetrievalHistory, int], ...] = ()
 
+    def require_tensor_metadata(self) -> tuple[Tensor, Tensor, Tensor]:
+        """Return materialized integer metadata or fail closed at the runtime boundary."""
+
+        sequence_ids = self.sequence_ids
+        head_codes = self.head_codes
+        operator_codes = self.operator_codes
+        if not isinstance(sequence_ids, Tensor):
+            raise RuntimeError("RetrievalHistoryView sequence_ids are unavailable")
+        if not isinstance(head_codes, Tensor):
+            raise RuntimeError("RetrievalHistoryView head_codes are unavailable")
+        if not isinstance(operator_codes, Tensor):
+            raise RuntimeError("RetrievalHistoryView operator_codes are unavailable")
+        return sequence_ids, head_codes, operator_codes
+
     def __post_init__(self) -> None:
         if (
             self.sources.ndim != 3
@@ -863,9 +877,7 @@ class RetrievalHistoryView:
             object.__setattr__(self, "sequence_ids", sequence_ids)
             object.__setattr__(self, "head_codes", head_codes)
             object.__setattr__(self, "operator_codes", operator_codes)
-        assert self.sequence_ids is not None
-        assert self.head_codes is not None
-        assert self.operator_codes is not None
+        sequence_ids, head_codes, operator_codes = self.require_tensor_metadata()
         masks = (self.present_mask, self.record_valid_mask, self.retrieval_eligible_mask)
         if any(mask.shape != shape or mask.dtype != torch.bool for mask in masks):
             raise ValueError("RetrievalHistoryView masks must be bool [B, N]")
@@ -880,7 +892,7 @@ class RetrievalHistoryView:
             or self.time_ranges.device != self.sources.device
         ):
             raise ValueError("RetrievalHistoryView time metadata is invalid")
-        integer_metadata = (self.sequence_ids, self.head_codes, self.operator_codes)
+        integer_metadata = (sequence_ids, head_codes, operator_codes)
         if any(value.shape != shape or value.dtype != torch.int64 for value in integer_metadata):
             raise ValueError("RetrievalHistoryView tensor metadata must be int64 [B, N]")
         if any(value.device != self.sources.device for value in integer_metadata):
@@ -922,8 +934,8 @@ class RetrievalHistoryView:
                 raise ValueError("RetrievalHistoryView masks are inconsistent")
             if not torch.equal(self.n_state, self.present_mask.sum(dim=1)):
                 raise ValueError("RetrievalHistoryView n_state must count present records")
-            if bool(torch.any(self.sequence_ids[self.present_mask] < 0)) or bool(
-                torch.any(self.sequence_ids[~self.present_mask] != -1)
+            if bool(torch.any(sequence_ids[self.present_mask] < 0)) or bool(
+                torch.any(sequence_ids[~self.present_mask] != -1)
             ):
                 raise ValueError("RetrievalHistoryView sequence IDs are inconsistent")
 
