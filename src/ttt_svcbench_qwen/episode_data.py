@@ -158,18 +158,12 @@ class A2QueryRecord:
     task_class: str
     query: ProductionQueryRecord
     sampling_weight: float
-    answer_user_content: str | None = None
 
     def __post_init__(self) -> None:
         if not self.video_id or not self.trajectory_id or not self.relative_video_path:
             raise ValueError("A2 Query ownership/path fields must be non-empty")
         if not math.isfinite(self.sampling_weight) or self.sampling_weight <= 0.0:
             raise ValueError("A2 sampling weight must be positive and finite")
-        if self.answer_user_content is not None:
-            if not self.answer_user_content.startswith("<video>\n"):
-                raise ValueError("baseline A2 user content must begin with exactly '<video>\\n'")
-            if not self.answer_user_content.removeprefix("<video>\n").strip():
-                raise ValueError("baseline A2 user content must contain a non-empty text prompt")
         assert_runtime_payload_safe(
             self.query.runtime.as_payload(),
             layer="A2 manifest runtime",
@@ -1529,12 +1523,7 @@ def _parse_a2_query(value: object) -> A2QueryRecord:
             "query",
             "sampling_weight",
     }
-    optional = {"answer_user_content"}
-    if set(row) - required - optional or required - set(row):
-        _require_exact_keys(row, required, "A2 Query")
-    answer_user_content = row.get("answer_user_content")
-    if answer_user_content is not None and not isinstance(answer_user_content, str):
-        raise ValueError("A2 answer_user_content must be a string or null")
+    _require_exact_keys(row, required, "A2 Query")
     return A2QueryRecord(
         source_dataset=string_value(row, "source_dataset"),
         relative_video_path=string_value(row, "relative_video_path"),
@@ -1544,7 +1533,6 @@ def _parse_a2_query(value: object) -> A2QueryRecord:
         task_class=string_value(row, "task_class"),
         query=_parse_production_query(row["query"]),
         sampling_weight=_float_value(row, "sampling_weight"),
-        answer_user_content=answer_user_content,
     )
 
 

@@ -417,9 +417,7 @@ def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
     assert set(extension.model_dump(exclude_none=True)) == {
         "stage",
         "project_config",
-        "a2_data_mode",
         "dataset_manifest",
-        "state_history_source",
         "visual_cost_index",
         "support_prefetch_depth",
         "support_decode_coalesce",
@@ -434,7 +432,6 @@ def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
         "answer_query_visual_mode",
         "answer_query_max_frames",
         "query_decode_max_groups",
-        "support_cache_mode",
         "state_query_cache_mode",
         "answer_query_cache_mode",
         "query_activation_offload",
@@ -564,38 +561,6 @@ def test_dual_query_visual_config_is_required_and_legacy_is_rejected() -> None:
         ProductionTTTConfig(**fields, query_decode_strategy="legacy_seek")
     with pytest.raises(ValueError, match="support_materialization"):
         ProductionTTTConfig(**{**fields, "support_materialization": "trainer_prefetch"})
-
-
-def test_baseline_clips_a2_yaml_disables_manifest_and_cost_balancing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    root = Path(__file__).parents[1]
-    monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
-    monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench-part")
-    monkeypatch.setenv("WEAK_SIDECAR_PATH", "/tmp/svcbench-part/raw/data.jsonl")
-    monkeypatch.setenv("OUTPUT_DIR", "/tmp/output")
-    monkeypatch.setenv("RUN_ROOT", "/tmp/run")
-
-    native, extension = load_training_yaml(
-        root / "configs/h200/a2_qwen3vl8b_baselineclips_4epoch_4gpu.yaml"
-    )
-
-    assert native["dataset"] == "svcbench_qwen3vl_sft"
-    assert native["num_train_epochs"] == 4.0
-    assert native["save_strategy"] == "steps"
-    assert native["save_steps"] == 0.5
-    assert native["save_total_limit"] == 2
-    assert extension.a2_data_mode == "llamafactory_sft_clips"
-    assert extension.dataset_manifest is None
-    assert extension.weak_sidecar_path == "/tmp/svcbench-part/raw/data.jsonl"
-    assert extension.state_history_source == "baseline_query_clip"
-    assert extension.visual_cost_index is None
-    assert extension.visual_cost_mode == "proxy"
-    assert extension.support_cache_mode == "disabled"
-    assert not extension.support_cache_enabled
-    assert extension.state_query_cache_mode == "inherit"
-    assert extension.answer_query_cache_mode == "disabled"
-    assert extension.preprocess_cache_max_gb == 200
 
 
 def test_split_query_specs_bound_state_to_16_and_answer_to_256(tmp_path: Path) -> None:

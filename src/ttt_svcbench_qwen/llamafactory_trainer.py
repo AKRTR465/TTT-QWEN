@@ -32,11 +32,6 @@ import transformers
 from safetensors import safe_open
 from torch import Tensor, nn
 
-from ttt_svcbench_qwen.baseline_a2_data import (
-    BaselineA2ClipDataset,
-    build_baseline_a2_train_sampler,
-    load_baseline_a2_clip_dataset,
-)
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
     A5EpisodeRecord,
@@ -1184,31 +1179,11 @@ def main(argv: list[str] | None = None) -> int:
         raise TypeError("built-in runtime must return ProductionTrainerRuntime")
     if runtime_raw.stage is not configured_stage:
         raise ValueError("runtime factory stage disagrees with ttt_qwen.stage")
-    baseline_a2_dataset: BaselineA2ClipDataset | None = None
     manifest_path = backbone.ttt_config.dataset_manifest
-    if (
-        configured_stage is ProductionStage.A2
-        and backbone.ttt_config.a2_data_mode == "llamafactory_sft_clips"
-    ):
-        weak_sidecar_path = backbone.ttt_config.weak_sidecar_path
-        if weak_sidecar_path is None:
-            raise RuntimeError("validated baseline-clips A2 config lost weak_sidecar_path")
-        dataset_dir = str(getattr(backbone.data_args, "dataset_dir", ""))
-        dataset_name = getattr(backbone.data_args, "dataset", "")
-        baseline_a2_dataset = load_baseline_a2_clip_dataset(
-            dataset_dir,
-            dataset_name=dataset_name,
-            weak_sidecar_path=weak_sidecar_path,
-        )
-        train_dataset = baseline_a2_dataset
-        eval_dataset = None
-    else:
-        if manifest_path is None:
-            raise RuntimeError("validated manifest mode lost dataset_manifest")
-        train_dataset, eval_dataset = load_production_manifest_views(
-            manifest_path,
-            stage=ManifestStage(configured_stage.value),
-        )
+    train_dataset, eval_dataset = load_production_manifest_views(
+        manifest_path,
+        stage=ManifestStage(configured_stage.value),
+    )
     runtime_raw = replace(
         runtime_raw,
         train_dataset=train_dataset,
@@ -1217,8 +1192,6 @@ def main(argv: list[str] | None = None) -> int:
     visual_cost_index: Mapping[str, VisualCostRecord] | None = None
     raw_cost_index = backbone.ttt_config.visual_cost_index
     if raw_cost_index is not None:
-        if manifest_path is None:
-            raise RuntimeError("visual cost index requires a production manifest")
         minimum_pixels, maximum_pixels = _video_pixel_bounds(backbone)
         balance = backbone.project_config.loss.official_weak_balance
         model_name = str(getattr(backbone.model_args, "model_name_or_path", "unknown-model"))
@@ -1304,22 +1277,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
         operator_diagnostics_interval=backbone.ttt_config.operator_diagnostics_interval,
         train_sampler_factory=(
-            (lambda dataset, rank, world_size: build_baseline_a2_train_sampler(
-                dataset, rank, world_size
-            ))
-            if baseline_a2_dataset is not None
-            else (
-                lambda dataset, rank, world_size: build_production_train_sampler(
-                    dataset,
-                    rank,
-                    world_size,
-                    visual_cost_index=visual_cost_index,
-                    query_sample_fps=backbone.ttt_config.query_sample_fps,
-                    state_query_visual_mode=backbone.ttt_config.state_query_visual_mode,
-                    state_query_max_frames=backbone.ttt_config.state_query_max_frames,
-                    answer_query_visual_mode=backbone.ttt_config.answer_query_visual_mode,
-                    answer_query_max_frames=backbone.ttt_config.answer_query_max_frames,
-                )
+            lambda dataset, rank, world_size: build_production_train_sampler(
+                dataset,
+                rank,
+                world_size,
+                visual_cost_index=visual_cost_index,
+                query_sample_fps=backbone.ttt_config.query_sample_fps,
+                state_query_visual_mode=backbone.ttt_config.state_query_visual_mode,
+                state_query_max_frames=backbone.ttt_config.state_query_max_frames,
+                answer_query_visual_mode=backbone.ttt_config.answer_query_visual_mode,
+                answer_query_max_frames=backbone.ttt_config.answer_query_max_frames,
             )
         ),
     )
@@ -1347,8 +1314,6 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("a smoke run cannot retain epoch checkpoints")
     if checkpoint_policy is CheckpointPolicy.EPOCH_2_AND_EPOCH_4:
         _validate_epoch_two_four_training_arguments(training_args)
-    if baseline_a2_dataset is not None:
-        _validate_baseline_a2_training_arguments(training_args, baseline_a2_dataset)
     trainer = cast(Any, build_production_trainer(backbone, runtime_raw))
     output_dir = Path(str(training_args.output_dir))
     artifact_root = Path(os.environ.get("RUN_ROOT", str(output_dir)))
@@ -1361,9 +1326,6 @@ def main(argv: list[str] | None = None) -> int:
             checkpoint_environment = asdict(checkpoint_audit)
             checkpoint_environment["checkpoint"] = str(checkpoint_audit.checkpoint)
         environment["a2_initialization_audit"] = checkpoint_environment
-        environment["baseline_a2_dataset_audit"] = (
-            None if baseline_a2_dataset is None else asdict(baseline_a2_dataset.audit)
-        )
         _write_json(artifact_root / "environment.json", environment)
     try:
         result = trainer.train(
@@ -1486,36 +1448,6 @@ def _validate_epoch_two_four_training_arguments(training_args: object) -> None:
         )
     if save_total_limit < 2:
         raise ValueError("epoch_2_and_epoch_4 checkpoint policy requires save_total_limit>=2")
-
-
-def _validate_baseline_a2_training_arguments(
-    training_args: object,
-    dataset: BaselineA2ClipDataset,
-) -> None:
-    """Pin the exact baseline-comparison sample and optimizer-step contract."""
-
-    arguments = cast(Any, training_args)
-    if len(dataset) != 4_576:
-        raise ValueError("baseline-clips A2 requires exactly 4,576 samples")
-    if int(arguments.per_device_train_batch_size) != 1:
-        raise ValueError("baseline-clips A2 requires per-device batch size 1")
-    if int(arguments.gradient_accumulation_steps) != 4:
-        raise ValueError("baseline-clips A2 requires gradient accumulation 4")
-    if int(arguments.world_size) != 4:
-        raise ValueError("baseline-clips A2 requires exactly four distributed ranks")
-    if bool(arguments.dataloader_drop_last):
-        raise ValueError("baseline-clips A2 may not drop SFT rows")
-    if int(arguments.max_steps) > 0 and os.environ.get("TTT_SMOKE_MAX_STEPS") is None:
-        raise ValueError("formal baseline-clips A2 must derive 1,144 steps from four epochs")
-    global_batch = (
-        int(arguments.per_device_train_batch_size)
-        * int(arguments.gradient_accumulation_steps)
-        * int(arguments.world_size)
-    )
-    if global_batch != 16 or len(dataset) % global_batch:
-        raise ValueError("baseline-clips A2 requires an exact global batch of 16")
-    if len(dataset) // global_batch != 286:
-        raise ValueError("baseline-clips A2 requires exactly 286 optimizer steps per epoch")
 
 
 def _standard_checkpoint_progress(checkpoint: Path) -> tuple[int, int, float]:

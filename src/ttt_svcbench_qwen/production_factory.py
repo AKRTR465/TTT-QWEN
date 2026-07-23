@@ -53,12 +53,7 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
 
     stage: Literal["a2", "a5"]
     project_config: str = Field(min_length=1)
-    a2_data_mode: Literal["production_manifest", "llamafactory_sft_clips"] = (
-        "production_manifest"
-    )
-    dataset_manifest: str | None = Field(default=None, min_length=1)
-    weak_sidecar_path: str | None = Field(default=None, min_length=1)
-    state_history_source: Literal["original_video", "baseline_query_clip"] = "original_video"
+    dataset_manifest: str = Field(min_length=1)
     visual_cost_index: str | None = Field(default=None, min_length=1)
     initialize_from_a2_checkpoint: str | None = Field(default=None, min_length=1)
     support_prefetch_depth: int = Field(gt=0)
@@ -74,7 +69,6 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     answer_query_visual_mode: Literal["causal_prefix"]
     answer_query_max_frames: Literal[256]
     query_decode_max_groups: int = Field(default=16, ge=1, le=16)
-    support_cache_mode: Literal["disabled", "inherit"] = "inherit"
     state_query_cache_mode: Literal["disabled", "inherit"]
     answer_query_cache_mode: Literal["disabled", "inherit"]
     query_activation_offload: bool = False
@@ -96,31 +90,6 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             raise ValueError("A2 must not initialize from an A2 checkpoint")
         if self.stage == "a5" and self.initialize_from_a2_checkpoint is None:
             raise ValueError("A5 requires initialize_from_a2_checkpoint")
-        if self.stage == "a5":
-            if self.a2_data_mode != "production_manifest":
-                raise ValueError("A5 cannot use the A2 baseline-clips data mode")
-            if self.dataset_manifest is None:
-                raise ValueError("A5 requires dataset_manifest")
-            if self.weak_sidecar_path is not None:
-                raise ValueError("A5 weak supervision must come from its episode manifest")
-            if self.state_history_source != "original_video":
-                raise ValueError("A5 requires original_video state history")
-        elif self.a2_data_mode == "llamafactory_sft_clips":
-            if self.dataset_manifest is not None:
-                raise ValueError("baseline-clips A2 must not read dataset_manifest")
-            if self.weak_sidecar_path is None:
-                raise ValueError("baseline-clips A2 requires weak_sidecar_path")
-            if self.state_history_source != "baseline_query_clip":
-                raise ValueError("baseline-clips A2 requires baseline_query_clip state history")
-            if self.visual_cost_index is not None or self.visual_cost_mode != "proxy":
-                raise ValueError("baseline-clips A2 disables visual-cost indexing and feedback")
-        else:
-            if self.dataset_manifest is None:
-                raise ValueError("manifest A2 requires dataset_manifest")
-            if self.weak_sidecar_path is not None:
-                raise ValueError("manifest A2 weak supervision is embedded in its manifest")
-            if self.state_history_source != "original_video":
-                raise ValueError("manifest A2 requires original_video state history")
         required_materialization = {
             "a2": "dataloader_episode",
             "a5": "segment_double_buffer",
@@ -163,12 +132,6 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             self.state_query_cache_mode if role == "state_query" else self.answer_query_cache_mode
         )
         return mode == "inherit"
-
-    @property
-    def support_cache_enabled(self) -> bool:
-        """Return whether Support chunks use the shared preprocessing cache."""
-
-        return self.support_cache_mode == "inherit"
 
     @property
     def cached_query_roles(self) -> frozenset[str]:

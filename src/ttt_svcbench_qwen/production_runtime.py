@@ -504,7 +504,7 @@ class PreparedA2Record:
         state_expected = f"{self.record.query.runtime.query_id}:state_query"
         if self.state_query.spec.chunk_id != state_expected:
             raise ValueError("prepared A2 State Query does not belong to its manifest Query")
-        schedule = _a2_support_schedule(self.record)
+        _, schedule = adaptive_support_schedule(self.record.query.runtime.query_time)
         if len(self.supports) != len(schedule):
             raise ValueError("prepared A2 Supports do not match the adaptive schedule")
 
@@ -1657,7 +1657,6 @@ class A2PrefetchCollator:
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
-            cache_support_visuals=ttt_config.support_cache_enabled,
             cache_query_roles=ttt_config.cached_query_roles,
             prefetch_depth=1,
             decode_coalesce=False,
@@ -1701,7 +1700,6 @@ class A2PrefetchCollator:
                 else None
             ),
             source_dataset=record.source_dataset,
-            user_content=record.answer_user_content,
         )
         support_started = time.perf_counter()
         support_specs = _a2_support_chunk_specs(record, video_path)
@@ -1780,7 +1778,6 @@ class A5PrefetchCollator:
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
-            cache_support_visuals=ttt_config.support_cache_enabled,
             cache_query_roles=ttt_config.cached_query_roles,
             prefetch_depth=1,
             decode_coalesce=False,
@@ -1865,7 +1862,7 @@ class ProductionEpisodeMaterializer:
         video_path = _resolve_video_path(record.source_dataset, record.relative_video_path)
         owner = RuntimeOwner((record.video_id,), (record.trajectory_id,))
         runtime = self.writer.reset(owner)
-        supports = _a2_support_schedule(record)
+        _, supports = adaptive_support_schedule(record.query.runtime.query_time)
         state_chunk = _query_chunk_spec(
             f"{record.query.runtime.query_id}:state_query",
             video_path,
@@ -2452,7 +2449,6 @@ def build_runtime(
         minimum_pixels=minimum_pixels,
         maximum_pixels=maximum_pixels,
         preprocess_cache=preprocess_cache,
-        cache_support_visuals=config.support_cache_enabled,
         cache_query_roles=config.cached_query_roles,
         prefetch_depth=support_prefetch_depth,
         decode_coalesce=support_decode_coalesce,
@@ -2788,7 +2784,7 @@ def _a2_support_chunk_specs(
     record: A2QueryRecord,
     video_path: Path,
 ) -> tuple[SupportChunkSpec, ...]:
-    supports = _a2_support_schedule(record)
+    _, supports = adaptive_support_schedule(record.query.runtime.query_time)
     return tuple(
         SupportChunkSpec(
             chunk_id=f"{record.query.runtime.query_id}:a2:{index}",
@@ -2800,16 +2796,6 @@ def _a2_support_chunk_specs(
         )
         for index, chunk in enumerate(supports)
     )
-
-
-def _a2_support_schedule(record: A2QueryRecord) -> tuple[AdaptiveChunkSpec, ...]:
-    """Return the legacy schedule or the baseline-clip zero-Support short-video variant."""
-
-    query_time = record.query.runtime.query_time
-    if record.answer_user_content is not None and query_time <= 8.0:
-        return ()
-    _, supports = adaptive_support_schedule(query_time)
-    return supports
 
 
 def _query_chunk_spec(
@@ -2859,7 +2845,6 @@ def _prepare_answer_cpu(
     maximum_pixels: int,
     preprocess_cache: PreprocessCache | None = None,
     source_dataset: str = "runtime",
-    user_content: str | None = None,
 ) -> PreparedAnswerCPU:
     """Decode, preprocess and tokenize one Query using CPU-only objects.
 
@@ -2921,7 +2906,7 @@ def _prepare_answer_cpu(
                 raise RuntimeError("writable Answer Query cache requires a fingerprint")
             preprocess_cache.put(fingerprint, _cached_from_materialized(materialized))
 
-    prompt_messages = [_user_message(query.runtime.question, user_content=user_content)]
+    prompt_messages = [_user_message(query.runtime.question)]
     full_messages = [*prompt_messages, {"role": "assistant", "content": answer_text}]
     prompt_text = typed_processor.apply_chat_template(
         prompt_messages, tokenize=False, add_generation_prompt=True
@@ -3233,21 +3218,12 @@ def _resolve_video_path(source_dataset: str, relative_path: str) -> Path:
     )
 
 
-def _user_message(question: str, *, user_content: str | None = None) -> dict[str, object]:
-    if user_content is None:
-        text = _ANSWER_INSTRUCTION.format(question=question)
-    else:
-        prefix = "<video>\n"
-        if not user_content.startswith(prefix) or user_content.count("<video>") != 1:
-            raise ValueError("baseline Answer prompt requires exactly one leading <video> marker")
-        text = user_content.removeprefix(prefix)
-        if not text.strip():
-            raise ValueError("baseline Answer prompt text cannot be empty")
+def _user_message(question: str) -> dict[str, object]:
     return {
         "role": "user",
         "content": [
             {"type": "video"},
-            {"type": "text", "text": text},
+            {"type": "text", "text": _ANSWER_INSTRUCTION.format(question=question)},
         ],
     }
 

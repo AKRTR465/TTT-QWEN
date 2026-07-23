@@ -14,7 +14,6 @@ import torch
 import yaml
 from safetensors.torch import load_file
 
-from ttt_svcbench_qwen.baseline_a2_data import load_baseline_a2_clip_dataset
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
@@ -83,10 +82,7 @@ def _add_cache_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_input_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--dataset-dir", type=Path)
-    parser.add_argument("--dataset", default="svcbench_qwen3vl_sft")
-    parser.add_argument("--weak-sidecar", type=Path)
+    parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--project-config", required=True, type=Path)
     parser.add_argument("--training-config", required=True, type=Path)
     parser.add_argument("--video-root", required=True, type=Path)
@@ -181,7 +177,7 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         prefetch_depth=1,
         decode_coalesce=False,
     )
-    records = _load_input_records(args, parser, ttt_config)
+    records = _load_input_records(args)
     candidates = tuple(_iter_specs(records, ttt_config, roles=roles))
     specs = _fingerprinted_specs(
         candidates,
@@ -219,36 +215,16 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
 def _load_input_records(
     args: argparse.Namespace,
-    parser: argparse.ArgumentParser,
-    ttt_config: ProductionTTTConfig,
 ) -> tuple[A2QueryRecord | A5EpisodeRecord, ...]:
-    if ttt_config.a2_data_mode == "llamafactory_sft_clips":
-        if args.stage != "a2":
-            parser.error("baseline-clips cache prewarm is A2-only")
-        if args.manifest is not None:
-            parser.error("baseline-clips cache prewarm must not receive --manifest")
-        if args.dataset_dir is None or args.weak_sidecar is None:
-            parser.error("baseline-clips cache prewarm requires --dataset-dir and --weak-sidecar")
-        if args.split == "validation":
-            parser.error("baseline-clips A2 has no validation split")
-        train = load_baseline_a2_clip_dataset(
-            args.dataset_dir,
-            dataset_name=args.dataset,
-            weak_sidecar_path=args.weak_sidecar,
-        )
-        return train.records
-    else:
-        if args.manifest is None:
-            parser.error("manifest data mode requires --manifest")
-        train, evaluation = load_production_manifest_views(
-            args.manifest,
-            stage=ManifestStage(args.stage),
-        )
-        return {
-            "train": train.records,
-            "validation": evaluation.records,
-            "all": (*train.records, *evaluation.records),
-        }[args.split]
+    train, evaluation = load_production_manifest_views(
+        args.manifest,
+        stage=ManifestStage(args.stage),
+    )
+    return {
+        "train": train.records,
+        "validation": evaluation.records,
+        "all": (*train.records, *evaluation.records),
+    }[args.split]
 
 
 def _verify_inputs(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -266,7 +242,7 @@ def _verify_inputs(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         if role in roles and not ttt_config.query_cache_enabled(role):
             parser.error(f"{role} verification requires its cache mode to be inherit")
     cache = _cache(args)
-    records = _load_input_records(args, parser, ttt_config)
+    records = _load_input_records(args)
     candidates = tuple(_iter_specs(records, ttt_config, roles=roles))
     specs = _fingerprinted_specs(
         candidates,
