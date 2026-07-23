@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +44,12 @@ SEMANTIC_DIM = 512
 SOURCE_DIM = 768
 
 
+@dataclass
+class _HistoryState:
+    bank_state: StateBankRuntimeState
+    ring: TensorizedRetrievalHistory
+
+
 @pytest.fixture
 def components() -> tuple[StructuredStateBank, EmbeddingStateRetriever]:
     config = load_config()
@@ -74,36 +81,54 @@ def _resolution(
 
 def _append_history(
     bank: StructuredStateBank,
-    state: StateBankRuntimeState,
+    state: _HistoryState,
     *,
     source: Tensor,
     timestamp: float,
     operator: Operator = Operator.O1_SNAP,
     valid: bool = True,
     eligible: bool = True,
-) -> StateBankRuntimeState:
+) -> _HistoryState:
     head = OPERATOR_TO_HEAD_TYPE[operator]
     if head is None:
         raise ValueError("history helper requires a supported operator")
-    return bank.append_retrieval_history(
-        state,
-        head_type=head,
-        operator=operator,
-        semantic_source=source,
-        timestamp=timestamp,
-        time_range=None,
-        valid=valid,
-        retrieval_eligible=eligible,
+    del bank
+    state.ring.append_many(
+        RetrievalHistoryAppendBatch(
+            sources=source.reshape(1, -1),
+            head_codes=torch.tensor((RETRIEVAL_HEAD_ORDER.index(head),), dtype=torch.int64),
+            operator_codes=torch.tensor((OPERATORS.index(operator),), dtype=torch.int64),
+            timestamps=torch.tensor((timestamp,), dtype=torch.float64),
+            time_ranges=torch.full((1, 2), -1.0, dtype=torch.float64),
+            valid_mask=torch.tensor((valid,), dtype=torch.bool),
+            eligible_mask=torch.tensor((eligible,), dtype=torch.bool),
+        )
+    )
+    return state
+
+
+def _new_history(bank: StructuredStateBank, video_id: str, trajectory_id: str) -> _HistoryState:
+    parameter = next(bank.semantic_projector.parameters())
+    return _HistoryState(
+        bank_state=bank.reset(video_id, trajectory_id),
+        ring=TensorizedRetrievalHistory(
+            video_id,
+            trajectory_id,
+            capacity_per_head=bank.config.retrieval_history_capacity_per_head,
+            source_dim=SOURCE_DIM,
+            dtype=parameter.dtype,
+            device=parameter.device,
+        ),
     )
 
 
 def _view(
-    bank: StructuredStateBank,
-    states: tuple[StateBankRuntimeState, ...],
-    operators: tuple[Operator, ...],
+    states: tuple[_HistoryState, ...],
 ) -> RetrievalHistoryView:
-    assert len(operators) == len(states)
-    return bank.retrieval_view(states, None)
+    return tensorized_retrieval_view(
+        tuple(state.ring for state in states),
+        guard_current_version=False,
+    )
 
 
 def _query(
@@ -140,9 +165,11 @@ def _retrieve(
 
 
 def _matching_query(bank: StructuredStateBank, view: RetrievalHistoryView) -> Tensor:
-    head = view.head_types[0][0]
-    if head is None:
+    _, head_codes, _ = view.require_tensor_metadata()
+    head_code = int(head_codes[0, 0].item())
+    if head_code < 0:
         raise ValueError("matching query requires one present history record")
+    head = RETRIEVAL_HEAD_ORDER[head_code]
     return bank.project(view.sources[0, 0].unsqueeze(0), (head,)).detach().clone()
 
 
@@ -150,27 +177,27 @@ def test_retriever_consumes_write_before_history_snapshot_only(
     components: tuple[StructuredStateBank, EmbeddingStateRetriever],
 ) -> None:
     bank, retriever = components
-    state = bank.reset("video-a", "trajectory-a")
+    state = _new_history(bank, "video-a", "trajectory-a")
     state = _append_history(bank, state, source=torch.randn(SOURCE_DIM), timestamp=1.0)
-    before_write = _view(bank, (state,), (Operator.O1_SNAP,))
+    before_write = _view((state,))
     query = _query(_matching_query(bank, before_write), (Operator.O1_SNAP,))
 
     state = _append_history(bank, state, source=torch.randn(SOURCE_DIM), timestamp=2.0)
     stale_output = _retrieve(retriever, bank, before_write, query)
-    after_write = _view(bank, (state,), (Operator.O1_SNAP,))
+    after_write = _view((state,))
     current_output = _retrieve(retriever, bank, after_write, query)
 
     assert stale_output.n_state.tolist() == [1]
     assert stale_output.bank_versions == before_write.bank_versions
     assert current_output.n_state.tolist() == [2]
-    assert before_write.record_ids[0][0] == stale_output.selected_record_ids[0][0]
+    assert stale_output.selected_record_ids == (("retrieval-00000000",),)
 
 
 def test_all_head_scoring_preserves_predicted_head_runtime_selection(
     components: tuple[StructuredStateBank, EmbeddingStateRetriever],
 ) -> None:
     bank, retriever = components
-    state = bank.reset("video-all-head", "trajectory-all-head")
+    state = _new_history(bank, "video-all-head", "trajectory-all-head")
     state = _append_history(bank, state, source=torch.randn(SOURCE_DIM), timestamp=1.0)
     state = _append_history(
         bank,
@@ -179,7 +206,7 @@ def test_all_head_scoring_preserves_predicted_head_runtime_selection(
         timestamp=2.0,
         operator=Operator.O2_UNIQUE,
     )
-    history = bank.retrieval_view((state,), None)
+    history = _view((state,))
     query = _query(_matching_query(bank, history), (Operator.O1_SNAP,))
     output = _retrieve(retriever, bank, history, query)
 
@@ -199,9 +226,9 @@ def test_history_reprojection_preserves_query_and_projector_gradients(
     torch.manual_seed(20260720)
     bank, retriever = components
     support_source = torch.randn(SOURCE_DIM, requires_grad=True)
-    state = bank.reset("video-gradient", "trajectory-gradient")
+    state = _new_history(bank, "video-gradient", "trajectory-gradient")
     state = _append_history(bank, state, source=support_source, timestamp=1.0)
-    history = _view(bank, (state,), (Operator.O1_SNAP,))
+    history = _view((state,))
     q_target = torch.randn((1, SEMANTIC_DIM), requires_grad=True)
 
     output = _retrieve(
@@ -230,10 +257,10 @@ def test_label_safe_wrong_route_bag_updates_semantic_projector(
 ) -> None:
     torch.manual_seed(20260722)
     bank, retriever = components
-    state = bank.reset("video-rescue", "trajectory-rescue")
+    state = _new_history(bank, "video-rescue", "trajectory-rescue")
     state = _append_history(bank, state, source=torch.randn(SOURCE_DIM), timestamp=1.0)
     state = _append_history(bank, state, source=torch.randn(SOURCE_DIM), timestamp=2.0)
-    history = bank.retrieval_view((state,), None)
+    history = _view((state,))
     output = _retrieve(
         retriever,
         bank,
@@ -266,21 +293,13 @@ def test_label_safe_wrong_route_bag_updates_semantic_projector(
     assert projector_grad > 0.0
 
 
-def test_tensor_ring_matches_legacy_overflow_retrieval_loss_and_gradient() -> None:
+def test_tensor_ring_overflow_retrieval_loss_and_gradient() -> None:
     torch.manual_seed(20260723)
     config = load_config()
     bank = build_state_bank(config)
     object.__setattr__(bank.config, "retrieval_history_capacity_per_head", 2)
     retriever = build_state_retriever(config)
-    legacy = bank.reset("video-ring", "trajectory-ring")
-    ring = TensorizedRetrievalHistory(
-        "video-ring",
-        "trajectory-ring",
-        capacity_per_head=2,
-        source_dim=SOURCE_DIM,
-        dtype=next(bank.semantic_projector.parameters()).dtype,
-        device=next(bank.semantic_projector.parameters()).device,
-    )
+    history = _new_history(bank, "video-ring", "trajectory-ring")
     writes = (
         (Operator.O1_SNAP, 1.0),
         (Operator.O1_SNAP, 2.0),
@@ -289,53 +308,18 @@ def test_tensor_ring_matches_legacy_overflow_retrieval_loss_and_gradient() -> No
     )
     for operator, timestamp in writes:
         source = torch.randn(SOURCE_DIM)
-        legacy = _append_history(
-            bank, legacy, source=source, timestamp=timestamp, operator=operator
-        )
-        head = OPERATOR_TO_HEAD_TYPE[operator]
-        assert head is not None
-        ring.append_many(
-            RetrievalHistoryAppendBatch(
-                sources=source.reshape(1, -1),
-                head_codes=torch.tensor((RETRIEVAL_HEAD_ORDER.index(head),), dtype=torch.int64),
-                operator_codes=torch.tensor((OPERATORS.index(operator),), dtype=torch.int64),
-                timestamps=torch.tensor((timestamp,), dtype=torch.float64),
-                time_ranges=torch.full((1, 2), -1.0, dtype=torch.float64),
-                valid_mask=torch.ones(1, dtype=torch.bool),
-                eligible_mask=torch.ones(1, dtype=torch.bool),
-            )
-        )
-        legacy_view = bank.retrieval_view((legacy,), None)
-        ring_view = tensorized_retrieval_view((ring,))
-        count = int(ring_view.n_state[0])
-        assert tuple(
-            f"retrieval-{int(value):08d}"
-            for value in ring_view.sequence_ids[0, :count].tolist()
-        ) == legacy_view.record_ids[0][:count]
-        assert tuple(
-            RETRIEVAL_HEAD_ORDER[int(value)]
-            for value in ring_view.head_codes[0, :count].tolist()
-        ) == legacy_view.head_types[0][:count]
-        assert torch.equal(ring_view.sequence_ids, legacy_view.sequence_ids)
-        assert torch.equal(ring_view.operator_codes, legacy_view.operator_codes)
-        assert torch.equal(ring_view.timestamps, legacy_view.timestamps)
-        assert torch.equal(ring_view.time_ranges, legacy_view.time_ranges)
-        assert torch.equal(ring_view.sources, legacy_view.sources)
+        _append_history(bank, history, source=source, timestamp=timestamp, operator=operator)
 
-    q_target = bank.project(
-        legacy_view.sources[0, 0].unsqueeze(0),
-        (legacy_view.head_types[0][0],),  # type: ignore[arg-type]
-    ).detach()
+    ring_view = tensorized_retrieval_view((history.ring,))
+    assert ring_view.n_state.tolist() == [3]
+    assert ring_view.sequence_ids[0, :3].tolist() == [1, 2, 3]
+
+    _, head_codes, _ = ring_view.require_tensor_metadata()
+    head = RETRIEVAL_HEAD_ORDER[int(head_codes[0, 0].item())]
+    q_target = bank.project(ring_view.sources[0, 0].unsqueeze(0), (head,)).detach()
     query = _query(q_target, (Operator.O1_SNAP,), (_resolution(query_time=4.0),))
-    legacy_output = _retrieve(retriever, bank, legacy_view, query)
     ring_output = _retrieve(retriever, bank, ring_view, query)
-    assert all(value is None for value in ring_view.record_ids[0])
-    assert all(value is None for value in ring_view.head_types[0])
-    assert all(value is None for value in ring_view.record_kinds[0])
-    assert all(record is None for record in ring_output.candidate_records[0])
-    assert ring_output.selected_record_ids == legacy_output.selected_record_ids
-    assert ring_output.status == legacy_output.status
-    assert torch.allclose(ring_output.scores, legacy_output.scores, atol=1.0e-6, rtol=0.0)
+    assert ring_output.n_state.tolist() == [3]
 
     label = OfficialWeakSupervision(
         query_id="ring-equivalence",
@@ -346,20 +330,9 @@ def test_tensor_ring_matches_legacy_overflow_retrieval_loss_and_gradient() -> No
         occurrence_points=(2.0,),
         occurrence_intervals=(),
     )
-    legacy_loss = _official_weak_retrieval_loss(legacy_output, 0, label)
     ring_loss = _official_weak_retrieval_loss(ring_output, 0, label)
-    assert legacy_loss.status == ring_loss.status == "valid_bag"
-    assert legacy_loss.loss is not None and ring_loss.loss is not None
-    assert torch.allclose(ring_loss.loss, legacy_loss.loss, atol=1.0e-6, rtol=0.0)
-    bank.zero_grad(set_to_none=True)
-    legacy_loss.loss.backward()
-    legacy_gradient = torch.cat(
-        tuple(
-            parameter.grad.detach().flatten()
-            for parameter in bank.semantic_projector.parameters()
-            if parameter.grad is not None
-        )
-    )
+    assert ring_loss.status == "valid_bag"
+    assert ring_loss.loss is not None
     bank.zero_grad(set_to_none=True)
     ring_loss.loss.backward()
     ring_gradient = torch.cat(
@@ -370,7 +343,6 @@ def test_tensor_ring_matches_legacy_overflow_retrieval_loss_and_gradient() -> No
         )
     )
     assert torch.isfinite(ring_gradient).all() and float(ring_gradient.norm()) > 0.0
-    assert torch.allclose(ring_gradient, legacy_gradient, atol=1.0e-6, rtol=0.0)
 
 
 def test_tensor_ring_snapshot_is_immutable_and_release_is_terminal() -> None:
@@ -410,7 +382,7 @@ def test_history_filters_future_invalid_and_ineligible_records(
     components: tuple[StructuredStateBank, EmbeddingStateRetriever],
 ) -> None:
     bank, retriever = components
-    state = bank.reset("video-filter", "trajectory-filter")
+    state = _new_history(bank, "video-filter", "trajectory-filter")
     sources = tuple(torch.randn(SOURCE_DIM) for _ in range(4))
     state = _append_history(bank, state, source=sources[0], timestamp=1.0)
     state = _append_history(
@@ -423,7 +395,7 @@ def test_history_filters_future_invalid_and_ineligible_records(
     )
     state = _append_history(bank, state, source=sources[2], timestamp=2.5, eligible=False)
     state = _append_history(bank, state, source=sources[3], timestamp=8.0)
-    history = _view(bank, (state,), (Operator.O1_SNAP,))
+    history = _view((state,))
     query = _query(
         _matching_query(bank, history),
         (Operator.O1_SNAP,),
@@ -444,9 +416,9 @@ def test_history_retriever_statuses_fail_closed(
     components: tuple[StructuredStateBank, EmbeddingStateRetriever],
 ) -> None:
     bank, retriever = components
-    state = bank.reset("video-status", "trajectory-status")
+    state = _new_history(bank, "video-status", "trajectory-status")
     state = _append_history(bank, state, source=torch.randn(SOURCE_DIM), timestamp=1.0)
-    history = _view(bank, (state,), (Operator.O1_SNAP,))
+    history = _view((state,))
     matching = _matching_query(bank, history)
 
     owner_mismatch = _retrieve(
@@ -459,7 +431,7 @@ def test_history_retriever_statuses_fail_closed(
     unsupported = _retrieve(
         retriever,
         bank,
-        _view(bank, (state,), (Operator.UNSUPPORTED,)),
+        _view((state,)),
         _query(matching, (Operator.UNSUPPORTED,)),
     )
     invalid_time = _retrieve(
@@ -485,15 +457,15 @@ def test_retriever_rejects_aggregate_or_malformed_inputs(
     components: tuple[StructuredStateBank, EmbeddingStateRetriever],
 ) -> None:
     bank, retriever = components
-    state = bank.reset("video-errors", "trajectory-errors")
+    state = _new_history(bank, "video-errors", "trajectory-errors")
     state = _append_history(bank, state, source=torch.randn(SOURCE_DIM), timestamp=1.0)
-    history = _view(bank, (state,), (Operator.O1_SNAP,))
+    history = _view((state,))
     query = _query(_matching_query(bank, history), (Operator.O1_SNAP,))
 
     with pytest.raises(TypeError, match="RetrievalHistoryView"):
         retriever(
             bank,
-            bank.view((state,), (HeadType.O1,)),  # type: ignore[arg-type]
+            bank.view((state.bank_state,), (HeadType.O1,)),  # type: ignore[arg-type]
             query,  # type: ignore[arg-type]
             video_ids=history.video_ids,
             trajectory_ids=history.trajectory_ids,

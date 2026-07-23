@@ -67,7 +67,12 @@ from ttt_svcbench_qwen.stage_a_targets import (
     StageATargetBatch,
     TargetProvenance,
 )
-from ttt_svcbench_qwen.state_bank import HeadType, RetrievalHistoryView, build_state_bank
+from ttt_svcbench_qwen.state_bank import (
+    HeadType,
+    RetrievalHistoryView,
+    TensorizedRetrievalHistory,
+    build_state_bank,
+)
 from ttt_svcbench_qwen.state_encoder import TemporalCache, TemporalEncoderOutput
 from ttt_svcbench_qwen.trainer import StageAEpisodeAnswerInputs, StageASupervisionBatch
 
@@ -90,6 +95,7 @@ class _RuntimeResetter:
         self.calls += 1
         state_bank = build_state_bank(load_config())
         identity_bank = build_identity_bank(load_config())
+        parameter = next(state_bank.semantic_projector.parameters())
         return BatchRuntimeState(
             tuple(
                 TrajectoryRuntimeState(
@@ -104,6 +110,14 @@ class _RuntimeResetter:
                         video_id,
                         trajectory_id,
                         hot_cache_enabled=False,
+                    ),
+                    retrieval_history=TensorizedRetrievalHistory(
+                        video_id,
+                        trajectory_id,
+                        capacity_per_head=state_bank.config.retrieval_history_capacity_per_head,
+                        source_dim=state_bank.config.retrieval_history_source_dim,
+                        dtype=parameter.dtype,
+                        device=parameter.device,
                     ),
                 )
                 for video_id, trajectory_id in zip(

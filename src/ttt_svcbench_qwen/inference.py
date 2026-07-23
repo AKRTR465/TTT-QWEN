@@ -598,17 +598,13 @@ class PerVideoRuntimeManager:
                     hot_device=self.hot_device,
                     hot_cache_enabled=self.hot_cache_enabled,
                 ),
-                retrieval_history=(
-                    TensorizedRetrievalHistory(
-                        video_id,
-                        trajectory_id,
-                        capacity_per_head=self.state_bank.config.retrieval_history_capacity_per_head,
-                        source_dim=self.state_bank.config.retrieval_history_source_dim,
-                        dtype=next(self.state_bank.semantic_projector.parameters()).dtype,
-                        device=next(self.state_bank.semantic_projector.parameters()).device,
-                    )
-                    if self.state_bank.config.retrieval_history_backend == "tensor_ring"
-                    else None
+                retrieval_history=TensorizedRetrievalHistory(
+                    video_id,
+                    trajectory_id,
+                    capacity_per_head=self.state_bank.config.retrieval_history_capacity_per_head,
+                    source_dim=self.state_bank.config.retrieval_history_source_dim,
+                    dtype=next(self.state_bank.semantic_projector.parameters()).dtype,
+                    device=next(self.state_bank.semantic_projector.parameters()).device,
                 ),
                 reader_audit=(),
                 released=False,
@@ -1471,7 +1467,6 @@ def _hash_value(digest: _Digest, value: object) -> None:
             value.eligible_mask,
             value.sizes,
             value.write_ptrs,
-            value.lifecycle_ids,
             value.next_sequence,
             value.version,
             value.released,

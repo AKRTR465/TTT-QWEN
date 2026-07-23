@@ -1597,16 +1597,6 @@ class _TaskLossResult:
     e1_unrepresentable_occurrences: int = 0
 
 
-def _official_weak_task_loss(
-    observations: ObservationOutputs,
-    row: int,
-    label: OfficialWeakSupervision,
-) -> Tensor:
-    """Backward-compatible scalar entry point; diagnostics use the typed result below."""
-
-    return _official_weak_task_result(observations, row, label).loss
-
-
 def _official_weak_task_result(
     observations: ObservationOutputs,
     row: int,
@@ -1993,16 +1983,6 @@ def _retrieval_occurrence_mask(
         matched |= is_point & (timestamps >= start) & (timestamps <= causal_end)
         matched |= ~is_point & (ranges[:, 0] <= causal_end) & (start <= ranges[:, 1])
     return matched & retrieval.present_mask[row]
-
-
-def _record_end_time(record: object) -> float:
-    timestamp = getattr(record, "timestamp", None)
-    if timestamp is not None:
-        return float(timestamp)
-    time_range = getattr(record, "time_range", None)
-    if time_range is None:
-        raise ValueError("Retrieval candidate requires timestamp or time_range")
-    return float(time_range[1])
 
 
 def _record_matches_causal_occurrence(

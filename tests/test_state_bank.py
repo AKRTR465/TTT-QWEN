@@ -17,7 +17,6 @@ from ttt_svcbench_qwen.observation_heads import (
     O1SoftOutput,
     StreamReplayAudit,
 )
-from ttt_svcbench_qwen.query_encoder import Operator
 from ttt_svcbench_qwen.state_bank import (
     E1EventKind,
     E1Payload,
@@ -253,75 +252,6 @@ def test_meta_topology_exact_parameter_count_builder_and_state_dict_boundary() -
         "semantic_projector.output_projection.weight",
         "semantic_projector.output_projection.bias",
     }
-
-
-def test_retrieval_history_is_detached_fifo_runtime_only_and_lifecycle_aware() -> None:
-    module = build_state_bank(load_config())
-    object.__setattr__(module.config, "retrieval_history_capacity_per_head", 2)
-    state = module.reset("video-history", "trajectory-history")
-    source = torch.randn(HIDDEN_DIM, requires_grad=True)
-    state_dict_keys = tuple(module.state_dict())
-
-    for timestamp in (0.0, 1.0, 2.0):
-        state = module.append_retrieval_history(
-            state,
-            head_type=HeadType.O1,
-            operator=Operator.O1_SNAP,
-            semantic_source=source + timestamp,
-            timestamp=timestamp,
-            time_range=None,
-        )
-
-    assert state.records == ()
-    assert tuple(record.record_id for record in state.retrieval_history) == (
-        "retrieval-00000001",
-        "retrieval-00000002",
-    )
-    assert all(
-        not record.semantic_source.requires_grad and record.semantic_source.grad_fn is None
-        for record in state.retrieval_history
-    )
-    assert all(
-        record.semantic_source.data_ptr() != source.data_ptr() for record in state.retrieval_history
-    )
-    assert tuple(module.state_dict()) == state_dict_keys
-
-    confirmed = _confirmed("identity-history", first_seen=0.0, last_seen=1.0)
-    state = module.append_record(
-        state,
-        head_type=HeadType.O2,
-        semantic_embedding=_unit_semantic(4),
-        timestamp=None,
-        time_range=(0.0, 1.0),
-        valid=True,
-        confidence=0.9,
-        payload=confirmed,
-    )
-    confirmed_record_id = state.records[-1].record_id
-    state = module.append_retrieval_history(
-        state,
-        head_type=HeadType.O2,
-        operator=Operator.O2_UNIQUE,
-        semantic_source=torch.randn(HIDDEN_DIM),
-        timestamp=None,
-        time_range=(0.0, 1.0),
-        lifecycle_id=confirmed.identity_id,
-    )
-    state = module.invalidate_record(
-        state,
-        confirmed_record_id,
-        audit_timestamp=2.0,
-        reason="synthetic lifecycle end",
-    )
-
-    lifecycle_history = tuple(
-        record for record in state.retrieval_history if record.lifecycle_id == confirmed.identity_id
-    )
-    assert len(lifecycle_history) == 1
-    assert lifecycle_history[0].valid
-    assert not lifecycle_history[0].retrieval_eligible
-    with pytest.raises(ValueError, match="[Cc]onfig"):
-        build_state_bank()
 
 
 def test_projector_normalization_zero_fallback_head_conditioning_and_gradients(

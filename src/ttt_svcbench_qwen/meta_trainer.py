@@ -68,7 +68,6 @@ from ttt_svcbench_qwen.model import (
     RuntimeOwner,
     StateTTTModel,
     StateTTTModelOutput,
-    TrajectoryRuntimeState,
     query_dropout_seed,
     query_reuse_key,
 )
@@ -1830,16 +1829,12 @@ def _contains_grad_tensor(value: object, seen: set[int] | None = None) -> bool:
 def _fork_retrieval_runtime(runtime: BatchRuntimeState) -> BatchRuntimeState:
     """Isolate mutable retrieval rings while retaining functional Bank/FSM state."""
 
-    rows: list[TrajectoryRuntimeState] = []
-    for row in runtime.rows:
-        history = row.retrieval_history
-        rows.append(
-            replace(
-                row,
-                retrieval_history=None if history is None else history.fork(),
-            )
+    return BatchRuntimeState(
+        tuple(
+            replace(row, retrieval_history=history.fork())
+            for row, history in zip(runtime.rows, runtime.retrieval_histories, strict=True)
         )
-    return BatchRuntimeState(tuple(rows))
+    )
 
 
 def _contains_tensor(value: object, seen: set[int] | None = None) -> bool:

@@ -49,7 +49,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     TargetProvenance,
     _balanced_dense_bce,
     _build_e1_fsm_targets,
-    _official_weak_task_loss,
+    _official_weak_task_result,
     _record_matches_causal_occurrence,
 )
 from ttt_svcbench_qwen.state_bank import (
@@ -945,12 +945,12 @@ def test_historical_occurrences_outside_state_tail_do_not_create_dense_targets()
     )
 
     assert torch.allclose(
-        _official_weak_task_loss(observations, 0, e1_empty),
-        _official_weak_task_loss(observations, 0, e1_historical),
+        _official_weak_task_result(observations, 0, e1_empty).loss,
+        _official_weak_task_result(observations, 0, e1_historical).loss,
     )
     assert torch.allclose(
-        _official_weak_task_loss(observations, 0, e2_empty),
-        _official_weak_task_loss(observations, 0, e2_historical),
+        _official_weak_task_result(observations, 0, e2_empty).loss,
+        _official_weak_task_result(observations, 0, e2_historical).loss,
     )
 
 

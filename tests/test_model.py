@@ -10,9 +10,11 @@ from torch import nn
 
 from tests.support import make_test_model as build_model
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
+from ttt_svcbench_qwen.identity_bank import build_identity_bank
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
     BankWriteOutput,
+    BatchRuntimeState,
     LifecycleError,
     LifecyclePhase,
     ModelComponents,
@@ -24,34 +26,20 @@ from ttt_svcbench_qwen.model import (
     QwenPrefillRequest,
     RuntimeOwner,
     StateTTTModel,
+    TrajectoryRuntimeState,
     VisualStageOutput,
     assert_training_number_agreement,
 )
 from ttt_svcbench_qwen.query_encoder import Operator
-from ttt_svcbench_qwen.state_bank import RetrievalHistoryView
+from ttt_svcbench_qwen.state_bank import (
+    RetrievalHistoryView,
+    StateBankRuntimeState,
+    TensorizedRetrievalHistory,
+)
 
 
 class _StateBankComponent:
-    def retrieval_view(self, states: Any, heads: Any) -> RetrievalHistoryView:
-        assert tuple(states) == ("bank-0",)
-        assert heads is None
-        return RetrievalHistoryView(
-            sources=torch.zeros((1, 0, 768)),
-            present_mask=torch.zeros((1, 0), dtype=torch.bool),
-            record_valid_mask=torch.zeros((1, 0), dtype=torch.bool),
-            retrieval_eligible_mask=torch.zeros((1, 0), dtype=torch.bool),
-            timestamps=torch.full((1, 0), -1.0, dtype=torch.float64),
-            time_ranges=torch.full((1, 0, 2), -1.0, dtype=torch.float64),
-            n_state=torch.zeros(1, dtype=torch.int64),
-            owner_record_counts=torch.zeros(1, dtype=torch.int64),
-            video_ids=("video-a",),
-            trajectory_ids=("trajectory-a",),
-            bank_versions=(0,),
-            record_ids=((),),
-            head_types=((),),
-            record_kinds=((),),
-            cloned_records=((),),
-        )
+    pass
 
 
 @pytest.fixture(scope="module")
@@ -91,7 +79,8 @@ class SpySuite:
         self.events.append("fast")
         assert visual.value == "main-visual"
         assert query.q_target == "q-target"
-        assert request.runtime_state == "runtime-0"
+        assert isinstance(request.runtime_state, BatchRuntimeState)
+        assert request.runtime_state.owner == request.owner
         return VisualStageOutput("adapted-main", "fast-audit")
 
     def spatial(
@@ -290,11 +279,35 @@ def make_owner(name: str = "a") -> RuntimeOwner:
 
 
 def make_observation_request(owner: RuntimeOwner) -> ObservationChunkRequest:
+    video_id = owner.video_ids[0]
+    trajectory_id = owner.trajectory_ids[0]
+    runtime = BatchRuntimeState(
+        (
+            TrajectoryRuntimeState(
+                owner=owner,
+                next_chunk_index=0,
+                slot_state=None,
+                temporal_cache=None,
+                e1_state=None,
+                e2_state=None,
+                state_bank=StateBankRuntimeState(video_id, trajectory_id, (), ()),
+                identity_bank=build_identity_bank(load_config()).reset(video_id, trajectory_id),
+                retrieval_history=TensorizedRetrievalHistory(
+                    video_id,
+                    trajectory_id,
+                    capacity_per_head=8,
+                    source_dim=768,
+                    dtype=torch.float32,
+                    device=torch.device("cpu"),
+                ),
+            ),
+        )
+    )
     return ObservationChunkRequest(
         owner=owner,
         video_input="video-input",
         query_input="query-input",
-        runtime_state="runtime-0",
+        runtime_state=runtime,
         bank_states=("bank-0",),
     )
 

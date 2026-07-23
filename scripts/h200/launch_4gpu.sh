@@ -211,7 +211,6 @@ payload = {
 Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 PY
 
-if [[ "$BASELINE_CLIPS_MODE" -eq 0 ]]; then
 "$PYTHON" - "$RUN_ROOT/dataset_manifest.json" "$RUN_ROOT/failed.jsonl" <<'PY'
 import json
 import sys
@@ -239,7 +238,6 @@ Path(failed_path).write_text(
     encoding="utf-8",
 )
 PY
-fi
 
 "$PYTHON" - "$RUN_ROOT" <<'PY'
 import sys

@@ -43,7 +43,6 @@ from ttt_svcbench_qwen.state_bank import (
     E2EventKind,
     HeadType,
     RetrievalHistoryAppendBatch,
-    StateBankRuntimeState,
     StructuredStateBank,
     TensorizedRetrievalHistory,
 )
@@ -254,17 +253,13 @@ class StageABankWriter:
                     e2_state=None,
                     state_bank=bank,
                     identity_bank=identity,
-                    retrieval_history=(
-                        TensorizedRetrievalHistory(
-                            video_id,
-                            trajectory_id,
-                            capacity_per_head=self.state_bank.config.retrieval_history_capacity_per_head,
-                            source_dim=self.state_bank.config.retrieval_history_source_dim,
-                            dtype=next(self.state_bank.semantic_projector.parameters()).dtype,
-                            device=next(self.state_bank.semantic_projector.parameters()).device,
-                        )
-                        if self.state_bank.config.retrieval_history_backend == "tensor_ring"
-                        else None
+                    retrieval_history=TensorizedRetrievalHistory(
+                        video_id,
+                        trajectory_id,
+                        capacity_per_head=self.state_bank.config.retrieval_history_capacity_per_head,
+                        source_dim=self.state_bank.config.retrieval_history_source_dim,
+                        dtype=next(self.state_bank.semantic_projector.parameters()).dtype,
+                        device=next(self.state_bank.semantic_projector.parameters()).device,
                     ),
                 )
                 for video_id, trajectory_id, bank, identity in zip(
@@ -313,7 +308,7 @@ class StageABankWriter:
             with trace_cuda_phase("retrieval_history_write"):
                 if not request.retrieval_history_write_enabled:
                     state = next_banks[row]
-                elif self.state_bank.config.retrieval_history_backend == "tensor_ring":
+                else:
                     history = runtime.rows[row].retrieval_history
                     if history is None:
                         raise RuntimeError("tensor retrieval backend requires an episode ring")
@@ -321,10 +316,6 @@ class StageABankWriter:
                         history, observations, soft, row=row
                     )
                     state = next_banks[row]
-                else:
-                    state = self._append_all_head_retrieval_history_legacy(
-                        next_banks[row], observations, soft, row=row
-                    )
             next_banks[row] = state
             if head is HeadType.O1:
                 mask = observations.o1.valid_mask[row]
@@ -424,59 +415,6 @@ class StageABankWriter:
             audit=audit,
             soft_write=soft,
         )
-
-    def _append_all_head_retrieval_history_legacy(
-        self,
-        state: StateBankRuntimeState,
-        observations: ObservationOutputs,
-        soft: StageASoftWriteOutput,
-        *,
-        row: int,
-    ) -> StateBankRuntimeState:
-        """Persist label-free sources for every head without changing hard FSM topology."""
-
-        next_state = state
-        o1_mask = observations.o1.valid_mask[row]
-        if bool(soft.o1_present_mask[row].item()):
-            next_state = self.state_bank.append_retrieval_history(
-                next_state,
-                head_type=HeadType.O1,
-                operator=Operator.O1_SNAP,
-                semantic_source=soft.o1_sources[row],
-                timestamp=None,
-                time_range=_time_range(observations.o1.timestamps[row], o1_mask),
-            )
-        o2_mask = observations.o2.valid_mask[row] & soft.o2_present_mask[row]
-        for slot in torch.nonzero(o2_mask, as_tuple=False).flatten().tolist():
-            next_state = self.state_bank.append_retrieval_history(
-                next_state,
-                head_type=HeadType.O2,
-                operator=Operator.O2_UNIQUE,
-                semantic_source=soft.o2_sources[row, slot],
-                timestamp=float(observations.o2.timestamps[row, slot].item()),
-                time_range=None,
-            )
-        e1_mask = observations.e1.valid_mask[row]
-        if bool(soft.e1_present_mask[row].any().item()):
-            next_state = self.state_bank.append_retrieval_history(
-                next_state,
-                head_type=HeadType.E1,
-                operator=Operator.E1_ACTION,
-                semantic_source=soft.e1_sources[row],
-                timestamp=None,
-                time_range=_time_range(observations.e1.timestamps[row], e1_mask),
-            )
-        e2_mask = observations.e2.valid_mask[row]
-        if bool(soft.e2_present_mask[row].any().item()):
-            next_state = self.state_bank.append_retrieval_history(
-                next_state,
-                head_type=HeadType.E2,
-                operator=Operator.E2_EPISODE,
-                semantic_source=soft.e2_sources[row],
-                timestamp=None,
-                time_range=_time_range(observations.e2.timestamps[row], e2_mask),
-            )
-        return next_state
 
     def _append_all_head_retrieval_history_tensorized(
         self,
@@ -626,13 +564,6 @@ class StageABankWriter:
             e1_sources=time_source.detach(),
             e2_sources=time_source.detach(),
         )
-
-
-def _time_range(timestamps: Tensor, mask: Tensor) -> tuple[float, float]:
-    selected = timestamps[mask]
-    if not selected.numel():
-        raise ValueError("retrieval history requires at least one valid timestamp")
-    return float(selected.min().item()), float(selected.max().item())
 
 
 def _time_range_tensor(timestamps: Tensor, mask: Tensor) -> Tensor:

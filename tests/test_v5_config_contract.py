@@ -419,7 +419,6 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "event_history_capacity": 512,
         "retrieval_history_capacity_per_head": 512,
         "retrieval_history_source_dim": 768,
-        "retrieval_history_backend": "tensor_ring",
         "isolation_keys": ("video_id", "trajectory_id", "head_type"),
         "hard_updates_no_grad": True,
         "detach_before_write": True,

@@ -11,7 +11,7 @@ import argparse
 import platform
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal, Self, cast
+from typing import Annotated, Self, cast
 
 import torch
 import transformers
@@ -387,7 +387,6 @@ class StateBankConfig(FrozenModel):
     event_history_capacity: PositiveInt
     retrieval_history_capacity_per_head: PositiveInt
     retrieval_history_source_dim: PositiveInt
-    retrieval_history_backend: Literal["legacy_tuple", "tensor_ring"] = "legacy_tuple"
     isolation_keys: tuple[str, ...]
     hard_updates_no_grad: bool
     detach_before_write: bool

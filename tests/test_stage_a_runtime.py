@@ -312,6 +312,10 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
     state_bank = build_state_bank(load_config())
     writer = StageABankWriter(state_bank, build_identity_bank(load_config()))
     runtime = writer.reset(owner)
+    pre_write_view = tensorized_retrieval_view(
+        runtime.retrieval_histories,
+        guard_current_version=False,
+    )
     result = writer(
         observations,
         spatial,
@@ -369,10 +373,6 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
     )
 
     retriever = build_state_retriever(load_config())
-    pre_write_view = state_bank.retrieval_view(
-        runtime.state_bank_states,
-        None,
-    )
     pre_write_retrieval = retriever(
         state_bank,
         pre_write_view,
@@ -571,5 +571,4 @@ def test_tensor_ring_chunk_write_has_no_per_slot_python_materialization() -> Non
     source = inspect.getsource(StageABankWriter._append_all_head_retrieval_history_tensorized)
     assert ".item(" not in source
     assert ".tolist(" not in source
-    assert "append_retrieval_history(" not in source
     assert source.count("append_many(") == 1

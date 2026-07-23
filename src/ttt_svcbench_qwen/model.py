@@ -1059,42 +1059,25 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             bank_audit: object | None = None
             soft_write: object | None = None
             if self.feature_flags.bank_enabled:
-                state_bank = self.components.require_state_bank()
                 if request.retrieval_snapshot_required and (
                     self.feature_flags.reader_enabled or self.feature_flags.state_tokens_enabled
                 ):
                     # Keep the write-before snapshot label-free and expose every head. Runtime
                     # selection is still constrained by the predicted hard operator inside the
                     # Retriever; official labels may only build a target-head MIL bag later.
+                    if not isinstance(request.runtime_state, BatchRuntimeState):
+                        raise TypeError("tensor retrieval backend requires BatchRuntimeState")
                     with trace_cuda_phase("retrieval_history_snapshot"):
-                        backend = getattr(
-                            getattr(state_bank, "config", None),
-                            "retrieval_history_backend",
-                            "legacy_tuple",
+                        retrieval_history = tensorized_retrieval_view(
+                            request.runtime_state.retrieval_histories,
+                            # A normal online Support observation intentionally commits a
+                            # hard write after taking its pre-write view. The gathered view
+                            # owns tensor copies, so it remains immutable. Query snapshots
+                            # never write and retain the strict version guard.
+                            guard_current_version=(
+                                not request.retrieval_history_write_enabled
+                            ),
                         )
-                        has_tensor_ring = isinstance(
-                            request.runtime_state, BatchRuntimeState
-                        ) and all(
-                            row.retrieval_history is not None for row in request.runtime_state.rows
-                        )
-                        if backend == "tensor_ring" and has_tensor_ring:
-                            if not isinstance(request.runtime_state, BatchRuntimeState):
-                                raise TypeError(
-                                    "tensor retrieval backend requires BatchRuntimeState"
-                                )
-                            retrieval_history = tensorized_retrieval_view(
-                                request.runtime_state.retrieval_histories,
-                                # A normal online Support observation intentionally commits a
-                                # hard write after taking its pre-write view.  The gathered view
-                                # owns tensor copies, so it remains an immutable legacy-compatible
-                                # answer snapshot.  Query snapshots never write and retain the
-                                # strict version guard.
-                                guard_current_version=(
-                                    not request.retrieval_history_write_enabled
-                                ),
-                            )
-                        else:
-                            retrieval_history = state_bank.retrieval_view(bank_states, None)
                 writer = self.components.require_bank_writer()
                 assert soft.observations is not None
                 assert soft.spatial is not None

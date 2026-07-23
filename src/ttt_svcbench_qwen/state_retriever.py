@@ -24,7 +24,6 @@ from ttt_svcbench_qwen.query_encoder import (
     QueryEncoderOutput,
     TimeResolution,
     TimeResolutionStatus,
-    TimeWindow,
 )
 from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase
 from ttt_svcbench_qwen.state_bank import (
@@ -33,7 +32,6 @@ from ttt_svcbench_qwen.state_bank import (
     RetrievalHistoryRecord,
     RetrievalHistoryView,
     StateRecord,
-    StateRecordKind,
     StructuredStateBank,
     clone_retrieval_history_record,
     clone_state_record,
@@ -142,7 +140,6 @@ class RetrieverOutput:
     candidate_operator_codes: Tensor | None = None
     candidate_timestamps: Tensor | None = None
     candidate_time_ranges: Tensor | None = None
-    candidate_lifecycle_ids: tuple[tuple[str | None, ...], ...] = ()
 
     def require_tensor_metadata(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Return materialized candidate metadata or fail closed at the runtime boundary."""
@@ -291,7 +288,6 @@ class RetrieverOutput:
             self.bank_video_ids,
             self.bank_trajectory_ids,
             self.bank_versions,
-            self.candidate_lifecycle_ids or tuple(() for _ in range(batch_size)),
         )
         if any(len(values) != batch_size for values in metadata):
             raise ValueError("Retriever metadata must contain one entry per batch item")
@@ -301,10 +297,6 @@ class RetrieverOutput:
             or any(len(row) != width for row in self.candidate_head_types)
         ):
             raise ValueError("candidate record snapshots must align to the padded score width")
-        if self.candidate_lifecycle_ids and any(
-            len(row) != width for row in self.candidate_lifecycle_ids
-        ):
-            raise ValueError("candidate lifecycle metadata must align to padded score width")
         for counts, name in ((self.n_state, "n_state"), (self.n_retrieved, "n_retrieved")):
             if (
                 counts.shape != (batch_size,)
@@ -658,7 +650,6 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
             candidate_operator_codes=operator_codes.detach().clone(),
             candidate_timestamps=history.timestamps.detach().clone(),
             candidate_time_ranges=history.time_ranges.detach().clone(),
-            candidate_lifecycle_ids=history.lifecycle_ids,
         )
 
     def _retrieve_row(
@@ -950,13 +941,6 @@ def _rejected_row(
     return status, reason, audit, (), (), ()
 
 
-def _record_end(record: RetrievalCandidate) -> float:
-    if record.timestamp is not None:
-        return float(record.timestamp)
-    assert record.time_range is not None
-    return float(record.time_range[1])
-
-
 def _project_history_sources(
     state_bank: StructuredStateBank,
     view: RetrievalHistoryView,
@@ -1051,20 +1035,6 @@ def _clone_candidate(record: RetrievalCandidate) -> RetrievalCandidate:
     return clone_retrieval_history_record(record)
 
 
-def _requires_atomic_window_filter(kind: StateRecordKind, window: TimeWindow) -> bool:
-    return bool(kind is StateRecordKind.O2_CONFIRMED and window.start_time is not None)
-
-
-def _intersects_window(record: RetrievalCandidate, window: TimeWindow) -> bool:
-    if window.start_time is None:
-        return True
-    if record.timestamp is not None:
-        return bool(window.start_time <= record.timestamp <= window.end_time)
-    assert record.time_range is not None
-    start, end = record.time_range
-    return bool(start <= window.end_time and end >= window.start_time)
-
-
 def _required_record_id(view: RetrievalHistoryView, row: int, column: int) -> str:
     sequence_ids, _, _ = view.require_tensor_metadata()
     record_id = view.record_ids[row][column]
@@ -1075,13 +1045,6 @@ def _required_record_id(view: RetrievalHistoryView, row: int, column: int) -> st
     if not isinstance(record_id, str) or not record_id:
         raise ValueError("present State Bank records require record IDs")
     return record_id
-
-
-def _required_record(view: RetrievalHistoryView, row: int, column: int) -> RetrievalCandidate:
-    record = view.cloned_records[row][column]
-    if record is None:
-        raise ValueError("present State Bank records require cloned records")
-    return record
 
 
 def _materialize_history_record(
@@ -1112,7 +1075,6 @@ def _materialize_history_record(
         values = view.time_ranges[row, column].detach().cpu()
         timestamp = None
         time_range = (float(values[0]), float(values[1]))
-    lifecycle = view.lifecycle_ids[row][column] if view.lifecycle_ids else None
     return RetrievalHistoryRecord(
         record_id=record_id,
         video_id=view.video_ids[row],
@@ -1124,25 +1086,7 @@ def _materialize_history_record(
         time_range=time_range,
         valid=bool(view.record_valid_mask[row, column]),
         retrieval_eligible=bool(view.retrieval_eligible_mask[row, column]),
-        lifecycle_id=lifecycle,
     )
-
-
-def _intersects_window_metadata(
-    view: RetrievalHistoryView,
-    row: int,
-    column: int,
-    window: TimeWindow,
-) -> bool:
-    if window.start_time is None:
-        return True
-    timestamp = float(view.timestamps[row, column].item())
-    if timestamp >= 0.0:
-        return bool(window.start_time <= timestamp <= window.end_time)
-    time_range = view.time_ranges[row, column]
-    start = float(time_range[0].item())
-    end = float(time_range[1].item())
-    return bool(start <= window.end_time and end >= window.start_time)
 
 
 def _empty_reason(audit: RetrievalFilterAudit, owner_record_count: int) -> RetrievalReason:
