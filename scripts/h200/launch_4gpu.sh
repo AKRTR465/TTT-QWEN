@@ -13,6 +13,11 @@ PLAY_ROOT="/mnt/shared-storage-user/mineru2-shared/niujunbo/play"
 export TTT_H200_PLAY_ROOT="${TTT_H200_PLAY_ROOT:-$PLAY_ROOT}"
 VENV="${TTT_H200_VENV:-$PROJECT_ROOT/.venv-h200-py312-torch28}"
 PYTHON="$VENV/bin/python"
+A2_DATA_MODE="${TTT_A2_DATA_MODE:-production_manifest}"
+BASELINE_CLIPS_MODE=0
+if [[ "$STAGE" == "a2" && "$A2_DATA_MODE" == "llamafactory_sft_clips" ]]; then
+  BASELINE_CLIPS_MODE=1
+fi
 
 if [[ "$(id -un)" != "$EXPECTED_USER" ]]; then
   echo "refusing to train as $(id -un); expected $EXPECTED_USER" >&2
@@ -26,11 +31,25 @@ if [[ ! -x "$PYTHON" ]]; then
   echo "project Python is missing; run scripts/h200/train_a2_a5.sh first" >&2
   exit 1
 fi
-: "${SVCBENCH_DATASET_MANIFEST:?set SVCBENCH_DATASET_MANIFEST to dataset_manifest.json}"
 : "${SVCBENCH_VIDEO_ROOT:?set SVCBENCH_VIDEO_ROOT to the converted SVCBench dataset root}"
-if [[ ! -f "$SVCBENCH_DATASET_MANIFEST" ]]; then
-  echo "dataset manifest not found: $SVCBENCH_DATASET_MANIFEST" >&2
-  exit 1
+if [[ "$BASELINE_CLIPS_MODE" -eq 1 ]]; then
+  : "${DATASET_DIR:?set DATASET_DIR to the baseline LLaMA-Factory dataset directory}"
+  : "${DATASET_NAME:?set DATASET_NAME to svcbench_qwen3vl_sft}"
+  : "${WEAK_SIDECAR_PATH:?set WEAK_SIDECAR_PATH to official weak JSONL}"
+  if [[ "$DATASET_NAME" != "svcbench_qwen3vl_sft" ]]; then
+    echo "baseline-clips A2 requires DATASET_NAME=svcbench_qwen3vl_sft" >&2
+    exit 1
+  fi
+  if [[ ! -f "$WEAK_SIDECAR_PATH" ]]; then
+    echo "official-weak sidecar not found: $WEAK_SIDECAR_PATH" >&2
+    exit 1
+  fi
+else
+  : "${SVCBENCH_DATASET_MANIFEST:?set SVCBENCH_DATASET_MANIFEST to dataset_manifest.json}"
+  if [[ ! -f "$SVCBENCH_DATASET_MANIFEST" ]]; then
+    echo "dataset manifest not found: $SVCBENCH_DATASET_MANIFEST" >&2
+    exit 1
+  fi
 fi
 if [[ ! -d "$SVCBENCH_VIDEO_ROOT" ]]; then
   echo "SVCBench video root not found: $SVCBENCH_VIDEO_ROOT" >&2
@@ -169,7 +188,15 @@ if [[ -e "$RUN_ROOT" ]]; then
   exit 1
 fi
 mkdir -p "$OUTPUT_DIR" "$RUN_ROOT/samples"
-cp "$SVCBENCH_DATASET_MANIFEST" "$RUN_ROOT/dataset_manifest.json"
+if [[ "$BASELINE_CLIPS_MODE" -eq 1 ]]; then
+  "$PYTHON" -m ttt_svcbench_qwen.baseline_a2_data \
+    --dataset-dir "$DATASET_DIR" \
+    --dataset "$DATASET_NAME" \
+    --weak-sidecar "$WEAK_SIDECAR_PATH" \
+    --output "$RUN_ROOT/dataset_source.json"
+else
+  cp "$SVCBENCH_DATASET_MANIFEST" "$RUN_ROOT/dataset_manifest.json"
+fi
 : > "$RUN_ROOT/succeeded.jsonl"
 : > "$RUN_ROOT/failed.jsonl"
 export LAUNCHER_PID="$$"
@@ -193,7 +220,11 @@ payload = {
     "model": os.environ["MODEL"],
     "world_size": 4,
     "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
-    "dataset_manifest": os.environ["SVCBENCH_DATASET_MANIFEST"],
+    "a2_data_mode": os.environ.get("TTT_A2_DATA_MODE", "production_manifest"),
+    "dataset_manifest": os.environ.get("SVCBENCH_DATASET_MANIFEST"),
+    "dataset_dir": os.environ.get("DATASET_DIR"),
+    "dataset": os.environ.get("DATASET_NAME"),
+    "weak_sidecar_path": os.environ.get("WEAK_SIDECAR_PATH"),
     "runtime_factory": "ttt_svcbench_qwen.production_runtime:build_runtime",
     "initialize_from_a2": os.environ.get("A2_CHECKPOINT"),
     "same_stage_resume_from": os.environ.get("TTT_RESUME_CHECKPOINT"),
@@ -211,6 +242,7 @@ payload = {
 Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 PY
 
+if [[ "$BASELINE_CLIPS_MODE" -eq 0 ]]; then
 "$PYTHON" - "$RUN_ROOT/dataset_manifest.json" "$RUN_ROOT/failed.jsonl" <<'PY'
 import json
 import sys
@@ -238,6 +270,7 @@ Path(failed_path).write_text(
     encoding="utf-8",
 )
 PY
+fi
 
 "$PYTHON" - "$RUN_ROOT" <<'PY'
 import sys
@@ -280,6 +313,7 @@ import json
 import sys
 from pathlib import Path
 
+from ttt_svcbench_qwen.baseline_a2_data import load_baseline_a2_clip_dataset
 from ttt_svcbench_qwen.episode_data import ManifestStage, load_production_manifest_views
 from ttt_svcbench_qwen.production_factory import import_llamafactory, load_training_yaml
 
@@ -301,15 +335,23 @@ missing_native = sorted(required_native.difference(native))
 if missing_native:
     raise RuntimeError(f"production YAML is missing LLaMA-Factory keys: {missing_native}")
 stage = ManifestStage(extension.stage)
-train, validation = load_production_manifest_views(
-    extension.dataset_manifest,
-    stage=stage,
-)
+if extension.a2_data_mode == "llamafactory_sft_clips":
+    train = load_baseline_a2_clip_dataset(
+        native["dataset_dir"],
+        dataset_name=native["dataset"],
+        weak_sidecar_path=extension.weak_sidecar_path,
+    )
+    validation = None
+else:
+    train, validation = load_production_manifest_views(
+        extension.dataset_manifest,
+        stage=stage,
+    )
 payload = {
     "status": "preflight_completed",
     "stage": stage.value,
     "train_records": len(train),
-    "validation_records": len(validation),
+    "validation_records": 0 if validation is None else len(validation),
     "llamafactory_commit": symbols.checkout.commit,
     "llamafactory_dirty": symbols.checkout.dirty,
     "python": sys.version,
@@ -366,7 +408,16 @@ root = Path(sys.argv[1])
 stage = sys.argv[2]
 status = int(sys.argv[3])
 elapsed = int(sys.argv[4])
-manifest = json.loads((root / "dataset_manifest.json").read_text(encoding="utf-8"))
+manifest_path = root / "dataset_manifest.json"
+dataset_source_path = root / "dataset_source.json"
+manifest = (
+    json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else None
+)
+dataset_source = (
+    json.loads(dataset_source_path.read_text(encoding="utf-8"))
+    if dataset_source_path.is_file()
+    else None
+)
 summary_path = root / "run_summary.json"
 if summary_path.exists():
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -378,7 +429,7 @@ summary.update(
         "stage": stage,
         "exit_code": status,
         "elapsed_seconds": elapsed,
-        "failed_query_count": len(manifest.get("failures", [])),
+        "failed_query_count": 0 if manifest is None else len(manifest.get("failures", [])),
         "successful_run_count": 1 if status == 0 else 0,
     }
 )
@@ -386,7 +437,11 @@ summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
 
 if status == 0:
     if stage == "a2":
-        manifest_units = sum(row["split"] == "train" for row in manifest["a2_queries"])
+        manifest_units = (
+            int(dataset_source["row_count"])
+            if dataset_source is not None
+            else sum(row["split"] == "train" for row in manifest["a2_queries"])
+        )
         unit_name = "train_queries"
     else:
         manifest_units = sum(

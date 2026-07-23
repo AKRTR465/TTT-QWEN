@@ -11,7 +11,7 @@ import argparse
 import platform
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Self, cast
+from typing import Annotated, Literal, Self, cast
 
 import torch
 import transformers
@@ -387,6 +387,7 @@ class StateBankConfig(FrozenModel):
     event_history_capacity: PositiveInt
     retrieval_history_capacity_per_head: PositiveInt
     retrieval_history_source_dim: PositiveInt
+    retrieval_history_backend: Literal["legacy_tuple", "tensor_ring"] = "legacy_tuple"
     isolation_keys: tuple[str, ...]
     hard_updates_no_grad: bool
     detach_before_write: bool
@@ -460,6 +461,7 @@ class RetrieverConfig(FrozenModel):
     aggregate_time_policy: str
     atomic_window_boundary: str
     metrics_policy: str
+    score_chunk_size: PositiveInt
     top_k: PositiveInt | None
     ann_enabled: bool
 
@@ -2237,9 +2239,7 @@ def _normalize_project_schema(value: object) -> object:
 
     normalized_loss = dict(loss)
     normalized_loss["official_weak_balance"] = {
-        key: item
-        for key, item in _SCHEMA6_BALANCE.items()
-        if key not in {"mode", "experimental"}
+        key: item for key, item in _SCHEMA6_BALANCE.items() if key not in {"mode", "experimental"}
     }
     normalized_loss["official_weak_balance"]["group_weight"] = 0.4
     optimizer_a2 = cast(dict[str, object], stage_a["optimizer"])

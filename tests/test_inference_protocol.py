@@ -985,6 +985,7 @@ def test_unified_runtime_commits_real_hard_state(dependencies: _Dependencies) ->
 def test_online_updater_publishes_overlap_and_next_only_fast_state(
     dependencies: _Dependencies,
 ) -> None:
+    torch.manual_seed(15)
     suite = _TypedStageSuite()
     manager = _manager(dependencies)
     model = _stage_a_model(dependencies, suite)

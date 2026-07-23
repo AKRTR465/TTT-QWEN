@@ -14,9 +14,10 @@ from ttt_svcbench_qwen.functional_sgd import (
     initialize_optimizer_state,
     snapshot_gradient_delta_group,
 )
-from ttt_svcbench_qwen.llamafactory_trainer import _semantic_projector_gradient_norm
+from ttt_svcbench_qwen.llamafactory_trainer import _SemanticProjectorStepAuditor
 from ttt_svcbench_qwen.losses import O1StateTarget, StateLossInput, compute_state_loss
 from ttt_svcbench_qwen.observation_heads import O1CurrentCountDecoder
+from ttt_svcbench_qwen.outer_gradient_control import GroupGradientAudit, OuterGradientAudit
 from ttt_svcbench_qwen.state_bank import SemanticProjector
 
 
@@ -24,19 +25,55 @@ def _storage_pointer(value: Tensor) -> int:
     return int(value.untyped_storage().data_ptr())
 
 
-def test_semantic_projector_training_log_captures_post_backward_gradient_norm() -> None:
+def test_semantic_projector_training_log_uses_pre_step_group_and_real_delta() -> None:
     projector = SemanticProjector(load_config().state_bank.semantic_projector)
     wrapper = nn.Module()
     wrapper.add_module("semantic_projector", projector)
-    parameter_count = 0
-    for parameter in projector.parameters():
-        parameter.grad = torch.ones_like(parameter)
-        parameter_count += parameter.numel()
-
-    assert _semantic_projector_gradient_norm(wrapper) == pytest.approx(
-        math.sqrt(parameter_count)
+    parameters = tuple(projector.parameters())
+    parameter_count = sum(parameter.numel() for parameter in parameters)
+    optimizer = torch.optim.SGD(
+        [{"params": parameters, "lr": 1.0e-3, "group_name": "state_retrieval"}]
     )
-    assert _semantic_projector_gradient_norm(nn.Linear(2, 2)) is None
+    sum(parameter.float().sum() for parameter in parameters).backward()
+    pre_norm = math.sqrt(parameter_count)
+    audit = OuterGradientAudit(
+        attempted_update_count=1,
+        successful_update_count=1,
+        skipped_update_count=0,
+        within_initial_audit_window=True,
+        skipped_nonfinite=False,
+        skipped_nonfinite_loss=False,
+        nonfinite_loss_sources=(),
+        groups=(
+            GroupGradientAudit(
+                name="state_retrieval",
+                learning_rate=1.0e-3,
+                max_norm=0.05,
+                pre_clip_norm=pre_norm,
+                post_clip_norm=0.05,
+                clip_coefficient=0.05 / pre_norm,
+                rms=1.0,
+                max_abs=1.0,
+                active_elements=parameter_count,
+                nonfinite_elements=0,
+            ),
+        ),
+    )
+    auditor = _SemanticProjectorStepAuditor(wrapper)
+    snapshot = auditor.before_step(optimizer, audit)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    auditor.after_step(snapshot, audit)
+
+    assert auditor.last_metrics["grad/semantic_projector/pre_clip_norm"] == pytest.approx(pre_norm)
+    assert auditor.last_metrics["grad/semantic_projector/parameter_delta_l2"] > 0.0
+    assert auditor.last_metrics["grad/semantic_projector/parameter_delta_nonzero"] == 1.0
+
+    wrong = torch.optim.SGD(
+        [{"params": parameters[:-1], "lr": 1.0e-3, "group_name": "state_retrieval"}]
+    )
+    with pytest.raises(RuntimeError, match="must equal"):
+        _SemanticProjectorStepAuditor(wrapper).before_step(wrong, audit)
 
 
 def test_actual_fast_bridge_observation_chain_has_exact_inner_update_boundary() -> None:

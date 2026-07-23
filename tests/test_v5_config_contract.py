@@ -419,6 +419,7 @@ def test_v5_encoder_head_and_capacity_contracts() -> None:
         "event_history_capacity": 512,
         "retrieval_history_capacity_per_head": 512,
         "retrieval_history_source_dim": 768,
+        "retrieval_history_backend": "tensor_ring",
         "isolation_keys": ("video_id", "trajectory_id", "head_type"),
         "hard_updates_no_grad": True,
         "detach_before_write": True,
@@ -532,6 +533,7 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
     assert config.retriever.aggregate_time_policy == "causal_availability_only_window_in_reader"
     assert config.retriever.atomic_window_boundary == "closed"
     assert config.retriever.metrics_policy == "offline_ground_truth_runtime_label_free"
+    assert config.retriever.score_chunk_size == 256
     assert config.retriever.top_k is None
     assert config.retriever.ann_enabled is False
     assert config.state_resampler.num_queries == 16

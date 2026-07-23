@@ -10,9 +10,11 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+import torch
 import yaml
 from safetensors.torch import load_file
 
+from ttt_svcbench_qwen.baseline_a2_data import load_baseline_a2_clip_dataset
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
@@ -44,28 +46,20 @@ def main() -> int:
         _add_cache_arguments(child)
     prewarm = subparsers.add_parser("prewarm")
     _add_cache_arguments(prewarm)
-    prewarm.add_argument("--manifest", required=True, type=Path)
-    prewarm.add_argument("--project-config", required=True, type=Path)
-    prewarm.add_argument("--training-config", required=True, type=Path)
-    prewarm.add_argument("--video-root", required=True, type=Path)
-    prewarm.add_argument("--stage", choices=("a2", "a5"), required=True)
-    prewarm.add_argument("--minimum-pixels", type=int, required=True)
-    prewarm.add_argument("--maximum-pixels", type=int, required=True)
+    _add_input_arguments(prewarm)
     prewarm.add_argument("--shard-index", type=int, default=0)
     prewarm.add_argument("--shard-count", type=int, default=1)
-    prewarm.add_argument("--split", choices=("train", "validation", "all"), default="all")
-    prewarm.add_argument(
-        "--roles",
-        nargs="+",
-        choices=("support", "state_query", "answer_query"),
-        default=("support", "state_query", "answer_query"),
-    )
     prewarm.add_argument("--summary", type=Path, default=None)
+    verify_inputs = subparsers.add_parser("verify-inputs")
+    _add_cache_arguments(verify_inputs)
+    _add_input_arguments(verify_inputs)
     args = parser.parse_args()
     if args.max_gb <= 0.0:
         parser.error("--max-gb must be positive")
     if args.command == "prewarm":
         return _prewarm(args, parser)
+    if args.command == "verify-inputs":
+        return _verify_inputs(args, parser)
     cache = _cache(args)
     if args.command == "prune":
         payload = _inspect(cache)
@@ -88,8 +82,28 @@ def _add_cache_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--namespace", required=True)
 
 
+def _add_input_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--dataset-dir", type=Path)
+    parser.add_argument("--dataset", default="svcbench_qwen3vl_sft")
+    parser.add_argument("--weak-sidecar", type=Path)
+    parser.add_argument("--project-config", required=True, type=Path)
+    parser.add_argument("--training-config", required=True, type=Path)
+    parser.add_argument("--video-root", required=True, type=Path)
+    parser.add_argument("--stage", choices=("a2", "a5"), required=True)
+    parser.add_argument("--minimum-pixels", type=int, required=True)
+    parser.add_argument("--maximum-pixels", type=int, required=True)
+    parser.add_argument("--split", choices=("train", "validation", "all"), default="all")
+    parser.add_argument(
+        "--roles",
+        nargs="+",
+        choices=("support", "state_query", "answer_query"),
+        default=("support", "state_query", "answer_query"),
+    )
+
+
 def _cache(args: argparse.Namespace) -> PreprocessCache:
-    mode = "readonly" if args.command in {"inspect", "verify"} else "read_write"
+    mode = "readonly" if args.command in {"inspect", "verify", "verify-inputs"} else "read_write"
     return PreprocessCache(
         args.root,
         max_bytes=int(args.max_gb * 1024**3),
@@ -119,12 +133,19 @@ def _verify(cache: PreprocessCache) -> dict[str, int]:
     for path in root.rglob("*.safetensors"):
         try:
             tensors = load_file(str(path), device="cpu")
-            if "__fingerprint_json__" not in tensors:
+            embedded = tensors.get("__fingerprint_json")
+            if embedded is None or embedded.dtype != torch.uint8 or embedded.ndim != 1:
                 raise ValueError("missing embedded fingerprint")
+            embedded_fingerprint = bytes(
+                int(value) for value in embedded.tolist()
+            ).decode("utf-8")
             metadata = path.with_suffix(".json")
-            if not metadata.is_file() or not isinstance(
-                json.loads(metadata.read_text(encoding="utf-8")), dict
-            ):
+            sidecar = (
+                json.loads(metadata.read_text(encoding="utf-8"))
+                if metadata.is_file()
+                else None
+            )
+            if not isinstance(sidecar, dict) or sidecar.get("fingerprint") != embedded_fingerprint:
                 raise ValueError("missing cache metadata sidecar")
         except (OSError, ValueError, json.JSONDecodeError):
             corrupt += 1
@@ -155,19 +176,12 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         minimum_pixels=args.minimum_pixels,
         maximum_pixels=args.maximum_pixels,
         preprocess_cache=cache,
+        cache_support_visuals="support" in roles,
         cache_query_roles=frozenset(roles & {"state_query", "answer_query"}),
         prefetch_depth=1,
         decode_coalesce=False,
     )
-    train, evaluation = load_production_manifest_views(
-        args.manifest,
-        stage=ManifestStage(args.stage),
-    )
-    records = {
-        "train": train.records,
-        "validation": evaluation.records,
-        "all": (*train.records, *evaluation.records),
-    }[args.split]
+    records = _load_input_records(args, parser, ttt_config)
     candidates = tuple(_iter_specs(records, ttt_config, roles=roles))
     specs = _fingerprinted_specs(
         candidates,
@@ -201,6 +215,80 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         args.summary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(payload, sort_keys=True))
     return 0
+
+
+def _load_input_records(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    ttt_config: ProductionTTTConfig,
+) -> tuple[A2QueryRecord | A5EpisodeRecord, ...]:
+    if ttt_config.a2_data_mode == "llamafactory_sft_clips":
+        if args.stage != "a2":
+            parser.error("baseline-clips cache prewarm is A2-only")
+        if args.manifest is not None:
+            parser.error("baseline-clips cache prewarm must not receive --manifest")
+        if args.dataset_dir is None or args.weak_sidecar is None:
+            parser.error("baseline-clips cache prewarm requires --dataset-dir and --weak-sidecar")
+        if args.split == "validation":
+            parser.error("baseline-clips A2 has no validation split")
+        train = load_baseline_a2_clip_dataset(
+            args.dataset_dir,
+            dataset_name=args.dataset,
+            weak_sidecar_path=args.weak_sidecar,
+        )
+        return train.records
+    else:
+        if args.manifest is None:
+            parser.error("manifest data mode requires --manifest")
+        train, evaluation = load_production_manifest_views(
+            args.manifest,
+            stage=ManifestStage(args.stage),
+        )
+        return {
+            "train": train.records,
+            "validation": evaluation.records,
+            "all": (*train.records, *evaluation.records),
+        }[args.split]
+
+
+def _verify_inputs(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.minimum_pixels <= 0 or args.maximum_pixels < args.minimum_pixels:
+        parser.error("pixel limits must satisfy 0 < minimum <= maximum")
+    os.environ["SVCBENCH_VIDEO_ROOT"] = str(args.video_root.resolve())
+    config = load_config(args.project_config)
+    ttt_config = _load_training_config(args.training_config)
+    if ttt_config.stage != args.stage:
+        parser.error(
+            f"training config stage {ttt_config.stage!r} does not match --stage {args.stage!r}"
+        )
+    roles = frozenset(args.roles)
+    for role in ("state_query", "answer_query"):
+        if role in roles and not ttt_config.query_cache_enabled(role):
+            parser.error(f"{role} verification requires its cache mode to be inherit")
+    cache = _cache(args)
+    records = _load_input_records(args, parser, ttt_config)
+    candidates = tuple(_iter_specs(records, ttt_config, roles=roles))
+    specs = _fingerprinted_specs(
+        candidates,
+        config=config,
+        minimum_pixels=args.minimum_pixels,
+        maximum_pixels=args.maximum_pixels,
+    )
+    missing = tuple(item[2].digest for item in specs if cache.payload_size(item[2]) <= 0)
+    integrity = _verify(cache)
+    payload = {
+        **_inspect(cache),
+        **integrity,
+        "stage": args.stage,
+        "split": args.split,
+        "roles": sorted(roles),
+        "candidate_chunk_count": len(candidates),
+        "unique_chunk_count": len(specs),
+        "missing_input_count": len(missing),
+        "missing_input_digests": list(missing[:32]),
+    }
+    print(json.dumps(payload, sort_keys=True))
+    return 1 if missing or integrity["corrupt_entries"] else 0
 
 
 def _iter_specs(

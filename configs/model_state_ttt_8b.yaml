@@ -292,6 +292,7 @@ state_bank:
   event_history_capacity: 512
   retrieval_history_capacity_per_head: 512
   retrieval_history_source_dim: 768
+  retrieval_history_backend: tensor_ring
   isolation_keys: [video_id, trajectory_id, head_type]
   hard_updates_no_grad: true
   detach_before_write: true
@@ -370,6 +371,7 @@ retriever:
   aggregate_time_policy: causal_availability_only_window_in_reader
   atomic_window_boundary: closed
   metrics_policy: offline_ground_truth_runtime_label_free
+  score_chunk_size: 256
   top_k: null
   ann_enabled: false
 

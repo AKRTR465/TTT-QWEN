@@ -1044,7 +1044,10 @@ def test_truncated_a5_ema_balance_composes_all_queries_once(
     output = runner.run_truncated(_truncated_episode(config, support_count=1, query_count=2))
 
     assert runner.last_balance_audit is not None
-    assert runner.last_balance_audit.auxiliary_to_answer_ratio <= 0.3
+    assert (
+        runner.last_balance_audit.auxiliary_to_answer_ratio
+        <= config.loss.official_weak_balance.group_weight
+    )
     assert len(output.audit.queries) == 2
     assert dict(runner.last_balance_audit.metrics())["loss/aux_to_answer_ratio"] is not None
     assert all(

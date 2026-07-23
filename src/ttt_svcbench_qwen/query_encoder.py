@@ -258,6 +258,7 @@ class OperatorRouterOutput:
     hard_operators: tuple[Operator, ...]
     head_types: tuple[HeadType | None, ...]
     confidence_gate_applied: bool
+    temperature: Tensor | None = None
 
     def __post_init__(self) -> None:
         batch_size = self.logits.shape[0] if self.logits.ndim == 2 else -1
@@ -276,6 +277,14 @@ class OperatorRouterOutput:
         expected_heads = tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in self.hard_operators)
         if self.head_types != expected_heads:
             raise ValueError("operator head types must follow the deterministic mapping")
+        if self.temperature is not None and (
+            self.temperature.ndim != 0
+            or not torch.is_floating_point(self.temperature)
+            or self.temperature.device != self.logits.device
+            or not bool(torch.isfinite(self.temperature).item())
+            or not bool(self.temperature > 0.0)
+        ):
+            raise ValueError("operator temperature must be one positive finite scalar")
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +425,9 @@ def detach_query_encoder_output(output: QueryEncoderOutput) -> QueryEncoderOutpu
             logits=output.route.logits.detach(),
             confidence=output.route.confidence.detach(),
             raw_indices=output.route.raw_indices.detach(),
+            temperature=(
+                output.route.temperature.detach() if output.route.temperature is not None else None
+            ),
         ),
         time=replace(
             output.time,
@@ -618,6 +630,7 @@ class OperatorRouter(nn.Module):  # type: ignore[misc]
             hard_operators=hard_operators,
             head_types=tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in hard_operators),
             confidence_gate_applied=apply_confidence_gate,
+            temperature=self.temperature,
         )
 
 

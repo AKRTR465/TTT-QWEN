@@ -19,13 +19,17 @@ from torch.nn import functional as F
 from ttt_svcbench_qwen.config import CalibrationStatus, ProjectConfig, RetrieverConfig
 from ttt_svcbench_qwen.query_encoder import (
     OPERATOR_TO_HEAD_TYPE,
+    OPERATORS,
+    HeadType,
     Operator,
     QueryEncoderOutput,
     TimeResolution,
     TimeResolutionStatus,
     TimeWindow,
 )
+from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase
 from ttt_svcbench_qwen.state_bank import (
+    RETRIEVAL_HEAD_ORDER,
     RetrievalHistoryRecord,
     RetrievalHistoryView,
     StateRecord,
@@ -91,7 +95,8 @@ class RetrievalFilterAudit:
         if any(type(value) is not int or value < 0 for value in values):
             raise ValueError("Retriever audit counts must be non-negative integers")
         exclusive = (
-            self.query_rejected_count
+            self.head_partition_excluded_count
+            + self.query_rejected_count
             + self.owner_mismatch_count
             + self.invalid_count
             + self.retrieval_ineligible_count
@@ -111,12 +116,14 @@ class RetrieverOutput:
     selected_records: tuple[tuple[RetrievalCandidate, ...], ...]
     candidate_record_ids: tuple[tuple[str | None, ...], ...]
     candidate_records: tuple[tuple[RetrievalCandidate | None, ...], ...]
+    candidate_head_types: tuple[tuple[HeadType | None, ...], ...]
     state_embeddings: Tensor
     scores: Tensor
     present_mask: Tensor
     record_valid_mask: Tensor
     retrieval_eligible_mask: Tensor
     causal_mask: Tensor
+    predicted_head_mask: Tensor
     selected_mask: Tensor
     status: tuple[RetrievalStatus, ...]
     reason: tuple[RetrievalReason, ...]
@@ -130,6 +137,28 @@ class RetrieverOutput:
     bank_video_ids: tuple[str, ...]
     bank_trajectory_ids: tuple[str, ...]
     bank_versions: tuple[int, ...]
+    candidate_sequence_ids: Tensor | None = None
+    candidate_head_codes: Tensor | None = None
+    candidate_operator_codes: Tensor | None = None
+    candidate_timestamps: Tensor | None = None
+    candidate_time_ranges: Tensor | None = None
+    candidate_lifecycle_ids: tuple[tuple[str | None, ...], ...] = ()
+
+    def candidate_record_id(self, row: int, column: int) -> str | None:
+        value = self.candidate_record_ids[row][column]
+        if value is not None:
+            return value
+        assert self.candidate_sequence_ids is not None
+        sequence_id = int(self.candidate_sequence_ids[row, column].item())
+        return f"retrieval-{sequence_id:08d}" if sequence_id >= 0 else None
+
+    def candidate_head_type(self, row: int, column: int) -> HeadType | None:
+        value = self.candidate_head_types[row][column]
+        if value is not None:
+            return value
+        assert self.candidate_head_codes is not None
+        code = int(self.candidate_head_codes[row, column].item())
+        return RETRIEVAL_HEAD_ORDER[code] if 0 <= code < len(RETRIEVAL_HEAD_ORDER) else None
 
     def __post_init__(self) -> None:
         if (
@@ -149,11 +178,13 @@ class RetrieverOutput:
             or self.record_valid_mask.shape != shape
             or self.retrieval_eligible_mask.shape != shape
             or self.causal_mask.shape != shape
+            or self.predicted_head_mask.shape != shape
             or self.selected_mask.shape != shape
             or self.present_mask.dtype != torch.bool
             or self.record_valid_mask.dtype != torch.bool
             or self.retrieval_eligible_mask.dtype != torch.bool
             or self.causal_mask.dtype != torch.bool
+            or self.predicted_head_mask.dtype != torch.bool
             or self.selected_mask.dtype != torch.bool
         ):
             raise ValueError("Retriever masks must be bool [B, N_s]")
@@ -164,17 +195,78 @@ class RetrieverOutput:
             self.record_valid_mask,
             self.retrieval_eligible_mask,
             self.causal_mask,
+            self.predicted_head_mask,
             self.selected_mask,
         )
         if any(tensor.device != self.scores.device for tensor in tensors):
             raise ValueError("Retriever aligned tensors must share one device")
         batch_size, width = shape
+        tensor_metadata = (
+            self.candidate_sequence_ids,
+            self.candidate_head_codes,
+            self.candidate_operator_codes,
+            self.candidate_timestamps,
+            self.candidate_time_ranges,
+        )
+        if any(value is None for value in tensor_metadata):
+            sequence_ids = torch.full(shape, -1, dtype=torch.int64, device=self.scores.device)
+            head_codes = torch.full_like(sequence_ids, -1)
+            operator_codes = torch.full_like(sequence_ids, -1)
+            timestamps = torch.full(shape, -1.0, dtype=torch.float64, device=self.scores.device)
+            time_ranges = torch.full(
+                (*shape, 2), -1.0, dtype=torch.float64, device=self.scores.device
+            )
+            for row, records in enumerate(self.candidate_records):
+                for column, record in enumerate(records):
+                    if record is None:
+                        continue
+                    sequence_ids[row, column] = column
+                    head_codes[row, column] = tuple(HeadType).index(record.head_type)
+                    if isinstance(record, RetrievalHistoryRecord):
+                        operator_codes[row, column] = OPERATORS.index(record.operator)
+                    if record.timestamp is not None:
+                        timestamps[row, column] = record.timestamp
+                    else:
+                        assert record.time_range is not None
+                        time_ranges[row, column] = torch.tensor(
+                            record.time_range, dtype=torch.float64, device=self.scores.device
+                        )
+            object.__setattr__(self, "candidate_sequence_ids", sequence_ids)
+            object.__setattr__(self, "candidate_head_codes", head_codes)
+            object.__setattr__(self, "candidate_operator_codes", operator_codes)
+            object.__setattr__(self, "candidate_timestamps", timestamps)
+            object.__setattr__(self, "candidate_time_ranges", time_ranges)
+        assert self.candidate_sequence_ids is not None
+        assert self.candidate_head_codes is not None
+        assert self.candidate_operator_codes is not None
+        assert self.candidate_timestamps is not None
+        assert self.candidate_time_ranges is not None
+        integer_metadata = (
+            self.candidate_sequence_ids,
+            self.candidate_head_codes,
+            self.candidate_operator_codes,
+        )
+        if any(value.shape != shape or value.dtype != torch.int64 for value in integer_metadata):
+            raise ValueError("Retriever candidate integer metadata must be int64 [B, N_s]")
+        if (
+            self.candidate_timestamps.shape != shape
+            or self.candidate_timestamps.dtype != torch.float64
+            or self.candidate_time_ranges.shape != (*shape, 2)
+            or self.candidate_time_ranges.dtype != torch.float64
+        ):
+            raise ValueError("Retriever candidate time metadata is invalid")
+        if any(
+            value.device != self.scores.device
+            for value in (*integer_metadata, self.candidate_timestamps, self.candidate_time_ranges)
+        ):
+            raise ValueError("Retriever candidate tensor metadata must share the score device")
         metadata = (
             self.selected_record_ids,
             self.selected_scores,
             self.selected_records,
             self.candidate_record_ids,
             self.candidate_records,
+            self.candidate_head_types,
             self.status,
             self.reason,
             self.hard_operators,
@@ -185,13 +277,20 @@ class RetrieverOutput:
             self.bank_video_ids,
             self.bank_trajectory_ids,
             self.bank_versions,
+            self.candidate_lifecycle_ids or tuple(() for _ in range(batch_size)),
         )
         if any(len(values) != batch_size for values in metadata):
             raise ValueError("Retriever metadata must contain one entry per batch item")
-        if any(len(row) != width for row in self.candidate_record_ids) or any(
-            len(row) != width for row in self.candidate_records
+        if (
+            any(len(row) != width for row in self.candidate_record_ids)
+            or any(len(row) != width for row in self.candidate_records)
+            or any(len(row) != width for row in self.candidate_head_types)
         ):
             raise ValueError("candidate record snapshots must align to the padded score width")
+        if self.candidate_lifecycle_ids and any(
+            len(row) != width for row in self.candidate_lifecycle_ids
+        ):
+            raise ValueError("candidate lifecycle metadata must align to padded score width")
         for counts, name in ((self.n_state, "n_state"), (self.n_retrieved, "n_retrieved")):
             if (
                 counts.shape != (batch_size,)
@@ -205,6 +304,10 @@ class RetrieverOutput:
             raise ValueError("Retriever embeddings/scores must be finite")
         if bool(torch.any(self.selected_mask & ~self.present_mask)):
             raise ValueError("Retriever cannot select padded records")
+        if bool(torch.any(self.predicted_head_mask & ~self.present_mask)):
+            raise ValueError("Retriever predicted-head mask cannot include padding")
+        if bool(torch.any(self.selected_mask & ~self.predicted_head_mask)):
+            raise ValueError("Retriever selections must stay inside the predicted head")
         if bool(torch.any(self.record_valid_mask & ~self.present_mask)) or bool(
             torch.any(self.retrieval_eligible_mask & ~self.record_valid_mask)
         ):
@@ -271,52 +374,105 @@ class RetrieverOutput:
         present_ids = self.candidate_record_ids[row]
         candidate_records = self.candidate_records[row]
         candidate_by_id: dict[str, RetrievalCandidate] = {}
-        for column, record_id in enumerate(present_ids):
-            if (record_id is not None) != bool(self.present_mask[row, column]):
-                raise ValueError("Retriever candidate IDs must align to present_mask")
-            candidate = candidate_records[column]
-            if (candidate is not None) != (record_id is not None):
-                raise ValueError("Retriever candidate typed snapshots must align to candidate IDs")
-            if candidate is None:
-                continue
-            if (
-                candidate.record_id != record_id
-                or candidate.video_id != self.bank_video_ids[row]
-                or candidate.trajectory_id != self.bank_trajectory_ids[row]
+        tensor_only = (
+            all(value is None for value in present_ids)
+            and all(value is None for value in self.candidate_head_types[row])
+            and all(value is None for value in candidate_records)
+        )
+        if tensor_only:
+            present = self.present_mask[row]
+            sequences = self.candidate_sequence_ids[row]
+            heads = self.candidate_head_codes[row]
+            if bool(torch.any(sequences[present] < 0)) or bool(
+                torch.any((heads[present] < 0) | (heads[present] >= len(RETRIEVAL_HEAD_ORDER)))
             ):
-                raise ValueError("Retriever candidate typed snapshot metadata is inconsistent")
-            if isinstance(candidate, StateRecord) and (
-                candidate.semantic_embedding.dtype != self.state_embeddings.dtype
-                or candidate.semantic_embedding.device != self.state_embeddings.device
-                or not torch.equal(candidate.semantic_embedding, self.state_embeddings[row, column])
+                raise ValueError("present tensor candidates require valid sequence/head codes")
+            if bool(torch.any(sequences[~present] != -1)) or bool(
+                torch.any(heads[~present] != -1)
             ):
-                raise ValueError("Retriever StateRecord snapshot semantics are inconsistent")
-            if isinstance(candidate, RetrievalHistoryRecord) and (
-                candidate.semantic_source.device != self.state_embeddings.device
-            ):
-                raise ValueError("Retriever history source and projected key devices differ")
-            if bool(self.record_valid_mask[row, column]) is not candidate.valid:
-                raise ValueError("Retriever candidate validity metadata is inconsistent")
-            if isinstance(candidate, RetrievalHistoryRecord) and (
-                bool(self.retrieval_eligible_mask[row, column])
-                is not candidate.retrieval_eligible
-            ):
-                raise ValueError("Retriever candidate eligibility metadata is inconsistent")
-            candidate_by_id[candidate.record_id] = candidate
-        live_candidate_ids = tuple(record_id for record_id in present_ids if record_id is not None)
-        if len(set(live_candidate_ids)) != len(live_candidate_ids):
-            raise ValueError("Retriever candidate record IDs must be unique per row")
+                raise ValueError("padded tensor candidate metadata must use -1")
+            live_sequences = sequences[present]
+            if torch.unique(live_sequences).numel() != live_sequences.numel():
+                raise ValueError("Retriever candidate sequence IDs must be unique per row")
+            if expected_head is not None:
+                expected_mask = present & (
+                    heads == RETRIEVAL_HEAD_ORDER.index(expected_head)
+                )
+            else:
+                expected_mask = torch.zeros_like(present)
+            if not torch.equal(self.predicted_head_mask[row], expected_mask):
+                raise ValueError("Retriever predicted-head mask disagrees with tensor metadata")
+        else:
+            for column, _record_id in enumerate(present_ids):
+                is_present = bool(self.present_mask[row, column])
+                resolved_id = self.candidate_record_id(row, column)
+                resolved_head = self.candidate_head_type(row, column)
+                if (resolved_id is not None) != is_present:
+                    raise ValueError("Retriever candidate IDs must align to present_mask")
+                candidate = candidate_records[column]
+                if candidate is None:
+                    if not is_present and resolved_head is not None:
+                        raise ValueError("padded Retriever candidate head type must be None")
+                    if is_present and resolved_head is None:
+                        raise ValueError("present tensor candidate requires a valid head code")
+                    continue
+                if resolved_head is not candidate.head_type:
+                    raise ValueError("Retriever candidate head metadata is inconsistent")
+                if (
+                    candidate.record_id != resolved_id
+                    or candidate.video_id != self.bank_video_ids[row]
+                    or candidate.trajectory_id != self.bank_trajectory_ids[row]
+                ):
+                    raise ValueError(
+                        "Retriever candidate typed snapshot metadata is inconsistent"
+                    )
+                if isinstance(candidate, StateRecord) and (
+                    candidate.semantic_embedding.dtype != self.state_embeddings.dtype
+                    or candidate.semantic_embedding.device != self.state_embeddings.device
+                    or not torch.equal(
+                        candidate.semantic_embedding, self.state_embeddings[row, column]
+                    )
+                ):
+                    raise ValueError("Retriever StateRecord snapshot semantics are inconsistent")
+                if isinstance(candidate, RetrievalHistoryRecord) and (
+                    candidate.semantic_source.device != self.state_embeddings.device
+                ):
+                    raise ValueError("Retriever history source and projected key devices differ")
+                if bool(self.record_valid_mask[row, column]) is not candidate.valid:
+                    raise ValueError("Retriever candidate validity metadata is inconsistent")
+                if isinstance(candidate, RetrievalHistoryRecord) and (
+                    bool(self.retrieval_eligible_mask[row, column])
+                    is not candidate.retrieval_eligible
+                ):
+                    raise ValueError("Retriever candidate eligibility metadata is inconsistent")
+                if bool(self.predicted_head_mask[row, column]) is not (
+                    expected_head is not None and candidate.head_type is expected_head
+                ):
+                    raise ValueError(
+                        "Retriever predicted-head mask disagrees with candidate metadata"
+                    )
+                candidate_by_id[candidate.record_id] = candidate
+            live_candidate_ids = tuple(
+                self.candidate_record_id(row, column)
+                for column in range(self.scores.shape[1])
+                if bool(self.present_mask[row, column])
+            )
+            if len(set(live_candidate_ids)) != len(live_candidate_ids):
+                raise ValueError("Retriever candidate record IDs must be unique per row")
         selected_columns = torch.nonzero(self.selected_mask[row], as_tuple=False).flatten().tolist()
-        mask_ids = tuple(present_ids[column] for column in selected_columns)
+        mask_ids = tuple(self.candidate_record_id(row, column) for column in selected_columns)
         if set(mask_ids) != set(ids):
             raise ValueError("Retriever selected IDs must exactly match selected_mask")
         if any(
-            not _snapshot_values_equal(record, candidate_by_id[record.record_id])
+            record.record_id in candidate_by_id
+            and not _snapshot_values_equal(record, candidate_by_id[record.record_id])
             for record in records
         ):
             raise ValueError("Retriever selected typed records must match the candidate snapshot")
         score_by_id = {
-            present_ids[column]: float(self.scores[row, column].detach().item())
+            self.candidate_record_id(row, column): float(
+                self.scores[row, column].detach().item()
+            )
             for column in selected_columns
         }
         expected_scores = tuple(score_by_id[record_id] for record_id in ids)
@@ -392,10 +548,18 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
             raise TypeError("Retriever requires the StructuredStateBank projector owner")
         if not isinstance(history, RetrievalHistoryView):
             raise TypeError("Retriever requires a write-before RetrievalHistoryView")
+        history.assert_snapshot_current()
         q_target = query.q_target
         hard_operators = query.hard_operators
         time_resolutions = query.time.resolutions
-        aligned_embeddings = _project_history_sources(state_bank, history)
+        with trace_cuda_phase("retrieval_project_and_score"):
+            aligned_embeddings, scores, query_norms = _project_and_score_history(
+                state_bank,
+                history,
+                q_target,
+                chunk_size=self.config.score_chunk_size,
+                normalization_eps=self.config.normalization_eps,
+            )
         batch_size = _validate_retrieval_inputs(
             self.config,
             q_target,
@@ -410,29 +574,8 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
         resolutions = _normalize_resolutions(time_resolutions, batch_size)
         query_video_ids = _normalize_owner_ids(video_ids, batch_size, "video_ids")
         query_trajectory_ids = _normalize_owner_ids(trajectory_ids, batch_size, "trajectory_ids")
-        query_fp32 = q_target.float()
-        query_norms = torch.linalg.vector_norm(query_fp32, dim=-1)
-        query_usable = (
-            torch.isfinite(query_fp32).all(dim=-1)
-            & torch.isfinite(query_norms)
-            & (query_norms > self.config.normalization_eps)
-        )
-        safe_query = torch.where(
-            query_usable.unsqueeze(-1),
-            query_fp32,
-            torch.zeros_like(query_fp32),
-        )
-        normalized_query = F.normalize(
-            safe_query,
-            dim=-1,
-            eps=self.config.normalization_eps,
-        )
-        normalized_state = F.normalize(
-            aligned_embeddings.float(), dim=-1, eps=self.config.normalization_eps
-        )
-        scores = torch.einsum("bd,bnd->bn", normalized_query, normalized_state)
-        scores = torch.where(history.present_mask, scores, torch.zeros_like(scores))
         selected_mask = torch.zeros_like(history.present_mask)
+        predicted_head_mask = _predicted_head_mask(history, operators)
         statuses: list[RetrievalStatus] = []
         reasons: list[RetrievalReason] = []
         audits: list[RetrievalFilterAudit] = []
@@ -450,6 +593,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
                 resolutions[row],
                 history,
                 causal_mask,
+                predicted_head_mask,
                 query_video_ids[row],
                 query_trajectory_ids[row],
                 float(query_norms[row].detach().item()),
@@ -472,12 +616,14 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
                 tuple(_clone_candidate(record) if record is not None else None for record in row)
                 for row in history.cloned_records
             ),
+            candidate_head_types=history.head_types,
             state_embeddings=aligned_embeddings,
             scores=scores,
             present_mask=history.present_mask.detach().clone(),
             record_valid_mask=history.record_valid_mask.detach().clone(),
             retrieval_eligible_mask=history.retrieval_eligible_mask.detach().clone(),
             causal_mask=causal_mask.detach().clone(),
+            predicted_head_mask=predicted_head_mask.detach().clone(),
             selected_mask=selected_mask,
             status=tuple(statuses),
             reason=tuple(reasons),
@@ -491,6 +637,12 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
             bank_video_ids=history.video_ids,
             bank_trajectory_ids=history.trajectory_ids,
             bank_versions=history.bank_versions,
+            candidate_sequence_ids=history.sequence_ids.detach().clone(),
+            candidate_head_codes=history.head_codes.detach().clone(),
+            candidate_operator_codes=history.operator_codes.detach().clone(),
+            candidate_timestamps=history.timestamps.detach().clone(),
+            candidate_time_ranges=history.time_ranges.detach().clone(),
+            candidate_lifecycle_ids=history.lifecycle_ids,
         )
 
     def _retrieve_row(
@@ -502,6 +654,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
         resolution: TimeResolution,
         state_view: RetrievalHistoryView,
         causal_mask: Tensor,
+        predicted_head_mask: Tensor,
         video_id: str,
         trajectory_id: str,
         query_norm: float,
@@ -515,7 +668,8 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
     ]:
         n_state = int(state_view.n_state[row].item())
         owner_count = int(state_view.owner_record_counts[row].item())
-        head_excluded = owner_count - n_state
+        if owner_count != n_state:
+            raise ValueError("all-head retrieval history must expose every owner record")
         owner_matches = (
             state_view.video_ids[row] == video_id
             and state_view.trajectory_ids[row] == trajectory_id
@@ -525,7 +679,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
                 RetrievalStatus.INVALID,
                 RetrievalReason.OWNER_MISMATCH,
                 n_state,
-                head_excluded,
+                0,
                 owner_mismatch=True,
             )
         if resolution.status is TimeResolutionStatus.INVALID:
@@ -533,7 +687,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
                 RetrievalStatus.INVALID,
                 RetrievalReason.INVALID_TIME,
                 n_state,
-                head_excluded,
+                0,
                 query_rejected=True,
             )
         if resolution.status is TimeResolutionStatus.UNSUPPORTED:
@@ -541,7 +695,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
                 RetrievalStatus.UNSUPPORTED,
                 RetrievalReason.UNSUPPORTED_TIME,
                 n_state,
-                head_excluded,
+                0,
                 query_rejected=True,
             )
         expected_head = OPERATOR_TO_HEAD_TYPE[operator]
@@ -550,7 +704,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
                 RetrievalStatus.UNSUPPORTED,
                 RetrievalReason.UNSUPPORTED_OPERATOR,
                 n_state,
-                head_excluded,
+                0,
                 query_rejected=True,
             )
         if not math.isfinite(query_norm) or query_norm <= self.config.normalization_eps:
@@ -558,48 +712,67 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
                 RetrievalStatus.UNSUPPORTED,
                 RetrievalReason.DEGENERATE_QUERY,
                 n_state,
-                head_excluded,
+                0,
                 query_rejected=True,
             )
 
-        invalid = ineligible = future = outside = below = 0
+        present = state_view.present_mask[row]
+        predicted = predicted_head_mask[row]
+        valid = state_view.record_valid_mask[row]
+        eligible = state_view.retrieval_eligible_mask[row]
+        causal = causal_mask[row]
+        after_head = predicted
+        after_valid = after_head & valid
+        after_eligible = after_valid & eligible
+        after_causal = after_eligible & causal
+        outside_mask = torch.zeros_like(present)
+        if resolution.window.start_time is not None:
+            start = state_view.timestamps.new_tensor(resolution.window.start_time)
+            end = state_view.timestamps.new_tensor(resolution.window.end_time)
+            atomic = state_view.head_codes[row] == RETRIEVAL_HEAD_ORDER.index(HeadType.O2)
+            timestamp_overlap = (state_view.timestamps[row] >= start) & (
+                state_view.timestamps[row] <= end
+            )
+            range_overlap = (state_view.time_ranges[row, :, 0] <= end) & (
+                state_view.time_ranges[row, :, 1] >= start
+            )
+            has_timestamp = state_view.timestamps[row] >= 0.0
+            intersects = torch.where(has_timestamp, timestamp_overlap, range_overlap)
+            outside_mask = after_causal & atomic & ~intersects
+        after_window = after_causal & ~outside_mask
         similarity_threshold = scores.new_tensor(self.config.record_similarity_threshold)
-        selected_columns: list[int] = []
-        for column in range(n_state):
-            record = state_view.cloned_records[row][column]
-            kind = state_view.record_kinds[row][column]
-            if record is None or kind is None:
-                raise ValueError("present State Bank columns require cloned record metadata")
-            if record.head_type is not expected_head:
-                raise ValueError("State Bank row-wise partition does not match the hard operator")
-            if not record.valid:
-                invalid += 1
-            elif not bool(state_view.retrieval_eligible_mask[row, column]):
-                ineligible += 1
-            elif not bool(causal_mask[row, column]):
-                future += 1
-            elif _requires_atomic_window_filter(kind, resolution.window) and not _intersects_window(
-                record, resolution.window
-            ):
-                outside += 1
-            elif bool(scores[row, column].detach() < similarity_threshold):
-                below += 1
-            else:
-                selected_columns.append(column)
-                selected_mask[row, column] = True
-
-        ordered_columns = sorted(
-            selected_columns,
-            key=lambda column: (
-                -float(scores[row, column].detach().item()),
-                _required_record_id(state_view, row, column),
-            ),
+        below_mask = after_window & (scores[row].detach() < similarity_threshold)
+        chosen = after_window & ~below_mask
+        selected_mask[row] = chosen
+        count_tensors = torch.stack(
+            (
+                (present & ~predicted).sum(),
+                (after_head & ~valid).sum(),
+                (after_valid & ~eligible).sum(),
+                (after_eligible & ~causal).sum(),
+                outside_mask.sum(),
+                below_mask.sum(),
+                chosen.sum(),
+            )
         )
+        head_excluded, invalid, ineligible, future, outside, below, _ = (
+            int(value) for value in count_tensors.detach().cpu().tolist()
+        )
+        ordered = torch.nonzero(chosen, as_tuple=False).flatten()
+        if ordered.numel():
+            id_order = torch.argsort(
+                state_view.sequence_ids[row].index_select(0, ordered), stable=True
+            )
+            ordered = ordered.index_select(0, id_order)
+            score_order = torch.argsort(
+                scores[row].detach().index_select(0, ordered), descending=True, stable=True
+            )
+            ordered = ordered.index_select(0, score_order)
+        ordered_columns = tuple(int(value) for value in ordered.detach().cpu().tolist())
         ids = tuple(_required_record_id(state_view, row, column) for column in ordered_columns)
         row_scores = tuple(float(scores[row, column].detach().item()) for column in ordered_columns)
         records = tuple(
-            _clone_candidate(_required_record(state_view, row, column))
-            for column in ordered_columns
+            _materialize_history_record(state_view, row, column) for column in ordered_columns
         )
         audit = RetrievalFilterAudit(
             n_state=n_state,
@@ -659,6 +832,7 @@ def _validate_retriever_config(config: RetrieverConfig) -> None:
             config.metrics_policy,
             "offline_ground_truth_runtime_label_free",
         ),
+        ("score_chunk_size", config.score_chunk_size, 256),
         ("top_k", config.top_k, None),
         ("ann_enabled", config.ann_enabled, False),
     )
@@ -769,6 +943,8 @@ def _record_end(record: RetrievalCandidate) -> float:
 def _project_history_sources(
     state_bank: StructuredStateBank,
     view: RetrievalHistoryView,
+    *,
+    chunk_size: int,
 ) -> Tensor:
     """Recreate trainable keys without reconnecting detached Support encoders."""
 
@@ -777,13 +953,16 @@ def _project_history_sources(
     for row in range(view.sources.shape[0]):
         count = int(view.n_state[row].item())
         if count:
-            heads = view.head_types[row][:count]
-            if any(head is None for head in heads):
-                raise ValueError("present retrieval history requires head metadata")
-            projected = state_bank.project(
-                view.sources[row, :count],
-                tuple(head for head in heads if head is not None),
-            )
+            projected_chunks: list[Tensor] = []
+            for start in range(0, count, chunk_size):
+                end = min(start + chunk_size, count)
+                projected_chunks.append(
+                    state_bank.project_codes(
+                        view.sources[row, start:end],
+                        view.head_codes[row, start:end],
+                    )
+                )
+            projected = torch.cat(projected_chunks, dim=0)
             padding = projected.new_zeros((width - count, projected.shape[-1]))
             rows.append(torch.cat((projected, padding), dim=0))
         else:
@@ -792,18 +971,59 @@ def _project_history_sources(
     return torch.stack(rows)
 
 
+def _project_and_score_history(
+    state_bank: StructuredStateBank,
+    view: RetrievalHistoryView,
+    q_target: Tensor,
+    *,
+    chunk_size: int,
+    normalization_eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    aligned = _project_history_sources(state_bank, view, chunk_size=chunk_size)
+    query_fp32 = q_target.float()
+    query_norms = torch.linalg.vector_norm(query_fp32, dim=-1)
+    query_usable = (
+        torch.isfinite(query_fp32).all(dim=-1)
+        & torch.isfinite(query_norms)
+        & (query_norms > normalization_eps)
+    )
+    safe_query = torch.where(query_usable.unsqueeze(-1), query_fp32, torch.zeros_like(query_fp32))
+    normalized_query = F.normalize(safe_query, dim=-1, eps=normalization_eps)
+    normalized_state = F.normalize(aligned.float(), dim=-1, eps=normalization_eps)
+    scores = torch.einsum("bd,bnd->bn", normalized_query, normalized_state)
+    scores = torch.where(view.present_mask, scores, torch.zeros_like(scores))
+    return aligned, scores, query_norms
+
+
+def _predicted_head_mask(
+    view: RetrievalHistoryView,
+    operators: Sequence[Operator],
+) -> Tensor:
+    mask = torch.zeros_like(view.present_mask)
+    for row, operator in enumerate(operators):
+        expected = OPERATOR_TO_HEAD_TYPE[operator]
+        if expected is None:
+            continue
+        mask[row] = view.head_codes[row] == RETRIEVAL_HEAD_ORDER.index(expected)
+    return mask & view.present_mask
+
+
 def _causal_mask(
     view: RetrievalHistoryView,
     resolutions: Sequence[TimeResolution],
     device: torch.device,
 ) -> Tensor:
-    mask = torch.zeros_like(view.present_mask, device=device)
-    for row, records in enumerate(view.cloned_records):
-        query_time = resolutions[row].window.query_time
-        for column, record in enumerate(records):
-            if record is not None and _record_end(record) <= query_time:
-                mask[row, column] = True
-    return mask
+    query_times = torch.tensor(
+        tuple(value.window.query_time for value in resolutions),
+        dtype=torch.float64,
+        device=device,
+    ).unsqueeze(1)
+    record_end = torch.where(
+        view.timestamps >= 0.0,
+        view.timestamps,
+        view.time_ranges[..., 1],
+    )
+    return view.present_mask & (record_end <= query_times)
 
 
 def _clone_candidate(record: RetrievalCandidate) -> RetrievalCandidate:
@@ -828,6 +1048,10 @@ def _intersects_window(record: RetrievalCandidate, window: TimeWindow) -> bool:
 
 def _required_record_id(view: RetrievalHistoryView, row: int, column: int) -> str:
     record_id = view.record_ids[row][column]
+    if record_id is None:
+        sequence_id = int(view.sequence_ids[row, column].item())
+        if sequence_id >= 0:
+            record_id = f"retrieval-{sequence_id:08d}"
     if not isinstance(record_id, str) or not record_id:
         raise ValueError("present State Bank records require record IDs")
     return record_id
@@ -840,10 +1064,70 @@ def _required_record(view: RetrievalHistoryView, row: int, column: int) -> Retri
     return record
 
 
+def _materialize_history_record(
+    view: RetrievalHistoryView, row: int, column: int
+) -> RetrievalHistoryRecord:
+    from ttt_svcbench_qwen.query_encoder import OPERATORS
+
+    head = view.head_types[row][column]
+    if head is None:
+        head_code = int(view.head_codes[row, column].item())
+        head = (
+            RETRIEVAL_HEAD_ORDER[head_code]
+            if 0 <= head_code < len(RETRIEVAL_HEAD_ORDER)
+            else None
+        )
+    record_id = _required_record_id(view, row, column)
+    if head is None:
+        raise ValueError("selected retrieval columns require tensor metadata")
+    operator_code = int(view.operator_codes[row, column].item())
+    if not 0 <= operator_code < len(OPERATORS):
+        raise ValueError("selected retrieval operator code is invalid")
+    timestamp_value = float(view.timestamps[row, column].item())
+    if timestamp_value >= 0.0:
+        timestamp: float | None = timestamp_value
+        time_range: tuple[float, float] | None = None
+    else:
+        values = view.time_ranges[row, column].detach().cpu()
+        timestamp = None
+        time_range = (float(values[0]), float(values[1]))
+    lifecycle = view.lifecycle_ids[row][column] if view.lifecycle_ids else None
+    return RetrievalHistoryRecord(
+        record_id=record_id,
+        video_id=view.video_ids[row],
+        trajectory_id=view.trajectory_ids[row],
+        head_type=head,
+        operator=OPERATORS[operator_code],
+        semantic_source=view.sources[row, column].detach().clone(),
+        timestamp=timestamp,
+        time_range=time_range,
+        valid=bool(view.record_valid_mask[row, column]),
+        retrieval_eligible=bool(view.retrieval_eligible_mask[row, column]),
+        lifecycle_id=lifecycle,
+    )
+
+
+def _intersects_window_metadata(
+    view: RetrievalHistoryView,
+    row: int,
+    column: int,
+    window: TimeWindow,
+) -> bool:
+    if window.start_time is None:
+        return True
+    timestamp = float(view.timestamps[row, column].item())
+    if timestamp >= 0.0:
+        return bool(window.start_time <= timestamp <= window.end_time)
+    time_range = view.time_ranges[row, column]
+    start = float(time_range[0].item())
+    end = float(time_range[1].item())
+    return bool(start <= window.end_time and end >= window.start_time)
+
+
 def _empty_reason(audit: RetrievalFilterAudit, owner_record_count: int) -> RetrievalReason:
     if owner_record_count == 0:
         return RetrievalReason.EMPTY_BANK
-    if audit.n_state == 0:
+    if audit.n_state == 0 or audit.head_partition_excluded_count == audit.n_state:
         return RetrievalReason.EMPTY_HEAD_PARTITION
     if audit.invalid_count == audit.n_state:
         return RetrievalReason.ALL_INVALID

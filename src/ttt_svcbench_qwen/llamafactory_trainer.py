@@ -32,6 +32,11 @@ import transformers
 from safetensors import safe_open
 from torch import Tensor, nn
 
+from ttt_svcbench_qwen.baseline_a2_data import (
+    BaselineA2ClipDataset,
+    build_baseline_a2_train_sampler,
+    load_baseline_a2_clip_dataset,
+)
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
     A5EpisodeRecord,
@@ -46,6 +51,7 @@ from ttt_svcbench_qwen.meta_trainer import (
     TruncatedMetaTTTEpisodeOutput,
 )
 from ttt_svcbench_qwen.outer_gradient_control import (
+    OuterGradientAudit,
     OuterGradientController,
     sanitize_scalar_loss,
 )
@@ -62,6 +68,7 @@ from ttt_svcbench_qwen.production_factory import (
     initialize_outer_model_from_a2,
     load_llamafactory_backbone,
 )
+from ttt_svcbench_qwen.query_encoder import OPERATORS
 from ttt_svcbench_qwen.runtime_metrics import (
     flush_runtime_metrics,
     trace_cuda_phase,
@@ -99,20 +106,40 @@ class TrainSamplerFactory(Protocol):
 class _ControlledDeepSpeedEngineWrapper:
     """Pinned Accelerate wrapper with group clipping inserted before the real engine step."""
 
-    def __init__(self, engine: object, gradient_controller: OuterGradientController) -> None:
+    def __init__(
+        self,
+        engine: object,
+        gradient_controller: OuterGradientController,
+        model: nn.Module | None = None,
+        semantic_projector_delta_audit_steps: int = 0,
+    ) -> None:
         required = ("set_gradient_accumulation_boundary", "backward", "step")
         if any(not callable(getattr(engine, name, None)) for name in required):
             raise TypeError("controlled DeepSpeed wrapper received an invalid engine")
         self.engine = engine
         self.gradient_controller = gradient_controller
+        self.semantic_projector_auditor = (
+            _SemanticProjectorStepAuditor(
+                model, delta_audit_steps=semantic_projector_delta_audit_steps
+            )
+            if model is not None
+            else None
+        )
 
     def backward(self, loss: Tensor, sync_gradients: bool = True, **kwargs: object) -> None:
         engine = cast(Any, self.engine)
         engine.set_gradient_accumulation_boundary(is_boundary=sync_gradients)
         engine.backward(loss, **kwargs)
         if sync_gradients:
-            self.gradient_controller.apply_deepspeed(engine.optimizer)
+            audit = self.gradient_controller.apply_deepspeed(engine.optimizer)
+            snapshot = (
+                self.semantic_projector_auditor.before_step(engine.optimizer, audit)
+                if self.semantic_projector_auditor is not None
+                else None
+            )
             engine.step()
+            if self.semantic_projector_auditor is not None:
+                self.semantic_projector_auditor.after_step(snapshot, audit)
 
     def get_global_grad_norm(self) -> float:
         value = cast(Any, self.engine).get_global_grad_norm()
@@ -135,6 +162,7 @@ class SegmentBackwardController:
         *,
         expected_count: int,
         gradient_controller: OuterGradientController | None = None,
+        semantic_projector_delta_audit_steps: int = 0,
     ) -> None:
         if type(expected_count) is not int or expected_count <= 0:
             raise ValueError("segment backward count must be a positive integer")
@@ -143,6 +171,14 @@ class SegmentBackwardController:
         self.backward_count = 0
         self.step_count = 0
         self.gradient_controller = gradient_controller
+        self.semantic_projector_auditor = (
+            _SemanticProjectorStepAuditor(
+                model, delta_audit_steps=semantic_projector_delta_audit_steps
+            )
+            if isinstance(gradient_controller, OuterGradientController)
+            and "state_retrieval" in gradient_controller.expected_groups
+            else None
+        )
         self.is_deepspeed = (
             "deepspeed" in str(getattr(accelerator, "distributed_type", "")).casefold()
         )
@@ -194,10 +230,130 @@ class SegmentBackwardController:
             raise RuntimeError("segment backward controller was finalized more than once")
         if self.is_deepspeed:
             engine = cast(Any, self.engine)
+            audit: OuterGradientAudit | None = None
             if self.gradient_controller is not None:
-                self.gradient_controller.apply_deepspeed(engine.optimizer)
+                audit = self.gradient_controller.apply_deepspeed(engine.optimizer)
+            snapshot = (
+                self.semantic_projector_auditor.before_step(engine.optimizer, audit)
+                if self.semantic_projector_auditor is not None and audit is not None
+                else None
+            )
             engine.step()
+            if self.semantic_projector_auditor is not None and audit is not None:
+                self.semantic_projector_auditor.after_step(snapshot, audit)
             self.step_count = 1
+
+    @property
+    def semantic_projector_metrics(self) -> dict[str, float]:
+        if self.semantic_projector_auditor is None:
+            return {}
+        return dict(self.semantic_projector_auditor.last_metrics)
+
+
+class _SemanticProjectorStepAuditor:
+    """Audit the exact retrieval optimizer group before clear and its real step delta."""
+
+    _GROUP_NAME = "state_retrieval"
+
+    def __init__(self, model: nn.Module, *, delta_audit_steps: int = 32) -> None:
+        if type(delta_audit_steps) is not int or delta_audit_steps < 0:
+            raise ValueError("SemanticProjector delta audit steps must be non-negative")
+        parameters = tuple(
+            parameter
+            for name, parameter in model.named_parameters()
+            if "semantic_projector" in name.casefold() and parameter.requires_grad
+        )
+        if not parameters:
+            raise RuntimeError("formal model exposes no trainable SemanticProjector parameters")
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise RuntimeError("SemanticProjector parameter aliases are not supported")
+        self.parameters = parameters
+        self.parameter_ids = frozenset(id(parameter) for parameter in parameters)
+        self.delta_audit_steps = delta_audit_steps
+        self.last_metrics: dict[str, float] = {}
+        self._optimizer_validated = False
+
+    def before_step(
+        self,
+        optimizer: object,
+        audit: OuterGradientAudit,
+    ) -> tuple[Tensor, ...] | None:
+        self._validate_optimizer_group(optimizer)
+        group = audit.group(self._GROUP_NAME)
+        self.last_metrics = {
+            "grad/semantic_projector/pre_clip_norm": group.pre_clip_norm,
+            "grad/semantic_projector/post_clip_norm": group.post_clip_norm,
+            "grad/semantic_projector/clip_coefficient": group.clip_coefficient,
+            "grad/semantic_projector/active_elements": float(group.active_elements),
+            "grad/semantic_projector/nonfinite_elements": float(group.nonfinite_elements),
+        }
+        if audit.skipped_nonfinite or audit.successful_update_count > self.delta_audit_steps:
+            return None
+        return tuple(parameter.detach().float().clone() for parameter in self.parameters)
+
+    def after_step(
+        self,
+        snapshot: tuple[Tensor, ...] | None,
+        audit: OuterGradientAudit,
+    ) -> None:
+        if snapshot is None:
+            return
+        if len(snapshot) != len(self.parameters):
+            raise RuntimeError("SemanticProjector parameter snapshot drifted")
+        squared = torch.zeros((), dtype=torch.float64, device=self.parameters[0].device)
+        for before, parameter in zip(snapshot, self.parameters, strict=True):
+            if before.shape != parameter.shape or before.device != parameter.device:
+                raise RuntimeError("SemanticProjector parameter topology changed across step")
+            squared.add_((parameter.detach().float() - before).double().square().sum())
+        local_delta = squared.sqrt().float()
+        minimum = local_delta.clone()
+        maximum = local_delta.clone()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(minimum, op=torch.distributed.ReduceOp.MIN)
+            torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX)
+        min_value = float(minimum.item())
+        max_value = float(maximum.item())
+        tolerance = 1.0e-6 + 1.0e-4 * max_value
+        if max_value - min_value > tolerance:
+            raise RuntimeError(
+                "SemanticProjector parameter delta diverged across ranks: "
+                f"min={min_value:.9g}, max={max_value:.9g}"
+            )
+        self.last_metrics.update(
+            {
+                "grad/semantic_projector/parameter_delta_l2": float(local_delta.item()),
+                "grad/semantic_projector/parameter_delta_nonzero": float(
+                    bool(local_delta.item() > 0.0)
+                ),
+                "grad/semantic_projector/delta_audit_step": float(audit.successful_update_count),
+            }
+        )
+
+    def _validate_optimizer_group(self, optimizer: object) -> None:
+        if self._optimizer_validated:
+            return
+        base_optimizer = getattr(optimizer, "optimizer", optimizer)
+        groups = getattr(base_optimizer, "param_groups", None)
+        if not isinstance(groups, list):
+            raise TypeError("SemanticProjector audit requires optimizer param_groups")
+        matches = tuple(group for group in groups if group.get("group_name") == self._GROUP_NAME)
+        if len(matches) != 1:
+            raise RuntimeError("state_retrieval optimizer group is missing or duplicated")
+        optimizer_module = type(optimizer).__module__.casefold()
+        optimizer_name = type(optimizer).__name__.casefold()
+        is_deepspeed = "deepspeed" in optimizer_module or "deepspeed" in optimizer_name
+        if is_deepspeed:
+            # The exact registered Parameter set was checked before DeepSpeed wrapped
+            # AdamW.  ZeRO may replace it here with flat/partition tensors, so object
+            # identity is no longer a meaningful ownership check at step time.
+            self._optimizer_validated = True
+            return
+        actual = frozenset(id(parameter) for parameter in matches[0].get("params", ()))
+        if actual != self.parameter_ids:
+            raise RuntimeError(
+                "state_retrieval optimizer group must equal the SemanticProjector parameter set"
+            )
+        self._optimizer_validated = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,12 +401,24 @@ class ProductionTrainerRuntime:
     gradient_controller: OuterGradientController | None = None
     train_sampler_factory: TrainSamplerFactory | None = None
     callbacks: tuple[object, ...] = ()
+    semantic_projector_delta_audit_steps: int = 0
+    operator_diagnostics_interval: int = 10
 
     def __post_init__(self) -> None:
         if not isinstance(self.stage, ProductionStage) or not isinstance(self.model, nn.Module):
             raise TypeError("production runtime stage/model is invalid")
         if not callable(self.data_collator):
             raise TypeError("production runtime requires a data collator")
+        if (
+            type(self.semantic_projector_delta_audit_steps) is not int
+            or self.semantic_projector_delta_audit_steps < 0
+        ):
+            raise ValueError("SemanticProjector delta audit steps must be non-negative")
+        if (
+            type(self.operator_diagnostics_interval) is not int
+            or self.operator_diagnostics_interval <= 0
+        ):
+            raise ValueError("Operator diagnostics interval must be positive")
         if self.stage is ProductionStage.A2:
             if not callable(self.stage_a_loss_step):
                 raise ValueError("A2 runtime requires a post-forward state+answer loss step")
@@ -361,10 +529,7 @@ class _A2AuditAccumulator:
             "loss/ga_microbatch_count": float(len(balances)),
         }
         answer = _weighted_audit_mean(
-            tuple(
-                (audit.answer_global_mean, audit.answer_global_count)
-                for audit in balances
-            )
+            tuple((audit.answer_global_mean, audit.answer_global_count) for audit in balances)
         )
         state = _audit_mean(tuple(audit.state_global_mean for audit in balances))
         if answer is not None:
@@ -476,7 +641,171 @@ class _A2AuditAccumulator:
         for audit in weak:
             for name, value in audit.metrics():
                 metrics[name] = metrics.get(name, 0.0) + float(value)
+        _aggregate_operator_diagnostics(metrics, weak)
+        _aggregate_task_diagnostics(metrics, weak)
         return metrics
+
+
+def _aggregate_operator_diagnostics(
+    metrics: dict[str, float],
+    audits: Sequence[OfficialWeakLossAudit],
+) -> None:
+    raw = [0] * 72
+    effective = [0] * 72
+    loss_sums = [0.0] * 8
+    support = [0] * 8
+    confidence_sum = entropy_sum = temperature_sum = 0.0
+    temperature_count = 0
+    for audit in audits:
+        values = audit.operator_diagnostics
+        raw = [left + right for left, right in zip(raw, values.raw_confusion, strict=True)]
+        effective = [
+            left + right for left, right in zip(effective, values.effective_confusion, strict=True)
+        ]
+        loss_sums = [
+            left + right for left, right in zip(loss_sums, values.class_loss_sums, strict=True)
+        ]
+        support = [left + right for left, right in zip(support, values.class_support, strict=True)]
+        confidence_sum += values.confidence_sum
+        entropy_sum += values.entropy_sum
+        temperature_sum += values.temperature_sum
+        temperature_count += values.temperature_count
+    total = sum(support)
+    if total != sum(raw) or total != sum(effective):
+        raise RuntimeError("aggregated Operator confusion totals drifted from support")
+    recalls: list[float] = []
+    raw_recalls: list[float] = []
+    raw_correct = effective_correct = 0
+    unsupported_index = len(OPERATORS) - 1
+    for target_index, target in enumerate(OPERATORS[:-1]):
+        target_name = target.value
+        row_offset = target_index * len(OPERATORS)
+        row_support = support[target_index]
+        metrics[f"operator/support/{target_name}"] = float(row_support)
+        if row_support:
+            target_raw_correct = raw[row_offset + target_index]
+            target_effective_correct = effective[row_offset + target_index]
+            raw_recall = target_raw_correct / float(row_support)
+            recall = target_effective_correct / float(row_support)
+            metrics[f"operator/raw_recall/{target_name}"] = raw_recall
+            metrics[f"operator/recall/{target_name}"] = recall
+            metrics[f"operator/raw_loss/{target_name}"] = loss_sums[target_index] / float(
+                row_support
+            )
+            raw_recalls.append(raw_recall)
+            recalls.append(recall)
+            raw_correct += target_raw_correct
+            effective_correct += target_effective_correct
+        for predicted_index, predicted in enumerate(OPERATORS):
+            metrics[f"operator/raw_confusion/{target_name}/{predicted.value}"] = float(
+                raw[row_offset + predicted_index]
+            )
+            metrics[f"operator/effective_confusion/{target_name}/{predicted.value}"] = float(
+                effective[row_offset + predicted_index]
+            )
+    metrics["operator/observed_class_count"] = float(len(recalls))
+    metrics["operator/observed_class_fraction"] = len(recalls) / 8.0
+    if total:
+        metrics["operator/raw_micro_accuracy"] = raw_correct / float(total)
+        metrics["operator/micro_accuracy"] = effective_correct / float(total)
+        metrics["operator/raw_macro_recall"] = sum(raw_recalls) / float(len(raw_recalls))
+        metrics["operator/macro_recall"] = sum(recalls) / float(len(recalls))
+        metrics["operator/raw_predicted_unsupported_rate"] = sum(
+            raw[index * 9 + unsupported_index] for index in range(8)
+        ) / float(total)
+        metrics["operator/predicted_unsupported_rate"] = sum(
+            effective[index * 9 + unsupported_index] for index in range(8)
+        ) / float(total)
+        metrics["operator/mean_confidence"] = confidence_sum / float(total)
+        metrics["operator/mean_entropy"] = entropy_sum / float(total)
+    if temperature_count:
+        metrics["operator/temperature"] = temperature_sum / float(temperature_count)
+
+
+def _aggregate_task_diagnostics(
+    metrics: dict[str, float],
+    audits: Sequence[OfficialWeakLossAudit],
+) -> None:
+    count_loss = [0.0] * 4
+    count_error = [0.0] * 4
+    count_rows = [0] * 4
+    component_loss = [0.0] * 3
+    component_rows = [0] * 3
+    o1_loss = [0.0] * 2
+    o1_rows = [0] * 2
+    channel_stats = [[0] * 7 for _ in range(6)]
+    representable = unrepresentable = 0
+    for audit in audits:
+        values = audit.task_diagnostics
+        count_loss = [
+            left + right for left, right in zip(count_loss, values.count_loss_sums, strict=True)
+        ]
+        count_error = [
+            left + right
+            for left, right in zip(count_error, values.count_abs_error_sums, strict=True)
+        ]
+        count_rows = [
+            left + right for left, right in zip(count_rows, values.count_rows, strict=True)
+        ]
+        component_loss = [
+            left + right
+            for left, right in zip(component_loss, values.component_loss_sums, strict=True)
+        ]
+        component_rows = [
+            left + right for left, right in zip(component_rows, values.component_rows, strict=True)
+        ]
+        o1_loss = [left + right for left, right in zip(o1_loss, values.o1_loss_sums, strict=True)]
+        o1_rows = [left + right for left, right in zip(o1_rows, values.o1_rows, strict=True)]
+        sources = (
+            values.channel_positive_counts,
+            values.channel_negative_counts,
+            values.channel_masked_counts,
+            values.channel_true_positive_counts,
+            values.channel_false_positive_counts,
+            values.channel_false_negative_counts,
+        )
+        for target, source in zip(channel_stats, sources, strict=True):
+            for index, value in enumerate(source):
+                target[index] += value
+        representable += values.e1_representable_occurrences
+        unrepresentable += values.e1_unrepresentable_occurrences
+    for index, name in enumerate(("o1", "o2", "e1", "e2")):
+        metrics[f"task/count_rows/{name}"] = float(count_rows[index])
+        if count_rows[index]:
+            metrics[f"task/count/{name}"] = count_loss[index] / float(count_rows[index])
+            metrics[f"task/count_mae/{name}"] = count_error[index] / float(count_rows[index])
+    for index, name in enumerate(("e1_dense", "e2_event", "e2_phase")):
+        metrics[f"task/{name}_rows"] = float(component_rows[index])
+        if component_rows[index]:
+            metrics[f"task/{name}"] = component_loss[index] / float(component_rows[index])
+    for index, name in enumerate(("snap", "delta")):
+        metrics[f"task/o1_rows/{name}"] = float(o1_rows[index])
+        if o1_rows[index]:
+            metrics[f"task/o1/{name}"] = o1_loss[index] / float(o1_rows[index])
+    metrics["task/e1_representable_occurrences"] = float(representable)
+    metrics["task/e1_unrepresentable_occurrences"] = float(unrepresentable)
+    channel_names = (
+        "e1_eventness",
+        "e1_completion",
+        "e1_transition",
+        "e2_start",
+        "e2_active",
+        "e2_end",
+        "e2_complete",
+    )
+    positive, negative, masked, true_positive, false_positive, false_negative = channel_stats
+    for index, name in enumerate(channel_names):
+        metrics[f"task/dense_positive/{name}"] = float(positive[index])
+        metrics[f"task/dense_negative/{name}"] = float(negative[index])
+        metrics[f"task/dense_masked/{name}"] = float(masked[index])
+        precision_denominator = true_positive[index] + false_positive[index]
+        recall_denominator = true_positive[index] + false_negative[index]
+        if precision_denominator:
+            metrics[f"task/dense_precision/{name}"] = true_positive[index] / float(
+                precision_denominator
+            )
+        if recall_denominator:
+            metrics[f"task/dense_recall/{name}"] = true_positive[index] / float(recall_denominator)
 
 
 def _audit_scalar(value: Tensor) -> float | None:
@@ -518,7 +847,7 @@ class TTTQwenTrainerMixin:
     ) -> None:
         self.ttt_runtime = ttt_runtime
         self.last_meta_output: TruncatedMetaTTTEpisodeOutput | None = None
-        self.last_semantic_projector_grad_norm: float | None = None
+        self.last_semantic_projector_metrics: dict[str, float] = {}
         self._a2_audit_accumulator = _A2AuditAccumulator()
         super().__init__(*args, **kwargs)
 
@@ -537,7 +866,10 @@ class TTTQwenTrainerMixin:
         if engine is None:
             raise RuntimeError("A2 DeepSpeed engine is unavailable before backward")
         self.accelerator.deepspeed_engine_wrapped = _ControlledDeepSpeedEngineWrapper(  # type: ignore[attr-defined]
-            engine, controller
+            engine,
+            controller,
+            self.ttt_runtime.model,
+            self.ttt_runtime.semantic_projector_delta_audit_steps,
         )
 
     def create_optimizer(self, *args: object, **kwargs: object) -> torch.optim.Optimizer:
@@ -587,6 +919,14 @@ class TTTQwenTrainerMixin:
         enriched = dict(logs)
         if self.ttt_runtime.stage is ProductionStage.A2:
             enriched.update(self._a2_audit_accumulator.flush())
+            global_step = int(getattr(getattr(self, "state", None), "global_step", 0))
+            if global_step % self.ttt_runtime.operator_diagnostics_interval:
+                enriched = {
+                    name: value
+                    for name, value in enriched.items()
+                    if not name.startswith("operator/raw_confusion/")
+                    and not name.startswith("operator/effective_confusion/")
+                }
         else:
             audit = getattr(self.ttt_runtime.meta_runner, "last_balance_audit", None)
             metrics = getattr(audit, "metrics", None)
@@ -601,8 +941,7 @@ class TTTQwenTrainerMixin:
                     if name.startswith("retrieval/") and value is not None:
                         retrieval_metrics[name] = retrieval_metrics.get(name, 0.0) + value
             enriched.update(retrieval_metrics)
-        if self.last_semantic_projector_grad_norm is not None:
-            enriched["grad/semantic_projector"] = self.last_semantic_projector_grad_norm
+        enriched.update(self.last_semantic_projector_metrics)
         controller = self.ttt_runtime.gradient_controller
         if isinstance(controller, OuterGradientController) and controller.last_audit is not None:
             enriched.update(dict(controller.last_audit.metrics()))
@@ -663,7 +1002,13 @@ class TTTQwenTrainerMixin:
             ):
                 raise RuntimeError("formal A2 step did not publish typed loss audits")
             self._a2_audit_accumulator.add(balance_audit, weak_audit)
-            self.last_semantic_projector_grad_norm = _semantic_projector_gradient_norm(model)
+            wrapper = getattr(self.accelerator, "deepspeed_engine_wrapped", None)  # type: ignore[attr-defined]
+            if not isinstance(wrapper, _ControlledDeepSpeedEngineWrapper):
+                raise RuntimeError("formal A2 lost its controlled DeepSpeed wrapper")
+            auditor = wrapper.semantic_projector_auditor
+            self.last_semantic_projector_metrics = (
+                dict(auditor.last_metrics) if auditor is not None else {}
+            )
             self._observe_runtime_cost(inputs, time.perf_counter() - step_started)
             return result
         if int(self.args.gradient_accumulation_steps) != 1:  # type: ignore[attr-defined]
@@ -695,6 +1040,9 @@ class TTTQwenTrainerMixin:
             model,
             expected_count=expected_backwards,
             gradient_controller=self.ttt_runtime.gradient_controller,
+            semantic_projector_delta_audit_steps=(
+                self.ttt_runtime.semantic_projector_delta_audit_steps
+            ),
         )
 
         def distributed_backward(loss: Tensor, retain_graph: bool) -> None:
@@ -709,7 +1057,7 @@ class TTTQwenTrainerMixin:
         if output.audit.backward_count != expected_backwards:
             raise RuntimeError("A5 streamed backward collective count drifted from its bucket")
         backward_controller.finalize()
-        self.last_semantic_projector_grad_norm = _semantic_projector_gradient_norm(model)
+        self.last_semantic_projector_metrics = backward_controller.semantic_projector_metrics
         self.last_meta_output = output
         self._observe_runtime_cost(inputs, time.perf_counter() - step_started)
         return (output.total * loss_weight).detach().to(self.args.device)  # type: ignore[attr-defined]
@@ -836,11 +1184,31 @@ def main(argv: list[str] | None = None) -> int:
         raise TypeError("built-in runtime must return ProductionTrainerRuntime")
     if runtime_raw.stage is not configured_stage:
         raise ValueError("runtime factory stage disagrees with ttt_qwen.stage")
+    baseline_a2_dataset: BaselineA2ClipDataset | None = None
     manifest_path = backbone.ttt_config.dataset_manifest
-    train_dataset, eval_dataset = load_production_manifest_views(
-        manifest_path,
-        stage=ManifestStage(configured_stage.value),
-    )
+    if (
+        configured_stage is ProductionStage.A2
+        and backbone.ttt_config.a2_data_mode == "llamafactory_sft_clips"
+    ):
+        weak_sidecar_path = backbone.ttt_config.weak_sidecar_path
+        if weak_sidecar_path is None:
+            raise RuntimeError("validated baseline-clips A2 config lost weak_sidecar_path")
+        dataset_dir = str(getattr(backbone.data_args, "dataset_dir", ""))
+        dataset_name = getattr(backbone.data_args, "dataset", "")
+        baseline_a2_dataset = load_baseline_a2_clip_dataset(
+            dataset_dir,
+            dataset_name=dataset_name,
+            weak_sidecar_path=weak_sidecar_path,
+        )
+        train_dataset = baseline_a2_dataset
+        eval_dataset = None
+    else:
+        if manifest_path is None:
+            raise RuntimeError("validated manifest mode lost dataset_manifest")
+        train_dataset, eval_dataset = load_production_manifest_views(
+            manifest_path,
+            stage=ManifestStage(configured_stage.value),
+        )
     runtime_raw = replace(
         runtime_raw,
         train_dataset=train_dataset,
@@ -849,6 +1217,8 @@ def main(argv: list[str] | None = None) -> int:
     visual_cost_index: Mapping[str, VisualCostRecord] | None = None
     raw_cost_index = backbone.ttt_config.visual_cost_index
     if raw_cost_index is not None:
+        if manifest_path is None:
+            raise RuntimeError("visual cost index requires a production manifest")
         minimum_pixels, maximum_pixels = _video_pixel_bounds(backbone)
         balance = backbone.project_config.loss.official_weak_balance
         model_name = str(getattr(backbone.model_args, "model_name_or_path", "unknown-model"))
@@ -929,17 +1299,27 @@ def main(argv: list[str] | None = None) -> int:
             backbone.project_config.outer_gradient_control,
             expected_groups=expected_gradient_groups,
         ),
+        semantic_projector_delta_audit_steps=(
+            backbone.ttt_config.semantic_projector_delta_audit_steps
+        ),
+        operator_diagnostics_interval=backbone.ttt_config.operator_diagnostics_interval,
         train_sampler_factory=(
-            lambda dataset, rank, world_size: build_production_train_sampler(
-                dataset,
-                rank,
-                world_size,
-                visual_cost_index=visual_cost_index,
-                query_sample_fps=backbone.ttt_config.query_sample_fps,
-                state_query_visual_mode=backbone.ttt_config.state_query_visual_mode,
-                state_query_max_frames=backbone.ttt_config.state_query_max_frames,
-                answer_query_visual_mode=backbone.ttt_config.answer_query_visual_mode,
-                answer_query_max_frames=backbone.ttt_config.answer_query_max_frames,
+            (lambda dataset, rank, world_size: build_baseline_a2_train_sampler(
+                dataset, rank, world_size
+            ))
+            if baseline_a2_dataset is not None
+            else (
+                lambda dataset, rank, world_size: build_production_train_sampler(
+                    dataset,
+                    rank,
+                    world_size,
+                    visual_cost_index=visual_cost_index,
+                    query_sample_fps=backbone.ttt_config.query_sample_fps,
+                    state_query_visual_mode=backbone.ttt_config.state_query_visual_mode,
+                    state_query_max_frames=backbone.ttt_config.state_query_max_frames,
+                    answer_query_visual_mode=backbone.ttt_config.answer_query_visual_mode,
+                    answer_query_max_frames=backbone.ttt_config.answer_query_max_frames,
+                )
             )
         ),
     )
@@ -967,6 +1347,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("a smoke run cannot retain epoch checkpoints")
     if checkpoint_policy is CheckpointPolicy.EPOCH_2_AND_EPOCH_4:
         _validate_epoch_two_four_training_arguments(training_args)
+    if baseline_a2_dataset is not None:
+        _validate_baseline_a2_training_arguments(training_args, baseline_a2_dataset)
     trainer = cast(Any, build_production_trainer(backbone, runtime_raw))
     output_dir = Path(str(training_args.output_dir))
     artifact_root = Path(os.environ.get("RUN_ROOT", str(output_dir)))
@@ -979,6 +1361,9 @@ def main(argv: list[str] | None = None) -> int:
             checkpoint_environment = asdict(checkpoint_audit)
             checkpoint_environment["checkpoint"] = str(checkpoint_audit.checkpoint)
         environment["a2_initialization_audit"] = checkpoint_environment
+        environment["baseline_a2_dataset_audit"] = (
+            None if baseline_a2_dataset is None else asdict(baseline_a2_dataset.audit)
+        )
         _write_json(artifact_root / "environment.json", environment)
     try:
         result = trainer.train(
@@ -1033,9 +1418,7 @@ def main(argv: list[str] | None = None) -> int:
                     },
                     "final_checkpoint": str(epoch_four_checkpoint),
                     "resume_state": str(epoch_four_checkpoint),
-                    "resumed_from": (
-                        None if same_stage_resume is None else str(same_stage_resume)
-                    ),
+                    "resumed_from": (None if same_stage_resume is None else str(same_stage_resume)),
                 },
             )
         return 0
@@ -1099,11 +1482,40 @@ def _validate_epoch_two_four_training_arguments(training_args: object) -> None:
         raise ValueError("epoch_2_and_epoch_4 checkpoint policy requires num_train_epochs=4")
     if strategy != "steps" or not math.isclose(save_steps, 0.5):
         raise ValueError(
-            "epoch_2_and_epoch_4 checkpoint policy requires save_strategy=steps and "
-            "save_steps=0.5"
+            "epoch_2_and_epoch_4 checkpoint policy requires save_strategy=steps and save_steps=0.5"
         )
     if save_total_limit < 2:
         raise ValueError("epoch_2_and_epoch_4 checkpoint policy requires save_total_limit>=2")
+
+
+def _validate_baseline_a2_training_arguments(
+    training_args: object,
+    dataset: BaselineA2ClipDataset,
+) -> None:
+    """Pin the exact baseline-comparison sample and optimizer-step contract."""
+
+    arguments = cast(Any, training_args)
+    if len(dataset) != 4_576:
+        raise ValueError("baseline-clips A2 requires exactly 4,576 samples")
+    if int(arguments.per_device_train_batch_size) != 1:
+        raise ValueError("baseline-clips A2 requires per-device batch size 1")
+    if int(arguments.gradient_accumulation_steps) != 4:
+        raise ValueError("baseline-clips A2 requires gradient accumulation 4")
+    if int(arguments.world_size) != 4:
+        raise ValueError("baseline-clips A2 requires exactly four distributed ranks")
+    if bool(arguments.dataloader_drop_last):
+        raise ValueError("baseline-clips A2 may not drop SFT rows")
+    if int(arguments.max_steps) > 0 and os.environ.get("TTT_SMOKE_MAX_STEPS") is None:
+        raise ValueError("formal baseline-clips A2 must derive 1,144 steps from four epochs")
+    global_batch = (
+        int(arguments.per_device_train_batch_size)
+        * int(arguments.gradient_accumulation_steps)
+        * int(arguments.world_size)
+    )
+    if global_batch != 16 or len(dataset) % global_batch:
+        raise ValueError("baseline-clips A2 requires an exact global batch of 16")
+    if len(dataset) // global_batch != 286:
+        raise ValueError("baseline-clips A2 requires exactly 286 optimizer steps per epoch")
 
 
 def _standard_checkpoint_progress(checkpoint: Path) -> tuple[int, int, float]:
@@ -1177,8 +1589,7 @@ def _publish_epoch_two_four_checkpoints(output_dir: Path) -> dict[int, Path]:
         selected[epoch_number] = source
 
     destinations = {
-        epoch_number: output_dir / f"epoch-{epoch_number}-checkpoint"
-        for epoch_number in (2, 4)
+        epoch_number: output_dir / f"epoch-{epoch_number}-checkpoint" for epoch_number in (2, 4)
     }
     for destination in destinations.values():
         if destination.exists():
@@ -1419,6 +1830,17 @@ def make_production_outer_optimizer_factory(
             raise ValueError("A2 Outer AdamW cannot own Predictor")
         if stage is ProductionStage.A5 and not groups["predictor"]:
             raise ValueError("A5 Outer AdamW must own Predictor")
+        semantic_projector_ids = {
+            id(parameter)
+            for name, parameter in model.named_parameters(remove_duplicate=False)
+            if "semantic_projector" in name.casefold() and parameter.requires_grad
+        }
+        retrieval_group_ids = {id(parameter) for parameter in groups["state_retrieval"]}
+        if retrieval_group_ids != semantic_projector_ids:
+            raise ValueError(
+                "state_retrieval optimizer group must exactly equal SemanticProjector "
+                "before DeepSpeed wrapping"
+            )
         trainable_ids = {
             id(parameter) for parameter in model.parameters() if parameter.requires_grad
         }
@@ -1498,26 +1920,6 @@ def _reset_a2_to_a5_balance(model: nn.Module) -> None:
     if not isinstance(balancer, OfficialWeakOuterLossComposer):
         raise RuntimeError("A5 outer model lost the official-weak EMA reset boundary")
     balancer.reset_ema()
-
-
-def _semantic_projector_gradient_norm(model: nn.Module) -> float | None:
-    """Capture the post-backward Projector norm before the optimizer clears gradients."""
-
-    squared_norm: Tensor | None = None
-    matched = False
-    for name, parameter in model.named_parameters():
-        if "semantic_projector" not in name:
-            continue
-        matched = True
-        if parameter.grad is None:
-            continue
-        value = parameter.grad.detach().float().square().sum()
-        squared_norm = value if squared_norm is None else squared_norm + value
-    if not matched:
-        return None
-    if squared_norm is None:
-        return 0.0
-    return math.sqrt(float(squared_norm.item()))
 
 
 def _write_json(path: Path, value: object) -> None:

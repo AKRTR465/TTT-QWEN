@@ -35,14 +35,16 @@ from ttt_svcbench_qwen.observation_heads import (
     ObservationOutputs,
 )
 from ttt_svcbench_qwen.query_encoder import (
-    OPERATOR_TO_HEAD_TYPE,
     QueryEncoderOutput,
     detach_query_encoder_output,
 )
+from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase
 from ttt_svcbench_qwen.state_bank import (
     RetrievalHistoryView,
     StateBankRuntimeState,
     StructuredStateBank,
+    TensorizedRetrievalHistory,
+    tensorized_retrieval_view,
 )
 from ttt_svcbench_qwen.state_encoder import (
     SpatialEncoderOutput,
@@ -166,6 +168,7 @@ class TrajectoryRuntimeState:
     e2_state: E2RuntimeState | None
     state_bank: StateBankRuntimeState
     identity_bank: IdentityBankRuntimeState
+    retrieval_history: TensorizedRetrievalHistory | None = None
     fast_weights: FastWeightsState | None = None
     optimizer: OptimizerRuntimeState | None = None
     reader_audit: tuple[ReaderResult, ...] = ()
@@ -186,6 +189,12 @@ class TrajectoryRuntimeState:
                 raise ValueError(f"{name} ownership does not match trajectory runtime")
             if state.released != self.released:
                 raise ValueError(f"{name} release state does not match trajectory runtime")
+        if self.retrieval_history is not None:
+            history = self.retrieval_history
+            if (history.video_id, history.trajectory_id) != (video_id, trajectory_id):
+                raise ValueError("retrieval ring ownership does not match trajectory runtime")
+            if history.released != self.released:
+                raise ValueError("retrieval ring release state does not match trajectory runtime")
         if self.slot_state is not None and self.slot_state.video_id != video_id:
             raise ValueError("slot-state ownership does not match trajectory runtime")
         for name, operator_state in (("E1", self.e1_state), ("E2", self.e2_state)):
@@ -285,6 +294,13 @@ class BatchRuntimeState:
     @property
     def identity_bank_states(self) -> tuple[IdentityBankRuntimeState, ...]:
         return tuple(row.identity_bank for row in self.rows)
+
+    @property
+    def retrieval_histories(self) -> tuple[TensorizedRetrievalHistory, ...]:
+        histories = tuple(row.retrieval_history for row in self.rows)
+        if any(value is None for value in histories):
+            raise ValueError("batch runtime does not own tensorized retrieval histories")
+        return tuple(value for value in histories if value is not None)
 
     @property
     def bank_states(self) -> tuple[StateBankRuntimeState, ...]:
@@ -499,11 +515,17 @@ class ObservationChunkRequest:
     runtime_state: BatchRuntimeState
     bank_states: tuple[StateBankRuntimeState, ...]
     inference: bool = True
+    retrieval_snapshot_required: bool = True
+    retrieval_history_write_enabled: bool = True
     prepared_query: PreparedQueryOutput | None = None
 
     def __post_init__(self) -> None:
         if type(self.inference) is not bool:
             raise TypeError("observation inference flag must be bool")
+        if type(self.retrieval_snapshot_required) is not bool:
+            raise TypeError("retrieval_snapshot_required must be bool")
+        if type(self.retrieval_history_write_enabled) is not bool:
+            raise TypeError("retrieval_history_write_enabled must be bool")
         if self.bank_states and len(self.bank_states) != len(self.owner.video_ids):
             raise ValueError("bank_states must align to the owner batch")
         if self.prepared_query is not None:
@@ -888,11 +910,7 @@ class ModelComponents:
                 "bank_writer": self.bank_writer,
                 "state_bank": self.state_bank,
             }
-            missing.extend(
-                name
-                for name, value in bank_dependencies.items()
-                if value is None
-            )
+            missing.extend(name for name, value in bank_dependencies.items() if value is None)
         if (flags.reader_enabled or flags.state_tokens_enabled) and self.retriever is None:
             missing.append("retriever")
         if flags.reader_enabled and self.reader is None:
@@ -1042,12 +1060,41 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             soft_write: object | None = None
             if self.feature_flags.bank_enabled:
                 state_bank = self.components.require_state_bank()
-                if self.feature_flags.reader_enabled or self.feature_flags.state_tokens_enabled:
-                    heads = tuple(
-                        OPERATOR_TO_HEAD_TYPE[operator]
-                        for operator in soft.query.hard_operators
-                    )
-                    retrieval_history = state_bank.retrieval_view(bank_states, heads)
+                if request.retrieval_snapshot_required and (
+                    self.feature_flags.reader_enabled or self.feature_flags.state_tokens_enabled
+                ):
+                    # Keep the write-before snapshot label-free and expose every head. Runtime
+                    # selection is still constrained by the predicted hard operator inside the
+                    # Retriever; official labels may only build a target-head MIL bag later.
+                    with trace_cuda_phase("retrieval_history_snapshot"):
+                        backend = getattr(
+                            getattr(state_bank, "config", None),
+                            "retrieval_history_backend",
+                            "legacy_tuple",
+                        )
+                        has_tensor_ring = isinstance(
+                            request.runtime_state, BatchRuntimeState
+                        ) and all(
+                            row.retrieval_history is not None for row in request.runtime_state.rows
+                        )
+                        if backend == "tensor_ring" and has_tensor_ring:
+                            if not isinstance(request.runtime_state, BatchRuntimeState):
+                                raise TypeError(
+                                    "tensor retrieval backend requires BatchRuntimeState"
+                                )
+                            retrieval_history = tensorized_retrieval_view(
+                                request.runtime_state.retrieval_histories,
+                                # A normal online Support observation intentionally commits a
+                                # hard write after taking its pre-write view.  The gathered view
+                                # owns tensor copies, so it remains an immutable legacy-compatible
+                                # answer snapshot.  Query snapshots never write and retain the
+                                # strict version guard.
+                                guard_current_version=(
+                                    not request.retrieval_history_write_enabled
+                                ),
+                            )
+                        else:
+                            retrieval_history = state_bank.retrieval_view(bank_states, None)
                 writer = self.components.require_bank_writer()
                 assert soft.observations is not None
                 assert soft.spatial is not None
@@ -1151,9 +1198,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             )
             _validate_answer_provenance(retrieval, resampler_output)
         state_tokens = None if resampler_output is None else resampler_output.state_tokens
-        state_valid = (
-            None if resampler_output is None else resampler_output.state_token_valid_mask
-        )
+        state_valid = None if resampler_output is None else resampler_output.state_token_valid_mask
         composed = self.components.composer(
             base_input_ids=request.base_input_ids,
             base_attention_mask=request.base_attention_mask,

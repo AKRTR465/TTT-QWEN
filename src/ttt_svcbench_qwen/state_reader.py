@@ -192,6 +192,7 @@ class StateResamplerOutput:
         ):
             raise ValueError("selected attention mass must be one for hits and zero for empty rows")
 
+
 @dataclass(frozen=True, slots=True)
 class ReaderResult:
     status: ReaderStatus
@@ -524,24 +525,39 @@ class StateResampler(nn.Module):  # type: ignore[misc]
         internal_masks: list[Tensor] = []
         external_masks: list[Tensor] = []
         for row, selected_ids in enumerate(retrieval.selected_record_ids):
-            id_to_column = {
-                record_id: column
-                for column, record_id in enumerate(retrieval.candidate_record_ids[row])
-                if record_id is not None
-            }
             if selected_ids:
-                try:
-                    columns = [id_to_column[record_id] for record_id in selected_ids]
-                except KeyError as error:
-                    raise ValueError(
-                        "selected record IDs are missing from the candidate axis"
-                    ) from error
-                indices = torch.tensor(
-                    columns,
-                    dtype=torch.int64,
-                    device=retrieval.state_embeddings.device,
-                )
-                selected = retrieval.state_embeddings[row].index_select(0, indices)
+                candidate_ids = retrieval.candidate_record_ids[row]
+                if all(record_id is None for record_id in candidate_ids):
+                    targets = torch.tensor(
+                        tuple(_retrieval_sequence_from_id(record_id) for record_id in selected_ids),
+                        dtype=torch.int64,
+                        device=retrieval.state_embeddings.device,
+                    )
+                    assert retrieval.candidate_sequence_ids is not None
+                    matches = (
+                        targets.unsqueeze(1) == retrieval.candidate_sequence_ids[row].unsqueeze(0)
+                    ) & retrieval.present_mask[row].unsqueeze(0)
+                    if not bool(torch.all(matches.sum(dim=1) == 1)):
+                        raise ValueError("selected record IDs are missing from the candidate axis")
+                    columns = matches.to(torch.int64).argmax(dim=1)
+                else:
+                    id_to_column = {
+                        record_id: column
+                        for column, record_id in enumerate(candidate_ids)
+                        if record_id is not None
+                    }
+                    try:
+                        column_values = [id_to_column[record_id] for record_id in selected_ids]
+                    except KeyError as error:
+                        raise ValueError(
+                            "selected record IDs are missing from the candidate axis"
+                        ) from error
+                    columns = torch.tensor(
+                        column_values,
+                        dtype=torch.int64,
+                        device=retrieval.state_embeddings.device,
+                    )
+                selected = retrieval.state_embeddings[row].index_select(0, columns)
                 selected = selected.to(dtype=self.q_state.dtype)
                 padding = selected.new_zeros(
                     (internal_width - len(selected_ids), self.config.hidden_dim)
@@ -570,6 +586,19 @@ class StateResampler(nn.Module):  # type: ignore[misc]
             torch.stack(internal_masks),
             torch.stack(external_masks),
         )
+
+
+def _retrieval_sequence_from_id(record_id: str) -> int:
+    prefix = "retrieval-"
+    if not record_id.startswith(prefix):
+        raise ValueError("tensor-only retrieval candidates require retrieval sequence IDs")
+    try:
+        value = int(record_id[len(prefix) :])
+    except ValueError as error:
+        raise ValueError("tensor-only retrieval record ID has an invalid sequence") from error
+    if value < 0:
+        raise ValueError("tensor-only retrieval sequence must be non-negative")
+    return value
 
 
 class _ReaderStateError(ValueError):
@@ -888,13 +917,20 @@ def _reader_bank_snapshot(
     ):
         raise ValueError("Reader Bank inputs must align to the Query batch")
     heads = tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in query.hard_operators)
-    view = state_bank.view(normalized_states, heads)
+    view = state_bank.view(normalized_states, None)
     scores = torch.zeros(
         view.present_mask.shape,
         dtype=torch.float32,
         device=view.embeddings.device,
     )
     selected_mask = torch.zeros_like(view.present_mask)
+    predicted_head_mask = torch.zeros_like(view.present_mask)
+    for row, expected_head in enumerate(heads):
+        if expected_head is None:
+            continue
+        for column, head in enumerate(view.head_types[row]):
+            if head is expected_head:
+                predicted_head_mask[row, column] = True
     statuses: list[RetrievalStatus] = []
     reasons: list[RetrievalReason] = []
     audits: list[RetrievalFilterAudit] = []
@@ -908,7 +944,8 @@ def _reader_bank_snapshot(
     ):
         n_state = int(view.n_state[row].item())
         owner_count = int(view.owner_record_counts[row].item())
-        head_excluded = owner_count - n_state
+        if owner_count != n_state:
+            raise ValueError("Reader all-head view must expose every owner record")
         owner_matches = (
             view.video_ids[row] == normalized_video_ids[row]
             and view.trajectory_ids[row] == normalized_trajectory_ids[row]
@@ -939,7 +976,7 @@ def _reader_bank_snapshot(
             audits.append(
                 RetrievalFilterAudit(
                     n_state=n_state,
-                    head_partition_excluded_count=head_excluded,
+                    head_partition_excluded_count=0,
                     query_rejected_count=query_rejected,
                     owner_mismatch_count=owner_mismatch,
                     invalid_count=0,
@@ -955,25 +992,23 @@ def _reader_bank_snapshot(
             selected_records.append(())
             continue
 
-        invalid = ineligible = 0
+        head_excluded = invalid = ineligible = 0
         selected_columns: list[int] = []
         for column in range(n_state):
             record = view.cloned_records[row][column]
             if record is None:
                 raise ValueError("present Reader Bank columns require typed records")
-            if not record.valid:
+            if not bool(predicted_head_mask[row, column]):
+                head_excluded += 1
+            elif not record.valid:
                 invalid += 1
             elif not bool(view.retrieval_eligible_mask[row, column]):
                 ineligible += 1
             else:
                 selected_columns.append(column)
                 selected_mask[row, column] = True
-        selected_columns.sort(
-            key=lambda column: str(view.record_ids[row][column])
-        )
-        row_ids = tuple(
-            str(view.record_ids[row][column]) for column in selected_columns
-        )
+        selected_columns.sort(key=lambda column: str(view.record_ids[row][column]))
+        row_ids = tuple(str(view.record_ids[row][column]) for column in selected_columns)
         row_records = tuple(
             clone_state_record(view.cloned_records[row][column])
             for column in selected_columns
@@ -992,14 +1027,12 @@ def _reader_bank_snapshot(
         else:
             statuses.append(RetrievalStatus.EMPTY)
             if n_state == 0:
-                reason = (
-                    RetrievalReason.EMPTY_BANK
-                    if owner_count == 0
-                    else RetrievalReason.EMPTY_HEAD_PARTITION
-                )
-            elif invalid == n_state:
+                reason = RetrievalReason.EMPTY_BANK
+            elif head_excluded == n_state:
+                reason = RetrievalReason.EMPTY_HEAD_PARTITION
+            elif invalid == n_state - head_excluded:
                 reason = RetrievalReason.ALL_INVALID
-            elif invalid + ineligible == n_state and ineligible:
+            elif invalid + ineligible == n_state - head_excluded and ineligible:
                 reason = RetrievalReason.ALL_RETRIEVAL_INELIGIBLE
             else:
                 reason = RetrievalReason.NO_MATCH
@@ -1025,12 +1058,14 @@ def _reader_bank_snapshot(
         selected_records=tuple(selected_records),
         candidate_record_ids=view.record_ids,
         candidate_records=view.cloned_records,
+        candidate_head_types=view.head_types,
         state_embeddings=view.embeddings,
         scores=scores,
         present_mask=view.present_mask,
         record_valid_mask=view.record_valid_mask,
         retrieval_eligible_mask=view.retrieval_eligible_mask,
         causal_mask=view.present_mask.clone(),
+        predicted_head_mask=predicted_head_mask,
         selected_mask=selected_mask,
         status=tuple(statuses),
         reason=tuple(reasons),

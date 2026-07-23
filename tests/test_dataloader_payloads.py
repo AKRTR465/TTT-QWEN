@@ -145,6 +145,27 @@ def test_disabled_query_cache_does_not_build_a_fingerprint(
     assert materializer._materialize(spec) is sentinel
 
 
+def test_disabled_support_cache_bypasses_shared_cache(tmp_path: Path) -> None:
+    materializer = VideoChunkMaterializer.__new__(VideoChunkMaterializer)
+    materializer.cache_support_visuals = False
+    materializer.preprocess_cache = object()
+
+    assert materializer._cache_for(_specs(tmp_path, 1)[0]) is None
+
+
+def test_support_group_preserves_requested_order(tmp_path: Path) -> None:
+    materializer = VideoChunkMaterializer.__new__(VideoChunkMaterializer)
+    specs = _specs(tmp_path, 4)
+    sentinels = {spec.chunk_id: object() for spec in specs}
+    materializer._materialize_group = lambda values: {  # type: ignore[method-assign]
+        value.chunk_id: sentinels[value.chunk_id] for value in values
+    }
+
+    assert materializer.materialize_support_group(specs) == tuple(
+        sentinels[spec.chunk_id] for spec in specs
+    )
+
+
 def test_coalesced_decode_matches_individual_decode(tmp_path: Path) -> None:
     path = tmp_path / "clip.mp4"
     with av.open(str(path), "w") as container:
@@ -159,9 +180,7 @@ def test_coalesced_decode_matches_individual_decode(tmp_path: Path) -> None:
         for packet in stream.encode():
             container.mux(packet)
     specs = tuple(
-        SupportChunkSpec(
-            f"c{index}", path, float(index), float(index + 2), 8, 20.0
-        )
+        SupportChunkSpec(f"c{index}", path, float(index), float(index + 2), 8, 20.0)
         for index in range(3)
     )
     coalesced = _decode_coalesced_intervals(specs, 2.0)

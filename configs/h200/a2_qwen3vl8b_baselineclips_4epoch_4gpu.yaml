@@ -15,7 +15,7 @@ freeze_language_model: false
 deepspeed: configs/h200/deepspeed_zero1_dynamic_graph.json
 
 dataset_dir: $DATASET_DIR
-dataset: $DATASET_NAME
+dataset: svcbench_qwen3vl_sft
 template: qwen3_vl_nothink
 cutoff_len: 16384
 packing: false
@@ -58,8 +58,11 @@ resume_from_checkpoint: null
 ttt_qwen:
   stage: a2
   project_config: configs/model_state_ttt_8b.yaml
-  dataset_manifest: $SVCBENCH_DATASET_MANIFEST
-  visual_cost_index: $VISUAL_COST_INDEX
+  a2_data_mode: llamafactory_sft_clips
+  dataset_manifest: null
+  weak_sidecar_path: $WEAK_SIDECAR_PATH
+  state_history_source: baseline_query_clip
+  visual_cost_index: null
   support_prefetch_depth: 2
   support_decode_coalesce: true
   support_materialization: dataloader_episode
@@ -73,15 +76,16 @@ ttt_qwen:
   answer_query_visual_mode: causal_prefix
   answer_query_max_frames: 256
   query_decode_max_groups: 16
+  support_cache_mode: disabled
   state_query_cache_mode: inherit
   answer_query_cache_mode: disabled
   query_activation_offload: false
   preprocess_cache_mode: readonly
   preprocess_cache_miss_policy: error
   preprocess_cache_root_env: TTT_PREPROCESS_CACHE_ROOT
-  preprocess_cache_max_gb: 800
+  preprocess_cache_max_gb: 200
   preprocess_cache_dtype: float32
-  visual_cost_mode: exact_tokens
+  visual_cost_mode: proxy
   runtime_trace_mode: cuda
   runtime_trace_dir: $RUN_ROOT/runtime_trace
   segment_prefetch_depth: 0

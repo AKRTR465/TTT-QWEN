@@ -282,8 +282,7 @@ def test_retrieval_history_is_detached_fifo_runtime_only_and_lifecycle_aware() -
         for record in state.retrieval_history
     )
     assert all(
-        record.semantic_source.data_ptr() != source.data_ptr()
-        for record in state.retrieval_history
+        record.semantic_source.data_ptr() != source.data_ptr() for record in state.retrieval_history
     )
     assert tuple(module.state_dict()) == state_dict_keys
 
@@ -316,9 +315,7 @@ def test_retrieval_history_is_detached_fifo_runtime_only_and_lifecycle_aware() -
     )
 
     lifecycle_history = tuple(
-        record
-        for record in state.retrieval_history
-        if record.lifecycle_id == confirmed.identity_id
+        record for record in state.retrieval_history if record.lifecycle_id == confirmed.identity_id
     )
     assert len(lifecycle_history) == 1
     assert lifecycle_history[0].valid

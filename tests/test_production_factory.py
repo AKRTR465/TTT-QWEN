@@ -20,6 +20,7 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     SegmentBackwardController,
     TTTQwenTrainerMixin,
     _A2AuditAccumulator,
+    _aggregate_operator_diagnostics,
     _checkpoint_policy_from_environment,
     _ControlledDeepSpeedEngineWrapper,
     _publish_epoch_two_four_checkpoints,
@@ -50,6 +51,7 @@ from ttt_svcbench_qwen.production_runtime import (
     ProductionOuterModel,
     QueryObservationSpec,
     SupportChunkSpec,
+    _build_runtime_preprocess_cache,
     _decode_query_targets_grouped,
     _decode_targets_with_seek,
     _decode_uniform_interval,
@@ -60,7 +62,10 @@ from ttt_svcbench_qwen.production_runtime import (
     _uniform_target_times,
     _video_pixel_bounds,
 )
-from ttt_svcbench_qwen.stage_a_targets import OfficialWeakLossAudit
+from ttt_svcbench_qwen.stage_a_targets import (
+    OfficialWeakLossAudit,
+    OperatorDiagnosticAudit,
+)
 
 
 class _OuterToy(nn.Module):
@@ -68,6 +73,36 @@ class _OuterToy(nn.Module):
         super().__init__()
         self.backbone = nn.Linear(3, 4)
         self.predictor = nn.Linear(4, 4)
+
+
+def test_runtime_preprocess_cache_honors_explicit_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "cache"
+    root.mkdir()
+    monkeypatch.setenv("TEST_PREPROCESS_CACHE_ROOT", str(root))
+    monkeypatch.setenv("TTT_PREPROCESS_CACHE_NAMESPACE", "statequery-v1")
+    backbone = SimpleNamespace(
+        model_args=SimpleNamespace(model_name_or_path="model", revision="main"),
+        processor=object(),
+        project_config=SimpleNamespace(
+            video_preprocessing=SimpleNamespace(
+                processor_shortest_edge=256,
+                processor_longest_edge=131072,
+            )
+        ),
+    )
+    config = SimpleNamespace(
+        preprocess_cache_mode="readonly",
+        preprocess_cache_miss_policy="error",
+        preprocess_cache_root_env="TEST_PREPROCESS_CACHE_ROOT",
+        preprocess_cache_max_gb=1,
+    )
+
+    cache = _build_runtime_preprocess_cache(backbone, config)
+
+    assert cache is not None
+    assert cache.namespace == "statequery-v1"
 
 
 class _GroupedOuterToy(nn.Module):
@@ -125,12 +160,8 @@ def _checkpoint_balance_state(
         "official_weak_balancer.ema_update_counts": torch.zeros(5, dtype=torch.int64),
         "official_weak_balancer.gradient_ema_values": torch.zeros(4, dtype=torch.float64),
         "official_weak_balancer.gradient_ema_valid": torch.zeros(4, dtype=torch.bool),
-        "official_weak_balancer.gradient_ema_update_counts": torch.zeros(
-            4, dtype=torch.int64
-        ),
-        "official_weak_balancer.balance_schema_version": torch.tensor(
-            schema, dtype=torch.int64
-        ),
+        "official_weak_balancer.gradient_ema_update_counts": torch.zeros(4, dtype=torch.int64),
+        "official_weak_balancer.balance_schema_version": torch.tensor(schema, dtype=torch.int64),
     }
 
 
@@ -289,9 +320,7 @@ def test_a2_audit_accumulator_aggregates_all_microbatches_and_flushes() -> None:
             gradient_ema_rms=tuple(
                 torch.tensor(answer + offset, dtype=torch.float64) for offset in range(4)
             ),
-            gradient_ema_update_counts=tuple(
-                torch.tensor(index + 1) for _ in range(4)
-            ),
+            gradient_ema_update_counts=tuple(torch.tensor(index + 1) for _ in range(4)),
         )
         weak = OfficialWeakLossAudit(
             labels_joined_after_forward=True,
@@ -319,6 +348,50 @@ def test_a2_audit_accumulator_aggregates_all_microbatches_and_flushes() -> None:
     assert accumulator.flush() == {}
 
 
+def test_operator_diagnostics_aggregate_confusion_before_macro_recall() -> None:
+    audits: list[OfficialWeakLossAudit] = []
+    rows = ((0, 0, 0), (1, 1, 8), (0, 1, 1), (1, 1, 1))
+    for target, raw_prediction, effective_prediction in rows:
+        raw = [0] * 72
+        effective = [0] * 72
+        support = [0] * 8
+        loss_sums = [0.0] * 8
+        raw[target * 9 + raw_prediction] = 1
+        effective[target * 9 + effective_prediction] = 1
+        support[target] = 1
+        loss_sums[target] = 1.0 + target
+        audits.append(
+            OfficialWeakLossAudit(
+                labels_joined_after_forward=True,
+                runtime_payload_reused_for_labels=False,
+                identity_target_fabricated=False,
+                unique_retrieval_id_fabricated=False,
+                future_occurrences_ignored=0,
+                retrieval_bag_sizes=(),
+                operator_diagnostics=OperatorDiagnosticAudit(
+                    raw_confusion=tuple(raw),
+                    effective_confusion=tuple(effective),
+                    class_loss_sums=tuple(loss_sums),
+                    class_support=tuple(support),
+                    confidence_sum=0.8,
+                    entropy_sum=1.0,
+                    temperature_sum=1.0,
+                    temperature_count=1,
+                ),
+            )
+        )
+    metrics: dict[str, float] = {}
+    _aggregate_operator_diagnostics(metrics, audits)
+
+    assert metrics["operator/support/o1-snap"] == 2.0
+    assert metrics["operator/support/o1-delta"] == 2.0
+    assert metrics["operator/micro_accuracy"] == pytest.approx(0.5)
+    assert metrics["operator/macro_recall"] == pytest.approx(0.5)
+    assert metrics["operator/predicted_unsupported_rate"] == pytest.approx(0.25)
+    assert metrics["operator/effective_confusion/o1-delta/unsupported"] == 1.0
+    assert metrics["operator/temperature"] == pytest.approx(1.0)
+
+
 def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -344,7 +417,9 @@ def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
     assert set(extension.model_dump(exclude_none=True)) == {
         "stage",
         "project_config",
+        "a2_data_mode",
         "dataset_manifest",
+        "state_history_source",
         "visual_cost_index",
         "support_prefetch_depth",
         "support_decode_coalesce",
@@ -359,6 +434,7 @@ def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
         "answer_query_visual_mode",
         "answer_query_max_frames",
         "query_decode_max_groups",
+        "support_cache_mode",
         "state_query_cache_mode",
         "answer_query_cache_mode",
         "query_activation_offload",
@@ -370,6 +446,8 @@ def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
         "visual_cost_mode",
         "runtime_trace_mode",
         "segment_prefetch_depth",
+        "semantic_projector_delta_audit_steps",
+        "operator_diagnostics_interval",
     }
 
 
@@ -486,6 +564,38 @@ def test_dual_query_visual_config_is_required_and_legacy_is_rejected() -> None:
         ProductionTTTConfig(**fields, query_decode_strategy="legacy_seek")
     with pytest.raises(ValueError, match="support_materialization"):
         ProductionTTTConfig(**{**fields, "support_materialization": "trainer_prefetch"})
+
+
+def test_baseline_clips_a2_yaml_disables_manifest_and_cost_balancing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[1]
+    monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
+    monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench-part")
+    monkeypatch.setenv("WEAK_SIDECAR_PATH", "/tmp/svcbench-part/raw/data.jsonl")
+    monkeypatch.setenv("OUTPUT_DIR", "/tmp/output")
+    monkeypatch.setenv("RUN_ROOT", "/tmp/run")
+
+    native, extension = load_training_yaml(
+        root / "configs/h200/a2_qwen3vl8b_baselineclips_4epoch_4gpu.yaml"
+    )
+
+    assert native["dataset"] == "svcbench_qwen3vl_sft"
+    assert native["num_train_epochs"] == 4.0
+    assert native["save_strategy"] == "steps"
+    assert native["save_steps"] == 0.5
+    assert native["save_total_limit"] == 2
+    assert extension.a2_data_mode == "llamafactory_sft_clips"
+    assert extension.dataset_manifest is None
+    assert extension.weak_sidecar_path == "/tmp/svcbench-part/raw/data.jsonl"
+    assert extension.state_history_source == "baseline_query_clip"
+    assert extension.visual_cost_index is None
+    assert extension.visual_cost_mode == "proxy"
+    assert extension.support_cache_mode == "disabled"
+    assert not extension.support_cache_enabled
+    assert extension.state_query_cache_mode == "inherit"
+    assert extension.answer_query_cache_mode == "disabled"
+    assert extension.preprocess_cache_max_gb == 200
 
 
 def test_split_query_specs_bound_state_to_16_and_answer_to_256(tmp_path: Path) -> None:
@@ -695,9 +805,7 @@ def test_a2_runtime_cost_observation_includes_collate_preparation(
 
 def test_a2_fullprefix_uses_dynamic_graph_safe_zero1_profile() -> None:
     root = Path(__file__).parents[1]
-    text = (root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml").read_text(
-        encoding="utf-8"
-    )
+    text = (root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml").read_text(encoding="utf-8")
     assert "deepspeed: configs/h200/deepspeed_zero1_dynamic_graph.json" in text
 
     profile = json.loads(
@@ -733,9 +841,7 @@ def test_h200_entries_default_to_fullprefix256_profiles() -> None:
 def test_h200_training_entries_disable_shortest_first_by_default() -> None:
     root = Path(__file__).parents[1]
     train = (root / "scripts/h200/train_a2_a5.sh").read_text(encoding="utf-8")
-    benchmark = (root / "scripts/h200/benchmark_fullprefix256_8step.sh").read_text(
-        encoding="utf-8"
-    )
+    benchmark = (root / "scripts/h200/benchmark_fullprefix256_8step.sh").read_text(encoding="utf-8")
 
     default_assignment = 'TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"'
     assert default_assignment in train
@@ -1361,9 +1467,7 @@ def test_a5_nonfinite_segment_preserves_backward_parity_and_skips_episode_update
     monkeypatch.setattr("ttt_svcbench_qwen.outer_gradient_control.version", lambda _name: "0.18.8")
     parameter = nn.Parameter(torch.tensor(1.0))
     parameter.grad = torch.zeros_like(parameter)
-    optimizer = torch.optim.SGD(
-        [{"params": [parameter], "lr": 1.0e-4, "group_name": "predictor"}]
-    )
+    optimizer = torch.optim.SGD([{"params": [parameter], "lr": 1.0e-4, "group_name": "predictor"}])
 
     class _Zero:
         def __init__(self) -> None:
@@ -1376,12 +1480,12 @@ def test_a5_nonfinite_segment_preserves_backward_parity_and_skips_episode_update
             self.clip_grad = 0.0
 
         @staticmethod
-        def get_grad_norm_direct(
-            gradients: list[torch.Tensor], _params: object
-        ) -> torch.Tensor:
-            return torch.stack(
-                [gradient.double().square().sum() for gradient in gradients]
-            ).sum().sqrt()
+        def get_grad_norm_direct(gradients: list[torch.Tensor], _params: object) -> torch.Tensor:
+            return (
+                torch.stack([gradient.double().square().sum() for gradient in gradients])
+                .sum()
+                .sqrt()
+            )
 
         def has_overflow(self, *, partition_gradients: bool) -> bool:
             assert partition_gradients

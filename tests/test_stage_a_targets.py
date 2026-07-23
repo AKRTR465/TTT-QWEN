@@ -6,7 +6,9 @@ from dataclasses import fields, replace
 import pytest
 import torch
 from torch import Tensor
+from torch.nn import functional as F
 
+from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.losses import compute_state_loss
 from ttt_svcbench_qwen.observation_heads import (
     E1RuntimeState,
@@ -45,10 +47,19 @@ from ttt_svcbench_qwen.stage_a_targets import (
     StageATargetBatch,
     StageATargetBuilder,
     TargetProvenance,
+    _balanced_dense_bce,
+    _build_e1_fsm_targets,
     _official_weak_task_loss,
     _record_matches_causal_occurrence,
 )
-from ttt_svcbench_qwen.state_bank import HeadType, O1Payload, StateRecord
+from ttt_svcbench_qwen.state_bank import (
+    E1EventKind,
+    E1Payload,
+    HeadType,
+    O1Payload,
+    StateRecord,
+    build_state_bank,
+)
 from ttt_svcbench_qwen.state_retriever import (
     RetrievalFilterAudit,
     RetrievalReason,
@@ -290,12 +301,14 @@ def _typed_predictions(
         selected_records=selected_records,
         candidate_record_ids=candidate_ids,
         candidate_records=candidate_records,
+        candidate_head_types=((HeadType.O1, HeadType.O1),) * batch_size,
         state_embeddings=state_embeddings,
         scores=retrieval_scores,
         present_mask=present_mask,
         record_valid_mask=present_mask.clone(),
         retrieval_eligible_mask=present_mask.clone(),
         causal_mask=present_mask.clone(),
+        predicted_head_mask=present_mask.clone(),
         selected_mask=selected_mask,
         status=(RetrievalStatus.OK,) * batch_size,
         reason=(RetrievalReason.MATCHED,) * batch_size,
@@ -740,13 +753,14 @@ def test_official_retrieval_requires_aligned_mixed_bag_and_ignores_selection_mas
         *,
         operator: Operator = Operator.O1_SNAP,
         candidate_retrieval: RetrieverOutput = retrieval,
+        query_time: float = 10.0,
     ) -> OfficialWeakStateLossOutput:
         label = OfficialWeakSupervision(
             query_id="weak-retrieval-structure",
             operator=operator,
             time_mode=TimeWindowMode.NOW,
             count=1,
-            query_time=10.0,
+            query_time=query_time,
             occurrence_points=points,
             occurrence_intervals=(),
         )
@@ -769,10 +783,17 @@ def test_official_retrieval_requires_aligned_mixed_bag_and_ignores_selection_mas
     assert retrieval.selected_mask.tolist() == [[True, False]]
     assert dict(valid.audit.metrics()) == {
         "retrieval/wrong_operator_rows": 0.0,
+        "retrieval/target_head_candidate_rows": 1.0,
+        "retrieval/no_target_head_candidate_rows": 0.0,
         "retrieval/no_candidate_rows": 0.0,
         "retrieval/no_positive_rows": 0.0,
         "retrieval/all_positive_rows": 0.0,
         "retrieval/valid_bag_rows": 1.0,
+        "retrieval/rescued_from_wrong_route_rows": 0.0,
+        "retrieval/legacy_valid_bag_rows": 1.0,
+        "retrieval/invalid_excluded_count": 0.0,
+        "retrieval/ineligible_excluded_count": 0.0,
+        "retrieval/causal_excluded_count": 0.0,
         "retrieval/candidate_count": 2.0,
         "retrieval/positive_count": 1.0,
         "retrieval/negative_count": 1.0,
@@ -789,10 +810,7 @@ def test_official_retrieval_requires_aligned_mixed_bag_and_ignores_selection_mas
 
     no_candidate = build(
         (1.0,),
-        candidate_retrieval=replace(
-            retrieval,
-            causal_mask=torch.zeros_like(retrieval.causal_mask),
-        ),
+        query_time=0.5,
     )
     assert no_candidate.retrieval.valid_rows == 0
     assert no_candidate.audit.retrieval_no_candidate_rows == 1
@@ -800,6 +818,63 @@ def test_official_retrieval_requires_aligned_mixed_bag_and_ignores_selection_mas
     wrong_operator = build((1.0,), operator=Operator.O2_UNIQUE)
     assert wrong_operator.retrieval.valid_rows == 0
     assert wrong_operator.audit.retrieval_wrong_operator_rows == 1
+
+
+def test_official_retrieval_rescues_valid_target_bag_from_wrong_hard_route() -> None:
+    observations, query, retrieval, _ = _typed_predictions(1)
+    wrong_route = replace(
+        retrieval,
+        selected_record_ids=((),),
+        selected_scores=((),),
+        selected_records=((),),
+        predicted_head_mask=torch.zeros_like(retrieval.predicted_head_mask),
+        selected_mask=torch.zeros_like(retrieval.selected_mask),
+        status=(RetrievalStatus.EMPTY,),
+        reason=(RetrievalReason.EMPTY_HEAD_PARTITION,),
+        hard_operators=(Operator.O2_UNIQUE,),
+        n_retrieved=torch.zeros_like(retrieval.n_retrieved),
+        audit=(
+            RetrievalFilterAudit(
+                n_state=2,
+                head_partition_excluded_count=2,
+                query_rejected_count=0,
+                owner_mismatch_count=0,
+                invalid_count=0,
+                retrieval_ineligible_count=0,
+                future_count=0,
+                outside_window_count=0,
+                below_similarity_count=0,
+                selected_count=0,
+            ),
+        ),
+    )
+    label = OfficialWeakSupervision(
+        query_id="retrieval-wrong-route-rescue",
+        operator=Operator.O1_SNAP,
+        time_mode=TimeWindowMode.HISTORY,
+        count=1,
+        query_time=10.0,
+        occurrence_points=(1.0,),
+        occurrence_intervals=(),
+    )
+    wrong_query = replace(
+        query,
+        hard_operators=(Operator.O2_UNIQUE,),
+        head_types=(HeadType.O2,),
+    )
+    output = OfficialWeakTargetBuilder().build(
+        observations,
+        wrong_query,
+        wrong_route,
+        (label,),
+    )
+    assert output.retrieval.valid_rows == 1
+    assert output.audit.retrieval_wrong_operator_rows == 1
+    assert output.audit.retrieval_rescued_from_wrong_route_rows == 1
+    assert output.audit.retrieval_legacy_valid_bag_rows == 0
+    output.retrieval.value.backward()
+    assert retrieval.scores.grad is not None
+    assert float(retrieval.scores.grad.abs().sum()) > 0.0
 
 
 @pytest.mark.parametrize(
@@ -877,6 +952,80 @@ def test_historical_occurrences_outside_state_tail_do_not_create_dense_targets()
         _official_weak_task_loss(observations, 0, e2_empty),
         _official_weak_task_loss(observations, 0, e2_historical),
     )
+
+
+def test_e1_dense_targets_follow_the_two_position_hard_fsm_contract() -> None:
+    timestamps = torch.tensor([0.0, 1.0, 2.0], dtype=torch.float64)
+    targets, mask, representable, unrepresentable = _build_e1_fsm_targets(
+        timestamps,
+        (1.0,),
+        2.0,
+    )
+    assert targets.tolist() == [[1.0, 0.0, 0.0], [0.0, 1.0, 1.0], [0.0, 0.0, 0.0]]
+    assert bool(mask.all())
+    assert (representable, unrepresentable) == (1, 0)
+
+    logits = torch.where(
+        targets.bool(),
+        torch.full_like(targets, 10.0),
+        -torch.full_like(targets, 10.0),
+    )
+    observation = E1SoftOutput(
+        logits=logits.unsqueeze(0),
+        probabilities=torch.sigmoid(logits).unsqueeze(0),
+        valid_mask=torch.ones(1, 3, dtype=torch.bool),
+        timestamps=timestamps.unsqueeze(0),
+        position_ids=torch.arange(3, dtype=torch.int64).unsqueeze(0),
+        next_states=(_fresh_e1(0),),
+        audit=StreamReplayAudit("e1", (3,), (0,), (0,)),
+    )
+    bank = build_state_bank(load_config())
+    state = bank.reset("video-e1", "trajectory-e1")
+    semantics = F.normalize(torch.randn(1, 3, 512), dim=-1)
+    updated = bank.update_e1(
+        state,
+        observation,
+        semantics,
+        event_kind=E1EventKind.ACTION,
+    )
+    payloads = tuple(
+        record.payload for record in updated.records if isinstance(record.payload, E1Payload)
+    )
+    assert len(payloads) == 1
+    assert payloads[0].event_count == 1
+
+
+def test_e1_unrepresentable_boundary_and_collision_are_masked() -> None:
+    timestamps = torch.tensor([0.0, 1.0, 2.0], dtype=torch.float64)
+    _, boundary_mask, representable, unrepresentable = _build_e1_fsm_targets(
+        timestamps,
+        (0.0,),
+        2.0,
+    )
+    assert (representable, unrepresentable) == (0, 1)
+    assert not bool(boundary_mask[0].any())
+
+    _, collision_mask, representable, unrepresentable = _build_e1_fsm_targets(
+        timestamps,
+        (1.0, 2.0),
+        2.0,
+    )
+    assert (representable, unrepresentable) == (1, 1)
+    assert not bool(collision_mask[1, 0])
+    assert not bool(collision_mask[2, 1:].any())
+
+
+def test_balanced_dense_bce_preserves_positive_and_negative_gradients() -> None:
+    logits = torch.zeros(4, 2, requires_grad=True)
+    targets = torch.tensor([[1.0, 0.0], [0.0, 0.0], [0.0, 1.0], [0.0, 0.0]])
+    loss, stats = _balanced_dense_bce(logits, targets, torch.ones_like(targets).bool())
+    loss.backward()
+    assert stats.positive_counts == (1, 1)
+    assert stats.negative_counts == (3, 3)
+    assert logits.grad is not None
+    assert bool((logits.grad[targets.bool()] < 0.0).all())
+    assert bool((logits.grad[~targets.bool()] > 0.0).all())
+
 
 def test_e2_retrieval_uses_interval_overlap_without_special_negative_generation() -> None:
     record = type(

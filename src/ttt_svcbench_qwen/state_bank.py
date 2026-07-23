@@ -374,6 +374,236 @@ class RetrievalHistoryRecord:
             raise ValueError("retrieval history lifecycle_id cannot be empty")
 
 
+RETRIEVAL_HEAD_ORDER: tuple[HeadType, ...] = (
+    HeadType.O1,
+    HeadType.O2,
+    HeadType.E1,
+    HeadType.E2,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalHistoryAppendBatch:
+    """One vectorized, label-free write produced by a single observation chunk."""
+
+    sources: Tensor
+    head_codes: Tensor
+    operator_codes: Tensor
+    timestamps: Tensor
+    time_ranges: Tensor
+    valid_mask: Tensor
+    eligible_mask: Tensor
+    lifecycle_ids: tuple[str | None, ...] = ()
+
+    def __post_init__(self) -> None:
+        count = self.sources.shape[0] if self.sources.ndim == 2 else -1
+        if self.sources.shape != (count, 768) or not torch.is_floating_point(self.sources):
+            raise ValueError("retrieval append sources must be floating [M, 768]")
+        vectors = (
+            self.head_codes,
+            self.operator_codes,
+            self.timestamps,
+            self.valid_mask,
+            self.eligible_mask,
+        )
+        if any(value.shape != (count,) for value in vectors):
+            raise ValueError("retrieval append metadata must align to M")
+        if self.head_codes.dtype != torch.int64 or self.operator_codes.dtype != torch.int64:
+            raise TypeError("retrieval append head/operator codes must be int64")
+        if self.timestamps.dtype != torch.float64:
+            raise TypeError("retrieval append timestamps must be float64")
+        if self.time_ranges.shape != (count, 2) or self.time_ranges.dtype != torch.float64:
+            raise ValueError("retrieval append time_ranges must be float64 [M, 2]")
+        if self.valid_mask.dtype != torch.bool or self.eligible_mask.dtype != torch.bool:
+            raise TypeError("retrieval append validity masks must be bool")
+        tensors = (
+            self.head_codes,
+            self.operator_codes,
+            self.timestamps,
+            self.time_ranges,
+            self.valid_mask,
+            self.eligible_mask,
+        )
+        if any(value.device != self.sources.device for value in tensors):
+            raise ValueError("retrieval append tensors must share one device")
+        if self.lifecycle_ids and len(self.lifecycle_ids) != count:
+            raise ValueError("retrieval append lifecycle metadata must align to M")
+        if any(value is not None and not value for value in self.lifecycle_ids):
+            raise ValueError("retrieval append lifecycle IDs cannot be empty")
+        if self.sources.device.type != "meta":
+            if not bool(torch.isfinite(self.sources).all()):
+                raise ValueError("retrieval append sources must be finite")
+            if bool(
+                torch.any((self.head_codes < 0) | (self.head_codes >= len(RETRIEVAL_HEAD_ORDER)))
+            ):
+                raise ValueError("retrieval append head codes are out of range")
+            if bool(torch.any(self.eligible_mask & ~self.valid_mask)):
+                raise ValueError("invalid retrieval rows cannot be eligible")
+            point = self.timestamps >= 0.0
+            ranged = self.time_ranges[:, 0] >= 0.0
+            if not bool(torch.all(point ^ ranged)):
+                raise ValueError("retrieval append rows require exactly one time representation")
+            if bool(torch.any(ranged & (self.time_ranges[:, 1] < self.time_ranges[:, 0]))):
+                raise ValueError("retrieval append time ranges are invalid")
+
+
+class TensorizedRetrievalHistory:
+    """Episode-local mutable tensor ring; never registered in model/checkpoint state."""
+
+    def __init__(
+        self,
+        video_id: str,
+        trajectory_id: str,
+        *,
+        capacity_per_head: int,
+        source_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        if not video_id or not trajectory_id:
+            raise ValueError("tensor retrieval history requires non-empty owners")
+        if capacity_per_head <= 0 or source_dim != 768:
+            raise ValueError("tensor retrieval history capacity/source dim is invalid")
+        self.video_id = video_id
+        self.trajectory_id = trajectory_id
+        self.capacity_per_head = capacity_per_head
+        self.source_dim = source_dim
+        self.sources = torch.zeros((4, capacity_per_head, source_dim), dtype=dtype, device=device)
+        self.sequence_ids = torch.full((4, capacity_per_head), -1, dtype=torch.int64, device=device)
+        self.operator_codes = torch.full_like(self.sequence_ids, -1)
+        self.timestamps = torch.full(
+            (4, capacity_per_head), -1.0, dtype=torch.float64, device=device
+        )
+        self.time_ranges = torch.full(
+            (4, capacity_per_head, 2), -1.0, dtype=torch.float64, device=device
+        )
+        self.valid_mask = torch.zeros((4, capacity_per_head), dtype=torch.bool, device=device)
+        self.eligible_mask = torch.zeros_like(self.valid_mask)
+        self.sizes = [0, 0, 0, 0]
+        self.write_ptrs = [0, 0, 0, 0]
+        self.lifecycle_ids: list[list[str | None]] = [
+            [None] * capacity_per_head for _ in RETRIEVAL_HEAD_ORDER
+        ]
+        self.next_sequence = 0
+        self.version = 0
+        self.released = False
+
+    @property
+    def count(self) -> int:
+        return sum(self.sizes)
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def append_many(self, batch: RetrievalHistoryAppendBatch) -> None:
+        if self.released:
+            raise RuntimeError("released tensor retrieval history cannot be written")
+        if batch.sources.dtype != self.sources.dtype or batch.sources.device != self.sources.device:
+            raise ValueError("retrieval append batch must match ring dtype/device")
+        count = batch.sources.shape[0]
+        if count == 0:
+            return
+        sequence_ids = torch.arange(
+            self.next_sequence,
+            self.next_sequence + count,
+            dtype=torch.int64,
+            device=self.sources.device,
+        )
+        for head_code in range(len(RETRIEVAL_HEAD_ORDER)):
+            source_indices = torch.nonzero(batch.head_codes == head_code, as_tuple=False).flatten()
+            head_count = source_indices.numel()
+            if head_count == 0:
+                continue
+            if head_count > self.capacity_per_head:
+                source_indices = source_indices[-self.capacity_per_head :]
+                head_count = self.capacity_per_head
+            destinations = (
+                torch.arange(head_count, dtype=torch.int64, device=self.sources.device)
+                + self.write_ptrs[head_code]
+            ) % self.capacity_per_head
+            self.sources[head_code].index_copy_(
+                0, destinations, batch.sources.index_select(0, source_indices).detach()
+            )
+            self.sequence_ids[head_code].index_copy_(
+                0, destinations, sequence_ids.index_select(0, source_indices)
+            )
+            self.operator_codes[head_code].index_copy_(
+                0, destinations, batch.operator_codes.index_select(0, source_indices)
+            )
+            self.timestamps[head_code].index_copy_(
+                0, destinations, batch.timestamps.index_select(0, source_indices)
+            )
+            self.time_ranges[head_code].index_copy_(
+                0, destinations, batch.time_ranges.index_select(0, source_indices)
+            )
+            self.valid_mask[head_code].index_copy_(
+                0, destinations, batch.valid_mask.index_select(0, source_indices)
+            )
+            self.eligible_mask[head_code].index_copy_(
+                0, destinations, batch.eligible_mask.index_select(0, source_indices)
+            )
+            if batch.lifecycle_ids and any(value is not None for value in batch.lifecycle_ids):
+                # Lifecycle metadata is CPU-only and absent from the production hot path.
+                source_cpu = source_indices.detach().cpu().tolist()
+                destination_cpu = destinations.detach().cpu().tolist()
+                for source, destination in zip(source_cpu, destination_cpu, strict=True):
+                    self.lifecycle_ids[head_code][destination] = batch.lifecycle_ids[source]
+            else:
+                start = self.write_ptrs[head_code]
+                first = min(head_count, self.capacity_per_head - start)
+                self.lifecycle_ids[head_code][start : start + first] = [None] * first
+                remainder = head_count - first
+                if remainder:
+                    self.lifecycle_ids[head_code][:remainder] = [None] * remainder
+            self.write_ptrs[head_code] = (
+                self.write_ptrs[head_code] + head_count
+            ) % self.capacity_per_head
+            self.sizes[head_code] = min(self.capacity_per_head, self.sizes[head_code] + head_count)
+        self.next_sequence += count
+        self.version += 1
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def fork(self) -> TensorizedRetrievalHistory:
+        clone = TensorizedRetrievalHistory(
+            self.video_id,
+            self.trajectory_id,
+            capacity_per_head=self.capacity_per_head,
+            source_dim=self.source_dim,
+            dtype=self.sources.dtype,
+            device=self.sources.device,
+        )
+        for name in (
+            "sources",
+            "sequence_ids",
+            "operator_codes",
+            "timestamps",
+            "time_ranges",
+            "valid_mask",
+            "eligible_mask",
+        ):
+            setattr(clone, name, getattr(self, name).clone())
+        clone.sizes = list(self.sizes)
+        clone.write_ptrs = list(self.write_ptrs)
+        clone.lifecycle_ids = [list(row) for row in self.lifecycle_ids]
+        clone.next_sequence = self.next_sequence
+        clone.version = self.version
+        clone.released = self.released
+        return clone
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def release(self) -> None:
+        self.sources = self.sources.new_empty((0, 0, self.source_dim))
+        self.sequence_ids = self.sequence_ids.new_empty((0, 0))
+        self.operator_codes = self.operator_codes.new_empty((0, 0))
+        self.timestamps = self.timestamps.new_empty((0, 0))
+        self.time_ranges = self.time_ranges.new_empty((0, 0, 2))
+        self.valid_mask = self.valid_mask.new_empty((0, 0))
+        self.eligible_mask = self.eligible_mask.new_empty((0, 0))
+        self.sizes = [0, 0, 0, 0]
+        self.write_ptrs = [0, 0, 0, 0]
+        self.lifecycle_ids = [[], [], [], []]
+        self.released = True
+        self.version += 1
+
+
 @dataclass(frozen=True, slots=True)
 class StateBankAuditEntry:
     action: str
@@ -600,6 +830,11 @@ class RetrievalHistoryView:
     head_types: tuple[tuple[HeadType | None, ...], ...]
     record_kinds: tuple[tuple[StateRecordKind | None, ...], ...]
     cloned_records: tuple[tuple[RetrievalHistoryRecord | None, ...], ...]
+    lifecycle_ids: tuple[tuple[str | None, ...], ...] = ()
+    sequence_ids: Tensor | None = None
+    head_codes: Tensor | None = None
+    operator_codes: Tensor | None = None
+    ring_guards: tuple[tuple[TensorizedRetrievalHistory, int], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -609,6 +844,28 @@ class RetrievalHistoryView:
         ):
             raise ValueError("RetrievalHistoryView sources must be floating [B, N, 768]")
         shape = self.sources.shape[:2]
+        if self.sequence_ids is None or self.head_codes is None or self.operator_codes is None:
+            sequence_ids = torch.full(shape, -1, dtype=torch.int64, device=self.sources.device)
+            head_codes = torch.full_like(sequence_ids, -1)
+            operator_codes = torch.full_like(sequence_ids, -1)
+            from ttt_svcbench_qwen.query_encoder import OPERATORS
+
+            for row, records in enumerate(self.cloned_records):
+                for column, record in enumerate(records):
+                    if record is None:
+                        continue
+                    try:
+                        sequence_ids[row, column] = int(record.record_id.rsplit("-", 1)[-1])
+                    except ValueError:
+                        sequence_ids[row, column] = column
+                    head_codes[row, column] = RETRIEVAL_HEAD_ORDER.index(record.head_type)
+                    operator_codes[row, column] = OPERATORS.index(record.operator)
+            object.__setattr__(self, "sequence_ids", sequence_ids)
+            object.__setattr__(self, "head_codes", head_codes)
+            object.__setattr__(self, "operator_codes", operator_codes)
+        assert self.sequence_ids is not None
+        assert self.head_codes is not None
+        assert self.operator_codes is not None
         masks = (self.present_mask, self.record_valid_mask, self.retrieval_eligible_mask)
         if any(mask.shape != shape or mask.dtype != torch.bool for mask in masks):
             raise ValueError("RetrievalHistoryView masks must be bool [B, N]")
@@ -623,6 +880,11 @@ class RetrievalHistoryView:
             or self.time_ranges.device != self.sources.device
         ):
             raise ValueError("RetrievalHistoryView time metadata is invalid")
+        integer_metadata = (self.sequence_ids, self.head_codes, self.operator_codes)
+        if any(value.shape != shape or value.dtype != torch.int64 for value in integer_metadata):
+            raise ValueError("RetrievalHistoryView tensor metadata must be int64 [B, N]")
+        if any(value.device != self.sources.device for value in integer_metadata):
+            raise ValueError("RetrievalHistoryView tensor metadata must share the source device")
         batch_size, width = shape
         for counts, name in (
             (self.n_state, "n_state"),
@@ -638,17 +900,17 @@ class RetrievalHistoryView:
             self.head_types,
             self.record_kinds,
             self.cloned_records,
+            self.lifecycle_ids or tuple(() for _ in range(batch_size)),
         )
         if any(len(values) != batch_size for values in metadata):
             raise ValueError("RetrievalHistoryView metadata must align to batch size")
         if any(
             len(row) != width
-            for row in self.record_ids
-            + self.head_types
-            + self.record_kinds
-            + self.cloned_records
+            for row in self.record_ids + self.head_types + self.record_kinds + self.cloned_records
         ):
             raise ValueError("RetrievalHistoryView metadata must align to padded width")
+        if self.lifecycle_ids and any(len(row) != width for row in self.lifecycle_ids):
+            raise ValueError("RetrievalHistoryView lifecycle metadata must align to padded width")
         if self.sources.device.type != "meta":
             if not bool(torch.isfinite(self.sources).all()):
                 raise ValueError("RetrievalHistoryView sources must be finite")
@@ -660,6 +922,175 @@ class RetrievalHistoryView:
                 raise ValueError("RetrievalHistoryView masks are inconsistent")
             if not torch.equal(self.n_state, self.present_mask.sum(dim=1)):
                 raise ValueError("RetrievalHistoryView n_state must count present records")
+            if bool(torch.any(self.sequence_ids[self.present_mask] < 0)) or bool(
+                torch.any(self.sequence_ids[~self.present_mask] != -1)
+            ):
+                raise ValueError("RetrievalHistoryView sequence IDs are inconsistent")
+
+    def assert_snapshot_current(self) -> None:
+        if self.ring_guards and len(self.ring_guards) != len(self.video_ids):
+            raise ValueError("retrieval snapshot ring guards must align to batch rows")
+        for history, version in self.ring_guards:
+            if history.released or history.version != version:
+                raise RuntimeError("retrieval history changed after its read-only snapshot")
+
+
+@torch.no_grad()  # type: ignore[untyped-decorator]
+def tensorized_retrieval_view(
+    histories: Sequence[TensorizedRetrievalHistory],
+    *,
+    guard_current_version: bool = True,
+) -> RetrievalHistoryView:
+    """Gather each four-head ring once and restore global sequence order."""
+
+    normalized = tuple(histories)
+    if not normalized or any(
+        not isinstance(item, TensorizedRetrievalHistory) for item in normalized
+    ):
+        raise ValueError("tensor retrieval view requires at least one ring")
+    if any(item.released for item in normalized):
+        raise RuntimeError("released tensor retrieval histories cannot be viewed")
+    owners = tuple((item.video_id, item.trajectory_id) for item in normalized)
+    if len(set(owners)) != len(owners):
+        raise ValueError("tensor retrieval view owners must be unique")
+    reference = normalized[0].sources
+    if any(
+        item.sources.dtype != reference.dtype or item.sources.device != reference.device
+        for item in normalized
+    ):
+        raise ValueError("tensor retrieval rings must share dtype/device")
+
+    gathered: list[dict[str, object]] = []
+    for history in normalized:
+        source_rows: list[Tensor] = []
+        sequence_rows: list[Tensor] = []
+        operator_rows: list[Tensor] = []
+        timestamp_rows: list[Tensor] = []
+        range_rows: list[Tensor] = []
+        valid_rows: list[Tensor] = []
+        eligible_rows: list[Tensor] = []
+        head_rows: list[Tensor] = []
+        lifecycle_rows: list[str | None] = []
+        for head_code, size in enumerate(history.sizes):
+            if size == 0:
+                continue
+            if size < history.capacity_per_head:
+                physical = torch.arange(size, dtype=torch.int64, device=reference.device)
+            else:
+                physical = (
+                    torch.arange(size, dtype=torch.int64, device=reference.device)
+                    + history.write_ptrs[head_code]
+                ) % history.capacity_per_head
+            source_rows.append(history.sources[head_code].index_select(0, physical))
+            sequence_rows.append(history.sequence_ids[head_code].index_select(0, physical))
+            operator_rows.append(history.operator_codes[head_code].index_select(0, physical))
+            timestamp_rows.append(history.timestamps[head_code].index_select(0, physical))
+            range_rows.append(history.time_ranges[head_code].index_select(0, physical))
+            valid_rows.append(history.valid_mask[head_code].index_select(0, physical))
+            eligible_rows.append(history.eligible_mask[head_code].index_select(0, physical))
+            head_rows.append(torch.full_like(physical, head_code))
+            if any(value is not None for value in history.lifecycle_ids[head_code]):
+                lifecycle_rows.extend(
+                    history.lifecycle_ids[head_code][index]
+                    for index in physical.detach().cpu().tolist()
+                )
+            else:
+                lifecycle_rows.extend((None,) * size)
+        if source_rows:
+            sequence = torch.cat(sequence_rows)
+            order = torch.argsort(sequence, stable=True)
+            lifecycle_order = (
+                order.detach().cpu().tolist()
+                if any(value is not None for value in lifecycle_rows)
+                else []
+            )
+            gathered.append(
+                {
+                    "sources": torch.cat(source_rows).index_select(0, order),
+                    "sequence": sequence.index_select(0, order),
+                    "operator": torch.cat(operator_rows).index_select(0, order),
+                    "timestamp": torch.cat(timestamp_rows).index_select(0, order),
+                    "ranges": torch.cat(range_rows).index_select(0, order),
+                    "valid": torch.cat(valid_rows).index_select(0, order),
+                    "eligible": torch.cat(eligible_rows).index_select(0, order),
+                    "head": torch.cat(head_rows).index_select(0, order),
+                    "lifecycle": tuple(lifecycle_rows[index] for index in lifecycle_order)
+                    if lifecycle_order
+                    else (None,) * len(lifecycle_rows),
+                }
+            )
+        else:
+            gathered.append(
+                {
+                    "sources": reference.new_empty((0, history.source_dim)),
+                    "sequence": history.sequence_ids.new_empty((0,)),
+                    "operator": history.operator_codes.new_empty((0,)),
+                    "timestamp": history.timestamps.new_empty((0,)),
+                    "ranges": history.time_ranges.new_empty((0, 2)),
+                    "valid": history.valid_mask.new_empty((0,)),
+                    "eligible": history.eligible_mask.new_empty((0,)),
+                    "head": history.sequence_ids.new_empty((0,)),
+                    "lifecycle": (),
+                }
+            )
+
+    batch_size = len(normalized)
+    width = max(history.count for history in normalized)
+    sources = reference.new_zeros((batch_size, width, reference.shape[-1]))
+    present = torch.zeros((batch_size, width), dtype=torch.bool, device=reference.device)
+    valid = torch.zeros_like(present)
+    eligible = torch.zeros_like(present)
+    timestamps = torch.full((batch_size, width), -1.0, dtype=torch.float64, device=reference.device)
+    ranges = torch.full((batch_size, width, 2), -1.0, dtype=torch.float64, device=reference.device)
+    sequences = torch.full((batch_size, width), -1, dtype=torch.int64, device=reference.device)
+    heads = torch.full_like(sequences, -1)
+    operators = torch.full_like(sequences, -1)
+    n_state = torch.zeros(batch_size, dtype=torch.int64, device=reference.device)
+    lifecycle_ids: list[tuple[str | None, ...]] = []
+    for row, values in enumerate(gathered):
+        count = normalized[row].count
+        if count:
+            sources[row, :count] = cast(Tensor, values["sources"])
+            sequences[row, :count] = cast(Tensor, values["sequence"])
+            operators[row, :count] = cast(Tensor, values["operator"])
+            timestamps[row, :count] = cast(Tensor, values["timestamp"])
+            ranges[row, :count] = cast(Tensor, values["ranges"])
+            valid[row, :count] = cast(Tensor, values["valid"])
+            eligible[row, :count] = cast(Tensor, values["eligible"])
+            heads[row, :count] = cast(Tensor, values["head"])
+            present[row, :count] = True
+            n_state[row] = count
+        lifecycle = cast(tuple[str | None, ...], values["lifecycle"])
+        lifecycle_ids.append(lifecycle + (None,) * (width - count))
+    # Tensor-ring snapshots deliberately keep the full candidate axis tensor-only.
+    # Python records/IDs/head enums are created lazily for selected audit rows only.
+    empty_metadata = tuple((None,) * width for _ in normalized)
+    return RetrievalHistoryView(
+        sources=sources,
+        present_mask=present,
+        record_valid_mask=valid,
+        retrieval_eligible_mask=eligible,
+        timestamps=timestamps,
+        time_ranges=ranges,
+        sequence_ids=sequences,
+        head_codes=heads,
+        operator_codes=operators,
+        n_state=n_state,
+        owner_record_counts=n_state.clone(),
+        video_ids=tuple(item.video_id for item in normalized),
+        trajectory_ids=tuple(item.trajectory_id for item in normalized),
+        bank_versions=tuple(item.version for item in normalized),
+        record_ids=empty_metadata,
+        head_types=empty_metadata,
+        record_kinds=empty_metadata,
+        cloned_records=empty_metadata,
+        lifecycle_ids=tuple(lifecycle_ids),
+        ring_guards=(
+            tuple((item, item.version) for item in normalized)
+            if guard_current_version
+            else ()
+        ),
+    )
 
 
 class SemanticProjector(nn.Module):  # type: ignore[misc]
@@ -708,6 +1139,37 @@ class SemanticProjector(nn.Module):  # type: ignore[misc]
         normalized = _normalize_semantic(raw, self.config.normalization_eps)
         return normalized.reshape(*source_states.shape[:-1], self.config.output_dim)
 
+    def forward_codes(self, source_states: Tensor, head_codes: Tensor) -> Tensor:
+        """Project tensor-ring candidates without materializing Python head enums."""
+
+        if (
+            source_states.ndim < 1
+            or source_states.shape[-1] != self.config.input_dim
+            or not torch.is_floating_point(source_states)
+        ):
+            raise ValueError("semantic source states must be floating [..., 768]")
+        if head_codes.shape != source_states.shape[:-1] or head_codes.dtype != torch.int64:
+            raise ValueError("head_codes must be int64 and align to semantic source rows")
+        parameter = next(self.parameters())
+        if (
+            source_states.dtype != parameter.dtype
+            or source_states.device != parameter.device
+            or head_codes.device != source_states.device
+        ):
+            raise ValueError("Semantic Projector sources/codes must share parameter device")
+        if source_states.device.type != "meta":
+            if not bool(torch.isfinite(source_states).all()):
+                raise ValueError("semantic source states must be finite")
+            if bool(torch.any((head_codes < 0) | (head_codes >= len(self.HEAD_TYPE_ORDER)))):
+                raise ValueError("semantic head codes are outside the four-head range")
+        flattened = source_states.reshape(-1, self.config.input_dim)
+        indices = head_codes.reshape(-1)
+        conditioned = flattened + self.head_type_embeddings(indices)
+        hidden = F.silu(self.hidden_projection(self.input_norm(conditioned)))
+        raw = self.output_projection(hidden)
+        normalized = _normalize_semantic(raw, self.config.normalization_eps)
+        return normalized.reshape(*source_states.shape[:-1], self.config.output_dim)
+
     def set_online_frozen(self, frozen: bool = True) -> SemanticProjector:
         if type(frozen) is not bool:
             raise TypeError("online frozen flag must be bool")
@@ -738,6 +1200,9 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
         """Compute trainable soft semantics before entering any hard no-grad write."""
 
         return self.semantic_projector(source_states, head_types)
+
+    def project_codes(self, source_states: Tensor, head_codes: Tensor) -> Tensor:
+        return self.semantic_projector.forward_codes(source_states, head_codes)
 
     def reset(self, video_id: str, trajectory_id: str) -> StateBankRuntimeState:
         if not video_id or not trajectory_id:
@@ -991,10 +1456,14 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             if isinstance(previous.payload, ConfirmedIdentity)
             else None
         )
-        disabled_history_count = sum(
-            record.lifecycle_id == lifecycle_id and record.retrieval_eligible
-            for record in state.retrieval_history
-        ) if lifecycle_id is not None else 0
+        disabled_history_count = (
+            sum(
+                record.lifecycle_id == lifecycle_id and record.retrieval_eligible
+                for record in state.retrieval_history
+            )
+            if lifecycle_id is not None
+            else 0
+        )
         replacement = replace(previous, valid=False)
         updated = cast(
             StateBankRuntimeState,
@@ -1377,6 +1846,8 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
         owners = tuple((state.video_id, state.trajectory_id) for state in normalized)
         if len(set(owners)) != len(owners):
             raise ValueError("retrieval history view owners must be unique")
+        from ttt_svcbench_qwen.query_encoder import OPERATORS
+
         rows = tuple(
             tuple(
                 _clone_retrieval_record(record)
@@ -1421,12 +1892,19 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
         head_types: list[tuple[HeadType | None, ...]] = []
         record_kinds: list[tuple[StateRecordKind | None, ...]] = []
         cloned_records: list[tuple[RetrievalHistoryRecord | None, ...]] = []
+        lifecycle_ids: list[tuple[str | None, ...]] = []
+        sequence_ids = torch.full(
+            (batch_size, width), -1, dtype=torch.int64, device=reference.device
+        )
+        head_codes = torch.full_like(sequence_ids, -1)
+        operator_codes = torch.full_like(sequence_ids, -1)
         for row, records in enumerate(rows):
             n_state[row] = len(records)
             ids: list[str | None] = [None] * width
             heads: list[HeadType | None] = [None] * width
             kinds: list[StateRecordKind | None] = [None] * width
             copies: list[RetrievalHistoryRecord | None] = [None] * width
+            lifecycles: list[str | None] = [None] * width
             for column, record in enumerate(records):
                 sources[row, column] = record.semantic_source
                 present[row, column] = True
@@ -1436,6 +1914,10 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
                 heads[column] = record.head_type
                 kinds[column] = _history_record_kind(record)
                 copies[column] = record
+                lifecycles[column] = record.lifecycle_id
+                sequence_ids[row, column] = int(record.record_id.rsplit("-", 1)[-1])
+                head_codes[row, column] = RETRIEVAL_HEAD_ORDER.index(record.head_type)
+                operator_codes[row, column] = OPERATORS.index(record.operator)
                 if record.timestamp is not None:
                     timestamps[row, column] = record.timestamp
                 else:
@@ -1447,6 +1929,7 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             head_types.append(tuple(heads))
             record_kinds.append(tuple(kinds))
             cloned_records.append(tuple(copies))
+            lifecycle_ids.append(tuple(lifecycles))
         return RetrievalHistoryView(
             sources=sources,
             present_mask=present,
@@ -1454,6 +1937,9 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             retrieval_eligible_mask=eligible,
             timestamps=timestamps,
             time_ranges=time_ranges,
+            sequence_ids=sequence_ids,
+            head_codes=head_codes,
+            operator_codes=operator_codes,
             n_state=n_state,
             owner_record_counts=owner_counts,
             video_ids=tuple(state.video_id for state in normalized),
@@ -1463,6 +1949,7 @@ class StructuredStateBank(nn.Module):  # type: ignore[misc]
             head_types=tuple(head_types),
             record_kinds=tuple(record_kinds),
             cloned_records=tuple(cloned_records),
+            lifecycle_ids=tuple(lifecycle_ids),
         )
 
     @torch.no_grad()  # type: ignore[untyped-decorator]

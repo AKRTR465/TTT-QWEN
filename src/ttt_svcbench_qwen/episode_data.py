@@ -158,12 +158,18 @@ class A2QueryRecord:
     task_class: str
     query: ProductionQueryRecord
     sampling_weight: float
+    answer_user_content: str | None = None
 
     def __post_init__(self) -> None:
         if not self.video_id or not self.trajectory_id or not self.relative_video_path:
             raise ValueError("A2 Query ownership/path fields must be non-empty")
         if not math.isfinite(self.sampling_weight) or self.sampling_weight <= 0.0:
             raise ValueError("A2 sampling weight must be positive and finite")
+        if self.answer_user_content is not None:
+            if not self.answer_user_content.startswith("<video>\n"):
+                raise ValueError("baseline A2 user content must begin with exactly '<video>\\n'")
+            if not self.answer_user_content.removeprefix("<video>\n").strip():
+                raise ValueError("baseline A2 user content must contain a non-empty text prompt")
         assert_runtime_payload_safe(
             self.query.runtime.as_payload(),
             layer="A2 manifest runtime",
@@ -379,7 +385,7 @@ def _a2_visual_length_key(
     state_query_max_frames: int = 16,
     answer_query_visual_mode: str = "causal_prefix",
     answer_query_max_frames: int = 256,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int]:
     """Return a cheap deterministic proxy for visual tokens and decode work.
 
     The first component is the exact configured upper bound on causal frames at 2 FPS across
@@ -396,6 +402,10 @@ def _a2_visual_length_key(
 
     frame_budget = sum(
         frames(chunk.start_time, chunk.end_time, chunk.maximum_frames) for chunk in supports
+    )
+    history_write_units = 3 * len(supports) + sum(
+        max(1, min(32, frames(chunk.start_time, chunk.end_time, chunk.maximum_frames)))
+        for chunk in supports
     )
     query_end = record.query.runtime.query_time
     query_roles = (
@@ -427,7 +437,7 @@ def _a2_visual_length_key(
     # work, decoded source pixels/second predicts short-window CPU work, and encoded bitrate
     # breaks ties for long random-access intervals.  File bytes remain a deterministic fallback
     # when a container cannot expose stream metadata.
-    return frame_budget, pixel_rate, encoded_bytes_per_second or file_bytes
+    return frame_budget, history_write_units, pixel_rate, encoded_bytes_per_second or file_bytes
 
 
 @lru_cache(maxsize=1_024)
@@ -519,7 +529,7 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         if tasks != {"O1", "O2", "E1", "E2"}:
             raise ValueError("balanced A2 production sampling requires all four task classes")
         self._buckets = {name: tuple(values) for name, values in buckets.items()}
-        self._visual_lengths: dict[int, tuple[float, int, int]] = {
+        self._visual_lengths: dict[int, tuple[float, int, int, int]] = {
             index: self._visual_key(_require_a2(raw), visual_length_fn)
             for index, raw in enumerate(dataset.records)
         }
@@ -540,9 +550,9 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         self,
         record: A2QueryRecord,
         visual_length_fn: Callable[[A2QueryRecord], int] | None,
-    ) -> tuple[float, int, int]:
+    ) -> tuple[float, int, int, int]:
         if visual_length_fn is not None:
-            return int(visual_length_fn(record)), 0, 0
+            return int(visual_length_fn(record)), 0, 0, 0
         sidecar = self.visual_cost_index.get(record.query.runtime.query_id)
         if sidecar is not None:
             if sidecar.support_count != len(
@@ -572,6 +582,7 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
                         sidecar.record_id,
                         sidecar.predicted_total_seconds,
                     ),
+                    sidecar.history_write_units,
                     sidecar.total_visual_tokens,
                     sidecar.maximum_visual_tokens,
                 )
@@ -743,7 +754,7 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
             raise RuntimeError("rank-aligned A5 global sampler length drifted")
         return iter(global_indices)
 
-    def _cost_key(self, episode_id: str) -> tuple[float, int, int]:
+    def _cost_key(self, episode_id: str) -> tuple[float, int, int, int]:
         record = _require_a5(self.dataset[self.dataset.index_by_id[episode_id]])
         sidecar = self.visual_cost_index.get(episode_id)
         if sidecar is not None:
@@ -758,6 +769,7 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
                     episode_id,
                     sidecar.predicted_total_seconds,
                 ),
+                sidecar.history_write_units,
                 sidecar.total_visual_tokens,
                 sidecar.maximum_visual_tokens,
             )
@@ -781,7 +793,8 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
             for query in record.queries
         )
         proxy = support_frames + sum(query_frames)
-        return float(proxy), proxy, max(query_frames)
+        history_write_units = record.support_count * 4
+        return float(proxy), history_write_units, proxy, max(query_frames)
 
     def __len__(self) -> int:
         return self._global_size
@@ -1506,9 +1519,7 @@ def _parse_production_query(value: object) -> ProductionQueryRecord:
 
 def _parse_a2_query(value: object) -> A2QueryRecord:
     row = object_value(value, "A2 Query")
-    _require_exact_keys(
-        row,
-        {
+    required = {
             "source_dataset",
             "relative_video_path",
             "video_id",
@@ -1517,9 +1528,13 @@ def _parse_a2_query(value: object) -> A2QueryRecord:
             "task_class",
             "query",
             "sampling_weight",
-        },
-        "A2 Query",
-    )
+    }
+    optional = {"answer_user_content"}
+    if set(row) - required - optional or required - set(row):
+        _require_exact_keys(row, required, "A2 Query")
+    answer_user_content = row.get("answer_user_content")
+    if answer_user_content is not None and not isinstance(answer_user_content, str):
+        raise ValueError("A2 answer_user_content must be a string or null")
     return A2QueryRecord(
         source_dataset=string_value(row, "source_dataset"),
         relative_video_path=string_value(row, "relative_video_path"),
@@ -1529,6 +1544,7 @@ def _parse_a2_query(value: object) -> A2QueryRecord:
         task_class=string_value(row, "task_class"),
         query=_parse_production_query(row["query"]),
         sampling_weight=_float_value(row, "sampling_weight"),
+        answer_user_content=answer_user_content,
     )
 
 

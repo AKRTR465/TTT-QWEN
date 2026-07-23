@@ -34,7 +34,7 @@ from ttt_svcbench_qwen.state_bank import RetrievalHistoryView
 class _StateBankComponent:
     def retrieval_view(self, states: Any, heads: Any) -> RetrievalHistoryView:
         assert tuple(states) == ("bank-0",)
-        assert len(tuple(heads)) == 1
+        assert heads is None
         return RetrievalHistoryView(
             sources=torch.zeros((1, 0, 768)),
             present_mask=torch.zeros((1, 0), dtype=torch.bool),

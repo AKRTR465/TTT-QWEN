@@ -504,10 +504,9 @@ class PreparedA2Record:
         state_expected = f"{self.record.query.runtime.query_id}:state_query"
         if self.state_query.spec.chunk_id != state_expected:
             raise ValueError("prepared A2 State Query does not belong to its manifest Query")
-        if self.supports:
-            _, schedule = adaptive_support_schedule(self.record.query.runtime.query_time)
-            if len(self.supports) != len(schedule):
-                raise ValueError("prepared A2 Supports do not match the adaptive schedule")
+        schedule = _a2_support_schedule(self.record)
+        if len(self.supports) != len(schedule):
+            raise ValueError("prepared A2 Supports do not match the adaptive schedule")
 
     def pin_memory(self) -> PreparedA2Record:
         return replace(
@@ -593,6 +592,7 @@ class VideoChunkMaterializer:
         minimum_pixels: int,
         maximum_pixels: int,
         preprocess_cache: PreprocessCache | None = None,
+        cache_support_visuals: bool = True,
         cache_query_visuals: bool = True,
         cache_query_roles: frozenset[str] | None = None,
         prefetch_depth: int = 2,
@@ -607,6 +607,9 @@ class VideoChunkMaterializer:
         self.maximum_pixels = maximum_pixels
         self.processor = QwenVideoPreprocessor(config)
         self.preprocess_cache = preprocess_cache
+        if type(cache_support_visuals) is not bool:
+            raise TypeError("cache_support_visuals must be bool")
+        self.cache_support_visuals = cache_support_visuals
         if type(cache_query_visuals) is not bool:
             raise TypeError("cache_query_visuals must be bool")
         self.cache_query_visuals = cache_query_visuals
@@ -778,14 +781,23 @@ class VideoChunkMaterializer:
         if len({spec.video_path for spec in specs}) != 1:
             raise ValueError("coalesced Support group must contain one video path")
         results: dict[str, CurrentChunkMaterialization] = {}
-        misses: list[tuple[SupportChunkSpec, PreprocessFingerprint]] = []
+        misses: list[
+            tuple[SupportChunkSpec, PreprocessFingerprint | None, PreprocessCache | None]
+        ] = []
         for spec in specs:
-            fingerprint = self._fingerprint(spec)
+            cache = self._cache_for(spec)
+            fingerprint = self._fingerprint(spec) if cache is not None else None
             cache_started = time.perf_counter()
             cache_bytes = (
-                self.preprocess_cache.payload_size(fingerprint) if self.preprocess_cache else 0
+                cache.payload_size(fingerprint)
+                if cache is not None and fingerprint is not None
+                else 0
             )
-            cached = self.preprocess_cache.get(fingerprint) if self.preprocess_cache else None
+            cached = (
+                cache.get(fingerprint)
+                if cache is not None and fingerprint is not None
+                else None
+            )
             _loader_trace(
                 "support_cache_read",
                 chunk_id=spec.chunk_id,
@@ -798,7 +810,7 @@ class VideoChunkMaterializer:
                 results[spec.chunk_id] = self._from_cached(spec, cached)
                 _loader_trace("support_cache_hit", chunk_id=spec.chunk_id)
             else:
-                misses.append((spec, fingerprint))
+                misses.append((spec, fingerprint, cache))
         if not misses:
             _loader_trace(
                 "support_decode_coalesced",
@@ -809,7 +821,7 @@ class VideoChunkMaterializer:
             return results
         try:
             decoded = _decode_coalesced_intervals(
-                tuple(spec for spec, _ in misses),
+                tuple(spec for spec, _, _ in misses),
                 self.config.video_preprocessing.sample_fps,
             )
         except Exception:
@@ -819,12 +831,16 @@ class VideoChunkMaterializer:
                 spec.chunk_id: _decode_uniform_interval(
                     spec, self.config.video_preprocessing.sample_fps
                 )
-                for spec, _ in misses
+                for spec, _, _ in misses
             }
-        for spec, fingerprint in misses:
+        for spec, fingerprint, cache in misses:
             frames, timestamps = decoded[spec.chunk_id]
             results[spec.chunk_id] = self._materialize_decoded(
-                spec, frames, timestamps, fingerprint
+                spec,
+                frames,
+                timestamps,
+                fingerprint,
+                cache=cache,
             )
         _loader_trace(
             "support_decode_coalesced",
@@ -832,6 +848,19 @@ class VideoChunkMaterializer:
             seconds=time.perf_counter() - group_started,
         )
         return results
+
+    def materialize_support_group(
+        self, specs: Sequence[SupportChunkSpec]
+    ) -> tuple[CurrentChunkMaterialization, ...]:
+        """Materialize one sample's Support windows with one video-container pass."""
+
+        values = tuple(specs)
+        if not values:
+            return ()
+        if any(spec.observation_role != "support" for spec in values):
+            raise ValueError("support group accepts Support observations only")
+        materialized = self._materialize_group(values)
+        return tuple(materialized[spec.chunk_id] for spec in values)
 
     def _materialize_decoded(
         self,
@@ -877,6 +906,8 @@ class VideoChunkMaterializer:
         return materialized
 
     def _cache_for(self, spec: ObservationSpec) -> PreprocessCache | None:
+        if isinstance(spec, SupportChunkSpec) and not self.cache_support_visuals:
+            return None
         if (
             isinstance(spec, QueryObservationSpec)
             and spec.observation_role not in self.cache_query_roles
@@ -1626,6 +1657,7 @@ class A2PrefetchCollator:
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
+            cache_support_visuals=ttt_config.support_cache_enabled,
             cache_query_roles=ttt_config.cached_query_roles,
             prefetch_depth=1,
             decode_coalesce=False,
@@ -1669,11 +1701,13 @@ class A2PrefetchCollator:
                 else None
             ),
             source_dataset=record.source_dataset,
+            user_content=record.answer_user_content,
         )
         support_started = time.perf_counter()
+        support_specs = _a2_support_chunk_specs(record, video_path)
         supports = tuple(
-            _compact_materialized_chunk(self.video(support_spec))
-            for support_spec in _a2_support_chunk_specs(record, video_path)
+            _compact_materialized_chunk(value)
+            for value in self.video.materialize_support_group(support_specs)
         )
         support_prepare_seconds = time.perf_counter() - support_started
         prepared_bytes = _prepared_a2_record_bytes(answer, supports, state_query)
@@ -1746,6 +1780,7 @@ class A5PrefetchCollator:
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
+            cache_support_visuals=ttt_config.support_cache_enabled,
             cache_query_roles=ttt_config.cached_query_roles,
             prefetch_depth=1,
             decode_coalesce=False,
@@ -1830,7 +1865,7 @@ class ProductionEpisodeMaterializer:
         video_path = _resolve_video_path(record.source_dataset, record.relative_video_path)
         owner = RuntimeOwner((record.video_id,), (record.trajectory_id,))
         runtime = self.writer.reset(owner)
-        _, supports = adaptive_support_schedule(record.query.runtime.query_time)
+        supports = _a2_support_schedule(record)
         state_chunk = _query_chunk_spec(
             f"{record.query.runtime.query_id}:state_query",
             video_path,
@@ -1879,6 +1914,7 @@ class ProductionEpisodeMaterializer:
                 runtime_state=runtime,
                 bank_states=runtime.state_bank_states,
                 inference=False,
+                retrieval_history_write_enabled=False,
             ),
         )
         supervision = StageASupervisionBatch(
@@ -1959,6 +1995,7 @@ class ProductionEpisodeMaterializer:
                 runtime_state=runtime,
                 bank_states=runtime.state_bank_states,
                 inference=False,
+                retrieval_history_write_enabled=False,
             )
             queries.append(
                 MetaTTTQueryPoint(
@@ -2012,6 +2049,7 @@ class ProductionEpisodeMaterializer:
             runtime_state=runtime,
             bank_states=runtime.state_bank_states,
             inference=False,
+            retrieval_snapshot_required=False,
         )
         return MetaCausalChunk(
             request,
@@ -2044,6 +2082,7 @@ class ProductionEpisodeMaterializer:
             runtime_state=runtime,
             bank_states=runtime.state_bank_states,
             inference=False,
+            retrieval_snapshot_required=False,
         )
 
     def _allocate_episode_nonce(self) -> int:
@@ -2365,7 +2404,11 @@ def _build_runtime_preprocess_cache(
             str(backbone.project_config.video_preprocessing.processor_longest_edge),
         )
     )
-    namespace = hashlib.sha256(namespace_seed.encode("utf-8")).hexdigest()[:20]
+    namespace = os.environ.get("TTT_PREPROCESS_CACHE_NAMESPACE")
+    if namespace is None:
+        namespace = hashlib.sha256(namespace_seed.encode("utf-8")).hexdigest()[:20]
+    elif not namespace.strip():
+        raise ValueError("TTT_PREPROCESS_CACHE_NAMESPACE must be non-empty when set")
     return PreprocessCache(
         root,
         max_bytes=int(max_gb * 1024**3),
@@ -2394,9 +2437,7 @@ def build_runtime(
     preprocess_cache = _build_runtime_preprocess_cache(backbone, config)
     support_prefetch_depth = config.support_prefetch_depth
     if stage is ProductionStage.A5 and config.support_materialization == "segment_double_buffer":
-        support_prefetch_depth = (
-            1 + config.segment_prefetch_depth
-        ) * project.a5.truncation_horizon
+        support_prefetch_depth = (1 + config.segment_prefetch_depth) * project.a5.truncation_horizon
     support_decode_coalesce = config.support_decode_coalesce
     fast = build_fast_ttt_adapter(project)
     qwen = Qwen3VLAdapter(
@@ -2411,6 +2452,7 @@ def build_runtime(
         minimum_pixels=minimum_pixels,
         maximum_pixels=maximum_pixels,
         preprocess_cache=preprocess_cache,
+        cache_support_visuals=config.support_cache_enabled,
         cache_query_roles=config.cached_query_roles,
         prefetch_depth=support_prefetch_depth,
         decode_coalesce=support_decode_coalesce,
@@ -2746,7 +2788,7 @@ def _a2_support_chunk_specs(
     record: A2QueryRecord,
     video_path: Path,
 ) -> tuple[SupportChunkSpec, ...]:
-    _, supports = adaptive_support_schedule(record.query.runtime.query_time)
+    supports = _a2_support_schedule(record)
     return tuple(
         SupportChunkSpec(
             chunk_id=f"{record.query.runtime.query_id}:a2:{index}",
@@ -2758,6 +2800,16 @@ def _a2_support_chunk_specs(
         )
         for index, chunk in enumerate(supports)
     )
+
+
+def _a2_support_schedule(record: A2QueryRecord) -> tuple[AdaptiveChunkSpec, ...]:
+    """Return the legacy schedule or the baseline-clip zero-Support short-video variant."""
+
+    query_time = record.query.runtime.query_time
+    if record.answer_user_content is not None and query_time <= 8.0:
+        return ()
+    _, supports = adaptive_support_schedule(query_time)
+    return supports
 
 
 def _query_chunk_spec(
@@ -2807,6 +2859,7 @@ def _prepare_answer_cpu(
     maximum_pixels: int,
     preprocess_cache: PreprocessCache | None = None,
     source_dataset: str = "runtime",
+    user_content: str | None = None,
 ) -> PreparedAnswerCPU:
     """Decode, preprocess and tokenize one Query using CPU-only objects.
 
@@ -2868,7 +2921,7 @@ def _prepare_answer_cpu(
                 raise RuntimeError("writable Answer Query cache requires a fingerprint")
             preprocess_cache.put(fingerprint, _cached_from_materialized(materialized))
 
-    prompt_messages = [_user_message(query.runtime.question)]
+    prompt_messages = [_user_message(query.runtime.question, user_content=user_content)]
     full_messages = [*prompt_messages, {"role": "assistant", "content": answer_text}]
     prompt_text = typed_processor.apply_chat_template(
         prompt_messages, tokenize=False, add_generation_prompt=True
@@ -3180,12 +3233,21 @@ def _resolve_video_path(source_dataset: str, relative_path: str) -> Path:
     )
 
 
-def _user_message(question: str) -> dict[str, object]:
+def _user_message(question: str, *, user_content: str | None = None) -> dict[str, object]:
+    if user_content is None:
+        text = _ANSWER_INSTRUCTION.format(question=question)
+    else:
+        prefix = "<video>\n"
+        if not user_content.startswith(prefix) or user_content.count("<video>") != 1:
+            raise ValueError("baseline Answer prompt requires exactly one leading <video> marker")
+        text = user_content.removeprefix(prefix)
+        if not text.strip():
+            raise ValueError("baseline Answer prompt text cannot be empty")
     return {
         "role": "user",
         "content": [
             {"type": "video"},
-            {"type": "text", "text": _ANSWER_INSTRUCTION.format(question=question)},
+            {"type": "text", "text": text},
         ],
     }
 
