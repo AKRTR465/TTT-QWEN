@@ -167,9 +167,6 @@ class SegmentBackwardController:
         self.backward_count = 0
         self.step_count = 0
         self.gradient_controller = gradient_controller
-        self._rank_stable_parameters = _unique_trainable_parameters(model)
-        if not self._rank_stable_parameters:
-            raise ValueError("A5 segment controller requires trainable Outer parameters")
         self.semantic_projector_auditor = (
             _SemanticProjectorStepAuditor(
                 model, delta_audit_steps=semantic_projector_delta_audit_steps
@@ -193,6 +190,17 @@ class SegmentBackwardController:
                 )
         elif not callable(getattr(accelerator, "backward", None)):
             raise TypeError("segment controller requires accelerator.backward")
+        if self.is_deepspeed and isinstance(
+            self.gradient_controller, OuterGradientController
+        ):
+            self._rank_stable_parameters = _rank_stable_optimizer_parameters(
+                cast(Any, self.engine).optimizer,
+                expected_groups=self.gradient_controller.expected_groups,
+            )
+        else:
+            self._rank_stable_parameters = _unique_trainable_parameters(model)
+        if not self._rank_stable_parameters:
+            raise ValueError("A5 segment controller requires rank-stable Outer parameters")
 
     @property
     def proxy_gradient_scale(self) -> float:
@@ -296,6 +304,43 @@ def _unique_trainable_parameters(model: nn.Module) -> tuple[nn.Parameter, ...]:
     return tuple(parameters)
 
 
+def _rank_stable_optimizer_parameters(
+    optimizer: object,
+    *,
+    expected_groups: Sequence[str],
+) -> tuple[nn.Parameter, ...]:
+    """Return conditionally used non-Qwen groups from the formal Outer optimizer."""
+
+    base_optimizer = getattr(optimizer, "optimizer", optimizer)
+    groups = getattr(base_optimizer, "param_groups", None)
+    if not isinstance(groups, list):
+        raise TypeError("rank-stable A5 anchor requires optimizer parameter groups")
+    actual = tuple(group.get("group_name") for group in groups)
+    if actual != tuple(expected_groups):
+        raise ValueError(
+            f"rank-stable A5 optimizer groups must be {tuple(expected_groups)}, found {actual}"
+        )
+    parameters: list[nn.Parameter] = []
+    seen: set[int] = set()
+    for group in groups:
+        if group["group_name"] == "qwen":
+            continue
+        raw_parameters = group.get("params")
+        if not isinstance(raw_parameters, list):
+            raise TypeError("rank-stable A5 optimizer group params must be a list")
+        for parameter in raw_parameters:
+            if not isinstance(parameter, nn.Parameter) or not parameter.requires_grad:
+                raise TypeError("rank-stable A5 optimizer groups require trainable Parameters")
+            parameter_id = id(parameter)
+            if parameter_id in seen:
+                raise ValueError("rank-stable A5 optimizer parameter is duplicated")
+            if parameter.numel() <= 0:
+                raise ValueError("A5 trainable Outer parameters cannot be empty")
+            seen.add(parameter_id)
+            parameters.append(parameter)
+    return tuple(parameters)
+
+
 def _attach_rank_stable_zero_anchor(
     loss: Tensor,
     parameters: Sequence[nn.Parameter],
@@ -303,10 +348,12 @@ def _attach_rank_stable_zero_anchor(
     """Expose an identical ZeRO-2 gradient-hook surface on every segmented backward.
 
     A5 intentionally executes several backwards per episode.  Official-weak routing and
-    retrieval validity are sample-dependent, so two ranks can otherwise touch different
+    retrieval validity are sample-dependent, so two ranks can otherwise touch different state
     parameters during the same backward call.  ZeRO-2 then launches different reduction
-    sequences and deadlocks.  One differentiable zero scalar from every trainable parameter
-    makes the hook set deterministic without changing the forward value or any gradient.
+    sequences and deadlocks.  One differentiable zero scalar from every conditionally used
+    non-Qwen parameter makes that hook set deterministic without changing the forward value or
+    any gradient.  Qwen is excluded because every Support and Query backward already traverses
+    its shared backbone; anchoring its 1.9B trainable parameters would add redundant reductions.
     The anchor is rebuilt for every call because a completed backward frees its graph.
     """
 
