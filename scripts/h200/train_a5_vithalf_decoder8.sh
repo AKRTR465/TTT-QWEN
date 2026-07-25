@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 usage:
-  bash scripts/h200/train_a5_vithalf_decoder8.sh <a2_final_checkpoint> [dataset_manifest.json]
+  bash scripts/h200/train_a5_vithalf_decoder8.sh <a2_final_checkpoint> <half_dataset_manifest.json>
 
 Starts four-GPU A5 Meta-TTT with this Qwen Outer policy:
   - freeze ViT patch embedding and blocks 0-12
@@ -13,14 +13,15 @@ Starts four-GPU A5 Meta-TTT with this Qwen Outer policy:
   - train Decoder layers 28-35 and the final language-model norm
   - train for 4 epochs and retain complete checkpoints at epochs 2 and 4 only
 
-The A2 checkpoint must contain the complete Outer model. Environment overrides accepted by
+The A2 checkpoint must contain the complete Outer model. The manifest must be the same deterministic
+half-data manifest used to prewarm the strict A5 cache. Environment overrides accepted by
 scripts/h200/train_a2_a5.sh remain available, including TTT_PROJECT_ROOT,
 TTT_PREPROCESS_CACHE_ROOT, TTT_RESUME_CHECKPOINT, RUN_ID, SESSION, and DRY_RUN.
 EOF
   exit 2
 }
 
-[[ $# -ge 1 && $# -le 2 ]] || usage
+[[ $# -eq 2 ]] || usage
 
 PLAY_ROOT="/mnt/shared-storage-user/mineru2-shared/niujunbo/play"
 PROJECT_ROOT="${TTT_PROJECT_ROOT:-$PLAY_ROOT/projects/ttt_qwen}"

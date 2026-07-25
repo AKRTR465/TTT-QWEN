@@ -53,12 +53,42 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
     exit 1
   fi
   mkdir -p "$RUN_ROOT" "$LOG_DIR"
-  printf -v script_q '%q' "$PROJECT_ROOT/scripts/h200/eval_svcbench_train3706_a2_static.sh"
-  printf -v checkpoint_q '%q' "$A2_CHECKPOINT"
-  printf -v manifest_q '%q' "$MANIFEST"
+  inner_env=(
+    env
+    "RUN_IN_TMUX=1"
+    "TTT_PROJECT_ROOT=$PROJECT_ROOT"
+    "LLAMAFACTORY_ROOT=$LF_ROOT"
+    "TTT_H200_VENV=$VENV"
+    "MODEL=$MODEL"
+    "SOURCE_DATASET_DIR=$SOURCE_DATASET_DIR"
+    "SOURCE_SFT=$SOURCE_SFT"
+    "RAW_ANNOTATIONS=$RAW_ANNOTATIONS"
+    "SCORE_ANNOTATIONS=$SCORE_ANNOTATIONS"
+    "SVCBENCH_VIDEO_ROOT=$SOURCE_VIDEO_ROOT"
+    "SVCBENCH_SCORER=$SCORER"
+    "A2_EVAL_YAML=$EVAL_YAML"
+    "TTT_PREPROCESS_CACHE_ROOT=$CACHE_ROOT"
+    "TTT_PREPROCESS_CACHE_NAMESPACE=$CACHE_NAMESPACE"
+    "VISUAL_COST_INDEX=$VISUAL_COST_INDEX"
+    "EXPECTED_SFT_SHA256=$EXPECTED_SFT_SHA256"
+    "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    "RUN_ID=$RUN_ID"
+    "SESSION=$SESSION"
+    "RUN_ROOT=$RUN_ROOT"
+    "LOG_DIR=$LOG_DIR"
+    "LOG_FILE=$LOG_FILE"
+  )
+  for forwarded_name in OMP_NUM_THREADS NCCL_IB_DISABLE NCCL_DEBUG MASTER_PORT; do
+    if [[ -n "${!forwarded_name:-}" ]]; then
+      inner_env+=("$forwarded_name=${!forwarded_name}")
+    fi
+  done
+  printf -v inner_command '%q ' "${inner_env[@]}" bash \
+    "$PROJECT_ROOT/scripts/h200/eval_svcbench_train3706_a2_static.sh" \
+    "$A2_CHECKPOINT" "$MANIFEST"
   printf -v root_q '%q' "$PROJECT_ROOT"
   printf -v log_q '%q' "$LOG_FILE"
-  command_text="cd $root_q && env RUN_IN_TMUX=1 RUN_ID=$(printf %q "$RUN_ID") SESSION=$(printf %q "$SESSION") RUN_ROOT=$(printf %q "$RUN_ROOT") LOG_DIR=$(printf %q "$LOG_DIR") LOG_FILE=$log_q CUDA_VISIBLE_DEVICES=$(printf %q "$CUDA_VISIBLE_DEVICES") A2_EVAL_YAML=$(printf %q "$EVAL_YAML") bash $script_q $checkpoint_q $manifest_q 2>&1 | tee -a $log_q"
+  command_text="set -o pipefail; cd $root_q && $inner_command 2>&1 | tee -a $log_q"
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
     echo "$command_text"
     exit 0
@@ -181,5 +211,16 @@ echo "stage=score method=a2_static scorer=$SCORER"
   --output-dir "$SCORE_OUT" \
   --evaluation-scope train_set \
   --elapsed-seconds "$(( $(date +%s) - START_SECONDS ))"
+
+"$PYTHON" "$PROJECT_ROOT/scripts/stamp_svcbench_eval_metrics.py" \
+  --metrics "$SCORE_OUT/metrics.json" \
+  --method a2_static \
+  --selection "$DATASET_OUT/selection.jsonl" \
+  --prepared-sft "$DATASET_OUT/$EVAL_DATASET_NAME.json" \
+  --score-annotations "$SCORE_ANNOTATIONS" \
+  --scorer "$SCORER" \
+  --manifest "$MANIFEST" \
+  --evaluation-config "$EVAL_YAML" \
+  --model-identity "$A2_CHECKPOINT"
 
 echo "status=completed method=a2_static score=$SCORE_OUT/metrics.json finished_at=$(date -Iseconds)"

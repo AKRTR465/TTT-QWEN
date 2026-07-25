@@ -25,7 +25,10 @@ import torch
 from safetensors.torch import load_file, save_file
 from torch import Tensor
 
-CACHE_SCHEMA_VERSION = 2
+# Keep the fingerprint schema stable for the existing float32 A2 cache. The sidecar format may
+# evolve independently because it is validated after the digest has selected an entry.
+CACHE_SCHEMA_VERSION = 1
+CACHE_METADATA_SCHEMA_VERSION = 2
 type PreprocessCacheStorageDtype = Literal["float32", "float16"]
 
 
@@ -304,7 +307,7 @@ class PreprocessCache:
                 json.dumps(
                     {
                         "fingerprint": fingerprint.canonical_json(),
-                        "cache_schema_version": CACHE_SCHEMA_VERSION,
+                        "cache_schema_version": CACHE_METADATA_SCHEMA_VERSION,
                         "storage_dtype": self.storage_dtype,
                     },
                     sort_keys=True,
@@ -491,6 +494,10 @@ def _read_sidecar_metadata(path: Path) -> tuple[str, str] | None:
     raw = json.loads(sidecar.read_text(encoding="utf-8"))
     fingerprint = raw.get("fingerprint") if isinstance(raw, Mapping) else None
     storage_dtype = raw.get("storage_dtype") if isinstance(raw, Mapping) else None
+    if storage_dtype is None:
+        # Schema-1 float32 entries predate the explicit storage dtype. They are byte-compatible
+        # with the current runtime and must remain readable by the strict A2 cache path.
+        storage_dtype = "float32"
     if not isinstance(fingerprint, str) or storage_dtype not in {"float32", "float16"}:
         raise ValueError("cache metadata sidecar is missing fingerprint or storage dtype")
     return fingerprint, storage_dtype
@@ -569,6 +576,7 @@ def _clone_cached_chunk(chunk: CachedChunk) -> CachedChunk:
 
 
 __all__ = [
+    "CACHE_METADATA_SCHEMA_VERSION",
     "CACHE_SCHEMA_VERSION",
     "CachedChunk",
     "PreprocessCache",

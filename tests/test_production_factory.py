@@ -1231,6 +1231,8 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
     )
     assert 'TTT_CHECKPOINT_POLICY="epoch_2_and_epoch_4"' in launcher
     assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
+    assert "[[ $# -eq 2 ]] || usage" in launcher
+    assert "<half_dataset_manifest.json>" in launcher
 
 
 def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoint(

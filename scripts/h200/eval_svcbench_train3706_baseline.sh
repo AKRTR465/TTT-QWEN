@@ -51,12 +51,39 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
     exit 1
   fi
   mkdir -p "$RUN_ROOT" "$LOG_DIR"
-  printf -v script_q '%q' "$PROJECT_ROOT/scripts/h200/eval_svcbench_train3706_baseline.sh"
-  printf -v model_q '%q' "$BASELINE_MODEL"
-  printf -v manifest_q '%q' "$MANIFEST"
+  inner_env=(
+    env
+    "RUN_IN_TMUX=1"
+    "TTT_PROJECT_ROOT=$PROJECT_ROOT"
+    "LLAMAFACTORY_ROOT=$LF_ROOT"
+    "TTT_PREP_VENV=$PREP_VENV"
+    "QWEN_EVAL_VENV=$EVAL_VENV"
+    "SOURCE_DATASET_DIR=$SOURCE_DATASET_DIR"
+    "SOURCE_SFT=$SOURCE_SFT"
+    "RAW_ANNOTATIONS=$RAW_ANNOTATIONS"
+    "SCORE_ANNOTATIONS=$SCORE_ANNOTATIONS"
+    "SVCBENCH_SCORER=$SCORER"
+    "SVCBENCH_EVAL_YAML=$EVAL_YAML"
+    "SVCBENCH_EVAL_HF_HOME=$EVAL_HF_HOME"
+    "EXPECTED_SFT_SHA256=$EXPECTED_SFT_SHA256"
+    "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    "RUN_ID=$RUN_ID"
+    "SESSION=$SESSION"
+    "RUN_ROOT=$RUN_ROOT"
+    "LOG_DIR=$LOG_DIR"
+    "LOG_FILE=$LOG_FILE"
+  )
+  for forwarded_name in NCCL_IB_DISABLE NCCL_DEBUG; do
+    if [[ -n "${!forwarded_name:-}" ]]; then
+      inner_env+=("$forwarded_name=${!forwarded_name}")
+    fi
+  done
+  printf -v inner_command '%q ' "${inner_env[@]}" bash \
+    "$PROJECT_ROOT/scripts/h200/eval_svcbench_train3706_baseline.sh" \
+    "$BASELINE_MODEL" "$MANIFEST"
   printf -v root_q '%q' "$PROJECT_ROOT"
   printf -v log_q '%q' "$LOG_FILE"
-  command_text="cd $root_q && env RUN_IN_TMUX=1 RUN_ID=$(printf %q "$RUN_ID") SESSION=$(printf %q "$SESSION") RUN_ROOT=$(printf %q "$RUN_ROOT") LOG_DIR=$(printf %q "$LOG_DIR") LOG_FILE=$log_q CUDA_VISIBLE_DEVICES=$(printf %q "$CUDA_VISIBLE_DEVICES") TTT_PREP_VENV=$(printf %q "$PREP_VENV") QWEN_EVAL_VENV=$(printf %q "$EVAL_VENV") LLAMAFACTORY_ROOT=$(printf %q "$LF_ROOT") SVCBENCH_EVAL_YAML=$(printf %q "$EVAL_YAML") SVCBENCH_EVAL_HF_HOME=$(printf %q "$EVAL_HF_HOME") bash $script_q $model_q $manifest_q 2>&1 | tee -a $log_q"
+  command_text="set -o pipefail; cd $root_q && $inner_command 2>&1 | tee -a $log_q"
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
     echo "$command_text"
     exit 0
@@ -174,5 +201,16 @@ echo "stage=score method=baseline scorer=$SCORER"
   --output-dir "$SCORE_OUT" \
   --evaluation-scope train_set \
   --elapsed-seconds "$(( $(date +%s) - START_SECONDS ))"
+
+"$PYTHON" "$PROJECT_ROOT/scripts/stamp_svcbench_eval_metrics.py" \
+  --metrics "$SCORE_OUT/metrics.json" \
+  --method baseline \
+  --selection "$DATASET_OUT/selection.jsonl" \
+  --prepared-sft "$DATASET_OUT/$DATASET_NAME.json" \
+  --score-annotations "$SCORE_ANNOTATIONS" \
+  --scorer "$SCORER" \
+  --manifest "$MANIFEST" \
+  --evaluation-config "$EVAL_YAML" \
+  --model-identity "$BASELINE_MODEL"
 
 echo "status=completed method=baseline score=$SCORE_OUT/metrics.json finished_at=$(date -Iseconds)"

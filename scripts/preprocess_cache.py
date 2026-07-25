@@ -151,10 +151,15 @@ def _verify(cache: PreprocessCache) -> dict[str, int]:
                 if metadata.is_file()
                 else None
             )
+            sidecar_dtype = (
+                sidecar.get("storage_dtype", "float32")
+                if isinstance(sidecar, dict)
+                else None
+            )
             if (
                 not isinstance(sidecar, dict)
                 or sidecar.get("fingerprint") != embedded_fingerprint
-                or sidecar.get("storage_dtype") != cache.storage_dtype
+                or sidecar_dtype != cache.storage_dtype
             ):
                 raise ValueError("missing cache metadata sidecar")
             expected_dtype = (

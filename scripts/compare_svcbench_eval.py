@@ -9,6 +9,15 @@ from pathlib import Path
 from typing import Any, cast
 
 METRICS = ("gpa", "moc", "uda", "exact_match", "exact_match_macro")
+CONTRACT_VERSION = "svcbench_train3706_v1"
+MATCHED_PROVENANCE_FIELDS = (
+    "contract_version",
+    "selection_sha256",
+    "prepared_sft_sha256",
+    "score_annotations_sha256",
+    "scorer_sha256",
+    "manifest_sha256",
+)
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -21,6 +30,35 @@ def _read(path: Path) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
+def _provenance(
+    metrics: dict[str, Any],
+    path: Path,
+    *,
+    expected_method: str,
+) -> dict[str, str]:
+    metadata = cast(dict[str, Any], metrics["metadata"])
+    raw = metadata.get("comparison_provenance")
+    if not isinstance(raw, dict):
+        raise ValueError(f"metrics lack comparison provenance: {path}")
+    required = {
+        *MATCHED_PROVENANCE_FIELDS,
+        "method",
+        "evaluation_config_sha256",
+        "model_identity",
+    }
+    values = {key: raw.get(key) for key in required}
+    if any(not isinstance(value, str) or not value for value in values.values()):
+        raise ValueError(f"metrics contain incomplete comparison provenance: {path}")
+    provenance = cast(dict[str, str], values)
+    if provenance["contract_version"] != CONTRACT_VERSION:
+        raise ValueError(f"unsupported comparison contract: {path}")
+    if provenance["method"] != expected_method:
+        raise ValueError(
+            f"expected {expected_method} metrics, got {provenance['method']}: {path}"
+        )
+    return provenance
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline", type=Path, required=True)
@@ -29,6 +67,19 @@ def main() -> int:
     args = parser.parse_args()
     baseline = _read(args.baseline)
     a2_static = _read(args.a2_static)
+    baseline_provenance = _provenance(
+        baseline,
+        args.baseline,
+        expected_method="baseline",
+    )
+    a2_provenance = _provenance(
+        a2_static,
+        args.a2_static,
+        expected_method="a2_static",
+    )
+    for field in MATCHED_PROVENANCE_FIELDS:
+        if baseline_provenance[field] != a2_provenance[field]:
+            raise ValueError(f"comparison provenance mismatch for {field}")
     base_overall = cast(dict[str, Any], baseline["overall"])
     a2_overall = cast(dict[str, Any], a2_static["overall"])
     for name, value in (("baseline", base_overall), ("a2_static", a2_overall)):
@@ -58,6 +109,13 @@ def main() -> int:
         "row_count": 3_706,
         "baseline_metrics": str(args.baseline.resolve()),
         "a2_static_metrics": str(args.a2_static.resolve()),
+        "comparison_provenance": {
+            "matched": {
+                field: baseline_provenance[field] for field in MATCHED_PROVENANCE_FIELDS
+            },
+            "baseline": baseline_provenance,
+            "a2_static": a2_provenance,
+        },
         "rows": rows,
     }
     (args.output_dir / "comparison.json").write_text(

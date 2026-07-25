@@ -132,3 +132,46 @@ def test_prompt_only_answer_inputs_requires_assistant_boundary() -> None:
     )
     with pytest.raises(ValueError, match="assistant answer boundary"):
         prompt_only_answer_inputs(answer, torch.full((1, 2), -100))
+
+
+@pytest.mark.parametrize(
+    ("script_name", "forwarded_names"),
+    (
+        (
+            "eval_svcbench_train3706_baseline.sh",
+            (
+                "TTT_PROJECT_ROOT",
+                "LLAMAFACTORY_ROOT",
+                "SOURCE_SFT",
+                "RAW_ANNOTATIONS",
+                "SCORE_ANNOTATIONS",
+                "SVCBENCH_SCORER",
+            ),
+        ),
+        (
+            "eval_svcbench_train3706_a2_static.sh",
+            (
+                "TTT_PROJECT_ROOT",
+                "LLAMAFACTORY_ROOT",
+                "TTT_H200_VENV",
+                "SOURCE_SFT",
+                "RAW_ANNOTATIONS",
+                "SCORE_ANNOTATIONS",
+                "SVCBENCH_VIDEO_ROOT",
+                "SVCBENCH_SCORER",
+                "TTT_PREPROCESS_CACHE_ROOT",
+                "TTT_PREPROCESS_CACHE_NAMESPACE",
+                "VISUAL_COST_INDEX",
+            ),
+        ),
+    ),
+)
+def test_eval_tmux_launchers_forward_resolved_environment(
+    script_name: str,
+    forwarded_names: tuple[str, ...],
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "scripts" / "h200" / script_name).read_text(encoding="utf-8")
+    assert 'command_text="set -o pipefail;' in script
+    for name in forwarded_names:
+        assert f'"{name}=$' in script
