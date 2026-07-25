@@ -50,6 +50,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     _balanced_dense_bce,
     _build_e1_fsm_targets,
     _official_weak_task_result,
+    _official_weak_term,
     _record_matches_causal_occurrence,
 )
 from ttt_svcbench_qwen.state_bank import (
@@ -74,6 +75,23 @@ MISSING = TargetProvenance.MISSING
 
 def _leaf(shape: tuple[int, ...], *, fill: float = 0.0) -> Tensor:
     return torch.full(shape, fill, dtype=torch.float32).requires_grad_(True)
+
+
+@pytest.mark.parametrize("valid", (False, True))
+def test_official_weak_term_always_keeps_the_shared_zero_anchor(valid: bool) -> None:
+    anchor_source = torch.tensor(2.0, requires_grad=True)
+    loss_source = torch.tensor(3.0, requires_grad=True)
+    anchor = anchor_source * 0.0
+    losses = (loss_source.square(),) if valid else ()
+
+    term = _official_weak_term(losses, anchor)
+    term.value.backward()
+
+    assert term.valid_rows == int(valid)
+    assert anchor_source.grad is not None
+    assert anchor_source.grad.item() == 0.0
+    if valid:
+        assert loss_source.grad is not None
 
 
 def _fresh_e1(row: int) -> E1RuntimeState:
@@ -742,7 +760,8 @@ def test_official_weak_post_forward_loss_uses_masks_bags_and_no_identity_pseudol
     ):
         assert leaves[name].grad is not None, name
         assert float(leaves[name].grad.norm()) > 0.0, name
-    assert leaves["o2_identity"].grad is None
+    assert leaves["o2_identity"].grad is not None
+    assert torch.count_nonzero(leaves["o2_identity"].grad).item() == 0
 
 
 def test_official_retrieval_requires_aligned_mixed_bag_and_ignores_selection_mask() -> None:

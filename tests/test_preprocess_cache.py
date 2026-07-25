@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import load_file
 from scripts.preprocess_cache import (
     _fingerprinted_specs,
     _iter_specs,
@@ -75,6 +76,71 @@ def test_cache_roundtrip_and_stable_key(tmp_path: Path) -> None:
     assert torch.equal(loaded.frames, _chunk().frames)
     assert torch.equal(loaded.pixel_values_videos, _chunk().pixel_values_videos)
     assert list((tmp_path / "cache" / "model-a").rglob("*.json"))
+
+
+def test_float16_disk_cache_restores_float32_runtime_pixels(tmp_path: Path) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    fingerprint = _fingerprint(video)
+    cache = PreprocessCache(
+        tmp_path / "cache",
+        memory_entries=0,
+        namespace="fp16",
+        storage_dtype="float16",
+    )
+    source = _chunk()
+    source.pixel_values_videos[0, 0] = 0.123456
+    cache.put(fingerprint, source)
+    path = cache._path_for(fingerprint)
+    assert path is not None
+    stored = load_file(str(path), device="cpu")
+    assert stored["pixel_values_videos"].dtype == torch.float16
+
+    loaded = cache.get(fingerprint)
+    assert loaded is not None
+    assert loaded.pixel_values_videos.dtype == torch.float32
+    assert loaded.pixel_values_videos[0, 0].item() == pytest.approx(0.123456, abs=1.0e-4)
+    sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+    assert sidecar["storage_dtype"] == "float16"
+
+
+def test_cache_rejects_storage_dtype_mismatch(tmp_path: Path) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    fingerprint = _fingerprint(video)
+    assert fingerprint.cache_schema_version == 1
+    root = tmp_path / "cache"
+    PreprocessCache(root, memory_entries=0, storage_dtype="float16").put(
+        fingerprint,
+        _chunk(),
+    )
+    mismatched = PreprocessCache(root, memory_entries=0, storage_dtype="float32")
+    assert mismatched.get(fingerprint) is None
+
+
+def test_legacy_float32_sidecar_remains_readable(tmp_path: Path) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    fingerprint = _fingerprint(video)
+    root = tmp_path / "cache"
+    cache = PreprocessCache(root, memory_entries=0, storage_dtype="float32")
+    cache.put(fingerprint, _chunk())
+    path = cache._path_for(fingerprint)
+    assert path is not None
+    sidecar_path = path.with_suffix(".json")
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar.pop("storage_dtype")
+    sidecar.pop("cache_schema_version")
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+
+    loaded = cache.get(fingerprint)
+    assert loaded is not None
+    assert torch.equal(loaded.pixel_values_videos, _chunk().pixel_values_videos)
+    assert PreprocessCache(
+        root,
+        memory_entries=0,
+        storage_dtype="float16",
+    ).get(fingerprint) is None
 
 
 def test_query_role_and_sampling_policy_cannot_reuse_support_cache_key(

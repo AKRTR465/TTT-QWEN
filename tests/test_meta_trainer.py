@@ -33,6 +33,7 @@ from ttt_svcbench_qwen.meta_trainer import (
     MetaTTTEpisodeRunner,
     MetaTTTQueryPoint,
     StageAQueryLossBuilder,
+    _reanchor_query_signature,
 )
 from ttt_svcbench_qwen.model import (
     BankWriteOutput,
@@ -46,6 +47,7 @@ from ttt_svcbench_qwen.model import (
     StateTTTModelOutput,
     TrajectoryRuntimeState,
     VisualStageOutput,
+    query_dropout_seed,
 )
 from ttt_svcbench_qwen.observation_heads import (
     E1RuntimeState,
@@ -963,8 +965,9 @@ def test_truncated_a5_t17_k8_has_two_numeric_truncations_and_bounded_graphs(
     assert output.audit.truncation_horizon == 8
     assert output.audit.truncation_count == 2
     assert output.audit.segment_count == 3
-    assert output.audit.backward_count == 4
+    assert output.audit.backward_count == 5
     assert output.audit.query_backward_count == 2
+    assert output.audit.deferred_vjp_backward_count == 1
     assert output.audit.maximum_retained_support_graphs == 8
     assert [segment.support_count for segment in output.audit.segments] == [8, 8, 1]
     assert [segment.includes_query_backward for segment in output.audit.segments] == [
@@ -1016,8 +1019,9 @@ def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectCon
     output = runner.run_truncated(_truncated_episode(config, support_count=8))
 
     assert output.audit.segment_count == 1
-    assert output.audit.backward_count == 2
+    assert output.audit.backward_count == 3
     assert output.audit.query_backward_count == 2
+    assert output.audit.deferred_vjp_backward_count == 1
     assert output.audit.truncation_count == 1
     assert output.audit.segments[0].support_count == 8
     assert output.audit.segments[0].includes_query_backward
@@ -1026,25 +1030,56 @@ def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectCon
     assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
 
 
-def test_sequential_multi_query_backward_matches_one_shot_mean() -> None:
-    initial = torch.tensor([0.75, -0.25], dtype=torch.float64)
+def test_truncated_queries_and_deferred_vjp_never_retain_local_graph(
+    config: ProjectConfig,
+) -> None:
+    runner, _, _, _ = _system(config)
+    retain_flags: list[bool] = []
 
-    one_shot = initial.clone().requires_grad_(True)
-    shared_one_shot = torch.sin(one_shot.square())
-    cases = ((1.0, 0.2), (2.0, -0.3), (-0.5, 0.7))
-    losses = tuple((shared_one_shot * scale - target).square().sum() for scale, target in cases)
-    torch.stack(losses).mean().backward()
-    expected = one_shot.grad.detach().clone()
+    def backward(loss: Tensor, retain_graph: bool) -> None:
+        retain_flags.append(retain_graph)
+        loss.backward(retain_graph=retain_graph)
 
-    streamed = initial.clone().requires_grad_(True)
-    shared_streamed = torch.sin(streamed.square())
-    query_count = 3
-    for index, (scale, target) in enumerate(cases):
-        loss = (shared_streamed * scale - target).square().sum() / float(query_count)
-        loss.backward(retain_graph=index + 1 < query_count)
+    output = runner.run_truncated(
+        _truncated_episode(config, support_count=1, query_count=4),
+        backward=backward,
+    )
 
-    assert streamed.grad is not None
-    assert torch.allclose(streamed.grad, expected, atol=1.0e-12, rtol=1.0e-12)
+    assert retain_flags == [False] * 5  # four local Queries plus one deferred VJP
+    assert output.audit.backward_count == 5
+    assert output.audit.query_backward_count == 4
+    assert output.audit.deferred_vjp_backward_count == 1
+    assert all(query.proxy_storage_isolated for query in output.audit.queries)
+    assert all(query.proxy_max_abs_value_drift == 0.0 for query in output.audit.queries)
+
+
+def test_zero_weight_padding_keeps_backward_schedule_but_contributes_zero(
+    config: ProjectConfig,
+) -> None:
+    runner, fast, predictor, _ = _system(config)
+    backward_values: list[float] = []
+
+    def backward(loss: Tensor, retain_graph: bool) -> None:
+        assert not retain_graph
+        backward_values.append(float(loss.detach()))
+        loss.backward()
+
+    output = runner.run_truncated(
+        _truncated_episode(config, support_count=9, query_count=3),
+        backward=backward,
+        episode_loss_weight=0.0,
+    )
+
+    assert output.audit.loss_weight == 0.0
+    assert output.audit.backward_count == 5
+    assert len(backward_values) == 5
+    assert backward_values == pytest.approx([0.0] * 5)
+    assert output.total == pytest.approx(0.0)
+    assert output.query_loss == pytest.approx(0.0)
+    assert output.support_auxiliary_loss == pytest.approx(0.0)
+    assert fast.w0_1.grad is not None and torch.count_nonzero(fast.w0_1.grad) == 0
+    assert fast.w0_2.grad is not None and torch.count_nonzero(fast.w0_2.grad) == 0
+    assert predictor.scale.grad is not None and torch.count_nonzero(predictor.scale.grad) == 0
 
 
 def test_truncated_a5_ema_balance_composes_all_queries_once(
@@ -1088,11 +1123,56 @@ def test_truncated_a5_reuses_one_query_graph_per_segment_and_final_key(
     assert isinstance(serial_query, _QueryStage)
     assert isinstance(reused_query, _QueryStage)
     assert serial_query.calls == 20  # prewarm + 17 Supports + 2 final Queries
-    assert reused_query.calls == 5  # prewarm + three K segments + one final key
+    # Query-local no-retain backward requires a fresh grad-bearing Query graph per final point.
+    assert reused_query.calls == 5
     assert torch.equal(serial_output.total, reused_output.total)
     assert torch.equal(serial_output.query_loss, reused_output.query_loss)
     assert torch.equal(serial_fast.w0_1.grad, reused_fast.w0_1.grad)
     assert torch.equal(serial_fast.w0_2.grad, reused_fast.w0_2.grad)
+
+
+def test_query_signature_reanchor_preserves_value_and_fresh_gradient() -> None:
+    reference = F.normalize(torch.randn(2, 512), dim=-1).to(torch.bfloat16)
+    current = reference.detach().clone().requires_grad_(True)
+    anchored = _reanchor_query_signature(current, reference)
+
+    assert torch.equal(anchored.detach(), reference)
+    anchored.float().sum().backward()
+    assert current.grad is not None
+    assert torch.equal(current.grad, torch.ones_like(current))
+
+    unrelated = F.normalize(torch.randn(2, 512), dim=-1).to(torch.bfloat16)
+    with pytest.raises(ValueError, match="changed semantically"):
+        _reanchor_query_signature(unrelated, reference)
+
+
+def test_query_dropout_seed_is_stable_for_same_question_within_episode() -> None:
+    base = RuntimeQueryInput(
+        video_id="video",
+        trajectory_id="trajectory",
+        query_id="query:0",
+        query_index=0,
+        video=Path("video.mp4"),
+        question="How many objects have appeared so far?",
+        query_time=10.0,
+        explicit_time_values=(),
+        episode_nonce=7,
+    )
+    later = replace(
+        base,
+        query_id="query:1",
+        query_index=1,
+        query_time=20.0,
+    )
+    different_question = replace(
+        later,
+        question="How many actions have completed so far?",
+    )
+    different_episode = replace(later, episode_nonce=8)
+
+    assert query_dropout_seed(base) == query_dropout_seed(later)
+    assert query_dropout_seed(base) != query_dropout_seed(different_question)
+    assert query_dropout_seed(base) != query_dropout_seed(different_episode)
 
 
 def test_truncated_a5_does_not_reuse_different_final_query_ids(
