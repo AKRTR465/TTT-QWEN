@@ -46,42 +46,6 @@ _FORBIDDEN_CHECKPOINT_TOKENS = (
 )
 
 
-class QwenOuterTrainabilityConfig(BaseModel):  # type: ignore[misc]
-    """Stage-local Qwen parameter policy applied after LLaMA-Factory model loading."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-    mode: Literal["full", "partial"] = "full"
-    vision_freeze_first_blocks: int = Field(default=0, ge=0)
-    decoder_train_last_layers: int = Field(default=36, gt=0)
-    train_vision_patch_embed: bool = True
-    train_main_merger: bool = True
-    train_deepstack_mergers: bool = True
-    train_language_model_norm: bool = True
-    train_input_embeddings: bool = True
-    train_lm_head: bool = True
-
-    @model_validator(mode="after")  # type: ignore[untyped-decorator]
-    def validate_full_policy(self) -> Self:
-        if self.mode == "full":
-            expected = (0, 36, True, True, True, True, True, True)
-            actual = (
-                self.vision_freeze_first_blocks,
-                self.decoder_train_last_layers,
-                self.train_vision_patch_embed,
-                self.train_main_merger,
-                self.train_deepstack_mergers,
-                self.train_language_model_norm,
-                self.train_input_embeddings,
-                self.train_lm_head,
-            )
-            if actual != expected:
-                raise ValueError(
-                    "full Qwen trainability must use the canonical all-trainable policy"
-                )
-        return self
-
-
 class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     """Strict State-TTT extension for production LLaMA-Factory YAML files."""
 
@@ -90,9 +54,6 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     stage: Literal["a2", "a5"]
     project_config: str = Field(min_length=1)
     dataset_manifest: str = Field(min_length=1)
-    qwen_outer_trainability: QwenOuterTrainabilityConfig = Field(
-        default_factory=QwenOuterTrainabilityConfig
-    )
     visual_cost_index: str | None = Field(default=None, min_length=1)
     initialize_from_a2_checkpoint: str | None = Field(default=None, min_length=1)
     support_prefetch_depth: int = Field(gt=0)
@@ -115,7 +76,7 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     preprocess_cache_miss_policy: Literal["decode", "error"]
     preprocess_cache_root_env: str = Field(min_length=1)
     preprocess_cache_max_gb: float = Field(gt=0.0)
-    preprocess_cache_dtype: Literal["float32", "float16"]
+    preprocess_cache_dtype: Literal["float32"]
     visual_cost_mode: Literal["proxy", "exact_tokens", "exact_tokens_then_runtime"] = "proxy"
     runtime_trace_mode: Literal["off", "cuda"] = "off"
     runtime_trace_dir: str | None = Field(default=None, min_length=1)
@@ -129,8 +90,6 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             raise ValueError("A2 must not initialize from an A2 checkpoint")
         if self.stage == "a5" and self.initialize_from_a2_checkpoint is None:
             raise ValueError("A5 requires initialize_from_a2_checkpoint")
-        if self.stage == "a2" and self.qwen_outer_trainability.mode != "full":
-            raise ValueError("A2 requires full Qwen outer trainability")
         required_materialization = {
             "a2": "dataloader_episode",
             "a5": "segment_double_buffer",
@@ -248,51 +207,6 @@ class FullUnfreezeAudit:
             raise ValueError("production A2/A5 requires every Qwen parameter trainable")
         if self.decoder_layer_count != 36 or not self.all_qwen_parameters_trainable:
             raise ValueError("production Qwen audit requires all 36 Decoder layers trainable")
-
-
-@dataclass(frozen=True, slots=True)
-class QwenTrainabilityAudit:
-    mode: str
-    total_parameters: int
-    trainable_parameters: int
-    vision_block_count: int
-    frozen_vision_block_indices: tuple[int, ...]
-    trainable_vision_block_indices: tuple[int, ...]
-    decoder_layer_count: int
-    frozen_decoder_layer_indices: tuple[int, ...]
-    trainable_decoder_layer_indices: tuple[int, ...]
-    vision_patch_embed_trainable: bool
-    main_merger_trainable: bool
-    deepstack_mergers_trainable: bool
-    language_model_norm_trainable: bool
-    input_embeddings_trainable: bool
-    lm_head_trainable: bool
-    all_qwen_parameters_trainable: bool
-
-    def __post_init__(self) -> None:
-        if self.mode not in {"full", "partial"}:
-            raise ValueError("Qwen trainability audit has an invalid mode")
-        if self.total_parameters <= 0 or self.trainable_parameters <= 0:
-            raise ValueError("Qwen trainability audit requires positive parameter counts")
-        if self.trainable_parameters > self.total_parameters:
-            raise ValueError("Qwen trainability audit trainable count exceeds total count")
-        if self.vision_block_count != 27 or self.decoder_layer_count != 36:
-            raise ValueError("Qwen trainability audit requires the pinned 27/36 layer structure")
-        vision_indices = self.frozen_vision_block_indices + self.trainable_vision_block_indices
-        decoder_indices = self.frozen_decoder_layer_indices + self.trainable_decoder_layer_indices
-        if tuple(sorted(vision_indices)) != tuple(range(self.vision_block_count)):
-            raise ValueError("Qwen trainability audit does not partition every vision block")
-        if tuple(sorted(decoder_indices)) != tuple(range(self.decoder_layer_count)):
-            raise ValueError("Qwen trainability audit does not partition every Decoder layer")
-        if self.mode == "full":
-            if self.trainable_parameters != self.total_parameters:
-                raise ValueError("full Qwen policy must train every parameter")
-            if self.frozen_vision_block_indices or self.frozen_decoder_layer_indices:
-                raise ValueError("full Qwen policy cannot freeze formal layers")
-            if not self.all_qwen_parameters_trainable:
-                raise ValueError("full Qwen policy audit reports frozen parameters")
-        elif self.all_qwen_parameters_trainable:
-            raise ValueError("partial Qwen policy must leave at least one parameter frozen")
 
 
 @dataclass(frozen=True, slots=True)
@@ -463,136 +377,6 @@ def fully_unfreeze_qwen(model: nn.Module, config: ProjectConfig) -> FullUnfreeze
         decoder_parameters=groups["decoder"],
         decoder_layer_count=decoder_layer_count,
         all_qwen_parameters_trainable=all(parameter.requires_grad for _, parameter in named),
-    )
-
-
-def configure_qwen_outer_trainability(
-    model: nn.Module,
-    config: ProjectConfig,
-    policy: QwenOuterTrainabilityConfig,
-) -> QwenTrainabilityAudit:
-    """Apply one exact full or partial Outer-AdamW policy to Qwen3-VL."""
-
-    owner = getattr(model, "model", model)
-    assert_qwen_runtime_structure(owner, config)
-    visual = _resolve_path(owner, "visual")
-    language_model = _resolve_path(owner, "language_model")
-    vision_blocks = _module_sequence(_resolve_path(visual, "blocks"), "visual.blocks")
-    decoder_layers = _module_sequence(
-        _resolve_path(language_model, "layers"),
-        "language_model.layers",
-    )
-    if len(vision_blocks) != config.model.vision.depth:
-        raise ValueError("Qwen vision block count drifted before trainability selection")
-    if len(decoder_layers) != config.model.llm.num_layers:
-        raise ValueError("Qwen Decoder layer count drifted before trainability selection")
-    if policy.vision_freeze_first_blocks > len(vision_blocks):
-        raise ValueError("vision_freeze_first_blocks exceeds the loaded ViT depth")
-    if policy.decoder_train_last_layers > len(decoder_layers):
-        raise ValueError("decoder_train_last_layers exceeds the loaded Decoder depth")
-
-    if policy.mode == "full":
-        model.requires_grad_(True)
-    else:
-        model.requires_grad_(False)
-        trainable_modules: list[nn.Module] = []
-        trainable_modules.extend(vision_blocks[policy.vision_freeze_first_blocks :])
-        trainable_modules.extend(decoder_layers[-policy.decoder_train_last_layers :])
-        if policy.train_vision_patch_embed:
-            trainable_modules.append(
-                _module(_resolve_path(visual, "patch_embed"), "visual.patch_embed")
-            )
-        if policy.train_main_merger:
-            trainable_modules.append(_module(_resolve_path(visual, "merger"), "visual.merger"))
-        if policy.train_deepstack_mergers:
-            trainable_modules.extend(
-                _module_sequence(
-                    _resolve_path(visual, "deepstack_merger_list"),
-                    "visual.deepstack_merger_list",
-                )
-            )
-        if policy.train_language_model_norm:
-            trainable_modules.append(
-                _module(_resolve_path(language_model, "norm"), "language_model.norm")
-            )
-        input_embeddings = _optional_module(language_model, "embed_tokens")
-        lm_head = _optional_module(model, "lm_head")
-        if policy.train_input_embeddings:
-            if input_embeddings is None:
-                raise ValueError("partial Qwen policy requires language_model.embed_tokens")
-            trainable_modules.append(input_embeddings)
-        if policy.train_lm_head:
-            if lm_head is None:
-                raise ValueError("partial Qwen policy requires lm_head")
-            trainable_modules.append(lm_head)
-        if input_embeddings is not None and lm_head is not None:
-            tied = bool(
-                {id(parameter) for parameter in input_embeddings.parameters()}
-                & {id(parameter) for parameter in lm_head.parameters()}
-            )
-            if tied and policy.train_input_embeddings != policy.train_lm_head:
-                raise ValueError(
-                    "tied input embeddings/lm_head cannot use different trainability flags"
-                )
-        for module in trainable_modules:
-            module.requires_grad_(True)
-
-    named = tuple(model.named_parameters())
-    if not named:
-        raise ValueError("Qwen model exposes no parameters")
-    frozen_vision = tuple(
-        index
-        for index, block in enumerate(vision_blocks)
-        if not _all_parameters_trainable(block)
-    )
-    trainable_vision = tuple(
-        index for index, block in enumerate(vision_blocks) if _all_parameters_trainable(block)
-    )
-    frozen_decoder = tuple(
-        index
-        for index, layer in enumerate(decoder_layers)
-        if not _all_parameters_trainable(layer)
-    )
-    trainable_decoder = tuple(
-        index for index, layer in enumerate(decoder_layers) if _all_parameters_trainable(layer)
-    )
-    input_embeddings = _optional_module(language_model, "embed_tokens")
-    lm_head = _optional_module(model, "lm_head")
-    return QwenTrainabilityAudit(
-        mode=policy.mode,
-        total_parameters=sum(parameter.numel() for _, parameter in named),
-        trainable_parameters=sum(
-            parameter.numel() for _, parameter in named if parameter.requires_grad
-        ),
-        vision_block_count=len(vision_blocks),
-        frozen_vision_block_indices=frozen_vision,
-        trainable_vision_block_indices=trainable_vision,
-        decoder_layer_count=len(decoder_layers),
-        frozen_decoder_layer_indices=frozen_decoder,
-        trainable_decoder_layer_indices=trainable_decoder,
-        vision_patch_embed_trainable=_all_parameters_trainable(
-            _module(_resolve_path(visual, "patch_embed"), "visual.patch_embed")
-        ),
-        main_merger_trainable=_all_parameters_trainable(
-            _module(_resolve_path(visual, "merger"), "visual.merger")
-        ),
-        deepstack_mergers_trainable=all(
-            _all_parameters_trainable(module)
-            for module in _module_sequence(
-                _resolve_path(visual, "deepstack_merger_list"),
-                "visual.deepstack_merger_list",
-            )
-        ),
-        language_model_norm_trainable=_all_parameters_trainable(
-            _module(_resolve_path(language_model, "norm"), "language_model.norm")
-        ),
-        input_embeddings_trainable=(
-            input_embeddings is not None and _all_parameters_trainable(input_embeddings)
-        ),
-        lm_head_trainable=lm_head is not None and _all_parameters_trainable(lm_head),
-        all_qwen_parameters_trainable=all(
-            parameter.requires_grad for _, parameter in named
-        ),
     )
 
 
@@ -787,35 +571,6 @@ def _resolve_path(value: object, path: str) -> object:
     return current
 
 
-def _module(value: object, path: str) -> nn.Module:
-    if not isinstance(value, nn.Module):
-        raise TypeError(f"Qwen trainability path must be a module: {path}")
-    return value
-
-
-def _module_sequence(value: object, path: str) -> tuple[nn.Module, ...]:
-    if not isinstance(value, (list, tuple, nn.ModuleList)):
-        raise TypeError(f"Qwen trainability path must be a module sequence: {path}")
-    modules = tuple(value)
-    if not modules or any(not isinstance(module, nn.Module) for module in modules):
-        raise TypeError(f"Qwen trainability sequence is empty or invalid: {path}")
-    return modules
-
-
-def _optional_module(value: object, name: str) -> nn.Module | None:
-    module = getattr(value, name, None)
-    if module is None:
-        return None
-    return _module(module, name)
-
-
-def _all_parameters_trainable(module: nn.Module) -> bool:
-    parameters = tuple(module.parameters())
-    if not parameters:
-        raise ValueError("Qwen trainability audit encountered a parameterless module")
-    return all(parameter.requires_grad for parameter in parameters)
-
-
 def _parameter_count(value: object) -> int:
     if isinstance(value, nn.Module):
         return sum(parameter.numel() for parameter in value.parameters())
@@ -834,10 +589,7 @@ __all__ = [
     "LlamaFactorySymbols",
     "OuterCheckpointAudit",
     "ProductionTTTConfig",
-    "QwenOuterTrainabilityConfig",
-    "QwenTrainabilityAudit",
     "audit_outer_checkpoint_boundary",
-    "configure_qwen_outer_trainability",
     "environment_manifest",
     "fully_unfreeze_qwen",
     "import_llamafactory",

@@ -2055,10 +2055,7 @@ def _official_count_mismatch(label: OfficialWeakSupervision) -> bool:
 
 def _official_weak_term(losses: Sequence[Tensor], anchor: Tensor) -> OfficialWeakLossTerm:
     values = tuple(loss.float() for loss in losses)
-    # Preserve one identical all-head graph surface on every rank. The anchor is exactly
-    # zero-valued, so adding it never changes the objective, but it prevents a locally valid
-    # MIL/Task branch and a locally masked branch from presenting different ZeRO hook sets.
-    value = torch.stack(values).mean() + anchor if values else anchor
+    value = torch.stack(values).mean() if values else anchor
     return OfficialWeakLossTerm(value=value, valid_rows=len(values))
 
 

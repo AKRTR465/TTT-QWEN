@@ -15,7 +15,6 @@ from torch import nn
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.llamafactory_trainer import (
     CheckpointPolicy,
-    OuterParameterAudit,
     ProductionStage,
     ProductionTrainerRuntime,
     SegmentBackwardController,
@@ -42,9 +41,7 @@ from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryCheckoutAudit,
     LlamaFactorySymbols,
     ProductionTTTConfig,
-    QwenOuterTrainabilityConfig,
     audit_outer_checkpoint_boundary,
-    configure_qwen_outer_trainability,
     fully_unfreeze_qwen,
     initialize_outer_model_from_a2,
     load_outer_checkpoint,
@@ -76,41 +73,6 @@ class _OuterToy(nn.Module):
         super().__init__()
         self.backbone = nn.Linear(3, 4)
         self.predictor = nn.Linear(4, 4)
-
-
-def test_a5_outer_parameter_audit_allows_partial_qwen_with_full_state_training() -> None:
-    audit = OuterParameterAudit(
-        stage=ProductionStage.A5,
-        total_parameter_count=100,
-        trainable_parameter_count=70,
-        qwen_parameter_count=60,
-        qwen_trainable_count=30,
-        non_qwen_parameter_count=40,
-        non_qwen_trainable_count=40,
-        predictor_parameter_count=10,
-        predictor_trainable_count=10,
-        transient_parameter_names=(),
-        backbone_registered=True,
-    )
-
-    assert audit.qwen_trainable_count < audit.qwen_parameter_count
-
-
-def test_a5_outer_parameter_audit_rejects_frozen_state_parameter() -> None:
-    with pytest.raises(ValueError, match="every state, W0, and Predictor"):
-        OuterParameterAudit(
-            stage=ProductionStage.A5,
-            total_parameter_count=100,
-            trainable_parameter_count=69,
-            qwen_parameter_count=60,
-            qwen_trainable_count=30,
-            non_qwen_parameter_count=40,
-            non_qwen_trainable_count=39,
-            predictor_parameter_count=10,
-            predictor_trainable_count=10,
-            transient_parameter_names=(),
-            backbone_registered=True,
-        )
 
 
 def test_runtime_preprocess_cache_honors_explicit_namespace(
@@ -180,16 +142,11 @@ class _QwenOwnerToy(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.visual = nn.Module()
-        self.visual.patch_embed = nn.Linear(2, 2)
-        self.visual.blocks = nn.ModuleList([nn.Linear(2, 2) for _ in range(27)])
+        self.visual.stem = nn.Linear(2, 2)
         self.visual.merger = nn.Linear(2, 2)
-        self.visual.deepstack_merger_list = nn.ModuleList(
-            [nn.Linear(2, 2) for _ in range(3)]
-        )
+        self.visual.deepstack_merger_list = nn.ModuleList([nn.Linear(2, 2)])
         self.language_model = nn.Module()
-        self.language_model.embed_tokens = nn.Embedding(8, 2)
         self.language_model.layers = nn.ModuleList([nn.Linear(2, 2) for _ in range(36)])
-        self.language_model.norm = nn.LayerNorm(2)
 
 
 def _checkpoint_balance_state(
@@ -461,7 +418,6 @@ def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
         "stage",
         "project_config",
         "dataset_manifest",
-        "qwen_outer_trainability",
         "visual_cost_index",
         "support_prefetch_depth",
         "support_decode_coalesce",
@@ -605,21 +561,6 @@ def test_dual_query_visual_config_is_required_and_legacy_is_rejected() -> None:
         ProductionTTTConfig(**fields, query_decode_strategy="legacy_seek")
     with pytest.raises(ValueError, match="support_materialization"):
         ProductionTTTConfig(**{**fields, "support_materialization": "trainer_prefetch"})
-    with pytest.raises(ValueError, match="A2 requires full"):
-        ProductionTTTConfig(
-            **fields,
-            qwen_outer_trainability={
-                "mode": "partial",
-                "vision_freeze_first_blocks": 13,
-                "decoder_train_last_layers": 8,
-                "train_vision_patch_embed": False,
-                "train_main_merger": True,
-                "train_deepstack_mergers": True,
-                "train_language_model_norm": True,
-                "train_input_embeddings": False,
-                "train_lm_head": False,
-            },
-        )
 
 
 def test_split_query_specs_bound_state_to_16_and_answer_to_256(tmp_path: Path) -> None:
@@ -1193,48 +1134,6 @@ def test_training_yaml_expands_required_environment_and_keeps_a5_fresh(
         load_training_yaml(root / "configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml")
 
 
-def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    root = Path(__file__).parents[1]
-    monkeypatch.setenv("OUTPUT_DIR", "/tmp/output")
-    monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/dataset_manifest.json")
-    monkeypatch.setenv("A2_CHECKPOINT", "/tmp/a2-final")
-    monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
-    monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
-    monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
-
-    native, extension = load_training_yaml(
-        root / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
-    )
-    policy = extension.qwen_outer_trainability
-
-    assert native["finetuning_type"] == "full"
-    assert native["num_train_epochs"] == 4.0
-    assert native["save_strategy"] == "steps"
-    assert native["save_steps"] == 0.5
-    assert native["save_total_limit"] == 2
-    assert native["save_only_model"] is False
-    assert extension.stage == "a5"
-    assert policy.mode == "partial"
-    assert policy.vision_freeze_first_blocks == 13
-    assert policy.decoder_train_last_layers == 8
-    assert not policy.train_vision_patch_embed
-    assert policy.train_main_merger
-    assert policy.train_deepstack_mergers
-    assert policy.train_language_model_norm
-    assert not policy.train_input_embeddings
-    assert not policy.train_lm_head
-
-    launcher = (root / "scripts/h200/train_a5_vithalf_decoder8.sh").read_text(
-        encoding="utf-8"
-    )
-    assert 'TTT_CHECKPOINT_POLICY="epoch_2_and_epoch_4"' in launcher
-    assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
-    assert "[[ $# -eq 2 ]] || usage" in launcher
-    assert "<half_dataset_manifest.json>" in launcher
-
-
 def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -1290,65 +1189,6 @@ def test_full_unfreeze_accepts_qwen_module_list(
     assert audit.decoder_layer_count == 36
     assert audit.all_qwen_parameters_trainable
     assert all(parameter.requires_grad for parameter in wrapper.parameters())
-
-
-def test_partial_qwen_trainability_freezes_vit_prefix_and_decoder_prefix(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    owner = _QwenOwnerToy()
-    wrapper = nn.Module()
-    wrapper.model = owner
-    wrapper.lm_head = nn.Linear(2, 8, bias=False)
-    monkeypatch.setattr(
-        "ttt_svcbench_qwen.production_factory.assert_qwen_runtime_structure",
-        lambda _owner, _config: None,
-    )
-    policy = QwenOuterTrainabilityConfig(
-        mode="partial",
-        vision_freeze_first_blocks=13,
-        decoder_train_last_layers=8,
-        train_vision_patch_embed=False,
-        train_main_merger=True,
-        train_deepstack_mergers=True,
-        train_language_model_norm=True,
-        train_input_embeddings=False,
-        train_lm_head=False,
-    )
-
-    audit = configure_qwen_outer_trainability(wrapper, load_config(), policy)
-
-    assert audit.mode == "partial"
-    assert audit.frozen_vision_block_indices == tuple(range(13))
-    assert audit.trainable_vision_block_indices == tuple(range(13, 27))
-    assert audit.frozen_decoder_layer_indices == tuple(range(28))
-    assert audit.trainable_decoder_layer_indices == tuple(range(28, 36))
-    assert not audit.vision_patch_embed_trainable
-    assert audit.main_merger_trainable
-    assert audit.deepstack_mergers_trainable
-    assert audit.language_model_norm_trainable
-    assert not audit.input_embeddings_trainable
-    assert not audit.lm_head_trainable
-    assert audit.trainable_parameters < audit.total_parameters
-    assert all(
-        not parameter.requires_grad
-        for block in owner.visual.blocks[:13]
-        for parameter in block.parameters()
-    )
-    assert all(
-        parameter.requires_grad
-        for block in owner.visual.blocks[13:]
-        for parameter in block.parameters()
-    )
-    assert all(
-        not parameter.requires_grad
-        for layer in owner.language_model.layers[:28]
-        for parameter in layer.parameters()
-    )
-    assert all(
-        parameter.requires_grad
-        for layer in owner.language_model.layers[28:]
-        for parameter in layer.parameters()
-    )
 
 
 def test_a2_weight_initialization_is_strict_and_excludes_runtime_state(tmp_path: Path) -> None:

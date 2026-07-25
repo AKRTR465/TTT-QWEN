@@ -1377,73 +1377,6 @@ def _build_segment_buckets(
     return tuple(buckets), tuple(padding_records)
 
 
-def sample_a5_training_manifest(
-    manifest: ProductionEpisodeManifest,
-    *,
-    fraction: float,
-    seed: int,
-    world_size: int = 4,
-) -> ProductionEpisodeManifest:
-    """Select a deterministic random fraction of real A5 train episodes.
-
-    Validation episodes remain intact. Existing padding is discarded and rebuilt so every
-    retained segment/query-shape bucket is still rank-aligned for the production four-rank
-    sampler. Sampling weights are recomputed from the selected train subset rather than retaining
-    denominators from the full manifest.
-    """
-
-    if not isinstance(manifest, ProductionEpisodeManifest):
-        raise TypeError("A5 subset sampling requires a production episode manifest")
-    if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
-        raise ValueError("A5 subset fraction must be finite within (0, 1]")
-    if type(seed) is not int or seed < 0:
-        raise ValueError("A5 subset seed must be a non-negative integer")
-    if type(world_size) is not int or world_size <= 0:
-        raise ValueError("A5 subset world_size must be a positive integer")
-
-    real_train = tuple(
-        episode
-        for episode in manifest.episodes
-        if episode.split is EpisodeSplit.TRAIN and episode.loss_weight == 1.0
-    )
-    real_validation = tuple(
-        episode
-        for episode in manifest.episodes
-        if episode.split is EpisodeSplit.VALIDATION and episode.loss_weight == 1.0
-    )
-    if not real_train or not real_validation:
-        raise ValueError("A5 subset sampling requires real train and validation episodes")
-    selected_count = min(len(real_train), max(1, math.ceil(len(real_train) * fraction)))
-    population = tuple(sorted(real_train, key=lambda episode: episode.episode_id))
-    selected_ids = {
-        episode.episode_id
-        for episode in random.Random(seed).sample(list(population), k=selected_count)
-    }
-    selected_train = tuple(
-        episode for episode in real_train if episode.episode_id in selected_ids
-    )
-
-    def reweight(rows: tuple[A5EpisodeRecord, ...]) -> tuple[A5EpisodeRecord, ...]:
-        query_counts = Counter[str]()
-        for episode in rows:
-            query_counts[episode.task_class] += episode.query_count
-        return tuple(
-            replace(
-                episode,
-                sampling_weight=episode.query_count / query_counts[episode.task_class],
-            )
-            for episode in rows
-        )
-
-    real_episodes = (*reweight(selected_train), *reweight(real_validation))
-    buckets, padding = _build_segment_buckets(tuple(real_episodes), world_size=world_size)
-    return replace(
-        manifest,
-        episodes=(*real_episodes, *padding),
-        buckets=buckets,
-    )
-
-
 def _split_map(folds: FoldManifest, fold_index: int) -> dict[str, EpisodeSplit]:
     fold = folds.folds[fold_index]
     result = {video_id: EpisodeSplit.TRAIN for video_id in fold.train_video_ids}
@@ -1786,6 +1719,5 @@ __all__ = [
     "load_visual_cost_index",
     "official_operator",
     "official_time_mode",
-    "sample_a5_training_manifest",
     "write_production_episode_manifest",
 ]

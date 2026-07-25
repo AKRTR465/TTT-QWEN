@@ -15,8 +15,6 @@ from ttt_svcbench_qwen.fast_ttt import (
     FastWeightsState,
     build_fast_ttt_adapter,
     collect_fast_parameters,
-    deferred_fast_vjp_loss,
-    make_query_proxy_fast_state,
     reanchor_fast_state,
 )
 from ttt_svcbench_qwen.qwen_adapter import QwenVideoFeatureBoundary
@@ -471,105 +469,6 @@ def test_fast_state_rejects_alias_nonfinite_nonleaf_and_invalid_metadata() -> No
             (0.0,),
             (0.0,),
         )
-
-
-def test_fast_state_accepts_disjoint_w0_views_from_one_flattened_allocation() -> None:
-    matrix_elements = 768 * 768
-    flat = torch.zeros(2 * matrix_elements)
-    w0_1 = flat[:matrix_elements].view(768, 768)
-    w0_2 = flat[matrix_elements:].view(768, 768)
-    assert storage_pointer(w0_1) == storage_pointer(w0_2)
-    assert w0_1.storage_offset() != w0_2.storage_offset()
-
-    state = FastWeightsState(
-        w0_1=w0_1,
-        w0_2=w0_2,
-        w_t_1=w0_1.clone().requires_grad_(True),
-        w_t_2=w0_2.clone().requires_grad_(True),
-        fast_version=0,
-        update_count=0,
-        skip_count=0,
-    )
-
-    flat_pointer = flat.untyped_storage().data_ptr()
-    assert state.fast_parameters[0].untyped_storage().data_ptr() != flat_pointer
-    assert state.fast_parameters[1].untyped_storage().data_ptr() != flat_pointer
-
-
-@pytest.mark.parametrize("query_count", (2, 4, 15))
-def test_query_proxy_deferred_vjp_matches_one_shot_second_order_gradient(
-    query_count: int,
-) -> None:
-    reference = make_adapter(dtype=torch.float64)
-    streamed = make_adapter(dtype=torch.float64)
-    streamed.load_state_dict(reference.state_dict())
-    direct_reference = nn.Parameter(torch.tensor(0.125, dtype=torch.float64))
-    direct_streamed = nn.Parameter(direct_reference.detach().clone())
-
-    def updated_state(adapter: FastTTTAdapter) -> FastWeightsState:
-        initial = adapter.initialize_fast_state(differentiable=True)
-        return FastWeightsState(
-            w0_1=initial.w0_1,
-            w0_2=initial.w0_2,
-            w_t_1=initial.w_t_1 - 0.01 * torch.sin(initial.w_t_1),
-            w_t_2=initial.w_t_2 - 0.02 * torch.tanh(initial.w_t_2),
-            fast_version=1,
-            update_count=1,
-            skip_count=0,
-            differentiable=True,
-        )
-
-    reference_state = updated_state(reference)
-    cases = tuple((0.5 + index / 7.0, -0.25 + index / 11.0) for index in range(query_count))
-    reference_losses = tuple(
-        (
-            scale * reference_state.w_t_1[:2, :3]
-            + reference_state.w_t_2[:2, :3]
-            + direct_reference
-            - target
-        )
-        .square()
-        .mean()
-        for scale, target in cases
-    )
-    torch.stack(reference_losses).mean().backward()
-
-    streamed_state = updated_state(streamed)
-    accumulated = tuple(
-        torch.zeros_like(value, dtype=torch.float64)
-        for value in streamed_state.fast_parameters
-    )
-    for scale, target in cases:
-        proxy, audit = make_query_proxy_fast_state(streamed_state)
-        assert audit.max_abs_value_drift == (0.0, 0.0)
-        query_loss = (
-            (
-                scale * proxy.w_t_1[:2, :3]
-                + proxy.w_t_2[:2, :3]
-                + direct_streamed
-                - target
-            )
-            .square()
-            .mean()
-            / float(query_count)
-        )
-        query_loss.backward()
-        for total, value in zip(accumulated, proxy.fast_parameters, strict=True):
-            assert value.grad is not None
-            total.add_(value.grad.detach())
-    deferred_fast_vjp_loss((streamed_state,), accumulated).backward()
-
-    assert reference.w0_1.grad is not None and streamed.w0_1.grad is not None
-    assert reference.w0_2.grad is not None and streamed.w0_2.grad is not None
-    assert direct_reference.grad is not None and direct_streamed.grad is not None
-    assert torch.allclose(streamed.w0_1.grad, reference.w0_1.grad, atol=1.0e-12, rtol=1.0e-12)
-    assert torch.allclose(streamed.w0_2.grad, reference.w0_2.grad, atol=1.0e-12, rtol=1.0e-12)
-    assert torch.allclose(
-        direct_streamed.grad,
-        direct_reference.grad,
-        atol=1.0e-12,
-        rtol=1.0e-12,
-    )
 
 
 def test_builder_requires_validated_project_config() -> None:

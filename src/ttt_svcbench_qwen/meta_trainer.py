@@ -27,8 +27,6 @@ from ttt_svcbench_qwen.fast_ttt import (
     FastTTTForwardAudit,
     FastWeightsState,
     OptimizerRuntimeState,
-    deferred_fast_vjp_loss,
-    make_query_proxy_fast_state,
     reanchor_fast_state,
 )
 from ttt_svcbench_qwen.functional_sgd import (
@@ -80,7 +78,7 @@ from ttt_svcbench_qwen.outer_loss_balance import (
     OfficialWeakOuterLossComposer,
 )
 from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput
-from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase, trace_event
+from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase
 from ttt_svcbench_qwen.stage_a_runtime import StageAWriteAudit
 from ttt_svcbench_qwen.stage_a_targets import (
     OfficialWeakStateLossOutput,
@@ -95,11 +93,7 @@ from ttt_svcbench_qwen.trainer import (
     StageAEpisodeAnswerInputs,
     StageASupervisionBatch,
 )
-from ttt_svcbench_qwen.training_context import (
-    QueryActivationOffloadBudget,
-    QueryActivationOffloadScope,
-    query_activation_context,
-)
+from ttt_svcbench_qwen.training_context import query_activation_context
 
 _SUPPORTED_TERMS = ("pred", "identity", "event")
 _CI_Z_95 = 1.959963984540054
@@ -862,9 +856,6 @@ class TruncatedQueryPointAudit:
     metrics: QueryMetricSnapshot
     prefill_count: int
     observation_immutable: bool
-    proxy_gradient_norms: tuple[float, ...]
-    proxy_storage_isolated: bool
-    proxy_max_abs_value_drift: float
 
     def __post_init__(self) -> None:
         if type(self.query_index) is not int or self.query_index < 0:
@@ -877,17 +868,6 @@ class TruncatedQueryPointAudit:
             raise ValueError("each production Query must execute exactly one prefill")
         if not self.observation_immutable:
             raise ValueError("production Query answer mutated its observation")
-        if not self.proxy_gradient_norms or any(
-            not math.isfinite(value) or value < 0.0 for value in self.proxy_gradient_norms
-        ):
-            raise ValueError("Query proxy gradient norms must be finite and non-negative")
-        if not self.proxy_storage_isolated:
-            raise ValueError("Query proxy fast matrices must use isolated storage")
-        if (
-            not math.isfinite(self.proxy_max_abs_value_drift)
-            or self.proxy_max_abs_value_drift != 0.0
-        ):
-            raise ValueError("Query proxy fast values must exactly match authoritative W_after")
 
 
 @dataclass(frozen=True, slots=True)
@@ -895,7 +875,6 @@ class TruncatedMetaTTTEpisodeAudit:
     """Bounded-memory evidence for an otherwise unbounded numeric fast trajectory."""
 
     active_terms: tuple[str, ...]
-    loss_weight: float
     support_count: int
     query_count: int
     prewarm_count: int
@@ -903,7 +882,6 @@ class TruncatedMetaTTTEpisodeAudit:
     segment_count: int
     backward_count: int
     query_backward_count: int
-    deferred_vjp_backward_count: int
     truncation_count: int
     maximum_retained_support_graphs: int
     update_attempt_count: int
@@ -918,21 +896,17 @@ class TruncatedMetaTTTEpisodeAudit:
     queries: tuple[TruncatedQueryPointAudit, ...]
 
     def __post_init__(self) -> None:
-        if self.loss_weight not in (0.0, 1.0):
-            raise ValueError("A5 episode audit loss weight must be deterministic zero or one")
         if self.prewarm_count != 1:
             raise ValueError("A5 production episodes require exactly one no-update prewarm")
         if self.truncation_horizon <= 0:
             raise ValueError("truncation horizon must be positive")
         expected_segments = math.ceil(self.support_count / self.truncation_horizon)
         expected_truncations = self.support_count // self.truncation_horizon
-        expected_backwards = expected_segments + self.query_count
+        expected_backwards = expected_segments + self.query_count - 1
         if self.segment_count != expected_segments:
             raise ValueError("A5 graph segment count drifted from ceil(T/K)")
         if self.query_backward_count != self.query_count:
             raise ValueError("A5 must backward every Query point exactly once")
-        if self.deferred_vjp_backward_count != 1:
-            raise ValueError("A5 must execute exactly one deferred fast-state VJP backward")
         if self.backward_count != expected_backwards:
             raise ValueError("A5 streamed Query/segment backward count drifted")
         if self.truncation_count != expected_truncations:
@@ -1056,31 +1030,16 @@ class MetaTTTEpisodeRunner:
         episode: MetaTTTEpisode,
         *,
         backward: Callable[[Tensor, bool], None] | None = None,
-        backward_gradient_scale: float = 1.0,
-        episode_loss_weight: float = 1.0,
     ) -> TruncatedMetaTTTEpisodeOutput:
         """Run production A5 with exact second order inside K-step graph segments.
 
         ``backward`` is injectable so LLaMA-Factory/Accelerate/DeepSpeed can own the
-        distributed backward call. It is invoked once per non-final Support segment, once per
-        Query-local proxy graph, and once for the final Support plus deferred fast-state VJP.
-        This method never executes an Outer optimizer step.
+        distributed backward call. It is invoked once per non-final Support segment and once
+        per Query; the final Query includes the final Support auxiliary loss. This method never
+        executes an Outer optimizer step.
         """
 
         self._validate_truncated_episode(episode)
-        if (
-            not isinstance(backward_gradient_scale, int | float)
-            or not math.isfinite(float(backward_gradient_scale))
-            or float(backward_gradient_scale) <= 0.0
-        ):
-            raise ValueError("backward_gradient_scale must be finite and positive")
-        if (
-            not isinstance(episode_loss_weight, int | float)
-            or not math.isfinite(float(episode_loss_weight))
-            or float(episode_loss_weight) not in (0.0, 1.0)
-        ):
-            raise ValueError("A5 episode loss weight must be deterministic zero or one")
-        episode_weight = float(episode_loss_weight)
         backward_fn = backward or _plain_backward
         self.model.train()
         self.predictor.train()
@@ -1100,31 +1059,12 @@ class MetaTTTEpisodeRunner:
         lifecycle = PrefillLifecycle(episode.owner)
 
         prewarm = cast(MetaCausalChunk, episode.prewarm_chunk)
-        segment_query: PreparedQueryOutput | None = None
-        prewarm_query: PreparedQueryOutput | None = None
-        if self.query_encoder_reuse:
-            first_support = episode.support_chunks[0]
-            if query_reuse_key(prewarm.request.query_input) == query_reuse_key(
-                first_support.request.query_input
-            ):
-                # Build the first differentiable Query graph once, then give prewarm only a
-                # detached view of those exact values.  Recomputing prewarm under no-grad and
-                # Support under grad can select different BF16 kernels, so bitwise cache-owner
-                # signatures are not guaranteed even with identical dropout seeds.
-                segment_query = self._prepare_query(first_support, adapted, with_grad=True)
-                prewarm_query = (
-                    segment_query.detached()
-                    if isinstance(segment_query.value, QueryEncoderOutput)
-                    else segment_query
-                )
-                prewarm_query.validate_for(prewarm.request.query_input)
         prewarm_observation, prewarm_fast_audit = self._observe(
             prewarm,
             adapted,
             lifecycle,
             seed=episode.seed,
             with_grad=False,
-            prepared_query=prewarm_query,
         )
         if any(prewarm_fast_audit.fast_versions):
             raise ValueError("the no-update prewarm must observe the initial W0 generation")
@@ -1135,6 +1075,7 @@ class MetaTTTEpisodeRunner:
         )
         del prewarm_observation
 
+        segment_query: PreparedQueryOutput | None = None
         active_segment: tuple[MetaCausalChunk, ...] = ()
         for support_index in range(support_count):
             segment_offset = support_index % horizon
@@ -1157,11 +1098,7 @@ class MetaTTTEpisodeRunner:
                     self._validate_prepared_segment(active_segment, prepared_segment)
                     active_segment = prepared_segment
             chunk = active_segment[segment_offset]
-            if (
-                self.query_encoder_reuse
-                and support_index % horizon == 0
-                and segment_query is None
-            ):
+            if self.query_encoder_reuse and support_index % horizon == 0:
                 segment_query = self._prepare_query(chunk, adapted, with_grad=True)
             elif segment_query is not None:
                 segment_query.validate_for(chunk.request.query_input)
@@ -1219,8 +1156,7 @@ class MetaTTTEpisodeRunner:
             final_support = support_index + 1 == support_count
             if boundary_reached and not final_support:
                 segment_loss = (
-                    episode_weight
-                    * auxiliary_scale
+                    auxiliary_scale
                     * torch.stack(tuple(output.total for output in segment_outputs)).sum()
                 )
                 backward_fn(segment_loss, False)
@@ -1281,62 +1217,37 @@ class MetaTTTEpisodeRunner:
                 )
                 output = self._answer(query, observation, lifecycle, with_grad=False)
                 calibration.append(self._query_objective(query, output, ()))
-            self._balance_query_objectives(
-                tuple(calibration),
-                calibration=True,
-                statistical_weight=episode_weight,
-            )
+            self._balance_query_objectives(tuple(calibration), calibration=True)
             balance_audit = self.last_balance_audit
             calibration.clear()
             calibration_queries.clear()
 
         final_segment_loss = (
-            episode_weight
-            * auxiliary_scale
-            * torch.stack(tuple(output.total for output in segment_outputs)).sum()
+            auxiliary_scale * torch.stack(tuple(output.total for output in segment_outputs)).sum()
         )
         query_audits: list[TruncatedQueryPointAudit] = []
         streamed_gradient_statistics: list[Tensor] = []
+        prepared_queries: dict[tuple[int, str, str], PreparedQueryOutput] = {}
         query_loss_detached = final_segment_loss.detach().new_zeros(())
         query_count = len(episode.query_points)
-        authoritative_fast_states = query_runtime_snapshot.fast_states
-        deferred_gradients = tuple(
-            torch.zeros_like(value, dtype=torch.float32)
-            for state in authoritative_fast_states
-            for value in state.fast_parameters
-        )
-        query_offload_budget = (
-            QueryActivationOffloadBudget.from_environment()
-            if self.query_activation_offload
-            else None
-        )
         for query_index, query in enumerate(episode.query_points):
-            proxy_pairs = tuple(
-                make_query_proxy_fast_state(state) for state in authoritative_fast_states
-            )
-            proxy_states = tuple(state for state, _ in proxy_pairs)
-            proxy_audits = tuple(audit for _, audit in proxy_pairs)
-            query_trajectory = _Trajectory(
-                _fork_retrieval_runtime(query_runtime_snapshot).with_fast_states(proxy_states)
-            )
+            adapted.runtime = _fork_retrieval_runtime(query_runtime_snapshot)
             query_lifecycle = PrefillLifecycle(episode.owner)
             prepared_query: PreparedQueryOutput | None = None
             if self.query_encoder_reuse:
-                # A grad-bearing PreparedQueryOutput belongs to exactly one local Query graph.
-                # Reusing it after a no-retain backward would reference a consumed graph.
-                prepared_query = self._prepare_query(
-                    query.chunk,
-                    query_trajectory,
-                    with_grad=True,
-                )
-            activation_scope = query_activation_context(
-                self.query_activation_offload,
-                shared_budget=query_offload_budget,
-            )
-            with activation_scope:
+                key = query_reuse_key(query.chunk.request.query_input)
+                prepared_query = prepared_queries.get(key)
+                if prepared_query is None:
+                    prepared_query = self._prepare_query(
+                        query.chunk,
+                        adapted,
+                        with_grad=True,
+                    )
+                    prepared_queries[key] = prepared_query
+            with query_activation_context(self.query_activation_offload):
                 observation, _ = self._observe(
                     query.chunk,
-                    query_trajectory,
+                    adapted,
                     query_lifecycle,
                     seed=episode.seed + 10_000 + query_index,
                     with_grad=True,
@@ -1346,14 +1257,12 @@ class MetaTTTEpisodeRunner:
                 output = self._answer(query, observation, query_lifecycle, with_grad=True)
             immutable = observation_versions == _tensor_version_signature(observation)
             objective = self._query_objective(query, output, ())
-            balanced_outer: OuterLossOutput | None = None
             if balance_audit is not None:
                 streamed_gradient_statistics.append(
                     self.outer_composer.measure_streamed_gradients(
                         cast(OfficialWeakStateLossOutput, objective.state),
                         objective.gradient_anchors,
                         balance_audit,
-                        statistical_weight=episode_weight,
                     )
                 )
                 balanced_outer = self.outer_composer.compose_one_from_audit(
@@ -1366,28 +1275,15 @@ class MetaTTTEpisodeRunner:
                     objective,
                     outer=balanced_outer,
                 )
-            normalized_query_loss = (
-                episode_weight * objective.outer.outer / float(query_count)
-            )
+            normalized_query_loss = objective.outer.outer / float(query_count)
             query_loss_detached = query_loss_detached + normalized_query_loss.detach()
-            backward_fn(normalized_query_loss, False)
-            captured_gradients, proxy_gradient_norms = _capture_query_proxy_gradients(
-                proxy_states,
-                backward_gradient_scale=float(backward_gradient_scale),
+            is_final_query = query_index + 1 == query_count
+            backward_loss = (
+                normalized_query_loss + final_segment_loss
+                if is_final_query
+                else normalized_query_loss
             )
-            if isinstance(activation_scope, QueryActivationOffloadScope):
-                activation_scope.release()
-            for accumulator, gradient in zip(
-                deferred_gradients,
-                captured_gradients,
-                strict=True,
-            ):
-                accumulator.add_(gradient)
-            maximum_proxy_drift = max(
-                value
-                for audit in proxy_audits
-                for value in audit.max_abs_value_drift
-            )
+            backward_fn(backward_loss, not is_final_query)
             query_audits.append(
                 TruncatedQueryPointAudit(
                     query_index=query_index,
@@ -1395,63 +1291,13 @@ class MetaTTTEpisodeRunner:
                     case_id=query.case_id,
                     query_time=query.query_time,
                     observation_end_time=query.chunk.end_time,
-                    fast_versions=tuple(state.fast_version for state in proxy_states),
+                    fast_versions=tuple(state.fast_version for state in adapted.fast_states),
                     metrics=objective.metrics,
                     prefill_count=query_lifecycle.audit().prefill_count,
                     observation_immutable=immutable,
-                    proxy_gradient_norms=proxy_gradient_norms,
-                    proxy_storage_isolated=all(
-                        audit.storage_isolated for audit in proxy_audits
-                    ),
-                    proxy_max_abs_value_drift=maximum_proxy_drift,
                 )
             )
-            device = proxy_states[0].w_t_1.device
-            for state in proxy_states:
-                state.w_t_1.grad = None
-                state.w_t_2.grad = None
-            del (
-                captured_gradients,
-                normalized_query_loss,
-                objective,
-                output,
-                observation,
-                prepared_query,
-                query_lifecycle,
-                query_trajectory,
-                activation_scope,
-                proxy_states,
-                proxy_audits,
-                proxy_pairs,
-                balanced_outer,
-            )
-            trace_event(
-                "a5_query_local_graph_released",
-                query_index=query_index,
-                query_count=query_count,
-                cuda_allocated_bytes=(
-                    torch.cuda.memory_allocated(device)
-                    if device.type == "cuda"
-                    else 0
-                ),
-                cuda_reserved_bytes=(
-                    torch.cuda.memory_reserved(device)
-                    if device.type == "cuda"
-                    else 0
-                ),
-                offload_live_bytes=(
-                    query_offload_budget.claimed_bytes
-                    if query_offload_budget is not None
-                    else 0
-                ),
-            )
-
-        deferred_vjp = deferred_fast_vjp_loss(
-            authoritative_fast_states,
-            deferred_gradients,
-        )
-        backward_fn(final_segment_loss + deferred_vjp, False)
-        del deferred_vjp, deferred_gradients
+            del backward_loss, normalized_query_loss, objective, output, observation
 
         if balance_audit is not None:
             balance_audit = self.outer_composer.commit_streamed_gradients(
@@ -1483,19 +1329,16 @@ class MetaTTTEpisodeRunner:
         updated = sum(sum(audit.did_update) for audit in update_audits)
         detached_query = query_loss_detached.detach().clone()
         detached_auxiliary = (auxiliary_scale * support_total_detached).detach().clone()
-        detached_auxiliary.mul_(episode_weight)
         detached_total = (detached_query + detached_auxiliary).detach().clone()
         audit = TruncatedMetaTTTEpisodeAudit(
             active_terms=self.enabled_terms,
-            loss_weight=episode_weight,
             support_count=support_count,
             query_count=len(episode.query_points),
             prewarm_count=1,
             truncation_horizon=horizon,
             segment_count=len(segment_audits),
-            backward_count=len(segment_audits) + query_count,
+            backward_count=len(segment_audits) + query_count - 1,
             query_backward_count=query_count,
-            deferred_vjp_backward_count=1,
             truncation_count=support_count // horizon,
             maximum_retained_support_graphs=maximum_retained,
             update_attempt_count=attempted,
@@ -1614,25 +1457,6 @@ class MetaTTTEpisodeRunner:
                 query_input,
                 inference=chunk.request.inference,
             )
-        cache = trajectory.runtime.temporal_cache
-        video_input = chunk.request.video_input
-        spec = getattr(video_input, "spec", video_input)
-        reset_soft_state = bool(getattr(spec, "reset_soft_state", False))
-        if (
-            isinstance(output, QueryEncoderOutput)
-            and cache is not None
-            and not reset_soft_state
-        ):
-            output = replace(
-                output,
-                embeddings=replace(
-                    output.embeddings,
-                    q_target=_reanchor_query_signature(
-                        output.q_target,
-                        cache.query_signatures,
-                    ),
-                ),
-            )
         return PreparedQueryOutput.bind(query_input, output)
 
     @staticmethod
@@ -1724,7 +1548,6 @@ class MetaTTTEpisodeRunner:
         objectives: tuple[MetaQueryObjective, ...],
         *,
         calibration: bool = False,
-        statistical_weight: float = 1.0,
     ) -> tuple[MetaQueryObjective, ...]:
         if not objectives:
             raise ValueError("Meta-TTT requires at least one Query objective")
@@ -1741,14 +1564,12 @@ class MetaTTTEpisodeRunner:
             self.outer_composer.calibrate(
                 tuple(item.answer for item in objectives),
                 states,
-                statistical_weights=(statistical_weight,) * len(objectives),
             )
             if calibration
             else self.outer_composer.compose(
                 tuple(item.answer for item in objectives),
                 states,
                 gradient_anchors=tuple(item.gradient_anchors for item in objectives),
-                statistical_weights=(statistical_weight,) * len(objectives),
             )
         )
         self.last_balance_audit = balanced.audit
@@ -1961,30 +1782,6 @@ def _plain_backward(loss: Tensor, retain_graph: bool = False) -> None:
     loss.backward(retain_graph=retain_graph)
 
 
-def _capture_query_proxy_gradients(
-    states: Sequence[FastWeightsState],
-    *,
-    backward_gradient_scale: float,
-) -> tuple[tuple[Tensor, ...], tuple[float, ...]]:
-    """Capture unscaled Query cotangents before releasing its isolated proxy state."""
-
-    values = tuple(value for state in states for value in state.fast_parameters)
-    if not values:
-        raise ValueError("Query proxy gradient capture requires fast matrices")
-    gradients: list[Tensor] = []
-    norms: list[float] = []
-    for value in values:
-        gradient = value.grad
-        if gradient is None:
-            raise ValueError("Query loss did not produce a gradient for every proxy fast matrix")
-        unscaled = gradient.detach().float().clone().div_(backward_gradient_scale)
-        if not bool(torch.isfinite(unscaled).all()):
-            raise ValueError("Query proxy gradient must be finite after backward unscale")
-        gradients.append(unscaled)
-        norms.append(float(torch.linalg.vector_norm(unscaled).cpu().item()))
-    return tuple(gradients), tuple(norms)
-
-
 class _SeededRNG:
     def __init__(self, seed: int, devices: tuple[int, ...]) -> None:
         self.seed = seed
@@ -2009,34 +1806,6 @@ def _seeded_rng(seed: int, states: Sequence[FastWeightsState]) -> _SeededRNG:
         )
     )
     return _SeededRNG(seed, devices)
-
-
-def _reanchor_query_signature(current: Tensor, reference: Tensor) -> Tensor:
-    """Keep one episode's Query signature bitwise stable without cutting its new graph."""
-
-    if (
-        current.shape != reference.shape
-        or current.dtype != reference.dtype
-        or current.device != reference.device
-        or not torch.is_floating_point(current)
-    ):
-        raise ValueError("Query signature reanchor requires aligned floating tensors")
-    current_fp32 = current.detach().float()
-    reference_fp32 = reference.detach().float()
-    tolerance = max(5.0e-4, 2.0 * float(torch.finfo(current.dtype).eps))
-    cosine = torch.nn.functional.cosine_similarity(current_fp32, reference_fp32, dim=-1)
-    if not torch.allclose(current_fp32, reference_fp32, atol=tolerance, rtol=0.0) or bool(
-        torch.any(cosine < 0.999)
-    ):
-        maximum_delta = float((current_fp32 - reference_fp32).abs().max().item())
-        minimum_cosine = float(cosine.min().item())
-        raise ValueError(
-            "Query signature changed semantically within one episode "
-            f"(max_abs_delta={maximum_delta:.6g}, min_cosine={minimum_cosine:.6g})"
-        )
-    # Forward value is exactly the authoritative cache signature.  The zero-valued residual
-    # preserves an identity gradient to the freshly recomputed Query graph.
-    return reference.detach() + (current - current.detach())
 
 
 def _contains_grad_tensor(value: object, seen: set[int] | None = None) -> bool:

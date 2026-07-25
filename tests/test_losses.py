@@ -307,26 +307,6 @@ def test_identity_current_to_previous_numeric_stopgrad_and_unit_norm() -> None:
         _identity_input(bad, previous.detach(), [IdentityPairStatus.MATCHED] * 3)
 
 
-def test_identity_unit_norm_validation_respects_bfloat16_quantization() -> None:
-    torch.manual_seed(17)
-    current = F.normalize(torch.randn(3, 256), dim=-1).to(torch.bfloat16)
-    previous = F.normalize(torch.randn(3, 256), dim=-1).to(torch.bfloat16)
-
-    inputs = _identity_input(
-        current,
-        previous,
-        [IdentityPairStatus.MATCHED] * 3,
-    )
-    output = compute_identity_consistency_loss(inputs)
-
-    assert torch.isfinite(output.term.value)
-
-    invalid = current.clone()
-    invalid[0].mul_(1.25)
-    with pytest.raises(ValueError, match="unit L2"):
-        _identity_input(invalid, previous, [IdentityPairStatus.MATCHED] * 3)
-
-
 def test_identity_status_audit_distinguishes_invalid_source_and_padding() -> None:
     current = _unit_rows([0])
     previous = _unit_rows([0])
