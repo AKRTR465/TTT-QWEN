@@ -1463,6 +1463,63 @@ def test_deepspeed_segment_backward_steps_only_after_all_segments() -> None:
         controller.finalize()
 
 
+def test_a5_segment_backward_anchors_every_trainable_parameter_on_every_call() -> None:
+    class _ConditionalModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.always = nn.Parameter(torch.tensor(2.0))
+            self.conditional = nn.Parameter(torch.tensor(3.0))
+            self.frozen = nn.Parameter(torch.tensor(4.0), requires_grad=False)
+
+    model = _ConditionalModel()
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.boundaries: list[bool] = []
+            self.backward_gradients: list[tuple[float, float, None]] = []
+
+        def set_gradient_accumulation_boundary(self, *, is_boundary: bool) -> None:
+            self.boundaries.append(is_boundary)
+
+        def backward(self, loss: torch.Tensor, **kwargs: object) -> None:
+            loss.backward(**kwargs)
+            assert model.always.grad is not None
+            assert model.conditional.grad is not None
+            self.backward_gradients.append(
+                (
+                    float(model.always.grad),
+                    float(model.conditional.grad),
+                    model.frozen.grad,
+                )
+            )
+            model.always.grad = None
+            model.conditional.grad = None
+
+        @staticmethod
+        def step() -> None:
+            return None
+
+    engine = _Engine()
+    controller = SegmentBackwardController(
+        SimpleNamespace(
+            distributed_type="DistributedType.DEEPSPEED",
+            deepspeed_engine_wrapped=SimpleNamespace(engine=engine),
+        ),
+        model,
+        expected_count=2,
+    )
+
+    controller.backward(model.always.square())
+    controller.backward(model.conditional.square())
+    controller.finalize()
+
+    assert engine.boundaries == [False, True]
+    assert engine.backward_gradients == [
+        (4.0, 0.0, None),
+        (0.0, 6.0, None),
+    ]
+
+
 def test_a2_controlled_wrapper_clips_only_at_the_final_ga_boundary() -> None:
     events: list[object] = []
 

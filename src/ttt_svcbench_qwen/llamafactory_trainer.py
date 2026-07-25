@@ -167,6 +167,9 @@ class SegmentBackwardController:
         self.backward_count = 0
         self.step_count = 0
         self.gradient_controller = gradient_controller
+        self._rank_stable_parameters = _unique_trainable_parameters(model)
+        if not self._rank_stable_parameters:
+            raise ValueError("A5 segment controller requires trainable Outer parameters")
         self.semantic_projector_auditor = (
             _SemanticProjectorStepAuditor(
                 model, delta_audit_steps=semantic_projector_delta_audit_steps
@@ -234,6 +237,10 @@ class SegmentBackwardController:
                 )
             elif loss.ndim != 0 or not loss.requires_grad:
                 raise ValueError("A5 segment loss must be one differentiable scalar Tensor")
+            loss = _attach_rank_stable_zero_anchor(
+                loss,
+                self._rank_stable_parameters,
+            )
             if self.is_deepspeed:
                 engine = cast(Any, self.engine)
                 is_final_segment = self.backward_count + 1 == self.expected_count
@@ -271,6 +278,49 @@ class SegmentBackwardController:
         if self.semantic_projector_auditor is None:
             return {}
         return dict(self.semantic_projector_auditor.last_metrics)
+
+
+def _unique_trainable_parameters(model: nn.Module) -> tuple[nn.Parameter, ...]:
+    """Return every trainable Outer parameter once in deterministic model order."""
+
+    parameters: list[nn.Parameter] = []
+    seen: set[int] = set()
+    for parameter in model.parameters():
+        parameter_id = id(parameter)
+        if not parameter.requires_grad or parameter_id in seen:
+            continue
+        if parameter.numel() <= 0:
+            raise ValueError("A5 trainable Outer parameters cannot be empty")
+        seen.add(parameter_id)
+        parameters.append(parameter)
+    return tuple(parameters)
+
+
+def _attach_rank_stable_zero_anchor(
+    loss: Tensor,
+    parameters: Sequence[nn.Parameter],
+) -> Tensor:
+    """Expose an identical ZeRO-2 gradient-hook surface on every segmented backward.
+
+    A5 intentionally executes several backwards per episode.  Official-weak routing and
+    retrieval validity are sample-dependent, so two ranks can otherwise touch different
+    parameters during the same backward call.  ZeRO-2 then launches different reduction
+    sequences and deadlocks.  One differentiable zero scalar from every trainable parameter
+    makes the hook set deterministic without changing the forward value or any gradient.
+    The anchor is rebuilt for every call because a completed backward frees its graph.
+    """
+
+    if loss.ndim != 0 or not loss.requires_grad:
+        raise ValueError("rank-stable anchor requires one differentiable scalar loss")
+    anchor = loss.new_zeros(())
+    for parameter in parameters:
+        if not parameter.requires_grad:
+            raise RuntimeError("rank-stable A5 parameter became frozen after controller setup")
+        if parameter.device != loss.device:
+            raise RuntimeError("rank-stable A5 parameter and loss must share one device")
+        first = parameter if parameter.ndim == 0 else parameter[(0,) * parameter.ndim]
+        anchor = anchor + first.to(dtype=loss.dtype) * 0.0
+    return loss + anchor
 
 
 class _SemanticProjectorStepAuditor:
