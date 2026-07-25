@@ -1521,17 +1521,14 @@ def test_a5_segment_backward_anchors_every_trainable_parameter_on_every_call() -
 
 
 def test_a5_rank_stable_optimizer_anchor_excludes_always_used_qwen_group() -> None:
-    qwen = nn.Parameter(torch.tensor(1.0))
-    state = nn.Parameter(torch.tensor(2.0))
-    predictor = nn.Parameter(torch.tensor(3.0))
-    optimizer = torch.optim.SGD(
-        [
-            {"params": [qwen], "group_name": "qwen"},
-            {"params": [state], "group_name": "state_shared"},
-            {"params": [predictor], "group_name": "predictor"},
-        ],
-        lr=1.0e-3,
-    )
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.qwen = nn.Linear(1, 1, bias=False)
+            self.state = nn.Linear(1, 1, bias=False)
+            self.predictor = nn.Linear(1, 1, bias=False)
+
+    model = _Model()
     gradient_controller = OuterGradientController(
         load_config().outer_gradient_control,
         expected_groups=("qwen", "state_shared", "predictor"),
@@ -1539,7 +1536,7 @@ def test_a5_rank_stable_optimizer_anchor_excludes_always_used_qwen_group() -> No
 
     class _Engine:
         def __init__(self) -> None:
-            self.optimizer = SimpleNamespace(optimizer=optimizer)
+            self.optimizer = object()
 
         @staticmethod
         def set_gradient_accumulation_boundary(*, is_boundary: bool) -> None:
@@ -1553,10 +1550,6 @@ def test_a5_rank_stable_optimizer_anchor_excludes_always_used_qwen_group() -> No
         def step() -> None:
             return None
 
-    model = nn.Module()
-    model.register_parameter("qwen", qwen)
-    model.register_parameter("state", state)
-    model.register_parameter("predictor", predictor)
     controller = SegmentBackwardController(
         SimpleNamespace(
             distributed_type="DistributedType.DEEPSPEED",
@@ -1567,7 +1560,10 @@ def test_a5_rank_stable_optimizer_anchor_excludes_always_used_qwen_group() -> No
         gradient_controller=gradient_controller,
     )
 
-    assert controller._rank_stable_parameters == (state, predictor)
+    assert controller._rank_stable_parameters == (
+        model.state.weight,
+        model.predictor.weight,
+    )
 
 
 def test_a2_controlled_wrapper_clips_only_at_the_final_ga_boundary() -> None:

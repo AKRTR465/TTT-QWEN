@@ -192,9 +192,9 @@ class SegmentBackwardController:
             raise TypeError("segment controller requires accelerator.backward")
         if self.is_deepspeed and isinstance(
             self.gradient_controller, OuterGradientController
-        ):
-            self._rank_stable_parameters = _rank_stable_optimizer_parameters(
-                cast(Any, self.engine).optimizer,
+        ) and "qwen" in self.gradient_controller.expected_groups:
+            self._rank_stable_parameters = _rank_stable_conditional_parameters(
+                model,
                 expected_groups=self.gradient_controller.expected_groups,
             )
         else:
@@ -304,40 +304,36 @@ def _unique_trainable_parameters(model: nn.Module) -> tuple[nn.Parameter, ...]:
     return tuple(parameters)
 
 
-def _rank_stable_optimizer_parameters(
-    optimizer: object,
+def _rank_stable_conditional_parameters(
+    model: nn.Module,
     *,
     expected_groups: Sequence[str],
 ) -> tuple[nn.Parameter, ...]:
-    """Return conditionally used non-Qwen groups from the formal Outer optimizer."""
+    """Return original conditionally used Parameters while excluding the shared Qwen."""
 
-    base_optimizer = getattr(optimizer, "optimizer", optimizer)
-    groups = getattr(base_optimizer, "param_groups", None)
-    if not isinstance(groups, list):
-        raise TypeError("rank-stable A5 anchor requires optimizer parameter groups")
-    actual = tuple(group.get("group_name") for group in groups)
-    if actual != tuple(expected_groups):
-        raise ValueError(
-            f"rank-stable A5 optimizer groups must be {tuple(expected_groups)}, found {actual}"
-        )
+    if "qwen" not in expected_groups:
+        raise ValueError("rank-stable A5 optimizer groups must include qwen")
     parameters: list[nn.Parameter] = []
     seen: set[int] = set()
-    for group in groups:
-        if group["group_name"] == "qwen":
+    qwen_ids: set[int] = set()
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        lowered = name.casefold()
+        parameter_id = id(parameter)
+        if lowered.startswith("qwen.") or ".visual_stage.qwen.qwen_model." in lowered:
+            if parameter.requires_grad:
+                qwen_ids.add(parameter_id)
             continue
-        raw_parameters = group.get("params")
-        if not isinstance(raw_parameters, list):
-            raise TypeError("rank-stable A5 optimizer group params must be a list")
-        for parameter in raw_parameters:
-            if not isinstance(parameter, nn.Parameter) or not parameter.requires_grad:
-                raise TypeError("rank-stable A5 optimizer groups require trainable Parameters")
-            parameter_id = id(parameter)
-            if parameter_id in seen:
-                raise ValueError("rank-stable A5 optimizer parameter is duplicated")
-            if parameter.numel() <= 0:
-                raise ValueError("A5 trainable Outer parameters cannot be empty")
-            seen.add(parameter_id)
-            parameters.append(parameter)
+        if not parameter.requires_grad or parameter_id in seen:
+            continue
+        if parameter.numel() <= 0:
+            raise ValueError("A5 trainable Outer parameters cannot be empty")
+        seen.add(parameter_id)
+        parameters.append(parameter)
+    if not qwen_ids:
+        raise RuntimeError("rank-stable A5 anchor could not identify trainable Qwen parameters")
+    trainable_ids = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    if qwen_ids | seen != trainable_ids or qwen_ids & seen:
+        raise RuntimeError("rank-stable A5 anchor did not partition trainable parameters")
     return tuple(parameters)
 
 
