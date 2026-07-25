@@ -11,6 +11,7 @@ from ttt_svcbench_qwen.losses import AnswerLossOutput, LossSkipReason, LossTerm
 from ttt_svcbench_qwen.outer_loss_balance import (
     OfficialWeakGradientAnchors,
     OfficialWeakOuterLossComposer,
+    _gradient_local_statistics,
 )
 from ttt_svcbench_qwen.stage_a_targets import (
     OfficialWeakLossAudit,
@@ -413,6 +414,120 @@ def test_formal_collectives_have_fixed_loss_then_streamed_gradient_lengths() -> 
     assert tuple(term.global_valid_count for term in committed.terms) == (4, 4, 0, 4)
     assert torch.isnan(committed.terms[2].raw_gradient_rms)
     assert dict(committed.metrics())["grad_balance/raw_rms/retrieval"] is None
+
+
+def test_zero_weight_padding_is_excluded_from_loss_gradient_and_ema_statistics() -> None:
+    composer = OfficialWeakOuterLossComposer(
+        OfficialWeakBalanceConfig(
+            group_weight=0.4,
+            scale_min=0.001,
+            scale_max=20.0,
+            epsilon=1.0e-8,
+        )
+    )
+    padding_anchors = _anchors()
+    real_anchors = _anchors()
+    output = composer.compose(
+        (
+            _answer(torch.tensor(100.0, requires_grad=True)),
+            _answer(torch.tensor(2.0, requires_grad=True)),
+        ),
+        (
+            _gradient_connected_state(
+                padding_anchors,
+                (100.0, 100.0, 100.0, 100.0),
+                value=100.0,
+            ),
+            _gradient_connected_state(
+                real_anchors,
+                (1.0, 2.0, 3.0, 4.0),
+                value=1.0,
+            ),
+        ),
+        gradient_anchors=(padding_anchors, real_anchors),
+        statistical_weights=(0.0, 1.0),
+    )
+
+    assert output.audit is not None
+    assert output.audit.answer_global_count == 1
+    assert output.audit.answer_global_mean == pytest.approx(2.0)
+    assert tuple(term.global_valid_count for term in output.audit.terms) == (1, 1, 1, 1)
+    assert tuple(term.raw_global_mean for term in output.audit.terms) == pytest.approx(
+        (1.0, 1.0, 1.0, 1.0)
+    )
+    assert output.audit.ema_means == pytest.approx((2.0, 1.0, 1.0, 1.0, 1.0))
+    assert output.audit.gradient_ema_rms == pytest.approx((1.0, 2.0, 3.0, 4.0))
+    assert float(output.objectives[0].total.detach()) == pytest.approx(0.0)
+    assert float(output.objectives[1].total.detach()) > 0.0
+
+
+def test_zero_weight_streamed_gradient_still_traverses_all_term_graphs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchors = _anchors()
+    state = _gradient_connected_state(
+        anchors,
+        (1.0, 2.0, 3.0, 4.0),
+    )
+    calls = 0
+    real_grad = torch.autograd.grad
+
+    def counted_grad(*args: object, **kwargs: object) -> tuple[Tensor | None, ...]:
+        nonlocal calls
+        calls += 1
+        return real_grad(*args, **kwargs)
+
+    monkeypatch.setattr(torch.autograd, "grad", counted_grad)
+    squares, counts = _gradient_local_statistics(
+        tuple((getattr(state, name),) for name in ("task", "operator", "retrieval", "time")),
+        (anchors,),
+        tuple(torch.ones((), dtype=torch.float64) for _ in range(4)),
+        statistical_weights=(0.0,),
+    )
+
+    assert calls == 4
+    assert counts == (0, 0, 0, 0)
+    assert all(square.item() == 0.0 for square in squares)
+
+
+def test_streamed_gradient_measurement_traverses_invalid_local_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchors = _anchors()
+    state = _gradient_connected_state(
+        anchors,
+        (1.0, 2.0, 3.0, 4.0),
+        valid=(True, True, False, True),
+    )
+    calls = 0
+    real_grad = torch.autograd.grad
+
+    def counted_grad(*args: object, **kwargs: object) -> tuple[Tensor | None, ...]:
+        nonlocal calls
+        calls += 1
+        return real_grad(*args, **kwargs)
+
+    monkeypatch.setattr(torch.autograd, "grad", counted_grad)
+    terms = (
+        (state.task,),
+        (state.operator,),
+        (state.retrieval,),
+        (state.time,),
+    )
+    squares, counts = _gradient_local_statistics(
+        terms,
+        (anchors,),
+        tuple(torch.ones((), dtype=torch.float64) for _ in range(4)),
+    )
+
+    assert calls == 4
+    assert counts == (
+        anchors.q_target.numel(),
+        anchors.q_operator.numel(),
+        0,
+        anchors.q_time.numel(),
+    )
+    assert squares[2].item() == 0.0
 
 
 def test_old_ema_checkpoint_cannot_silently_load_into_schema_six() -> None:

@@ -127,6 +127,30 @@ class FastReanchorAudit:
 
 
 @dataclass(frozen=True, slots=True)
+class FastQueryProxyAudit:
+    """Detached evidence for one Query-local fast-weight proxy."""
+
+    fast_version: int
+    update_count: int
+    skip_count: int
+    max_abs_value_drift: tuple[float, float]
+    storage_isolated: bool
+    graph_detached: bool
+    leaf_fast_weights: bool
+
+    def __post_init__(self) -> None:
+        counters = (self.fast_version, self.update_count, self.skip_count)
+        if any(type(value) is not int or value < 0 for value in counters):
+            raise ValueError("Fast Query proxy counters must be non-negative integers")
+        if self.fast_version != self.update_count:
+            raise ValueError("Fast Query proxy version must equal accepted updates")
+        if any(not math.isfinite(value) or value < 0.0 for value in self.max_abs_value_drift):
+            raise ValueError("Fast Query proxy drift must be finite and non-negative")
+        if not self.storage_isolated or not self.graph_detached or not self.leaf_fast_weights:
+            raise ValueError("Fast Query proxy must be detached, leaf, and storage-isolated")
+
+
+@dataclass(frozen=True, slots=True)
 class FastTTTForwardAudit:
     fast_versions: tuple[int, ...]
     update_counts: tuple[int, ...]
@@ -514,6 +538,112 @@ def collect_fast_parameters(state: FastWeightsState) -> tuple[Tensor, Tensor]:
     return state.fast_parameters
 
 
+def make_query_proxy_fast_state(
+    state: FastWeightsState,
+) -> tuple[FastWeightsState, FastQueryProxyAudit]:
+    """Create an isolated leaf proxy with the exact numeric value of differentiable ``W_t``.
+
+    Query-local backward may consume and release this proxy graph immediately.  A later
+    deferred VJP explicitly links the captured proxy gradient back to the authoritative
+    differentiable fast state, so this helper must not retain any edge to the Support graph.
+    """
+
+    if not isinstance(state, FastWeightsState):
+        raise TypeError("make_query_proxy_fast_state requires one FastWeightsState")
+    if not state.differentiable:
+        raise ValueError("Query proxy requires a differentiable meta-training fast state")
+
+    old_values = tuple(value.detach() for value in state.fast_parameters)
+    proxy_1 = old_values[0].clone().requires_grad_(True)
+    proxy_2 = old_values[1].clone().requires_grad_(True)
+    proxy_state = FastWeightsState(
+        # W0 is metadata-only during a Query fast binding.  A detached view prevents a
+        # second direct W0 path without copying another pair of 768x768 matrices.
+        w0_1=state.w0_1.detach(),
+        w0_2=state.w0_2.detach(),
+        w_t_1=proxy_1,
+        w_t_2=proxy_2,
+        fast_version=state.fast_version,
+        update_count=state.update_count,
+        skip_count=state.skip_count,
+        differentiable=True,
+    )
+    isolated = all(
+        not _shares_storage(proxy, authoritative)
+        for proxy, authoritative in zip(
+            proxy_state.fast_parameters,
+            state.fast_parameters,
+            strict=True,
+        )
+    )
+    isolated = isolated and all(
+        not _shares_storage(proxy, base)
+        for proxy in proxy_state.fast_parameters
+        for base in (state.w0_1, state.w0_2)
+    )
+    if state.w_t_1.device.type == "meta":
+        drift = (0.0, 0.0)
+    else:
+        drift_values = tuple(
+            float((proxy.detach() - old).abs().max().float().cpu().item())
+            for proxy, old in zip(proxy_state.fast_parameters, old_values, strict=True)
+        )
+        drift = (drift_values[0], drift_values[1])
+    audit = FastQueryProxyAudit(
+        fast_version=state.fast_version,
+        update_count=state.update_count,
+        skip_count=state.skip_count,
+        max_abs_value_drift=(drift[0], drift[1]),
+        storage_isolated=isolated,
+        graph_detached=all(
+            proxy.grad_fn is None for proxy in proxy_state.fast_parameters
+        ),
+        leaf_fast_weights=all(proxy.is_leaf for proxy in proxy_state.fast_parameters),
+    )
+    return proxy_state, audit
+
+
+def deferred_fast_vjp_loss(
+    authoritative_states: Sequence[FastWeightsState],
+    proxy_gradients: Sequence[Tensor],
+) -> Tensor:
+    """Return a numerically-zero scalar whose gradient injects a deferred fast-state VJP."""
+
+    states = tuple(authoritative_states)
+    gradients = tuple(proxy_gradients)
+    authoritative = tuple(value for state in states for value in state.fast_parameters)
+    if not states or len(gradients) != len(authoritative):
+        raise ValueError("deferred fast VJP states and gradients must be non-empty and aligned")
+    if any(not state.differentiable for state in states):
+        raise ValueError("deferred fast VJP requires differentiable authoritative states")
+    if any(not value.requires_grad for value in authoritative):
+        raise ValueError("deferred fast VJP authoritative matrices must require gradients")
+    terms: list[Tensor] = []
+    for value, gradient in zip(authoritative, gradients, strict=True):
+        if (
+            gradient.shape != value.shape
+            or gradient.device != value.device
+            or not torch.is_floating_point(gradient)
+        ):
+            raise ValueError("deferred fast VJP gradient shape/device/dtype contract drifted")
+        if gradient.requires_grad or gradient.grad_fn is not None:
+            raise ValueError("deferred fast VJP gradients must be detached cotangents")
+        if gradient.device.type != "meta" and not bool(torch.isfinite(gradient).all()):
+            raise ValueError("deferred fast VJP gradients must be finite")
+        accumulation_dtype = torch.promote_types(value.dtype, gradient.dtype)
+        terms.append(
+            (
+                value.to(dtype=accumulation_dtype)
+                * gradient.to(dtype=accumulation_dtype)
+            ).sum()
+        )
+    link = torch.stack(terms).sum()
+    if link.ndim != 0 or not link.requires_grad:
+        raise ValueError("deferred fast VJP link must remain one differentiable scalar")
+    # Preserve only d<link>/dW.  The arbitrary dot-product value is not part of L_total.
+    return link - link.detach()
+
+
 def reanchor_fast_state(
     state: FastWeightsState,
 ) -> tuple[FastWeightsState, FastReanchorAudit]:
@@ -607,7 +737,29 @@ def _detached_norm(tensor: Tensor) -> float:
 def _shares_storage(left: Tensor, right: Tensor) -> bool:
     if left.device.type == "meta" or right.device.type == "meta":
         return left is right
-    return int(left.untyped_storage().data_ptr()) == int(right.untyped_storage().data_ptr())
+    if left.device != right.device or left.numel() == 0 or right.numel() == 0:
+        return False
+    if int(left.untyped_storage().data_ptr()) != int(right.untyped_storage().data_ptr()):
+        return False
+
+    # ZeRO may repoint multiple Parameters at disjoint views of one flattened
+    # allocation.  A shared base pointer alone is therefore not evidence that
+    # the live tensor regions alias.  Compare the byte spans addressed by each
+    # strided view; overlapping spans remain a fail-closed result.
+    left_start, left_end = _storage_byte_span(left)
+    right_start, right_end = _storage_byte_span(right)
+    return left_start < right_end and right_start < left_end
+
+
+def _storage_byte_span(tensor: Tensor) -> tuple[int, int]:
+    minimum = tensor.storage_offset()
+    maximum = minimum
+    for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
+        delta = (size - 1) * stride
+        minimum += min(0, delta)
+        maximum += max(0, delta)
+    element_size = tensor.element_size()
+    return minimum * element_size, (maximum + 1) * element_size
 
 
 def _assert_batched_state_storage_isolated(states: Sequence[FastWeightsState]) -> None:

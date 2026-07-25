@@ -502,8 +502,11 @@ def query_reuse_key(query: RuntimeQueryInput) -> tuple[int, str, str]:
 
 
 def query_dropout_seed(query: RuntimeQueryInput) -> int:
-    # Preserve the production dropout contract that predates Query graph reuse.
-    encoded = f"{query.episode_nonce}:{query.query_id}".encode()
+    # The temporal cache is owned by one question signature.  A5 may expose several
+    # causal Query points for that same question, each with a different query_id/time.
+    # They must therefore receive the same dropout mask inside one episode; otherwise
+    # question-only q_target drifts even though the semantic Query is unchanged.
+    encoded = f"{query.episode_nonce}:{query.question}".encode()
     return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "little") % (2**63 - 1)
 
 

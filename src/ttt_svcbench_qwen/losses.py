@@ -1758,11 +1758,15 @@ def _require_unit_norm(values: Tensor, mask: Tensor, name: str) -> None:
     if not selected.numel():
         return
     norms = torch.linalg.vector_norm(selected.float(), dim=-1)
+    norm_tolerance = max(
+        _NORM_ATOL,
+        2.0 * float(torch.finfo(selected.dtype).eps),
+    )
     if not torch.allclose(
         norms,
         torch.ones_like(norms),
-        atol=_NORM_ATOL,
-        rtol=_NORM_ATOL,
+        atol=norm_tolerance,
+        rtol=0.0,
     ):
         raise ValueError(f"{name} must be unit L2 normalized")
 
