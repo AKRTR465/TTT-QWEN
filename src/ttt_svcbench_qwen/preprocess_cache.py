@@ -19,12 +19,14 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 import torch
 from safetensors.torch import load_file, save_file
 from torch import Tensor
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
+type PreprocessCacheStorageDtype = Literal["float32", "float16"]
 
 
 class PreprocessCacheMode(StrEnum):
@@ -168,6 +170,7 @@ class PreprocessCache:
         mode: PreprocessCacheMode | str = PreprocessCacheMode.READ_WRITE,
         miss_policy: PreprocessCacheMissPolicy | str = PreprocessCacheMissPolicy.DECODE,
         namespace: str | None = None,
+        storage_dtype: PreprocessCacheStorageDtype = "float32",
     ) -> None:
         if type(max_bytes) is not int or max_bytes <= 0:
             raise ValueError("preprocess cache max_bytes must be a positive integer")
@@ -175,6 +178,9 @@ class PreprocessCache:
             raise ValueError("preprocess cache memory_entries must be non-negative")
         self.mode = PreprocessCacheMode(mode)
         self.miss_policy = PreprocessCacheMissPolicy(miss_policy)
+        if storage_dtype not in {"float32", "float16"}:
+            raise ValueError("preprocess cache storage_dtype must be float32 or float16")
+        self.storage_dtype: PreprocessCacheStorageDtype = storage_dtype
         if self.mode is not PreprocessCacheMode.DISABLED and root is None:
             raise ValueError("enabled preprocess cache requires a root directory")
         if (
@@ -239,12 +245,18 @@ class PreprocessCache:
             tensors = load_file(str(path), device="cpu")
             embedded_metadata = _read_metadata(tensors)
             sidecar_metadata = _read_sidecar_metadata(path)
-            if sidecar_metadata is not None and sidecar_metadata != embedded_metadata:
-                return self._miss(fingerprint, "sidecar_mismatch")
-            metadata = sidecar_metadata or embedded_metadata
+            if sidecar_metadata is not None:
+                sidecar_fingerprint, sidecar_dtype = sidecar_metadata
+                if sidecar_fingerprint != embedded_metadata:
+                    return self._miss(fingerprint, "sidecar_mismatch")
+                if sidecar_dtype != self.storage_dtype:
+                    return self._miss(fingerprint, "storage_dtype_mismatch")
+                metadata = sidecar_fingerprint
+            else:
+                metadata = embedded_metadata
             if metadata != fingerprint.canonical_json():
                 return self._miss(fingerprint, "fingerprint_mismatch")
-            cached = _cached_chunk_from_tensors(tensors)
+            cached = _cached_chunk_from_tensors(tensors, storage_dtype=self.storage_dtype)
         except PreprocessCacheMissError:
             raise
         except Exception:  # corrupt/partially replaced entries follow the configured miss policy
@@ -273,7 +285,11 @@ class PreprocessCache:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-        tensors = _cached_chunk_tensors(chunk, fingerprint.canonical_json())
+        tensors = _cached_chunk_tensors(
+            chunk,
+            fingerprint.canonical_json(),
+            storage_dtype=self.storage_dtype,
+        )
         try:
             save_file(
                 tensors,
@@ -289,6 +305,7 @@ class PreprocessCache:
                     {
                         "fingerprint": fingerprint.canonical_json(),
                         "cache_schema_version": CACHE_SCHEMA_VERSION,
+                        "storage_dtype": self.storage_dtype,
                     },
                     sort_keys=True,
                 ),
@@ -309,6 +326,7 @@ class PreprocessCache:
             "hit_count": self.hit_count,
             "miss_count": self.miss_count,
             "memory_entries": len(self._memory),
+            "storage_dtype": self.storage_dtype,
         }
 
     def disk_size_bytes(self) -> int:
@@ -397,15 +415,21 @@ class PreprocessCache:
             self._memory_sizes.pop(old_key, None)
 
 
-def _cached_chunk_tensors(chunk: CachedChunk, fingerprint_json: str) -> dict[str, Tensor]:
+def _cached_chunk_tensors(
+    chunk: CachedChunk,
+    fingerprint_json: str,
+    *,
+    storage_dtype: PreprocessCacheStorageDtype,
+) -> dict[str, Tensor]:
     # safetensors metadata is written separately; storing the JSON as a tiny tensor also lets
     # load_file() validate it without opening a second sidecar file.
     metadata_tensor = torch.tensor(list(fingerprint_json.encode("utf-8")), dtype=torch.uint8)
+    pixel_dtype = torch.float32 if storage_dtype == "float32" else torch.float16
     return {
         "frames": chunk.frames.detach().cpu().contiguous(),
         "frame_timestamps": chunk.frame_timestamps.detach().cpu().contiguous(),
         "pixel_values_videos": (
-            chunk.pixel_values_videos.detach().cpu().to(torch.float32).contiguous()
+            chunk.pixel_values_videos.detach().cpu().to(pixel_dtype).contiguous()
         ),
         "video_grid_thw": chunk.video_grid_thw.detach().cpu().to(torch.int64).contiguous(),
         "tubelet_timestamps": chunk.tubelet_timestamps.detach().cpu().contiguous(),
@@ -415,7 +439,11 @@ def _cached_chunk_tensors(chunk: CachedChunk, fingerprint_json: str) -> dict[str
     }
 
 
-def _cached_chunk_from_tensors(tensors: Mapping[str, Tensor]) -> CachedChunk:
+def _cached_chunk_from_tensors(
+    tensors: Mapping[str, Tensor],
+    *,
+    storage_dtype: PreprocessCacheStorageDtype,
+) -> CachedChunk:
     required = {
         "frames",
         "frame_timestamps",
@@ -428,10 +456,18 @@ def _cached_chunk_from_tensors(tensors: Mapping[str, Tensor]) -> CachedChunk:
     missing = required.difference(tensors)
     if missing:
         raise KeyError(f"cache entry is missing tensors: {sorted(missing)}")
+    expected_dtype = torch.float32 if storage_dtype == "float32" else torch.float16
+    pixels = tensors["pixel_values_videos"]
+    if pixels.dtype != expected_dtype:
+        raise TypeError(
+            f"cached Qwen pixels use {pixels.dtype}, expected storage dtype {expected_dtype}"
+        )
     chunk = CachedChunk(
         frames=tensors["frames"],
         frame_timestamps=tensors["frame_timestamps"],
-        pixel_values_videos=tensors["pixel_values_videos"],
+        # The disk dtype is an I/O/storage contract only. Runtime materialization remains FP32,
+        # preserving the existing Qwen processor boundary and autocast behavior.
+        pixel_values_videos=pixels.to(torch.float32),
         video_grid_thw=tensors["video_grid_thw"],
         tubelet_timestamps=tensors["tubelet_timestamps"],
         tubelet_valid_mask=tensors["tubelet_valid_mask"],
@@ -448,13 +484,16 @@ def _read_metadata(tensors: Mapping[str, Tensor]) -> str:
     return bytes(int(value) for value in raw.tolist()).decode("utf-8")
 
 
-def _read_sidecar_metadata(path: Path) -> str | None:
+def _read_sidecar_metadata(path: Path) -> tuple[str, str] | None:
     sidecar = path.with_suffix(".json")
     if not sidecar.is_file():
         return None
     raw = json.loads(sidecar.read_text(encoding="utf-8"))
-    value = raw.get("fingerprint") if isinstance(raw, Mapping) else None
-    return value if isinstance(value, str) else None
+    fingerprint = raw.get("fingerprint") if isinstance(raw, Mapping) else None
+    storage_dtype = raw.get("storage_dtype") if isinstance(raw, Mapping) else None
+    if not isinstance(fingerprint, str) or storage_dtype not in {"float32", "float16"}:
+        raise ValueError("cache metadata sidecar is missing fingerprint or storage dtype")
+    return fingerprint, storage_dtype
 
 
 def _replace_idempotent(source: Path, target: Path) -> None:
@@ -536,6 +575,7 @@ __all__ = [
     "PreprocessCacheMissError",
     "PreprocessCacheMissPolicy",
     "PreprocessCacheMode",
+    "PreprocessCacheStorageDtype",
     "PreprocessFingerprint",
     "build_fingerprint",
 ]

@@ -115,7 +115,7 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     preprocess_cache_miss_policy: Literal["decode", "error"]
     preprocess_cache_root_env: str = Field(min_length=1)
     preprocess_cache_max_gb: float = Field(gt=0.0)
-    preprocess_cache_dtype: Literal["float32"]
+    preprocess_cache_dtype: Literal["float32", "float16"]
     visual_cost_mode: Literal["proxy", "exact_tokens", "exact_tokens_then_runtime"] = "proxy"
     runtime_trace_mode: Literal["off", "cuda"] = "off"
     runtime_trace_dir: str | None = Field(default=None, min_length=1)

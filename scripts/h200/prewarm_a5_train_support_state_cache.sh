@@ -5,8 +5,9 @@ PROJECT_ROOT="${TTT_PROJECT_ROOT:-/mnt/shared-storage-user/mineru2-shared/niujun
 PLAY_ROOT="${TTT_H200_PLAY_ROOT:-/mnt/shared-storage-user/mineru2-shared/niujunbo/play}"
 MANIFEST="${1:?usage: bash scripts/h200/prewarm_a5_train_support_state_cache.sh MANIFEST}"
 VIDEO_ROOT="${SVCBENCH_VIDEO_ROOT:-$PLAY_ROOT/datasets/SVCBench/videos}"
-CACHE_ROOT="${TTT_PREPROCESS_CACHE_ROOT:-$PROJECT_ROOT/.cache/preprocess/260723_a2_original_trainsplit_support_statequery}"
-CACHE_NAMESPACE="${TTT_PREPROCESS_CACHE_NAMESPACE:-a2_original_trainsplit_support_statequery_v1}"
+CACHE_ROOT="${TTT_PREPROCESS_CACHE_ROOT:-$PROJECT_ROOT/.cache/preprocess/260725_a5_half_support_statequery_fp16}"
+CACHE_NAMESPACE="${TTT_PREPROCESS_CACHE_NAMESPACE:-a5_half_seed42_support_statequery_fp16_v2}"
+CACHE_DTYPE="${TTT_PREPROCESS_CACHE_DTYPE:-float16}"
 TRAINING_CONFIG="${TTT_TRAINING_CONFIG:-$PROJECT_ROOT/configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml}"
 PROJECT_CONFIG="${TTT_PROJECT_CONFIG:-$PROJECT_ROOT/configs/model_state_ttt_8b.yaml}"
 VENV="${TTT_H200_VENV:-$PROJECT_ROOT/.venv-h200-py312-torch28}"
@@ -40,6 +41,7 @@ export SVCBENCH_VIDEO_ROOT="$VIDEO_ROOT"
   printf 'video_root=%s\n' "$VIDEO_ROOT"
   printf 'cache_root=%s\n' "$CACHE_ROOT"
   printf 'cache_namespace=%s\n' "$CACHE_NAMESPACE"
+  printf 'cache_dtype=%s\n' "$CACHE_DTYPE"
   printf 'split=train\nroles=support,state_query\nstage=a5\nshard_count=%s\n' "$SHARD_COUNT"
 } > "$RUN_ROOT/command.txt"
 git -C "$PROJECT_ROOT" status --short > "$RUN_ROOT/git_state.txt"
@@ -55,6 +57,7 @@ for ((index = 0; index < SHARD_COUNT; index++)); do
       --root "$CACHE_ROOT" \
       --max-gb 800 \
       --namespace "$CACHE_NAMESPACE" \
+      --storage-dtype "$CACHE_DTYPE" \
       --manifest "$MANIFEST" \
       --project-config "$PROJECT_CONFIG" \
       --training-config "$TRAINING_CONFIG" \
@@ -117,3 +120,26 @@ summary = {
 print(json.dumps(summary, sort_keys=True))
 raise SystemExit(0 if ok else 1)
 PY
+
+"$PYTHON" "$PROJECT_ROOT/scripts/preprocess_cache.py" verify-inputs \
+  --root "$CACHE_ROOT" \
+  --max-gb 800 \
+  --namespace "$CACHE_NAMESPACE" \
+  --storage-dtype "$CACHE_DTYPE" \
+  --manifest "$MANIFEST" \
+  --project-config "$PROJECT_CONFIG" \
+  --training-config "$TRAINING_CONFIG" \
+  --video-root "$VIDEO_ROOT" \
+  --stage a5 \
+  --minimum-pixels 256 \
+  --maximum-pixels 131072 \
+  --split train \
+  --roles support state_query \
+  > "$RUN_ROOT/cache_verify.json"
+
+"$PYTHON" "$PROJECT_ROOT/scripts/preprocess_cache.py" inspect \
+  --root "$CACHE_ROOT" \
+  --max-gb 800 \
+  --namespace "$CACHE_NAMESPACE" \
+  --storage-dtype "$CACHE_DTYPE" \
+  > "$RUN_ROOT/cache_inspect.json"

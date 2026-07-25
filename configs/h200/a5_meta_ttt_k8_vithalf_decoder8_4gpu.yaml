@@ -89,7 +89,7 @@ ttt_qwen:
   preprocess_cache_miss_policy: error
   preprocess_cache_root_env: TTT_PREPROCESS_CACHE_ROOT
   preprocess_cache_max_gb: 200
-  preprocess_cache_dtype: float32
+  preprocess_cache_dtype: float16
   visual_cost_mode: proxy
   runtime_trace_mode: "off"
   runtime_trace_dir: null

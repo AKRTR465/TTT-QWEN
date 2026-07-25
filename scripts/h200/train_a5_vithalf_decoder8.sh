@@ -33,6 +33,8 @@ fi
 
 export YAML="$PARTIAL_YAML"
 export TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"
+export TTT_PREPROCESS_CACHE_ROOT="${TTT_PREPROCESS_CACHE_ROOT:-$PROJECT_ROOT/.cache/preprocess/260725_a5_half_support_statequery_fp16}"
+export TTT_PREPROCESS_CACHE_NAMESPACE="${TTT_PREPROCESS_CACHE_NAMESPACE:-a5_half_seed42_support_statequery_fp16_v2}"
 if [[ -n "${TTT_SMOKE_MAX_STEPS:-}" ]]; then
   # Max-step acceptance runs use the atomic smoke path and do not publish epoch checkpoints.
   export TTT_CHECKPOINT_POLICY="atomic_final_only"
