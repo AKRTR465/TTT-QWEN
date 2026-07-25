@@ -1566,6 +1566,72 @@ def test_a5_rank_stable_optimizer_anchor_excludes_always_used_qwen_group() -> No
     )
 
 
+@pytest.mark.parametrize("diverge", (False, True))
+def test_a5_rank_stable_hook_order_audit_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    diverge: bool,
+) -> None:
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.qwen = nn.Linear(1, 1, bias=False)
+            self.state = nn.Linear(1, 1, bias=False)
+            self.predictor = nn.Linear(1, 1, bias=False)
+
+    model = _Model()
+    gradient_controller = OuterGradientController(
+        load_config().outer_gradient_control,
+        expected_groups=("qwen", "state_shared", "predictor"),
+    )
+    step_calls = 0
+
+    class _Engine:
+        optimizer = object()
+
+        @staticmethod
+        def set_gradient_accumulation_boundary(*, is_boundary: bool) -> None:
+            assert is_boundary
+
+        @staticmethod
+        def backward(loss: torch.Tensor, **kwargs: object) -> None:
+            loss.backward(**kwargs)
+
+        @staticmethod
+        def step() -> None:
+            nonlocal step_calls
+            step_calls += 1
+
+    def fake_all_gather(outputs: list[torch.Tensor], value: torch.Tensor) -> None:
+        outputs[0].copy_(value)
+        outputs[1].copy_(
+            value if not diverge or value.numel() == 1 else value.flip(0)
+        )
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    controller = SegmentBackwardController(
+        SimpleNamespace(
+            distributed_type="DistributedType.DEEPSPEED",
+            deepspeed_engine_wrapped=SimpleNamespace(engine=_Engine()),
+        ),
+        model,
+        expected_count=1,
+        gradient_controller=gradient_controller,
+    )
+
+    if diverge:
+        with pytest.raises(RuntimeError, match="hook order diverged"):
+            controller.backward(model.qwen.weight.square().sum())
+        assert controller.backward_count == 0
+    else:
+        controller.backward(model.qwen.weight.square().sum())
+        assert controller.backward_count == 1
+
+    assert step_calls == 0
+
+
 def test_a2_controlled_wrapper_clips_only_at_the_final_ga_boundary() -> None:
     events: list[object] = []
 

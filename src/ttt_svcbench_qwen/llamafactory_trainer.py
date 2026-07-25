@@ -201,6 +201,12 @@ class SegmentBackwardController:
             self._rank_stable_parameters = _unique_trainable_parameters(model)
         if not self._rank_stable_parameters:
             raise ValueError("A5 segment controller requires rank-stable Outer parameters")
+        self._rank_hook_order_audit_enabled = (
+            self.is_deepspeed
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        )
 
     @property
     def proxy_gradient_scale(self) -> float:
@@ -253,13 +259,59 @@ class SegmentBackwardController:
                 engine = cast(Any, self.engine)
                 is_final_segment = self.backward_count + 1 == self.expected_count
                 engine.set_gradient_accumulation_boundary(is_boundary=is_final_segment)
-                if retain_graph:
-                    engine.backward(loss, retain_graph=True)
-                else:
-                    engine.backward(loss)
+                hook_order: list[int] | None = (
+                    [] if self._rank_hook_order_audit_enabled else None
+                )
+                handles = (
+                    tuple(
+                        parameter.register_post_accumulate_grad_hook(
+                            lambda _parameter, index=index: hook_order.append(index)
+                        )
+                        for index, parameter in enumerate(self._rank_stable_parameters)
+                    )
+                    if hook_order is not None
+                    else ()
+                )
+                try:
+                    if retain_graph:
+                        engine.backward(loss, retain_graph=True)
+                    else:
+                        engine.backward(loss)
+                finally:
+                    for handle in handles:
+                        handle.remove()
+                if hook_order is not None:
+                    self._assert_rank_hook_order(hook_order, device=loss.device)
             else:
                 cast(Any, self.accelerator).backward(loss, retain_graph=retain_graph)
         self.backward_count += 1
+
+    def _assert_rank_hook_order(self, order: Sequence[int], *, device: torch.device) -> None:
+        """Fail before the Outer step when ZeRO-2 observes rank-local hook order."""
+
+        expected = len(self._rank_stable_parameters)
+        if len(order) != expected or len(set(order)) != expected:
+            raise RuntimeError(
+                "A5 rank-stable anchor hook coverage drifted: "
+                f"expected={expected}, observed={len(order)}"
+            )
+        world_size = torch.distributed.get_world_size()
+        local_count = torch.tensor([len(order)], dtype=torch.int64, device=device)
+        gathered_counts = [torch.empty_like(local_count) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_counts, local_count)
+        counts = tuple(int(value.item()) for value in gathered_counts)
+        if len(set(counts)) != 1:
+            raise RuntimeError(f"A5 parameter hook count diverged across ranks: {counts}")
+        local_order = torch.tensor(tuple(order), dtype=torch.int64, device=device)
+        gathered_orders = [torch.empty_like(local_order) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_orders, local_order)
+        reference = gathered_orders[0]
+        for rank, candidate in enumerate(gathered_orders[1:], start=1):
+            if not torch.equal(candidate, reference):
+                raise RuntimeError(
+                    "A5 parameter hook order diverged across ranks before Outer step: "
+                    f"segment={self.backward_count}, rank=0/{rank}"
+                )
 
     def finalize(self) -> None:
         if self.backward_count != self.expected_count:
