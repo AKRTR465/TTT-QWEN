@@ -8,7 +8,7 @@ import os
 import shutil
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 import yaml
@@ -79,6 +79,11 @@ def _add_cache_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--max-gb", type=float, default=200.0)
     parser.add_argument("--namespace", required=True)
+    parser.add_argument(
+        "--storage-dtype",
+        choices=("float32", "float16"),
+        default="float32",
+    )
 
 
 def _add_input_arguments(parser: argparse.ArgumentParser) -> None:
@@ -106,12 +111,15 @@ def _cache(args: argparse.Namespace) -> PreprocessCache:
         memory_entries=0,
         mode=mode,
         namespace=args.namespace,
+        storage_dtype=args.storage_dtype,
     )
 
 
 def _inspect(cache: PreprocessCache) -> dict[str, object]:
-    root = cache.root if cache.namespace is None else cache.root / cache.namespace  # type: ignore[operator]
-    usage = shutil.disk_usage(cache.root)  # type: ignore[arg-type]
+    if cache.root is None:
+        raise ValueError("cache inspection requires a filesystem root")
+    root = cache.root if cache.namespace is None else cache.root / cache.namespace
+    usage = shutil.disk_usage(cache.root)
     return {
         "root": str(cache.root),
         "namespace": cache.namespace,
@@ -124,7 +132,9 @@ def _inspect(cache: PreprocessCache) -> dict[str, object]:
 
 
 def _verify(cache: PreprocessCache) -> dict[str, int]:
-    root = cache.root if cache.namespace is None else cache.root / cache.namespace  # type: ignore[operator]
+    if cache.root is None:
+        raise ValueError("cache verification requires a filesystem root")
+    root = cache.root if cache.namespace is None else cache.root / cache.namespace
     valid = corrupt = 0
     for path in root.rglob("*.safetensors"):
         try:
@@ -141,8 +151,22 @@ def _verify(cache: PreprocessCache) -> dict[str, int]:
                 if metadata.is_file()
                 else None
             )
-            if not isinstance(sidecar, dict) or sidecar.get("fingerprint") != embedded_fingerprint:
+            sidecar_dtype = (
+                sidecar.get("storage_dtype", "float32")
+                if isinstance(sidecar, dict)
+                else None
+            )
+            if (
+                not isinstance(sidecar, dict)
+                or sidecar.get("fingerprint") != embedded_fingerprint
+                or sidecar_dtype != cache.storage_dtype
+            ):
                 raise ValueError("missing cache metadata sidecar")
+            expected_dtype = (
+                torch.float32 if cache.storage_dtype == "float32" else torch.float16
+            )
+            if tensors.get("pixel_values_videos", torch.empty(0)).dtype != expected_dtype:
+                raise ValueError("cached Qwen pixel storage dtype drifted")
         except (OSError, ValueError, json.JSONDecodeError):
             corrupt += 1
         else:
@@ -161,6 +185,10 @@ def _prewarm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if ttt_config.stage != args.stage:
         parser.error(
             f"training config stage {ttt_config.stage!r} does not match --stage {args.stage!r}"
+        )
+    if ttt_config.preprocess_cache_dtype != args.storage_dtype:
+        parser.error(
+            "training config preprocess_cache_dtype does not match --storage-dtype"
         )
     roles = frozenset(args.roles)
     for role in ("state_query", "answer_query"):
@@ -236,6 +264,10 @@ def _verify_inputs(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     if ttt_config.stage != args.stage:
         parser.error(
             f"training config stage {ttt_config.stage!r} does not match --stage {args.stage!r}"
+        )
+    if ttt_config.preprocess_cache_dtype != args.storage_dtype:
+        parser.error(
+            "training config preprocess_cache_dtype does not match --storage-dtype"
         )
     roles = frozenset(args.roles)
     for role in ("state_query", "answer_query"):
@@ -383,7 +415,7 @@ def _load_training_config(path: Path) -> ProductionTTTConfig:
     raw: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or not isinstance(raw.get("ttt_qwen"), dict):
         raise ValueError("training config must contain a ttt_qwen mapping")
-    return ProductionTTTConfig.model_validate(raw["ttt_qwen"])
+    return cast(ProductionTTTConfig, ProductionTTTConfig.model_validate(raw["ttt_qwen"]))
 
 
 if __name__ == "__main__":

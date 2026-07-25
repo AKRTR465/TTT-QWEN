@@ -58,6 +58,7 @@ from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
     OuterCheckpointAudit,
     audit_outer_checkpoint_boundary,
+    configure_qwen_outer_trainability,
     environment_manifest,
     fully_unfreeze_qwen,
     initialize_outer_model_from_a2,
@@ -189,6 +190,33 @@ class SegmentBackwardController:
                 )
         elif not callable(getattr(accelerator, "backward", None)):
             raise TypeError("segment controller requires accelerator.backward")
+
+    @property
+    def proxy_gradient_scale(self) -> float:
+        """Return the engine scale applied to non-parameter proxy leaf gradients.
+
+        Production A5 is BF16 with episode-level GA=1, so the expected value is exactly one.
+        Refuse an unmodelled DeepSpeed loss scale instead of silently squaring it in the
+        deferred VJP.
+        """
+
+        if not self.is_deepspeed:
+            return 1.0
+        engine = cast(Any, self.engine)
+        accumulation = getattr(engine, "gradient_accumulation_steps", None)
+        if callable(accumulation) and int(accumulation()) != 1:
+            raise ValueError("A5 deferred VJP requires DeepSpeed gradient accumulation of one")
+        raw_scale = getattr(getattr(engine, "optimizer", None), "loss_scale", 1.0)
+        if isinstance(raw_scale, Tensor):
+            if raw_scale.numel() != 1:
+                raise ValueError("DeepSpeed loss scale must be scalar")
+            raw_scale = raw_scale.detach().float().cpu().item()
+        scale = float(raw_scale)
+        if not math.isfinite(scale) or scale != 1.0:
+            raise ValueError(
+                "A5 deferred VJP currently requires unscaled BF16 DeepSpeed backward"
+            )
+        return scale
 
     def backward(self, loss: Tensor, retain_graph: bool = False) -> None:
         if self.backward_count >= self.expected_count:
@@ -356,6 +384,10 @@ class OuterParameterAudit:
     stage: ProductionStage
     total_parameter_count: int
     trainable_parameter_count: int
+    qwen_parameter_count: int
+    qwen_trainable_count: int
+    non_qwen_parameter_count: int
+    non_qwen_trainable_count: int
     predictor_parameter_count: int
     predictor_trainable_count: int
     transient_parameter_names: tuple[str, ...]
@@ -370,14 +402,28 @@ class OuterParameterAudit:
             raise ValueError("transient fast matrices entered registered outer parameters")
         if not self.backbone_registered:
             raise ValueError("runtime model did not register the loaded Qwen backbone")
+        if self.qwen_parameter_count <= 0 or self.non_qwen_parameter_count <= 0:
+            raise ValueError("production outer model must register Qwen and state parameters")
+        if self.qwen_parameter_count + self.non_qwen_parameter_count != self.total_parameter_count:
+            raise ValueError("Qwen/non-Qwen parameter audit does not cover the outer model")
+        if (
+            self.qwen_trainable_count + self.non_qwen_trainable_count
+            != self.trainable_parameter_count
+        ):
+            raise ValueError("Qwen/non-Qwen trainable audit does not cover the outer model")
         if self.stage is ProductionStage.A2:
             if self.predictor_trainable_count:
                 raise ValueError("A2 Predictor must remain frozen")
             expected = self.total_parameter_count - self.predictor_parameter_count
             if self.trainable_parameter_count != expected:
                 raise ValueError("A2 must train every registered non-Predictor parameter")
-        elif self.trainable_parameter_count != self.total_parameter_count:
-            raise ValueError("A5 must train Qwen, state modules, W0, and Predictor")
+        else:
+            if self.qwen_trainable_count <= 0:
+                raise ValueError("A5 must train at least one configured Qwen parameter")
+            if self.non_qwen_trainable_count != self.non_qwen_parameter_count:
+                raise ValueError("A5 must train every state, W0, and Predictor parameter")
+            if self.predictor_trainable_count != self.predictor_parameter_count:
+                raise ValueError("A5 Predictor must be fully trainable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -931,10 +977,16 @@ class TTTQwenTrainerMixin:
                         enriched[name] = float(value)
         if self.ttt_runtime.stage is ProductionStage.A5 and self.last_meta_output is not None:
             retrieval_metrics: dict[str, float] = {}
-            for query in self.last_meta_output.audit.queries:
-                for name, value in query.metrics.metrics:
-                    if name.startswith("retrieval/") and value is not None:
-                        retrieval_metrics[name] = retrieval_metrics.get(name, 0.0) + value
+            if self.last_meta_output.audit.loss_weight == 1.0:
+                for query in self.last_meta_output.audit.queries:
+                    for name, value in query.metrics.metrics:
+                        if name.startswith("retrieval/") and value is not None:
+                            retrieval_metrics[name] = retrieval_metrics.get(name, 0.0) + value
+            balance = getattr(self.ttt_runtime.meta_runner, "last_balance_audit", None)
+            if isinstance(balance, OfficialWeakBalanceAudit):
+                retrieval_metrics["retrieval/valid_bag_rows"] = float(
+                    balance.terms[2].global_valid_count.item()
+                )
             enriched.update(retrieval_metrics)
         enriched.update(self.last_semantic_projector_metrics)
         controller = self.ttt_runtime.gradient_controller
@@ -1022,7 +1074,7 @@ class TTTQwenTrainerMixin:
         expected_segments = math.ceil(
             len(episode.support_chunks) / runner.config.a5.truncation_horizon
         )
-        expected_backwards = expected_segments + len(episode.query_points) - 1
+        expected_backwards = expected_segments + len(episode.query_points)
         horizon = runner.config.a5.truncation_horizon
         segment_lengths = tuple(
             min(horizon, len(episode.support_chunks) - start)
@@ -1045,7 +1097,12 @@ class TTTQwenTrainerMixin:
 
         end_prefetch = getattr(adapter, "end_prefetch", None)
         try:
-            output = runner.run_truncated(episode, backward=distributed_backward)
+            output = runner.run_truncated(
+                episode,
+                backward=distributed_backward,
+                backward_gradient_scale=backward_controller.proxy_gradient_scale,
+                episode_loss_weight=loss_weight,
+            )
         finally:
             if callable(end_prefetch):
                 end_prefetch()
@@ -1160,8 +1217,17 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("usage: python -m ttt_svcbench_qwen.llamafactory_trainer CONFIG.yaml")
     started = time.monotonic()
     backbone = load_llamafactory_backbone(arguments[0])
-    unfreeze_audit = fully_unfreeze_qwen(backbone.model, backbone.project_config)
     configured_stage = ProductionStage(backbone.ttt_config.stage)
+    trainability_audit = configure_qwen_outer_trainability(
+        backbone.model,
+        backbone.project_config,
+        backbone.ttt_config.qwen_outer_trainability,
+    )
+    full_unfreeze_audit = (
+        fully_unfreeze_qwen(backbone.model, backbone.project_config)
+        if trainability_audit.mode == "full"
+        else None
+    )
     if getattr(backbone.training_args, "resume_from_checkpoint", None) is not None:
         raise ValueError(
             "set TTT_RESUME_CHECKPOINT for same-stage resume; YAML resume is forbidden"
@@ -1319,7 +1385,9 @@ def main(argv: list[str] | None = None) -> int:
     artifact_root = Path(os.environ.get("RUN_ROOT", str(output_dir)))
     if trainer.is_world_process_zero():
         environment = environment_manifest(backbone)
-        environment["full_unfreeze_audit"] = asdict(unfreeze_audit)
+        environment["qwen_trainability_audit"] = asdict(trainability_audit)
+        if full_unfreeze_audit is not None:
+            environment["full_unfreeze_audit"] = asdict(full_unfreeze_audit)
         environment["outer_parameter_audit"] = asdict(parameter_audit)
         checkpoint_environment = None
         if checkpoint_audit is not None:
@@ -1673,11 +1741,25 @@ def _audit_outer_parameters(
     )
     backbone_ids = {id(parameter) for parameter in backbone.model.parameters()}
     runtime_ids = {id(parameter) for _, parameter in named}
+    qwen = tuple(
+        (name, parameter) for name, parameter in named if id(parameter) in backbone_ids
+    )
+    non_qwen = tuple(
+        (name, parameter) for name, parameter in named if id(parameter) not in backbone_ids
+    )
     return OuterParameterAudit(
         stage=runtime.stage,
         total_parameter_count=sum(parameter.numel() for _, parameter in named),
         trainable_parameter_count=sum(
             parameter.numel() for _, parameter in named if parameter.requires_grad
+        ),
+        qwen_parameter_count=sum(parameter.numel() for _, parameter in qwen),
+        qwen_trainable_count=sum(
+            parameter.numel() for _, parameter in qwen if parameter.requires_grad
+        ),
+        non_qwen_parameter_count=sum(parameter.numel() for _, parameter in non_qwen),
+        non_qwen_trainable_count=sum(
+            parameter.numel() for _, parameter in non_qwen if parameter.requires_grad
         ),
         predictor_parameter_count=sum(parameter.numel() for _, parameter in predictor),
         predictor_trainable_count=sum(

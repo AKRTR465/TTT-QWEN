@@ -87,6 +87,7 @@ from ttt_svcbench_qwen.preprocess_cache import (
     PreprocessCache,
     PreprocessCacheMissPolicy,
     PreprocessCacheMode,
+    PreprocessCacheStorageDtype,
     PreprocessFingerprint,
     build_fingerprint,
 )
@@ -2391,6 +2392,10 @@ def _build_runtime_preprocess_cache(
     processor_name = (
         type(backbone.processor).__qualname__ if backbone.processor is not None else "none"
     )
+    raw_cache_dtype = str(getattr(config, "preprocess_cache_dtype", "float32"))
+    if raw_cache_dtype not in {"float32", "float16"}:
+        raise ValueError(f"unsupported preprocess cache dtype: {raw_cache_dtype}")
+    cache_dtype = cast(PreprocessCacheStorageDtype, raw_cache_dtype)
     namespace_seed = "|".join(
         (
             model_id,
@@ -2399,6 +2404,7 @@ def _build_runtime_preprocess_cache(
             processor_name,
             str(backbone.project_config.video_preprocessing.processor_shortest_edge),
             str(backbone.project_config.video_preprocessing.processor_longest_edge),
+            cache_dtype,
         )
     )
     namespace = os.environ.get("TTT_PREPROCESS_CACHE_NAMESPACE")
@@ -2413,6 +2419,7 @@ def _build_runtime_preprocess_cache(
         mode=mode,
         miss_policy=miss_policy,
         namespace=namespace,
+        storage_dtype=cache_dtype,
     )
 
 

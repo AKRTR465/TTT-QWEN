@@ -451,6 +451,7 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         support_ttt: Sequence[tuple[TTTLossOutput, ...]] | None = None,
         gradient_anchors: Sequence[OfficialWeakGradientAnchors] | None = None,
         measure_gradients: bool = True,
+        statistical_weights: Sequence[float] | None = None,
     ) -> OfficialWeakBalancedBatch:
         self._assert_balance_state()
         answer_items = tuple(answers)
@@ -463,6 +464,10 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         anchors = () if gradient_anchors is None else tuple(gradient_anchors)
         if anchors and len(anchors) != len(answer_items):
             raise ValueError("official-weak gradient anchors must align to Query objectives")
+        weights = _normalize_statistical_weights(
+            statistical_weights,
+            count=len(answer_items),
+        )
         device = answer_items[0].loss.value.device
         if any(answer.loss.value.device != device for answer in answer_items) or any(
             state.total.device != device for state in state_items
@@ -474,13 +479,31 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             raise RuntimeError("official-weak activation gradients require grad-enabled execution")
 
         pack_started = time.perf_counter()
-        answer_sums = tuple(_answer_local_sum(answer) for answer in answer_items)
-        answer_counts = tuple(_answer_valid_rows(answer) for answer in answer_items)
+        answer_sums = tuple(
+            _answer_local_sum(answer) * weight
+            for answer, weight in zip(answer_items, weights, strict=True)
+        )
+        answer_counts = tuple(
+            _answer_valid_rows(answer) * int(weight)
+            for answer, weight in zip(answer_items, weights, strict=True)
+        )
         term_items = tuple(
             tuple(getattr(state, name) for state in state_items) for name in _TERM_NAMES
         )
-        term_sums = tuple(tuple(_weak_local_sum(term) for term in terms) for terms in term_items)
-        term_counts = tuple(tuple(term.valid_rows for term in terms) for terms in term_items)
+        term_sums = tuple(
+            tuple(
+                _weak_local_sum(term) * weight
+                for term, weight in zip(terms, weights, strict=True)
+            )
+            for terms in term_items
+        )
+        term_counts = tuple(
+            tuple(
+                term.valid_rows * int(weight)
+                for term, weight in zip(terms, weights, strict=True)
+            )
+            for terms in term_items
+        )
         local_sums = (
             _sum_tensors(answer_sums),
             *(_sum_tensors(sums) for sums in term_sums),
@@ -495,6 +518,7 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
                 term_items,
                 anchors,
                 tuple(prior_loss_scales.unbind()),
+                statistical_weights=weights,
             )
         else:
             local_gradient_squares = tuple(
@@ -511,6 +535,7 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             "outer_loss_balance_pack",
             seconds=time.perf_counter() - pack_started,
             query_count=len(answer_items),
+            statistical_weight_sum=sum(weights),
         )
         with trace_cuda_phase("outer_loss_balance_collective", payload_values=stats.numel()):
             reduced, world_size = self._global_sum(stats)
@@ -809,6 +834,8 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         self,
         answers: Sequence[AnswerLossOutput],
         states: Sequence[OfficialWeakStateLossOutput],
+        *,
+        statistical_weights: Sequence[float] | None = None,
     ) -> OfficialWeakBalancedBatch:
         """Select streamed-A5 coefficients without differentiating no-grad calibration graphs."""
 
@@ -816,6 +843,7 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             answers,
             states,
             measure_gradients=False,
+            statistical_weights=statistical_weights,
         )
 
     def measure_streamed_gradients(
@@ -823,6 +851,8 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         state: OfficialWeakStateLossOutput,
         anchors: OfficialWeakGradientAnchors,
         audit: OfficialWeakBalanceAudit,
+        *,
+        statistical_weight: float = 1.0,
     ) -> Tensor:
         """Measure one streamed Query locally; buffer/parameter gradients remain untouched."""
 
@@ -834,6 +864,10 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
             tuple((getattr(state, name),) for name in _TERM_NAMES),
             (anchors,),
             loss_scales,
+            statistical_weights=_normalize_statistical_weights(
+                (statistical_weight,),
+                count=1,
+            ),
         )
         return _pack_gradient_stats(squares, counts)
 
@@ -994,6 +1028,26 @@ def _weak_local_sum(term: OfficialWeakLossTerm) -> Tensor:
     return term.value * float(term.valid_rows)
 
 
+def _normalize_statistical_weights(
+    values: Sequence[float] | None,
+    *,
+    count: int,
+) -> tuple[float, ...]:
+    if count <= 0:
+        raise ValueError("official-weak statistical weights require a positive item count")
+    weights = (1.0,) * count if values is None else tuple(values)
+    if len(weights) != count:
+        raise ValueError("official-weak statistical weights must align to Query objectives")
+    if any(
+        not isinstance(value, int | float)
+        or not math.isfinite(float(value))
+        or float(value) not in (0.0, 1.0)
+        for value in weights
+    ):
+        raise ValueError("official-weak statistical weights must be deterministic zero or one")
+    return tuple(float(value) for value in weights)
+
+
 def _sum_tensors(values: Sequence[Tensor]) -> Tensor:
     tensors = tuple(values)
     if not tensors:
@@ -1045,6 +1099,8 @@ def _gradient_local_statistics(
     term_items: Sequence[Sequence[OfficialWeakLossTerm]],
     anchors: Sequence[OfficialWeakGradientAnchors],
     loss_scales: Sequence[Tensor],
+    *,
+    statistical_weights: Sequence[float] | None = None,
 ) -> tuple[tuple[Tensor, ...], tuple[int, ...]]:
     if (
         len(term_items) != _TERM_SLOT_COUNT
@@ -1054,6 +1110,10 @@ def _gradient_local_statistics(
         raise ValueError("official-weak activation-gradient inputs are not aligned")
     if not anchors:
         raise ValueError("official-weak activation-gradient measurement requires anchors")
+    weights = _normalize_statistical_weights(
+        statistical_weights,
+        count=len(anchors),
+    )
     device = anchors[0].q_target.device
     squared_sums: list[Tensor] = []
     counts: list[int] = []
@@ -1065,16 +1125,32 @@ def _gradient_local_statistics(
     ):
         squared = torch.zeros((), dtype=torch.float64, device=device)
         count = 0
-        for term, anchor_set in zip(terms, anchors, strict=True):
-            if term.valid_rows <= 0:
-                continue
+        for term, anchor_set, weight in zip(terms, anchors, weights, strict=True):
             anchor = anchor_set.for_term(name)
             if anchor.device != device or term.value.device != device:
                 raise ValueError("official-weak gradient terms and anchors must share one device")
-            count += anchor.numel()
+            locally_valid = term.valid_rows > 0
+            statistically_valid = locally_valid and weight == 1.0
+            if statistically_valid:
+                count += anchor.numel()
             gradient: Tensor | None = None
-            if anchor.requires_grad and term.value.requires_grad:
-                scaled = loss_scale.to(device=device, dtype=term.value.dtype) * term.value
+            if anchor.requires_grad:
+                if locally_valid and not term.value.requires_grad:
+                    raise ValueError("valid official-weak loss term must remain differentiable")
+                source = (
+                    term.value
+                    if term.value.requires_grad
+                    else anchor.sum().to(dtype=term.value.dtype) * 0.0
+                )
+                scaled = loss_scale.to(device=device, dtype=source.dtype) * source
+                trace_event(
+                    "outer_gradient_local_term_start",
+                    term=name,
+                    locally_valid=locally_valid,
+                    statistically_valid=statistically_valid,
+                    statistical_weight=weight,
+                    valid_rows=term.valid_rows,
+                )
                 gradient = torch.autograd.grad(
                     scaled,
                     anchor,
@@ -1082,7 +1158,13 @@ def _gradient_local_statistics(
                     create_graph=False,
                     allow_unused=True,
                 )[0]
-            if gradient is not None:
+                trace_event(
+                    "outer_gradient_local_term_done",
+                    term=name,
+                    locally_valid=locally_valid,
+                    gradient_present=gradient is not None,
+                )
+            if statistically_valid and gradient is not None:
                 squared = squared + gradient.detach().double().square().sum()
         squared_sums.append(squared)
         counts.append(count)

@@ -53,7 +53,7 @@ if [[ "$(id -un)" != "$EXPECTED_USER" ]]; then
   echo "refusing to train as $(id -un); expected $EXPECTED_USER" >&2
   exit 1
 fi
-if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+if [[ ! -e "$PROJECT_ROOT/.git" ]]; then
   echo "project checkout not found: $PROJECT_ROOT" >&2
   exit 1
 fi
@@ -110,7 +110,10 @@ SESSION="${SESSION:-${TASK_NAME}_${RUN_ID}}"
 RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/runs/$RUN_ID}"
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs/$RUN_ID}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/experiment.log}"
-export MODEL DATASET_DIR DATASET_NAME RUN_ID SESSION RUN_ROOT LOG_DIR LOG_FILE YAML
+TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/triton_${EXPECTED_USER}_${RUN_ID}}"
+mkdir -p "$TRITON_CACHE_DIR"
+export MODEL DATASET_DIR DATASET_NAME RUN_ID SESSION RUN_ROOT LOG_DIR LOG_FILE YAML \
+  TRITON_CACHE_DIR
 
 if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
   command -v tmux >/dev/null 2>&1 || { echo "tmux is required on the H200 worker" >&2; exit 1; }
@@ -130,6 +133,7 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
     "LOG_FILE=$LOG_FILE"
     "YAML=$YAML"
     "TTT_H200_VENV=$VENV"
+    "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
     "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
   )
   if [[ -n "$MANIFEST" ]]; then
@@ -160,6 +164,8 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
     TTT_SUPPORT_VISUAL_BATCH_SIZE \
     TTT_SKIP_ENV_SETUP \
     TTT_QUERY_ACTIVATION_OFFLOAD \
+    TTT_QUERY_ACTIVATION_OFFLOAD_MAX_GB \
+    PYTORCH_CUDA_ALLOC_CONF \
     NCCL_DEBUG \
     NCCL_DEBUG_SUBSYS \
     TORCH_DISTRIBUTED_DEBUG \

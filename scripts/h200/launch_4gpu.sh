@@ -18,7 +18,7 @@ if [[ "$(id -un)" != "$EXPECTED_USER" ]]; then
   echo "refusing to train as $(id -un); expected $EXPECTED_USER" >&2
   exit 1
 fi
-if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+if [[ ! -e "$PROJECT_ROOT/.git" ]]; then
   echo "project checkout not found: $PROJECT_ROOT" >&2
   exit 1
 fi
