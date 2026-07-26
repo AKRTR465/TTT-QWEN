@@ -195,7 +195,10 @@ class A5SupervisedSegmentRecord:
         if any(right <= left for left, right in pairwise(query_times)):
             raise ValueError("A5 segment Query bundle must advance strictly")
         if ends[-1] >= query_times[0]:
-            raise ValueError("A5 segment Query bundle must follow every segment Support")
+            raise ValueError(
+                "A5 segment Query bundle must follow every segment Support: "
+                f"support_end={ends[-1]:.6f}, first_query={query_times[0]:.6f}"
+            )
         if self.query_weight != 1.0:
             raise ValueError("A5 Intermediate and Final Query weights are frozen to one")
 
