@@ -28,6 +28,7 @@ from ttt_svcbench_qwen.losses import (
     RetrievalLossInput,
     StateLossInput,
     TemporalPredictionInput,
+    TemporalPredictionScaleAudit,
     TimeLossInput,
     TrainingLossInput,
     TTTLossInput,
@@ -192,6 +193,24 @@ def _fake_ttt(values: list[float], valid: list[bool]) -> TTTLossOutput:
             invalid_source_counts=zeros.clone(),
             padding_counts=zeros.clone(),
         ),
+        temporal_scale_audit=_zero_temporal_scale_audit(),
+    )
+
+
+def _zero_temporal_scale_audit() -> TemporalPredictionScaleAudit:
+    zero = torch.zeros((), dtype=torch.float32)
+    count = torch.zeros((), dtype=torch.int64)
+    return TemporalPredictionScaleAudit(
+        hidden_sum_squares=zero.clone(),
+        hidden_element_count=count.clone(),
+        hidden_max_abs=zero.clone(),
+        target_sum_squares=zero.clone(),
+        prediction_sum_squares=zero.clone(),
+        error_sum_squares=zero.clone(),
+        pair_element_count=count.clone(),
+        target_max_abs=zero.clone(),
+        prediction_max_abs=zero.clone(),
+        error_max_abs=zero.clone(),
     )
 
 
@@ -473,6 +492,21 @@ def test_ttt_weights_are_exact_and_no_o1_term_exists() -> None:
     assert torch.allclose(output.total, expected)
     assert (output.pred_weight, output.identity_weight, output.event_weight) == (1.0, 0.5, 0.5)
     assert output.o1_unlabeled_weight == 0.0
+    scale = output.temporal_scale_audit
+    assert scale.hidden_element_count.item() == 2 * 768
+    assert scale.pair_element_count.item() == 768
+    assert scale.hidden_sum_squares.item() == pytest.approx(hidden.detach().square().sum().item())
+    expected_predictions = predictor(hidden[:, :-1]).detach().float()
+    expected_targets = hidden[:, 1:].detach().float()
+    assert scale.prediction_sum_squares.item() == pytest.approx(
+        expected_predictions.square().sum().item()
+    )
+    assert scale.target_sum_squares.item() == pytest.approx(
+        expected_targets.square().sum().item()
+    )
+    assert scale.error_sum_squares.item() == pytest.approx(
+        (expected_predictions - expected_targets).square().sum().item()
+    )
 
 
 def test_ttt_scalar_uses_union_valid_per_row_mean_for_mixed_batch() -> None:

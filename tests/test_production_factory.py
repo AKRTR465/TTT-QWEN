@@ -545,6 +545,7 @@ def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
         "runtime_trace_mode",
         "segment_prefetch_depth",
         "semantic_projector_delta_audit_steps",
+        "a5_parameter_delta_audit_steps",
         "operator_diagnostics_interval",
     }
 

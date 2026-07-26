@@ -1035,6 +1035,20 @@ class TruncatedMetaTTTEpisodeAudit:
     update_attempt_count: int
     update_count: int
     skip_count: int
+    support_ttt_raw_mean: float
+    support_pred_mean: float
+    support_identity_weighted_mean: float
+    support_event_weighted_mean: float
+    temporal_hidden_rms: float
+    temporal_target_rms: float
+    temporal_prediction_rms: float
+    temporal_error_rms: float
+    temporal_hidden_max_abs: float
+    temporal_target_max_abs: float
+    temporal_prediction_max_abs: float
+    temporal_error_max_abs: float
+    temporal_hidden_element_count: int
+    temporal_pair_element_count: int
     parameter_versions_unchanged_before_outer_step: bool
     overlap_graph_detached: bool
     support_supervision_reachable: bool
@@ -1072,6 +1086,41 @@ class TruncatedMetaTTTEpisodeAudit:
             raise ValueError("A5 retained more than K Support graphs")
         if self.update_attempt_count != self.update_count + self.skip_count:
             raise ValueError("A5 update attempts must equal accepted plus skipped")
+        nonnegative_finite = (
+            self.support_ttt_raw_mean,
+            self.support_pred_mean,
+            self.support_identity_weighted_mean,
+            self.support_event_weighted_mean,
+            self.temporal_hidden_rms,
+            self.temporal_target_rms,
+            self.temporal_prediction_rms,
+            self.temporal_error_rms,
+            self.temporal_hidden_max_abs,
+            self.temporal_target_max_abs,
+            self.temporal_prediction_max_abs,
+            self.temporal_error_max_abs,
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in nonnegative_finite):
+            raise ValueError("A5 TTT scale audit values must be finite and non-negative")
+        if (
+            type(self.temporal_hidden_element_count) is not int
+            or type(self.temporal_pair_element_count) is not int
+            or self.temporal_hidden_element_count < 0
+            or self.temporal_pair_element_count < 0
+        ):
+            raise ValueError("A5 TTT scale audit counts must be non-negative integers")
+        component_total = (
+            self.support_pred_mean
+            + self.support_identity_weighted_mean
+            + self.support_event_weighted_mean
+        )
+        if not math.isclose(
+            self.support_ttt_raw_mean,
+            component_total,
+            rel_tol=1.0e-5,
+            abs_tol=1.0e-6,
+        ):
+            raise ValueError("A5 TTT component means do not reconstruct the raw mean")
         if len(self.segments) != self.segment_count:
             raise ValueError("A5 segment audit count drifted")
         if len(self.updates) != self.support_count or len(self.queries) != self.query_count:
@@ -1243,6 +1292,35 @@ class MetaTTTEpisodeRunner:
         device = adapted.fast_states[0].w_t_1.device
         query_loss_detached = torch.zeros((), dtype=torch.float32, device=device)
         support_total_detached = torch.zeros((), dtype=torch.float32, device=device)
+        support_pred_total_detached = torch.zeros((), dtype=torch.float32, device=device)
+        support_identity_total_detached = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        support_event_total_detached = torch.zeros((), dtype=torch.float32, device=device)
+        temporal_hidden_sum_squares = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        temporal_target_sum_squares = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        temporal_prediction_sum_squares = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        temporal_error_sum_squares = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        temporal_hidden_element_count = torch.zeros(
+            (), dtype=torch.int64, device=device
+        )
+        temporal_pair_element_count = torch.zeros(
+            (), dtype=torch.int64, device=device
+        )
+        temporal_hidden_max_abs = torch.zeros((), dtype=torch.float32, device=device)
+        temporal_target_max_abs = torch.zeros((), dtype=torch.float32, device=device)
+        temporal_prediction_max_abs = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        temporal_error_max_abs = torch.zeros((), dtype=torch.float32, device=device)
         support_lifecycle = PrefillLifecycle(episode.owner)
         query_offload_budget = (
             QueryActivationOffloadBudget.from_environment()
@@ -1376,6 +1454,66 @@ class MetaTTTEpisodeRunner:
                 maximum_retained = max(maximum_retained, len(segment_outputs))
                 support_total_detached = (
                     support_total_detached + ttt_output.total.detach().to(torch.float32)
+                )
+                valid_rows = ttt_output.update_valid_mask
+                valid_denominator = valid_rows.sum().clamp_min(1)
+                support_pred_total_detached = (
+                    support_pred_total_detached
+                    + (
+                        ttt_output.pred.per_row
+                        * valid_rows.to(dtype=torch.float32)
+                    ).sum().detach()
+                    / valid_denominator
+                )
+                support_identity_total_detached = (
+                    support_identity_total_detached
+                    + 0.5
+                    * (
+                        ttt_output.identity.per_row
+                        * valid_rows.to(dtype=torch.float32)
+                    ).sum().detach()
+                    / valid_denominator
+                )
+                support_event_total_detached = (
+                    support_event_total_detached
+                    + 0.5
+                    * (
+                        ttt_output.event.per_row
+                        * valid_rows.to(dtype=torch.float32)
+                    ).sum().detach()
+                    / valid_denominator
+                )
+                scale_audit = ttt_output.temporal_scale_audit
+                temporal_hidden_sum_squares = (
+                    temporal_hidden_sum_squares + scale_audit.hidden_sum_squares
+                )
+                temporal_target_sum_squares = (
+                    temporal_target_sum_squares + scale_audit.target_sum_squares
+                )
+                temporal_prediction_sum_squares = (
+                    temporal_prediction_sum_squares
+                    + scale_audit.prediction_sum_squares
+                )
+                temporal_error_sum_squares = (
+                    temporal_error_sum_squares + scale_audit.error_sum_squares
+                )
+                temporal_hidden_element_count = (
+                    temporal_hidden_element_count + scale_audit.hidden_element_count
+                )
+                temporal_pair_element_count = (
+                    temporal_pair_element_count + scale_audit.pair_element_count
+                )
+                temporal_hidden_max_abs = torch.maximum(
+                    temporal_hidden_max_abs, scale_audit.hidden_max_abs
+                )
+                temporal_target_max_abs = torch.maximum(
+                    temporal_target_max_abs, scale_audit.target_max_abs
+                )
+                temporal_prediction_max_abs = torch.maximum(
+                    temporal_prediction_max_abs, scale_audit.prediction_max_abs
+                )
+                temporal_error_max_abs = torch.maximum(
+                    temporal_error_max_abs, scale_audit.error_max_abs
                 )
                 del results, ttt_output, built, observation
 
@@ -1641,6 +1779,7 @@ class MetaTTTEpisodeRunner:
             )
             trace_event(
                 "a5_query_aligned_segment_released",
+                episode_id=episode.owner,
                 segment_index=segment_index,
                 segment_count=len(episode.segment_lengths),
                 query_roles=query_roles,
@@ -1692,7 +1831,51 @@ class MetaTTTEpisodeRunner:
             episode_weight * auxiliary_scale * support_total_detached
         ).detach().clone()
         detached_total = (detached_query + detached_auxiliary).detach().clone()
+        support_ttt_raw_mean = float((support_total_detached / support_count).item())
+        support_pred_mean = float(
+            (support_pred_total_detached / support_count).item()
+        )
+        support_identity_weighted_mean = float(
+            (support_identity_total_detached / support_count).item()
+        )
+        support_event_weighted_mean = float(
+            (support_event_total_detached / support_count).item()
+        )
+        hidden_elements = int(temporal_hidden_element_count.item())
+        pair_elements = int(temporal_pair_element_count.item())
+
+        def rms(sum_squares: Tensor, count: int) -> float:
+            return math.sqrt(float(sum_squares.item()) / count) if count else 0.0
+
         query_count = len(episode.query_points)
+        trace_event(
+            "a5_ttt_numerical_audit",
+            episode_id=episode.owner,
+            support_count=support_count,
+            query_count=query_count,
+            support_ttt_raw_mean=support_ttt_raw_mean,
+            support_pred_mean=support_pred_mean,
+            support_identity_weighted_mean=support_identity_weighted_mean,
+            support_event_weighted_mean=support_event_weighted_mean,
+            temporal_hidden_rms=rms(
+                temporal_hidden_sum_squares, hidden_elements
+            ),
+            temporal_target_rms=rms(
+                temporal_target_sum_squares, pair_elements
+            ),
+            temporal_prediction_rms=rms(
+                temporal_prediction_sum_squares, pair_elements
+            ),
+            temporal_error_rms=rms(
+                temporal_error_sum_squares, pair_elements
+            ),
+            temporal_hidden_max_abs=float(temporal_hidden_max_abs.item()),
+            temporal_target_max_abs=float(temporal_target_max_abs.item()),
+            temporal_prediction_max_abs=float(
+                temporal_prediction_max_abs.item()
+            ),
+            temporal_error_max_abs=float(temporal_error_max_abs.item()),
+        )
         audit = TruncatedMetaTTTEpisodeAudit(
             active_terms=self.enabled_terms,
             loss_weight=episode_weight,
@@ -1713,6 +1896,24 @@ class MetaTTTEpisodeRunner:
             update_attempt_count=attempted,
             update_count=updated,
             skip_count=attempted - updated,
+            support_ttt_raw_mean=support_ttt_raw_mean,
+            support_pred_mean=support_pred_mean,
+            support_identity_weighted_mean=support_identity_weighted_mean,
+            support_event_weighted_mean=support_event_weighted_mean,
+            temporal_hidden_rms=rms(temporal_hidden_sum_squares, hidden_elements),
+            temporal_target_rms=rms(temporal_target_sum_squares, pair_elements),
+            temporal_prediction_rms=rms(
+                temporal_prediction_sum_squares, pair_elements
+            ),
+            temporal_error_rms=rms(temporal_error_sum_squares, pair_elements),
+            temporal_hidden_max_abs=float(temporal_hidden_max_abs.item()),
+            temporal_target_max_abs=float(temporal_target_max_abs.item()),
+            temporal_prediction_max_abs=float(
+                temporal_prediction_max_abs.item()
+            ),
+            temporal_error_max_abs=float(temporal_error_max_abs.item()),
+            temporal_hidden_element_count=hidden_elements,
+            temporal_pair_element_count=pair_elements,
             parameter_versions_unchanged_before_outer_step=versions_before == versions_after,
             overlap_graph_detached=all(item.match.snapshot_detached for item in update_audits),
             support_supervision_reachable=False,

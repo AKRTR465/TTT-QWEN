@@ -135,6 +135,44 @@ class TemporalPredictionInput:
                 raise ValueError("invalid temporal positions must use -1")
 
 
+@dataclass(frozen=True, slots=True)
+class TemporalPredictionScaleAudit:
+    """Detached sufficient statistics for diagnosing temporal-target scale drift."""
+
+    hidden_sum_squares: Tensor
+    hidden_element_count: Tensor
+    hidden_max_abs: Tensor
+    target_sum_squares: Tensor
+    prediction_sum_squares: Tensor
+    error_sum_squares: Tensor
+    pair_element_count: Tensor
+    target_max_abs: Tensor
+    prediction_max_abs: Tensor
+    error_max_abs: Tensor
+
+    def __post_init__(self) -> None:
+        floating = (
+            self.hidden_sum_squares,
+            self.hidden_max_abs,
+            self.target_sum_squares,
+            self.prediction_sum_squares,
+            self.error_sum_squares,
+            self.target_max_abs,
+            self.prediction_max_abs,
+            self.error_max_abs,
+        )
+        counts = (self.hidden_element_count, self.pair_element_count)
+        if any(value.ndim != 0 or value.dtype != torch.float32 for value in floating):
+            raise ValueError("temporal scale audit values must be FP32 scalars")
+        if any(value.ndim != 0 or value.dtype != torch.int64 for value in counts):
+            raise ValueError("temporal scale audit counts must be int64 scalars")
+        tensors = (*floating, *counts)
+        if any(value.requires_grad or value.grad_fn is not None for value in tensors):
+            raise ValueError("temporal scale audit must be detached")
+        if len({value.device for value in tensors}) != 1:
+            raise ValueError("temporal scale audit values must share one device")
+
+
 class TemporalPredictor(nn.Module):  # type: ignore[misc]
     """LayerNorm -> Linear -> SiLU -> Linear next-tubelet predictor."""
 
@@ -513,6 +551,7 @@ class TTTLossOutput:
     per_row_total: Tensor
     update_valid_mask: Tensor
     identity_audit: IdentityConsistencyAudit
+    temporal_scale_audit: TemporalPredictionScaleAudit
     pred_weight: float = _PRED_WEIGHT
     identity_weight: float = _IDENTITY_WEIGHT
     event_weight: float = _EVENT_WEIGHT
@@ -539,9 +578,64 @@ class TTTLossOutput:
             raise ValueError("O1 unlabeled loss is forbidden")
 
 
-def compute_temporal_prediction_loss(
+def _temporal_prediction_scale_audit(
+    inputs: TemporalPredictionInput,
+    *,
+    predictions: Tensor | None,
+    targets: Tensor | None,
+    contiguous_mask: Tensor | None,
+) -> TemporalPredictionScaleAudit:
+    hidden = inputs.hidden.detach().float()
+    hidden_mask = inputs.valid_mask.unsqueeze(-1)
+    hidden_values = hidden * hidden_mask
+    hidden_sum_squares = hidden_values.square().sum().detach()
+    hidden_element_count = (
+        inputs.valid_mask.sum(dtype=torch.int64) * inputs.hidden.shape[-1]
+    ).detach()
+    hidden_max_abs = (
+        hidden_values.abs().amax().detach()
+        if hidden_values.numel()
+        else hidden_sum_squares.new_zeros(())
+    )
+    zero = hidden_sum_squares.new_zeros(())
+    zero_count = hidden_element_count.new_zeros(())
+    if predictions is None or targets is None or contiguous_mask is None:
+        return TemporalPredictionScaleAudit(
+            hidden_sum_squares=hidden_sum_squares,
+            hidden_element_count=hidden_element_count,
+            hidden_max_abs=hidden_max_abs,
+            target_sum_squares=zero.clone(),
+            prediction_sum_squares=zero.clone(),
+            error_sum_squares=zero.clone(),
+            pair_element_count=zero_count,
+            target_max_abs=zero.clone(),
+            prediction_max_abs=zero.clone(),
+            error_max_abs=zero.clone(),
+        )
+    pair_mask = contiguous_mask.unsqueeze(-1)
+    target_values = targets.detach().float() * pair_mask
+    prediction_values = predictions.detach().float() * pair_mask
+    error_values = (predictions.detach().float() - targets.detach().float()) * pair_mask
+    pair_element_count = (
+        contiguous_mask.sum(dtype=torch.int64) * inputs.hidden.shape[-1]
+    ).detach()
+    return TemporalPredictionScaleAudit(
+        hidden_sum_squares=hidden_sum_squares,
+        hidden_element_count=hidden_element_count,
+        hidden_max_abs=hidden_max_abs,
+        target_sum_squares=target_values.square().sum().detach(),
+        prediction_sum_squares=prediction_values.square().sum().detach(),
+        error_sum_squares=error_values.square().sum().detach(),
+        pair_element_count=pair_element_count,
+        target_max_abs=target_values.abs().amax().detach(),
+        prediction_max_abs=prediction_values.abs().amax().detach(),
+        error_max_abs=error_values.abs().amax().detach(),
+    )
+
+
+def _compute_temporal_prediction_loss_with_audit(
     predictor: TemporalPredictor, inputs: TemporalPredictionInput
-) -> LossTerm:
+) -> tuple[LossTerm, TemporalPredictionScaleAudit]:
     """Predict the next contiguous valid tubelet and detach only its target."""
 
     if inputs.hidden.shape[-1] != predictor.input_dim:
@@ -552,11 +646,17 @@ def compute_temporal_prediction_loss(
     if length < 2:
         zero = _differentiable_zero(inputs.hidden)
         zeros = torch.zeros(batch_size, dtype=torch.int64, device=inputs.hidden.device)
-        return _make_term_from_rows(
+        term = _make_term_from_rows(
             torch.zeros(batch_size, dtype=torch.float32, device=inputs.hidden.device) + zero,
             zeros,
             zeros,
             tuple(LossSkipReason.INSUFFICIENT_TIME for _ in range(batch_size)),
+        )
+        return term, _temporal_prediction_scale_audit(
+            inputs,
+            predictions=None,
+            targets=None,
+            contiguous_mask=None,
         )
     predictions = predictor(inputs.hidden[:, :-1])
     targets = inputs.hidden[:, 1:].detach()
@@ -577,7 +677,22 @@ def compute_temporal_prediction_loss(
         )
         for row in range(batch_size)
     )
-    return _reduce_items(item_losses, contiguous_mask, mask_counts, reasons)
+    term = _reduce_items(item_losses, contiguous_mask, mask_counts, reasons)
+    return term, _temporal_prediction_scale_audit(
+        inputs,
+        predictions=predictions,
+        targets=targets,
+        contiguous_mask=contiguous_mask,
+    )
+
+
+def compute_temporal_prediction_loss(
+    predictor: TemporalPredictor, inputs: TemporalPredictionInput
+) -> LossTerm:
+    """Preserve the public loss-only API while the formal TTT path records scale audit."""
+
+    term, _ = _compute_temporal_prediction_loss_with_audit(predictor, inputs)
+    return term
 
 
 def compute_identity_consistency_loss(inputs: IdentityConsistencyInput) -> IdentityLossOutput:
@@ -669,7 +784,9 @@ def compute_event_consistency_loss(inputs: EventConsistencyInput) -> EventLossOu
 
 
 def compute_ttt_loss(predictor: TemporalPredictor, inputs: TTTLossInput) -> TTTLossOutput:
-    pred = compute_temporal_prediction_loss(predictor, inputs.temporal)
+    pred, temporal_scale_audit = _compute_temporal_prediction_loss_with_audit(
+        predictor, inputs.temporal
+    )
     identity_output = compute_identity_consistency_loss(inputs.identity)
     event_output = compute_event_consistency_loss(inputs.event)
     per_row = (
@@ -693,6 +810,7 @@ def compute_ttt_loss(predictor: TemporalPredictor, inputs: TTTLossInput) -> TTTL
         per_row_total=per_row,
         update_valid_mask=update_valid,
         identity_audit=identity_output.audit,
+        temporal_scale_audit=temporal_scale_audit,
     )
 
 
