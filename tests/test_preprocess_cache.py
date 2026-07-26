@@ -17,7 +17,12 @@ from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
+    A5EpisodeRecord,
+    A5QueryRole,
+    A5SupervisedSegmentRecord,
+    AdaptiveChunkSpec,
     AnswerSupervisionSidecar,
+    ChunkRole,
     EpisodeSplit,
     ProductionQueryRecord,
     WeakQuerySidecar,
@@ -321,3 +326,83 @@ def test_prewarm_enumerates_distinct_state_and_answer_query_entries(
     }
     assert set(query_fingerprints) == {"state_query", "answer_query"}
     assert len(set(query_fingerprints.values())) == 2
+
+
+def test_a5_prewarm_binds_each_support_segment_to_its_meta_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setenv("SVCBENCH_VIDEO_ROOT", str(tmp_path))
+
+    def query(query_id: str, query_index: int, query_time: float) -> ProductionQueryRecord:
+        runtime = RuntimeQueryInput(
+            video_id="video-a",
+            trajectory_id="trajectory-a",
+            query_id=query_id,
+            query_index=query_index,
+            video=video,
+            question="How many?",
+            query_time=query_time,
+            explicit_time_values=(),
+        )
+        return ProductionQueryRecord(
+            runtime=runtime,
+            answer=AnswerSupervisionSidecar(query_id, "1", "official_explicit"),
+            weak=WeakQuerySidecar(
+                query_id=query_id,
+                query_index=query_index,
+                query_time=query_time,
+                count=1,
+                counting_type="O1",
+                counting_subtype="O1-Snap",
+                operator="o1-snap",
+                time_mode="now",
+                occurrence_points=(),
+                occurrence_intervals=(),
+            ),
+        )
+
+    first = query("query-a", 0, 4.0)
+    final = query("query-b", 1, 10.0)
+    first_supports = (
+        AdaptiveChunkSpec(ChunkRole.SUPPORT, 0.5, 2.0, 8),
+        AdaptiveChunkSpec(ChunkRole.SUPPORT, 2.0, 3.0, 8),
+    )
+    final_supports = (
+        AdaptiveChunkSpec(ChunkRole.SUPPORT, 4.5, 6.0, 8),
+        AdaptiveChunkSpec(ChunkRole.SUPPORT, 6.0, 8.0, 8),
+    )
+    record = A5EpisodeRecord(
+        episode_id="episode-a",
+        source_dataset="svcbench",
+        relative_video_path="clip.mp4",
+        video_id="video-a",
+        trajectory_id="trajectory-a",
+        split=EpisodeSplit.TRAIN,
+        task_class="O1",
+        operator="o1-snap",
+        prewarm=AdaptiveChunkSpec(ChunkRole.PREWARM, 0.0, 0.5, 8),
+        supervised_segments=(
+            A5SupervisedSegmentRecord(A5QueryRole.INTERMEDIATE, first_supports, first),
+            A5SupervisedSegmentRecord(A5QueryRole.FINAL, final_supports, final),
+        ),
+        diagnostic_queries=(),
+        support_count=4,
+        meta_query_count=2,
+        diagnostic_query_count=0,
+        truncation_horizon=8,
+        tbptt_segment_count=2,
+        sampling_weight=1.0,
+    )
+    root = Path(__file__).parents[1]
+    ttt_config = _load_training_config(
+        root / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
+    )
+
+    candidates = tuple(
+        _iter_specs((record,), ttt_config, roles=frozenset(("support",)))
+    )
+    support_specs = [spec for spec, _source in candidates]
+    assert [spec.query_time for spec in support_specs] == [4.0, 4.0, 4.0, 10.0, 10.0]
+    assert [spec.end_time for spec in support_specs] == [0.5, 2.0, 3.0, 6.0, 8.0]

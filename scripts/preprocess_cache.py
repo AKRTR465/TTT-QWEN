@@ -248,10 +248,20 @@ def _load_input_records(
         args.manifest,
         stage=ManifestStage(args.stage),
     )
+    train_records = tuple(
+        record
+        for record in train.records
+        if not isinstance(record, A5EpisodeRecord) or record.loss_weight == 1.0
+    )
+    evaluation_records = tuple(
+        record
+        for record in evaluation.records
+        if not isinstance(record, A5EpisodeRecord) or record.loss_weight == 1.0
+    )
     return {
-        "train": train.records,
-        "validation": evaluation.records,
-        "all": (*train.records, *evaluation.records),
+        "train": train_records,
+        "validation": evaluation_records,
+        "all": (*train_records, *evaluation_records),
     }[args.split]
 
 
@@ -334,25 +344,35 @@ def _iter_specs(
                     ),
                 )
         else:
-            query_time = record.queries[0].runtime.query_time
-            chunks = (record.prewarm, *record.supports)
-            specs = (
-                tuple(
+            specs = ()
+            if "support" in roles:
+                first_query_time = record.supervised_segments[0].meta_query.runtime.query_time
+                support_specs = [
                     SupportChunkSpec(
-                        chunk_id=f"{record.episode_id}:prewarm"
-                        if index == 0
-                        else f"{record.episode_id}:s{index}",
+                        chunk_id=f"{record.episode_id}:prewarm",
                         video_path=path,
-                        start_time=chunk.start_time,
-                        end_time=chunk.end_time,
-                        maximum_frames=chunk.maximum_frames,
-                        query_time=query_time,
+                        start_time=record.prewarm.start_time,
+                        end_time=record.prewarm.end_time,
+                        maximum_frames=record.prewarm.maximum_frames,
+                        query_time=first_query_time,
                     )
-                    for index, chunk in enumerate(chunks)
-                )
-                if "support" in roles
-                else ()
-            )
+                ]
+                support_index = 0
+                for segment in record.supervised_segments:
+                    query_time = segment.meta_query.runtime.query_time
+                    for chunk in segment.supports:
+                        support_index += 1
+                        support_specs.append(
+                            SupportChunkSpec(
+                                chunk_id=f"{record.episode_id}:s{support_index}",
+                                video_path=path,
+                                start_time=chunk.start_time,
+                                end_time=chunk.end_time,
+                                maximum_frames=chunk.maximum_frames,
+                                query_time=query_time,
+                            )
+                        )
+                specs = tuple(support_specs)
             specs += tuple(
                 spec
                 for index, query in enumerate(record.queries)
