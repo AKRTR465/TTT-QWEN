@@ -1411,12 +1411,24 @@ def _episode_from_group(
     prewarm, original_supports = adaptive_support_schedule(first.query_time)
     query_records = tuple(_production_query(item, operator) for item in group)
     final_query = query_records[-1]
-    split_candidates = tuple(
-        index
-        for index, query in enumerate(query_records[:-1])
-        if query.runtime.query_time <= final_query.runtime.query_time - 4.0
+    split_candidates: list[tuple[int, tuple[AdaptiveChunkSpec, ...]]] = []
+    for index, query in enumerate(query_records[:-1]):
+        query_gap = final_query.runtime.query_time - query.runtime.query_time
+        if query_gap < 4.0:
+            continue
+        _unused_prewarm, relative_supports = adaptive_support_schedule(query_gap)
+        candidate_supports = _compress_support_schedule(
+            _shift_support_schedule(
+                relative_supports,
+                query.runtime.query_time,
+            ),
+            truncation_horizon,
+        )
+        if candidate_supports[-1].end_time < query_records[index + 1].runtime.query_time:
+            split_candidates.append((index, candidate_supports))
+    split_index, split_supports = (
+        split_candidates[-1] if split_candidates else (None, ())
     )
-    split_index = split_candidates[-1] if split_candidates else None
     split_episode = split_index is not None
     insufficient_gap = len(query_records) > 1 and not split_episode
     first_supports = _compress_support_schedule(
@@ -1426,12 +1438,6 @@ def _episode_from_group(
     if split_episode:
         assert split_index is not None
         pivot_query = query_records[split_index]
-        query_gap = final_query.runtime.query_time - pivot_query.runtime.query_time
-        _unused_prewarm, relative_supports = adaptive_support_schedule(query_gap)
-        later_supports = _compress_support_schedule(
-            _shift_support_schedule(relative_supports, pivot_query.runtime.query_time),
-            truncation_horizon,
-        )
         supervised_segments = (
             A5SupervisedSegmentRecord(
                 role=A5QueryRole.INTERMEDIATE,
@@ -1441,7 +1447,7 @@ def _episode_from_group(
             ),
             A5SupervisedSegmentRecord(
                 role=A5QueryRole.FINAL,
-                supports=later_supports,
+                supports=split_supports,
                 meta_query=final_query,
                 additional_meta_queries=query_records[split_index + 1 : -1],
             ),
