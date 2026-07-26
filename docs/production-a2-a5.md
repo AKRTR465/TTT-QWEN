@@ -141,3 +141,26 @@ CPU 测试覆盖 `T=17/K=8`、两次历史截断、数值连续、旧图断开�
 Inner 参数、256 帧 causal Query、LLaMA-Factory 索引一致性、顺序 Query 梯度等价、manifest
 防泄漏、四 rank backward parity 和原子 checkpoint 边界。真实四卡 8B 验收证据写入各自 run
 目录。
+
+## H200 观测工具
+
+以下工具只读取训练日志或设备状态，不修改模型、checkpoint 和训练进程。输出应写入对应的
+独立 run 目录，避免覆盖历史实验：
+
+```bash
+python scripts/h200/capture_gpu_telemetry.py \
+  --output runs/<run_id>/gpu_telemetry_300s.csv \
+  --seconds 300
+
+python scripts/h200/bridge_train_log_tensorboard.py \
+  --train-log runs/<run_id>/train.log \
+  --logdir runs/<run_id>/tensorboard_bridge
+
+python scripts/benchmark_retrieval_history.py \
+  --device both \
+  --output runs/<run_id>/retrieval_history_benchmark.json
+```
+
+GPU 遥测在完成后写同名 `.done` 哨兵。TensorBoard bridge 需要安装项目的 `tracking` extra；
+Retrieval benchmark 比较逐行写入与生产 `append_many()` 批量写入当前 tensor ring 的耗时，
+不再依赖已删除的 legacy tuple backend。
