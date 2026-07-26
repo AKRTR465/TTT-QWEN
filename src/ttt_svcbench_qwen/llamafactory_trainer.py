@@ -1701,7 +1701,7 @@ def _run_main(argv: list[str] | None = None) -> int:
     checkpoint_policy = _checkpoint_policy_from_environment()
     if skip_final_checkpoint and checkpoint_policy is not CheckpointPolicy.ATOMIC_FINAL_ONLY:
         raise ValueError("a smoke run cannot retain epoch checkpoints")
-    if skip_final_checkpoint:
+    if checkpoint_policy is CheckpointPolicy.ATOMIC_FINAL_ONLY:
         _disable_smoke_checkpoints(training_args)
     if checkpoint_policy is CheckpointPolicy.EPOCH_2_AND_EPOCH_4:
         _validate_epoch_two_four_training_arguments(training_args)
@@ -1827,7 +1827,7 @@ def _checkpoint_policy_from_environment() -> CheckpointPolicy:
 
 
 def _disable_smoke_checkpoints(training_args: object) -> None:
-    """Disable Trainer's periodic saves when an explicit smoke keeps no checkpoint."""
+    """Disable periodic saves when the atomic policy publishes only the final checkpoint."""
 
     arguments = cast(Any, training_args)
     strategy = arguments.save_strategy
