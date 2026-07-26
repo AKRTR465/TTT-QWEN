@@ -181,6 +181,7 @@ class A5SupervisedSegmentRecord:
     supports: tuple[AdaptiveChunkSpec, ...]
     meta_query: ProductionQueryRecord
     query_weight: float = 1.0
+    additional_meta_queries: tuple[ProductionQueryRecord, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.supports or len(self.supports) > 8:
@@ -190,10 +191,32 @@ class A5SupervisedSegmentRecord:
         ends = tuple(chunk.end_time for chunk in self.supports)
         if any(right <= left for left, right in pairwise(ends)):
             raise ValueError("A5 supervised segment Support ends must advance strictly")
-        if ends[-1] >= self.meta_query.runtime.query_time:
-            raise ValueError("A5 segment Query must follow every segment Support")
+        query_times = tuple(query.runtime.query_time for query in self.queries)
+        if any(right <= left for left, right in pairwise(query_times)):
+            raise ValueError("A5 segment Query bundle must advance strictly")
+        if ends[-1] >= query_times[0]:
+            raise ValueError("A5 segment Query bundle must follow every segment Support")
         if self.query_weight != 1.0:
             raise ValueError("A5 Intermediate and Final Query weights are frozen to one")
+
+    @property
+    def queries(self) -> tuple[ProductionQueryRecord, ...]:
+        """All official Query points supervised by this post-Support fast state."""
+
+        return (*self.additional_meta_queries, self.meta_query)
+
+    @property
+    def query_roles(self) -> tuple[A5QueryRole, ...]:
+        if self.role is A5QueryRole.FINAL:
+            return (
+                *(A5QueryRole.INTERMEDIATE for _ in self.additional_meta_queries),
+                A5QueryRole.FINAL,
+            )
+        return (A5QueryRole.INTERMEDIATE,) * len(self.queries)
+
+    @property
+    def query_weights(self) -> tuple[float, ...]:
+        return (self.query_weight,) * len(self.queries)
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,7 +254,7 @@ class A5EpisodeRecord:
         if self.support_count != len(supports):
             raise ValueError("A5 support_count does not match supervised segments")
         if self.meta_query_count != len(queries):
-            raise ValueError("A5 meta_query_count does not match supervised segments")
+            raise ValueError("A5 meta_query_count does not match supervised Query bundles")
         if self.diagnostic_query_count != len(self.diagnostic_queries):
             raise ValueError("A5 diagnostic_query_count does not match diagnostic Queries")
         if self.tbptt_segment_count != len(self.supervised_segments):
@@ -257,7 +280,7 @@ class A5EpisodeRecord:
         if roles != expected_roles:
             raise ValueError("A5 segment roles must be Final or Intermediate then Final")
         for previous, current in pairwise(self.supervised_segments):
-            previous_time = previous.meta_query.runtime.query_time
+            previous_time = previous.queries[-1].runtime.query_time
             if any(chunk.end_time <= previous_time for chunk in current.supports):
                 raise ValueError(
                     "each later A5 segment Support must advance beyond its prior Query"
@@ -292,7 +315,9 @@ class A5EpisodeRecord:
 
     @property
     def queries(self) -> tuple[ProductionQueryRecord, ...]:
-        return tuple(segment.meta_query for segment in self.supervised_segments)
+        return tuple(
+            query for segment in self.supervised_segments for query in segment.queries
+        )
 
     @property
     def query_count(self) -> int:
@@ -303,6 +328,10 @@ class A5EpisodeRecord:
     @property
     def segment_lengths(self) -> tuple[int, ...]:
         return tuple(len(segment.supports) for segment in self.supervised_segments)
+
+    @property
+    def segment_query_counts(self) -> tuple[int, ...]:
+        return tuple(len(segment.queries) for segment in self.supervised_segments)
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,7 +383,7 @@ class ProductionEpisodeManifest:
     failures: tuple[EpisodeFailure, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != "svcbench_a2_a5_v3":
+        if self.schema_version != "svcbench_a2_a5_v4":
             raise ValueError("unknown production episode manifest schema")
         if self.minimum_inter_query_seconds != 4.0:
             raise ValueError("support-aligned A5 requires a four-second minimum Query gap")
@@ -944,7 +973,15 @@ def _a5_segment_lengths(record: A5EpisodeRecord) -> tuple[int, ...]:
 
 
 def _a5_alignment_shape(record: A5EpisodeRecord) -> tuple[int, ...]:
-    return _a5_segment_lengths(record)
+    return tuple(
+        value
+        for pair in zip(
+            record.segment_lengths,
+            record.segment_query_counts,
+            strict=True,
+        )
+        for value in pair
+    )
 
 
 def official_operator(counting_type: str, counting_subtype: str) -> Operator:
@@ -1085,7 +1122,12 @@ def adaptive_support_schedule(
         if left.end_time - right.start_time + 1.0e-9 < overlap_seconds:
             raise ValueError("adjacent adaptive Support chunks must overlap by at least 4 seconds")
     first = supports[0]
-    prewarm_end = min(first.start_time + 8.0, first.end_time - 1.0e-6)
+    # Prewarm establishes the initial detached online state, but must leave a real
+    # unseen tail for the first Support Inner-SGD update.  Consuming an entire
+    # short first Support here made W_after identical to W0 for many segments.
+    first_duration = first.end_time - first.start_time
+    prewarm_end = first.start_time + min(4.0, first_duration / 2.0)
+    prewarm_end = min(prewarm_end, first.end_time - 1.0e-6)
     if prewarm_end <= first.start_time:
         prewarm_end = first.start_time + (first.end_time - first.start_time) / 2.0
     prewarm = AdaptiveChunkSpec(ChunkRole.PREWARM, first.start_time, prewarm_end)
@@ -1229,7 +1271,7 @@ def build_production_episode_manifest(
     buckets, padding = _build_segment_buckets(episodes, world_size=world_size)
     all_episodes = episodes + padding
     return ProductionEpisodeManifest(
-        schema_version="svcbench_a2_a5_v3",
+        schema_version="svcbench_a2_a5_v4",
         dataset_name=annotations.source.name,
         dataset_revision=annotations.source.revision,
         annotation_sha256=annotations.annotation_sha256,
@@ -1355,47 +1397,53 @@ def _episode_from_group(
         raise ValueError("one trajectory Query group cannot mix official operators")
     prewarm, original_supports = adaptive_support_schedule(first.query_time)
     query_records = tuple(_production_query(item, operator) for item in group)
-    first_query = query_records[0]
     final_query = query_records[-1]
-    query_gap = final_query.runtime.query_time - first_query.runtime.query_time
-    split_episode = (
-        len(original_supports) > truncation_horizon and query_gap >= 4.0
+    split_candidates = tuple(
+        index
+        for index, query in enumerate(query_records[:-1])
+        if query.runtime.query_time <= final_query.runtime.query_time - 4.0
     )
-    insufficient_gap = (
-        len(original_supports) > truncation_horizon and not split_episode
-    )
+    split_index = split_candidates[-1] if split_candidates else None
+    split_episode = split_index is not None
+    insufficient_gap = len(query_records) > 1 and not split_episode
     first_supports = _compress_support_schedule(
         original_supports,
         truncation_horizon,
     )
     if split_episode:
+        assert split_index is not None
+        pivot_query = query_records[split_index]
+        query_gap = final_query.runtime.query_time - pivot_query.runtime.query_time
         _unused_prewarm, relative_supports = adaptive_support_schedule(query_gap)
         later_supports = _compress_support_schedule(
-            _shift_support_schedule(relative_supports, first_query.runtime.query_time),
+            _shift_support_schedule(relative_supports, pivot_query.runtime.query_time),
             truncation_horizon,
         )
         supervised_segments = (
             A5SupervisedSegmentRecord(
                 role=A5QueryRole.INTERMEDIATE,
                 supports=first_supports,
-                meta_query=first_query,
+                meta_query=pivot_query,
+                additional_meta_queries=query_records[:split_index],
             ),
             A5SupervisedSegmentRecord(
                 role=A5QueryRole.FINAL,
                 supports=later_supports,
                 meta_query=final_query,
+                additional_meta_queries=query_records[split_index + 1 : -1],
             ),
         )
-        diagnostic_queries = query_records[1:-1]
+        diagnostic_queries = ()
     else:
         supervised_segments = (
             A5SupervisedSegmentRecord(
                 role=A5QueryRole.FINAL,
                 supports=first_supports,
                 meta_query=final_query,
+                additional_meta_queries=query_records[:-1],
             ),
         )
-        diagnostic_queries = query_records[:-1]
+        diagnostic_queries = ()
     digest = hashlib.sha256(
         "|".join(item.identity.query_id for item in group).encode("utf-8")
     ).hexdigest()[:12]
@@ -1420,7 +1468,7 @@ def _episode_from_group(
         supervised_segments=supervised_segments,
         diagnostic_queries=diagnostic_queries,
         support_count=sum(len(segment.supports) for segment in supervised_segments),
-        meta_query_count=len(supervised_segments),
+        meta_query_count=sum(len(segment.queries) for segment in supervised_segments),
         diagnostic_query_count=len(diagnostic_queries),
         truncation_horizon=truncation_horizon,
         tbptt_segment_count=len(supervised_segments),
@@ -1499,7 +1547,7 @@ def _build_segment_buckets(
 ) -> tuple[tuple[SegmentBucket, ...], tuple[A5EpisodeRecord, ...]]:
     grouped: dict[tuple[EpisodeSplit, tuple[int, ...]], list[A5EpisodeRecord]] = defaultdict(list)
     for episode in episodes:
-        grouped[(episode.split, _a5_segment_lengths(episode))].append(episode)
+        grouped[(episode.split, _a5_alignment_shape(episode))].append(episode)
     buckets: list[SegmentBucket] = []
     padding_records: list[A5EpisodeRecord] = []
     for key in sorted(grouped, key=lambda item: (item[0].value, item[1])):
@@ -1535,7 +1583,7 @@ def _build_segment_buckets(
         buckets.append(
             SegmentBucket(
                 split=key[0],
-                tbptt_segment_count=len(key[1]),
+                tbptt_segment_count=rows[0].tbptt_segment_count,
                 episode_ids=tuple(row.episode_id for row in rows),
                 loss_weights=tuple(row.loss_weight for row in rows),
                 world_size=world_size,
@@ -1831,7 +1879,13 @@ def _parse_a5_supervised_segment(value: object) -> A5SupervisedSegmentRecord:
     row = object_value(value, "A5 supervised segment")
     _require_exact_keys(
         row,
-        {"role", "supports", "meta_query", "query_weight"},
+        {
+            "role",
+            "supports",
+            "meta_query",
+            "query_weight",
+            "additional_meta_queries",
+        },
         "A5 supervised segment",
     )
     return A5SupervisedSegmentRecord(
@@ -1839,6 +1893,10 @@ def _parse_a5_supervised_segment(value: object) -> A5SupervisedSegmentRecord:
         supports=tuple(_parse_chunk(item) for item in _object_list(row, "supports")),
         meta_query=_parse_production_query(row["meta_query"]),
         query_weight=_float_value(row, "query_weight"),
+        additional_meta_queries=tuple(
+            _parse_production_query(item)
+            for item in _object_list(row, "additional_meta_queries")
+        ),
     )
 
 

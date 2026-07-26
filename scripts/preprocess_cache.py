@@ -346,7 +346,7 @@ def _iter_specs(
         else:
             specs = ()
             if "support" in roles:
-                first_query_time = record.supervised_segments[0].meta_query.runtime.query_time
+                first_query_time = record.supervised_segments[0].queries[0].runtime.query_time
                 support_specs = [
                     SupportChunkSpec(
                         chunk_id=f"{record.episode_id}:prewarm",
@@ -359,7 +359,7 @@ def _iter_specs(
                 ]
                 support_index = 0
                 for segment in record.supervised_segments:
-                    query_time = segment.meta_query.runtime.query_time
+                    query_time = segment.queries[0].runtime.query_time
                     for chunk in segment.supports:
                         support_index += 1
                         support_specs.append(

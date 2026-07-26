@@ -1947,7 +1947,7 @@ class ProductionEpisodeMaterializer:
         )
         supports_list: list[MetaCausalChunk] = []
         for segment in record.supervised_segments:
-            runtime_query = segment.meta_query.runtime
+            runtime_query = segment.queries[0].runtime
             for chunk in segment.supports:
                 supports_list.append(
                     self._meta_chunk(
@@ -2025,9 +2025,16 @@ class ProductionEpisodeMaterializer:
             query_points=tuple(queries),
             seed=self.config.a5.seed,
             segment_lengths=record.segment_lengths,
-            query_roles=tuple(segment.role.value for segment in record.supervised_segments),
+            segment_query_counts=record.segment_query_counts,
+            query_roles=tuple(
+                role.value
+                for segment in record.supervised_segments
+                for role in segment.query_roles
+            ),
             query_weights=tuple(
-                segment.query_weight for segment in record.supervised_segments
+                weight
+                for segment in record.supervised_segments
+                for weight in segment.query_weights
             ),
             diagnostic_query_count=record.diagnostic_query_count,
             insufficient_inter_query_gap=record.insufficient_inter_query_gap,

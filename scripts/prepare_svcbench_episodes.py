@@ -134,13 +134,24 @@ def main() -> int:
             episode.diagnostic_query_count for episode in real_episodes
         ),
         "a5_single_segment_count": sum(
-            episode.meta_query_count == 1 for episode in real_episodes
+            episode.tbptt_segment_count == 1 for episode in real_episodes
         ),
         "a5_double_segment_count": sum(
-            episode.meta_query_count == 2 for episode in real_episodes
+            episode.tbptt_segment_count == 2 for episode in real_episodes
         ),
         "a5_execution_shapes": sorted(
-            {episode.segment_lengths for episode in real_episodes}
+            {
+                tuple(
+                    value
+                    for pair in zip(
+                        episode.segment_lengths,
+                        episode.segment_query_counts,
+                        strict=True,
+                    )
+                    for value in pair
+                )
+                for episode in real_episodes
+            }
         ),
         "a5_zero_support_query_count": 0,
         "a5_support_segments_without_query": 0,

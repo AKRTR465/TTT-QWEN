@@ -73,13 +73,24 @@ def main() -> int:
             episode.diagnostic_query_count for episode in real_train
         ),
         "train_single_segment_count": sum(
-            episode.meta_query_count == 1 for episode in real_train
+            episode.tbptt_segment_count == 1 for episode in real_train
         ),
         "train_double_segment_count": sum(
-            episode.meta_query_count == 2 for episode in real_train
+            episode.tbptt_segment_count == 2 for episode in real_train
         ),
         "train_execution_shapes": sorted(
-            {episode.segment_lengths for episode in real_train}
+            {
+                tuple(
+                    value
+                    for pair in zip(
+                        episode.segment_lengths,
+                        episode.segment_query_counts,
+                        strict=True,
+                    )
+                    for value in pair
+                )
+                for episode in real_train
+            }
         ),
         "train_unique_video_count": len(
             {episode.relative_video_path for episode in real_train}

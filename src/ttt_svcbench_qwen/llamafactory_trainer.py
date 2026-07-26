@@ -1072,6 +1072,9 @@ class TTTQwenTrainerMixin:
         self.last_meta_output: TruncatedMetaTTTEpisodeOutput | None = None
         self.last_semantic_projector_metrics: dict[str, float] = {}
         self._a2_audit_accumulator = _A2AuditAccumulator()
+        self._last_a5_training_seconds: float | None = None
+        self._last_optimizer_log_time: float | None = None
+        self._last_timed_global_step = -1
         super().__init__(*args, **kwargs)
 
     def _install_a2_deepspeed_gradient_control(self) -> None:
@@ -1158,6 +1161,17 @@ class TTTQwenTrainerMixin:
                     if value is not None:
                         enriched[name] = float(value)
         if self.ttt_runtime.stage is ProductionStage.A5 and self.last_meta_output is not None:
+            now = time.perf_counter()
+            global_step = int(getattr(getattr(self, "state", None), "global_step", 0))
+            if global_step != self._last_timed_global_step:
+                if self._last_optimizer_log_time is not None:
+                    enriched["a5/optimizer_step_seconds"] = (
+                        now - self._last_optimizer_log_time
+                    )
+                self._last_optimizer_log_time = now
+                self._last_timed_global_step = global_step
+            if self._last_a5_training_seconds is not None:
+                enriched["a5/training_step_seconds"] = self._last_a5_training_seconds
             retrieval_metrics: dict[str, float] = {}
             meta_output = self.last_meta_output
             meta_audit = meta_output.audit
@@ -1189,17 +1203,27 @@ class TTTQwenTrainerMixin:
                     ),
                 }
             )
+            role_norms: dict[str, list[float]] = {}
+            role_losses: dict[str, list[float]] = {}
             for query in meta_audit.queries:
                 proxy_norm = math.sqrt(
                     sum(value * value for value in query.proxy_gradient_norms)
                 )
                 enriched[f"a5/query_weight/{query.query_role}"] = query.query_weight
                 enriched[
-                    f"a5/query_proxy_grad_norm/{query.query_role}"
+                    f"a5/query_proxy_grad_norm/query_{query.query_index}_{query.query_role}"
                 ] = proxy_norm
                 enriched[
-                    f"a5/query_outer_loss/{query.query_role}"
+                    f"a5/query_outer_loss/query_{query.query_index}_{query.query_role}"
                 ] = query.weighted_outer_loss
+                role_norms.setdefault(query.query_role, []).append(proxy_norm)
+                role_losses.setdefault(query.query_role, []).append(
+                    query.weighted_outer_loss
+                )
+            for role, values in role_norms.items():
+                enriched[f"a5/query_proxy_grad_norm/{role}"] = sum(values) / len(values)
+            for role, values in role_losses.items():
+                enriched[f"a5/query_outer_loss/{role}"] = sum(values) / len(values)
             for segment in meta_audit.segments:
                 enriched[
                     f"a5/deferred_vjp_norm/segment_{segment.segment_index}"
@@ -1207,6 +1231,25 @@ class TTTQwenTrainerMixin:
                 enriched[
                     f"a5/fast_version_at_query/segment_{segment.segment_index}"
                 ] = float(max(segment.fast_version_at_query))
+                enriched[
+                    f"a5/fast_version_delta/segment_{segment.segment_index}"
+                ] = float(
+                    max(segment.fast_version_at_query)
+                    - max(segment.fast_version_before_segment)
+                )
+                enriched[
+                    f"a5/update_count/segment_{segment.segment_index}"
+                ] = float(segment.update_count)
+                enriched[
+                    f"a5/skip_count/segment_{segment.segment_index}"
+                ] = float(segment.skip_count)
+                enriched[
+                    f"a5/query_count/segment_{segment.segment_index}"
+                ] = float(segment.query_count)
+                for reason, count in segment.skip_reason_counts:
+                    enriched[
+                        f"a5/skip_reason/segment_{segment.segment_index}/{reason}"
+                    ] = float(count)
         enriched.update(self.last_semantic_projector_metrics)
         controller = self.ttt_runtime.gradient_controller
         if isinstance(controller, OuterGradientController) and controller.last_audit is not None:
@@ -1292,8 +1335,11 @@ class TTTQwenTrainerMixin:
         runner = cast(MetaTTTEpisodeRunner, self.ttt_runtime.meta_runner)
         segment_lengths = episode.segment_lengths
         expected_segments = len(segment_lengths)
-        expected_backwards = 2 * expected_segments
-        self._assert_rank_episode_parity(segment_lengths, len(episode.query_points))
+        expected_backwards = len(episode.query_points) + expected_segments
+        self._assert_rank_episode_parity(
+            segment_lengths,
+            episode.segment_query_counts,
+        )
 
         backward_controller = SegmentBackwardController(
             self.accelerator,  # type: ignore[attr-defined]
@@ -1324,7 +1370,15 @@ class TTTQwenTrainerMixin:
         backward_controller.finalize()
         self.last_semantic_projector_metrics = backward_controller.semantic_projector_metrics
         self.last_meta_output = output
-        self._observe_runtime_cost(inputs, time.perf_counter() - step_started)
+        local_training_seconds = time.perf_counter() - step_started
+        timing = torch.tensor(
+            [local_training_seconds],
+            dtype=torch.float64,
+            device=self.args.device,  # type: ignore[attr-defined]
+        )
+        gathered_timing = self.accelerator.gather(timing)  # type: ignore[attr-defined]
+        self._last_a5_training_seconds = float(gathered_timing.max().item())
+        self._observe_runtime_cost(inputs, local_training_seconds)
         return (output.total * loss_weight).detach().to(self.args.device)  # type: ignore[attr-defined]
 
     def _observe_runtime_cost(
@@ -1370,11 +1424,19 @@ class TTTQwenTrainerMixin:
     def _assert_rank_episode_parity(
         self,
         segment_lengths: tuple[int, ...],
-        query_count: int,
+        segment_query_counts: tuple[int, ...],
     ) -> None:
         device = self.args.device  # type: ignore[attr-defined]
         local = torch.tensor(
-            (query_count, *segment_lengths),
+            tuple(
+                value
+                for pair in zip(
+                    segment_lengths,
+                    segment_query_counts,
+                    strict=True,
+                )
+                for value in pair
+            ),
             dtype=torch.int64,
             device=device,
         )

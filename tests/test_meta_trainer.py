@@ -1000,6 +1000,47 @@ def test_truncated_a5_two_k8_segments_each_close_with_a_query(
     assert resetter.calls == 1
 
 
+def test_truncated_a5_query_bundle_sums_proxy_gradients_then_closes_once(
+    config: ProjectConfig,
+) -> None:
+    runner, fast, _, _ = _system(config)
+    base = _truncated_episode(config, support_count=8)
+    first = base.query_points[0]
+    second_chunk = _chunk(
+        base.owner,
+        chunk_index=99,
+        end_time=first.query_time + 0.5,
+        width=2,
+    )
+    second = replace(
+        first,
+        chunk=second_chunk,
+        query_time=first.query_time + 0.5,
+        case_id="case-bundle-final",
+    )
+    episode = replace(
+        base,
+        query_points=(first, second),
+        segment_query_counts=(2,),
+        query_roles=("intermediate", "final"),
+        query_weights=(1.0, 1.0),
+    )
+
+    output = runner.run_truncated(episode)
+
+    assert output.audit.segment_count == 1
+    assert output.audit.query_count == 2
+    assert output.audit.backward_count == 3
+    assert output.audit.query_backward_count == 2
+    assert output.audit.deferred_vjp_backward_count == 1
+    assert output.audit.segments[0].query_count == 2
+    assert output.audit.segments[0].query_roles == ("intermediate", "final")
+    assert output.audit.segments[0].update_count == 8
+    assert output.audit.segments[0].skip_count == 0
+    assert output.audit.segments[0].deferred_vjp_norm > 0.0
+    assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
+
+
 def test_truncated_a5_batches_raw_visuals_only_within_each_k_segment(
     config: ProjectConfig,
 ) -> None:

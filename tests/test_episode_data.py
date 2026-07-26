@@ -122,7 +122,7 @@ def test_production_manifest_has_fold0_buckets_padding_and_explicit_failures(
     )
     stored = json.loads((output / "dataset_manifest.json").read_text(encoding="utf-8"))
     failures = (output / "failed.jsonl").read_text(encoding="utf-8").splitlines()
-    assert stored["schema_version"] == "svcbench_a2_a5_v3"
+    assert stored["schema_version"] == "svcbench_a2_a5_v4"
     assert set(stored["a2_queries"][0]["query"]) == {"runtime", "answer", "weak"}
     assert len(failures) == 1
     assert load_production_episode_manifest(output / "dataset_manifest.json") == failed_manifest
@@ -232,10 +232,11 @@ def test_a5_supervised_segments_align_every_meta_query_to_new_supports(
         1.0,
         1.0,
     )
-    assert [query.runtime.query_time for query in double.queries] == [50.0, 70.0]
-    assert [query.runtime.query_time for query in double.diagnostic_queries] == [52.0]
+    assert [query.runtime.query_time for query in double.queries] == [50.0, 52.0, 70.0]
+    assert double.segment_query_counts == (2, 1)
+    assert not double.diagnostic_queries
     assert all(
-        chunk.end_time < segment.meta_query.runtime.query_time
+        chunk.end_time < segment.queries[0].runtime.query_time
         for segment in double.supervised_segments
         for chunk in segment.supports
     )
@@ -249,12 +250,13 @@ def test_a5_supervised_segments_align_every_meta_query_to_new_supports(
     assert tuple(segment.role.value for segment in collapsed.supervised_segments) == (
         "final",
     )
-    assert [query.runtime.query_time for query in collapsed.queries] == [52.0]
-    assert [query.runtime.query_time for query in collapsed.diagnostic_queries] == [50.0]
+    assert [query.runtime.query_time for query in collapsed.queries] == [50.0, 52.0]
+    assert collapsed.segment_query_counts == (2,)
+    assert not collapsed.diagnostic_queries
     assert collapsed.insufficient_inter_query_gap
     assert all(1 <= length <= 8 for episode in real.values() for length in episode.segment_lengths)
-    assert sum(episode.meta_query_count for episode in real.values()) == 9
-    assert sum(episode.diagnostic_query_count for episode in real.values()) == 2
+    assert sum(episode.meta_query_count for episode in real.values()) == 11
+    assert sum(episode.diagnostic_query_count for episode in real.values()) == 0
 
 
 def test_remote_query_video_mapping_uses_each_a2_clip_and_latest_a5_clip(
