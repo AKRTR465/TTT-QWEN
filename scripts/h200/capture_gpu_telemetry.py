@@ -50,6 +50,8 @@ def main() -> int:
 
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
+    sentinel = output.with_suffix(".done")
+    sentinel.unlink(missing_ok=True)
     deadline = time.monotonic() + args.seconds
     with output.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
@@ -63,7 +65,7 @@ def main() -> int:
             if remaining <= 0:
                 break
             time.sleep(min(args.interval_seconds, remaining))
-    output.with_suffix(".done").touch()
+    sentinel.touch()
     return 0
 
 

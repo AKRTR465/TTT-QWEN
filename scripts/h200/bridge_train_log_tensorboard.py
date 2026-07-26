@@ -9,7 +9,7 @@ import math
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 
 def parse_row(line: str) -> dict[str, object] | None:
@@ -37,6 +37,14 @@ def scalar_items(row: dict[str, object]) -> Iterator[tuple[str, float]]:
             continue
         if key in {"loss", "grad_norm", "learning_rate", "epoch"} or key.startswith(prefixes):
             yield key, numeric
+
+
+def _complete_lines(source: TextIO) -> Iterator[tuple[str, int]]:
+    while True:
+        line = source.readline()
+        if not line or not line.endswith("\n"):
+            return
+        yield line, source.tell()
 
 
 def write_row(
@@ -110,7 +118,8 @@ def main() -> int:
                 observed_steps = 0
             with args.train_log.open(encoding="utf-8", errors="replace") as source:
                 source.seek(offset)
-                for line in source:
+                for line, next_offset in _complete_lines(source):
+                    offset = next_offset
                     row = parse_row(line)
                     if row is None:
                         continue
@@ -122,7 +131,6 @@ def main() -> int:
                         row,
                         args.step_offset + observed_steps,
                     )
-                offset = source.tell()
             writer.flush()
             print(f"published_current_steps={observed_steps}", flush=True)
             time.sleep(args.poll_seconds)

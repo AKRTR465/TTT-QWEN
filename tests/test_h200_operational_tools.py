@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import math
 import sys
 from pathlib import Path
 from types import ModuleType
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +40,36 @@ def test_gpu_telemetry_parser_rejects_malformed_rows() -> None:
         raise AssertionError("malformed telemetry must fail")
 
 
+def test_gpu_telemetry_clears_stale_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_script("scripts/h200/capture_gpu_telemetry.py")
+    output = tmp_path / "gpu.csv"
+    sentinel = output.with_suffix(".done")
+    sentinel.touch()
+    sampled_with_sentinel: list[bool] = []
+
+    def sample_gpus() -> list[tuple[int, float, int, float]]:
+        sampled_with_sentinel.append(sentinel.exists())
+        return [(0, 91.0, 12345, 612.5)]
+
+    monkeypatch.setattr(module, "sample_gpus", sample_gpus)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "capture_gpu_telemetry.py",
+            "--output",
+            str(output),
+            "--seconds",
+            "0.000001",
+        ],
+    )
+    assert module.main() == 0
+    assert sampled_with_sentinel and not any(sampled_with_sentinel)
+    assert sentinel.is_file()
+
+
 def test_train_log_bridge_extracts_only_finite_training_scalars() -> None:
     module = _load_script("scripts/h200/bridge_train_log_tensorboard.py")
     row = module.parse_row(
@@ -57,6 +89,22 @@ def test_train_log_bridge_extracts_only_finite_training_scalars() -> None:
         "loss/task": 0.2,
         "outer_grad/qwen": 3.0,
     }
+
+
+def test_train_log_bridge_retries_incomplete_trailing_line() -> None:
+    module = _load_script("scripts/h200/bridge_train_log_tensorboard.py")
+    prefix = "prefix {'loss': 0."
+    committed = "noise\n"
+    source = io.StringIO(committed + prefix)
+    offset = 0
+    for _line, next_offset in module._complete_lines(source):
+        offset = next_offset
+    assert offset == len(committed)
+
+    source = io.StringIO(committed + prefix + "5}\n")
+    source.seek(offset)
+    rows = [module.parse_row(line) for line, _next_offset in module._complete_lines(source)]
+    assert rows == [{"loss": 0.5}]
 
 
 def test_retrieval_history_benchmark_uses_current_tensor_ring() -> None:
