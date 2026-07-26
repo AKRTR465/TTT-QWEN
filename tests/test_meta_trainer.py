@@ -936,6 +936,26 @@ def test_stage_c_invalid_chunk_skips_then_later_supports_continue(
     assert len(output.audit.queries) == 1
 
 
+def test_a5_all_skipped_segment_is_explicit_outer_only(
+    config: ProjectConfig,
+) -> None:
+    runner, _, _, _ = _system(config)
+
+    output = runner.run_truncated(
+        _truncated_episode(config, support_count=1, invalid_first_support=True)
+    )
+
+    segment = output.audit.segments[0]
+    assert segment.training_mode == "outer_only"
+    assert segment.update_attempt_count == 1
+    assert segment.update_count == 0
+    assert segment.skip_count == 1
+    assert output.audit.meta_ttt_segment_count == 0
+    assert output.audit.outer_only_segment_count == 1
+    assert output.audit.query_backward_count == 1
+    assert output.audit.queries[0].query_weight == 1.0
+
+
 @pytest.mark.parametrize("support_count", [1, 4, 8])
 def test_a5_support_schedule_is_bounded_and_next_only(
     config: ProjectConfig,
@@ -974,6 +994,9 @@ def test_truncated_a5_two_k8_segments_each_close_with_a_query(
     assert output.audit.deferred_vjp_backward_count == 2
     assert output.audit.maximum_retained_support_graphs == 8
     assert [segment.support_count for segment in output.audit.segments] == [8, 8]
+    assert all(segment.training_mode == "meta_ttt" for segment in output.audit.segments)
+    assert output.audit.meta_ttt_segment_count == 2
+    assert output.audit.outer_only_segment_count == 0
     assert all(segment.includes_query_backward for segment in output.audit.segments)
     assert all(segment.reanchored for segment in output.audit.segments)
     assert output.final_fast_states[0].fast_version == 16
@@ -1132,6 +1155,10 @@ def test_zero_weight_padding_keeps_backward_schedule_but_contributes_zero(
     assert output.total == pytest.approx(0.0)
     assert output.query_loss == pytest.approx(0.0)
     assert output.support_auxiliary_loss == pytest.approx(0.0)
+    assert all(
+        query.proxy_gradient_status == "zero_padding"
+        for query in output.audit.queries
+    )
     assert fast.w0_1.grad is not None and torch.count_nonzero(fast.w0_1.grad) == 0
     assert fast.w0_2.grad is not None and torch.count_nonzero(fast.w0_2.grad) == 0
     assert predictor.scale.grad is not None and torch.count_nonzero(predictor.scale.grad) == 0

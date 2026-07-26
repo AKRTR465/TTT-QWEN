@@ -870,6 +870,7 @@ class InnerUpdateAudit:
 class TruncatedSegmentAudit:
     """One bounded second-order graph segment and its local backward boundary."""
 
+    training_mode: str
     segment_index: int
     support_start_index: int
     support_end_index: int
@@ -891,6 +892,8 @@ class TruncatedSegmentAudit:
     reanchor_audits: tuple[FastReanchorAudit, ...]
 
     def __post_init__(self) -> None:
+        if self.training_mode not in {"meta_ttt", "outer_only"}:
+            raise ValueError("A5 segment training mode must be meta_ttt or outer_only")
         integers = (
             self.segment_index,
             self.support_start_index,
@@ -924,6 +927,9 @@ class TruncatedSegmentAudit:
             raise ValueError("segment update attempts must equal updates plus skips")
         if sum(count for _, count in self.skip_reason_counts) != self.skip_count:
             raise ValueError("segment skip-reason counts must equal skip count")
+        expected_mode = "meta_ttt" if self.update_count > 0 else "outer_only"
+        if self.training_mode != expected_mode:
+            raise ValueError("A5 segment training mode disagrees with its fast updates")
         if not self.fast_version_before_segment or len(
             self.fast_version_before_segment
         ) != len(self.fast_version_at_query):
@@ -961,6 +967,7 @@ class TruncatedQueryPointAudit:
     prefill_count: int
     observation_immutable: bool
     proxy_gradient_norms: tuple[float, ...]
+    proxy_gradient_status: str
     proxy_storage_isolated: bool
     proxy_max_abs_value_drift: float
 
@@ -985,6 +992,17 @@ class TruncatedQueryPointAudit:
             not math.isfinite(value) or value < 0.0 for value in self.proxy_gradient_norms
         ):
             raise ValueError("Query proxy gradient norms must be finite and non-negative")
+        gradient_nonzero = any(value > 0.0 for value in self.proxy_gradient_norms)
+        if gradient_nonzero != (self.proxy_gradient_status == "nonzero"):
+            raise ValueError("Query proxy gradient status disagrees with measured norms")
+        if self.proxy_gradient_status not in {
+            "nonzero",
+            "zero_padding",
+            "zero_fast_objective_satisfied",
+            "zero_no_valid_retrieval_bag",
+            "zero_no_fast_dependent_term",
+        }:
+            raise ValueError("Query proxy gradient status is invalid")
         if not self.proxy_storage_isolated:
             raise ValueError("Query proxy fast matrices must use isolated storage")
         if (
@@ -1076,6 +1094,14 @@ class TruncatedMetaTTTEpisodeAudit:
             raise ValueError("Support labels became reachable from the A5 inner path")
         if self.training_counterfactual_executed:
             raise ValueError("the production A5 path must not execute static-W0 counterfactuals")
+
+    @property
+    def meta_ttt_segment_count(self) -> int:
+        return sum(segment.training_mode == "meta_ttt" for segment in self.segments)
+
+    @property
+    def outer_only_segment_count(self) -> int:
+        return sum(segment.training_mode == "outer_only" for segment in self.segments)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1512,6 +1538,11 @@ class MetaTTTEpisodeRunner:
                         prefill_count=query_lifecycle.audit().prefill_count,
                         observation_immutable=immutable,
                         proxy_gradient_norms=proxy_gradient_norms,
+                        proxy_gradient_status=_proxy_gradient_status(
+                            proxy_gradient_norms,
+                            objective.metrics,
+                            episode_weight=episode_weight,
+                        ),
                         proxy_storage_isolated=all(
                             audit.storage_isolated for audit in proxy_audits
                         ),
@@ -1584,6 +1615,9 @@ class MetaTTTEpisodeRunner:
                         )
             segment_audits.append(
                 TruncatedSegmentAudit(
+                    training_mode=(
+                        "meta_ttt" if segment_update_count > 0 else "outer_only"
+                    ),
                     segment_index=segment_index,
                     support_start_index=segment_start,
                     support_end_index=segment_start + segment_length - 1,
@@ -1614,10 +1648,14 @@ class MetaTTTEpisodeRunner:
                 support_count=segment_length,
                 query_weights=query_weights,
                 diagnostic_query_count=episode.diagnostic_query_count,
+                training_mode=(
+                    "meta_ttt" if segment_update_count > 0 else "outer_only"
+                ),
                 fast_version_delta=max(fast_versions)
                 - max(fast_version_before_segment),
                 update_count=segment_update_count,
                 skip_count=segment_update_attempts - segment_update_count,
+                skip_reason_counts=tuple(sorted(segment_skip_reasons.items())),
                 deferred_vjp_norm=deferred_vjp_norm,
                 cuda_allocated_bytes=(
                     torch.cuda.memory_allocated(device) if device.type == "cuda" else 0
@@ -2090,6 +2128,28 @@ def _query_metrics(
             ("state/e2", _term_float(state.e2)),
         )
     return QueryMetricSnapshot(metrics=(*common, *state_metrics))
+
+
+def _proxy_gradient_status(
+    norms: tuple[float, ...],
+    metrics: QueryMetricSnapshot,
+    *,
+    episode_weight: float,
+) -> str:
+    """Classify a zero Query-to-fast cotangent without changing the loss path."""
+
+    if any(value > 0.0 for value in norms):
+        return "nonzero"
+    if episode_weight == 0.0:
+        return "zero_padding"
+    values = dict(metrics.metrics)
+    task = values.get("state/task")
+    valid_bags = values.get("retrieval/valid_bag_rows")
+    if task is not None and abs(task) <= 1.0e-12:
+        return "zero_fast_objective_satisfied"
+    if valid_bags is not None and valid_bags <= 0.0:
+        return "zero_no_valid_retrieval_bag"
+    return "zero_no_fast_dependent_term"
 
 
 def _weak_term_float(term: object) -> float | None:

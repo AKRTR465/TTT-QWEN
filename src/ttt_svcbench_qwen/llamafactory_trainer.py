@@ -1194,6 +1194,12 @@ class TTTQwenTrainerMixin:
                     "a5/support_segments_without_query": float(
                         meta_audit.support_segments_without_query
                     ),
+                    "a5/meta_ttt_segment_count": float(
+                        meta_audit.meta_ttt_segment_count
+                    ),
+                    "a5/outer_only_segment_count": float(
+                        meta_audit.outer_only_segment_count
+                    ),
                     "a5/insufficient_inter_query_gap": float(
                         meta_audit.insufficient_inter_query_gap
                     ),
@@ -1213,6 +1219,13 @@ class TTTQwenTrainerMixin:
                 enriched[
                     f"a5/query_proxy_grad_norm/query_{query.query_index}_{query.query_role}"
                 ] = proxy_norm
+                enriched[
+                    f"a5/query_proxy_grad_nonzero/query_{query.query_index}_{query.query_role}"
+                ] = float(query.proxy_gradient_status == "nonzero")
+                status_key = (
+                    f"a5/query_proxy_grad_status/{query.proxy_gradient_status}"
+                )
+                enriched[status_key] = enriched.get(status_key, 0.0) + 1.0
                 enriched[
                     f"a5/query_outer_loss/query_{query.query_index}_{query.query_role}"
                 ] = query.weighted_outer_loss
@@ -1246,6 +1259,12 @@ class TTTQwenTrainerMixin:
                 enriched[
                     f"a5/query_count/segment_{segment.segment_index}"
                 ] = float(segment.query_count)
+                enriched[
+                    f"a5/meta_ttt_active/segment_{segment.segment_index}"
+                ] = float(segment.training_mode == "meta_ttt")
+                enriched[
+                    f"a5/outer_only/segment_{segment.segment_index}"
+                ] = float(segment.training_mode == "outer_only")
                 for reason, count in segment.skip_reason_counts:
                     enriched[
                         f"a5/skip_reason/segment_{segment.segment_index}/{reason}"

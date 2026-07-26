@@ -40,6 +40,9 @@ export TTT_PREPROCESS_CACHE_NAMESPACE="${TTT_PREPROCESS_CACHE_NAMESPACE:-a5_supp
 if [[ -n "${TTT_SMOKE_MAX_STEPS:-}" ]]; then
   # Max-step acceptance runs use the atomic smoke path and do not publish epoch checkpoints.
   export TTT_CHECKPOINT_POLICY="atomic_final_only"
+  # Acceptance needs per-rank segment/update evidence. CUDA-event tracing is buffered and
+  # therefore does not synchronize the hot path per event.
+  export TTT_DATALOADER_TRACE="${TTT_DATALOADER_TRACE:-1}"
 else
   export TTT_CHECKPOINT_POLICY="epoch_2_and_epoch_4"
 fi
