@@ -1397,6 +1397,9 @@ class TTTQwenTrainerMixin:
                         meta_output.support_auxiliary_loss.item()
                     ),
                     "a5/ttt/raw_mean": meta_audit.support_ttt_raw_mean,
+                    "a5/ttt/outer_effective_mean": (
+                        meta_audit.support_ttt_outer_mean
+                    ),
                     "a5/ttt/pred_mean": meta_audit.support_pred_mean,
                     "a5/ttt/identity_weighted_mean": (
                         meta_audit.support_identity_weighted_mean

@@ -18,6 +18,7 @@ from ttt_svcbench_qwen.config import PredictorConfig
 
 _FP32_EPS = 1.0e-8
 _NORM_ATOL = 5.0e-4
+_TTT_OUTER_TARGET_RMS_FLOOR = 1.0
 _PRED_WEIGHT = 1.0
 _IDENTITY_WEIGHT = 0.5
 _EVENT_WEIGHT = 0.5
@@ -578,6 +579,38 @@ class TTTLossOutput:
             raise ValueError("O1 unlabeled loss is forbidden")
 
 
+def compute_ttt_outer_auxiliary_loss(output: TTTLossOutput) -> Tensor:
+    """Scale only outer temporal supervision; keep the Inner-SGD TTT loss unchanged.
+
+    The target mean-square is detached by the temporal audit. Dividing the
+    prediction component by ``max(target_rms, 1)^2`` turns the outer auxiliary
+    into a relative MSE when raw hidden-state scale grows, while never
+    amplifying small targets. Identity and event consistency keep their exact
+    frozen weights.
+    """
+
+    audit = output.temporal_scale_audit
+    pair_count = audit.pair_element_count.to(dtype=torch.float32)
+    target_mean_square = audit.target_sum_squares / pair_count.clamp_min(1.0)
+    prediction_scale = torch.where(
+        audit.pair_element_count > 0,
+        target_mean_square.clamp_min(_TTT_OUTER_TARGET_RMS_FLOOR**2).reciprocal(),
+        torch.ones_like(target_mean_square),
+    ).detach()
+    outer_per_row = (
+        prediction_scale * output.pred.per_row
+        + output.identity_weight * output.identity.per_row
+        + output.event_weight * output.event.per_row
+    )
+    valid_weights = output.update_valid_mask.to(dtype=torch.float32)
+    outer = (
+        (outer_per_row * valid_weights).sum()
+        / valid_weights.sum().clamp_min(1.0)
+    )
+    _require_fp32_scalar(outer, "TTT outer auxiliary")
+    return outer
+
+
 def _temporal_prediction_scale_audit(
     inputs: TemporalPredictionInput,
     *,
@@ -712,7 +745,9 @@ def compute_identity_consistency_loss(inputs: IdentityConsistencyInput) -> Ident
         1,
         safe_previous.unsqueeze(-1).expand(-1, -1, feature_dim),
     ).detach()
-    item_losses = 1.0 - (current.float() * previous.float()).sum(dim=-1)
+    item_losses = (
+        1.0 - (current.float() * previous.float()).sum(dim=-1)
+    ).clamp_min(0.0)
     valid_counts = matched.sum(dim=1, dtype=torch.int64)
     mask_counts = (inputs.statuses != int(IdentityPairStatus.PADDING)).sum(dim=1, dtype=torch.int64)
     reasons = tuple(

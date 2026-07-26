@@ -58,6 +58,7 @@ from ttt_svcbench_qwen.losses import (
     compute_outer_loss,
     compute_state_loss,
     compute_ttt_loss,
+    compute_ttt_outer_auxiliary_loss,
 )
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
@@ -1036,6 +1037,7 @@ class TruncatedMetaTTTEpisodeAudit:
     update_count: int
     skip_count: int
     support_ttt_raw_mean: float
+    support_ttt_outer_mean: float
     support_pred_mean: float
     support_identity_weighted_mean: float
     support_event_weighted_mean: float
@@ -1088,6 +1090,7 @@ class TruncatedMetaTTTEpisodeAudit:
             raise ValueError("A5 update attempts must equal accepted plus skipped")
         nonnegative_finite = (
             self.support_ttt_raw_mean,
+            self.support_ttt_outer_mean,
             self.support_pred_mean,
             self.support_identity_weighted_mean,
             self.support_event_weighted_mean,
@@ -1292,6 +1295,9 @@ class MetaTTTEpisodeRunner:
         device = adapted.fast_states[0].w_t_1.device
         query_loss_detached = torch.zeros((), dtype=torch.float32, device=device)
         support_total_detached = torch.zeros((), dtype=torch.float32, device=device)
+        support_outer_total_detached = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
         support_pred_total_detached = torch.zeros((), dtype=torch.float32, device=device)
         support_identity_total_detached = torch.zeros(
             (), dtype=torch.float32, device=device
@@ -1402,6 +1408,7 @@ class MetaTTTEpisodeRunner:
                 self._validate_prepared_segment(raw_segment, prepared_segment)
                 active_segment = prepared_segment
             segment_outputs: list[TTTLossOutput] = []
+            segment_outer_losses: list[Tensor] = []
             segment_query = first_segment_query if segment_index == 0 else None
             for segment_offset, chunk in enumerate(active_segment):
                 support_index = support_offset + segment_offset
@@ -1426,6 +1433,7 @@ class MetaTTTEpisodeRunner:
                 )
                 ttt_output = compute_ttt_loss(self.predictor, built.inputs)
                 _validate_variant_loss_terms(ttt_output, self.enabled_terms)
+                outer_ttt_loss = compute_ttt_outer_auxiliary_loss(ttt_output)
                 before_versions = tuple(state.fast_version for state in adapted.fast_states)
                 results = functional_sgd_steps_from_ttt(
                     ttt_output=ttt_output,
@@ -1451,9 +1459,13 @@ class MetaTTTEpisodeRunner:
                 )
                 previous_snapshot = built.snapshot
                 segment_outputs.append(ttt_output)
+                segment_outer_losses.append(outer_ttt_loss)
                 maximum_retained = max(maximum_retained, len(segment_outputs))
                 support_total_detached = (
                     support_total_detached + ttt_output.total.detach().to(torch.float32)
+                )
+                support_outer_total_detached = (
+                    support_outer_total_detached + outer_ttt_loss.detach()
                 )
                 valid_rows = ttt_output.update_valid_mask
                 valid_denominator = valid_rows.sum().clamp_min(1)
@@ -1728,7 +1740,7 @@ class MetaTTTEpisodeRunner:
             segment_loss = (
                 episode_weight
                 * auxiliary_scale
-                * torch.stack(tuple(item.total for item in segment_outputs)).sum()
+                * torch.stack(tuple(segment_outer_losses)).sum()
             )
             backward_fn(segment_loss + deferred_vjp, False)
             reanchor_audits = self._reanchor_trajectory(adapted)
@@ -1816,6 +1828,7 @@ class MetaTTTEpisodeRunner:
                 deferred_vjp,
                 segment_loss,
                 segment_outputs,
+                segment_outer_losses,
                 segment_query,
                 segment_updates,
             )
@@ -1829,10 +1842,13 @@ class MetaTTTEpisodeRunner:
         updated = sum(sum(audit.did_update) for audit in update_audits)
         detached_query = query_loss_detached.detach().clone()
         detached_auxiliary = (
-            episode_weight * auxiliary_scale * support_total_detached
+            episode_weight * auxiliary_scale * support_outer_total_detached
         ).detach().clone()
         detached_total = (detached_query + detached_auxiliary).detach().clone()
         support_ttt_raw_mean = float((support_total_detached / support_count).item())
+        support_ttt_outer_mean = float(
+            (support_outer_total_detached / support_count).item()
+        )
         support_pred_mean = float(
             (support_pred_total_detached / support_count).item()
         )
@@ -1856,6 +1872,7 @@ class MetaTTTEpisodeRunner:
             support_count=support_count,
             query_count=query_count,
             support_ttt_raw_mean=support_ttt_raw_mean,
+            support_ttt_outer_mean=support_ttt_outer_mean,
             support_pred_mean=support_pred_mean,
             support_identity_weighted_mean=support_identity_weighted_mean,
             support_event_weighted_mean=support_event_weighted_mean,
@@ -1899,6 +1916,7 @@ class MetaTTTEpisodeRunner:
             update_count=updated,
             skip_count=attempted - updated,
             support_ttt_raw_mean=support_ttt_raw_mean,
+            support_ttt_outer_mean=support_ttt_outer_mean,
             support_pred_mean=support_pred_mean,
             support_identity_weighted_mean=support_identity_weighted_mean,
             support_event_weighted_mean=support_event_weighted_mean,
