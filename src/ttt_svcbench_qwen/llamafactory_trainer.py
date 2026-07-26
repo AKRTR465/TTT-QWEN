@@ -207,6 +207,10 @@ class SegmentBackwardController:
             and torch.distributed.is_initialized()
             and torch.distributed.get_world_size() > 1
         )
+        self._requires_exact_rank_hook_order = (
+            self.is_deepspeed
+            and _deepspeed_partitions_gradients(cast(Any, self.engine))
+        )
 
     @property
     def proxy_gradient_scale(self) -> float:
@@ -307,9 +311,19 @@ class SegmentBackwardController:
         torch.distributed.all_gather(gathered_orders, local_order)
         reference = gathered_orders[0]
         for rank, candidate in enumerate(gathered_orders[1:], start=1):
-            if not torch.equal(candidate, reference):
+            if self._requires_exact_rank_hook_order and not torch.equal(
+                candidate, reference
+            ):
                 raise RuntimeError(
                     "A5 parameter hook order diverged across ranks before Outer step: "
+                    f"segment={self.backward_count}, rank=0/{rank}"
+                )
+            if not self._requires_exact_rank_hook_order and not torch.equal(
+                candidate.sort().values,
+                reference.sort().values,
+            ):
+                raise RuntimeError(
+                    "A5 parameter hook coverage diverged across ranks before Outer step: "
                     f"segment={self.backward_count}, rank=0/{rank}"
                 )
 
@@ -354,6 +368,28 @@ def _unique_trainable_parameters(model: nn.Module) -> tuple[nn.Parameter, ...]:
         seen.add(parameter_id)
         parameters.append(parameter)
     return tuple(parameters)
+
+
+def _deepspeed_partitions_gradients(engine: object) -> bool:
+    """Return whether DeepSpeed communicates gradient partitions from autograd hooks.
+
+    ZeRO-2 appends gradients to collective buckets as parameter hooks fire, so every rank
+    must observe the exact same hook order.  ZeRO-1 performs the reduction at the accumulation
+    boundary by iterating optimizer parameters in a fixed order; for that profile the
+    rank-stable anchor only needs to guarantee identical hook coverage.
+    """
+
+    partitions_gradients = getattr(engine, "zero_optimization_partition_gradients", None)
+    if not callable(partitions_gradients):
+        # Existing tests and third-party wrappers historically omitted this query.  Preserve
+        # the fail-closed ZeRO-2 behavior unless the engine explicitly identifies ZeRO-1.
+        return True
+    result = partitions_gradients()
+    if type(result) is not bool:
+        raise TypeError(
+            "DeepSpeed zero_optimization_partition_gradients() must return bool"
+        )
+    return result
 
 
 def _rank_stable_conditional_parameters(

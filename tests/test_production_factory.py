@@ -1215,6 +1215,7 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
     assert native["save_steps"] == 0.5
     assert native["save_total_limit"] == 2
     assert native["save_only_model"] is False
+    assert native["deepspeed"] == "configs/h200/deepspeed_zero1_dynamic_graph.json"
     assert extension.stage == "a5"
     assert policy.mode == "partial"
     assert policy.vision_freeze_first_blocks == 13
@@ -1232,7 +1233,7 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
     assert 'TTT_CHECKPOINT_POLICY="epoch_2_and_epoch_4"' in launcher
     assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
     assert "[[ $# -eq 2 ]] || usage" in launcher
-    assert "<half_dataset_manifest.json>" in launcher
+    assert "<dataset_manifest.json>" in launcher
 
 
 def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoint(
@@ -1630,6 +1631,65 @@ def test_a5_rank_stable_hook_order_audit_is_fail_closed(
         assert controller.backward_count == 1
 
     assert step_calls == 0
+
+
+def test_a5_zero1_rank_audit_allows_order_drift_with_identical_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.qwen = nn.Linear(1, 1, bias=False)
+            self.state = nn.Linear(1, 1, bias=False)
+            self.predictor = nn.Linear(1, 1, bias=False)
+
+    model = _Model()
+    gradient_controller = OuterGradientController(
+        load_config().outer_gradient_control,
+        expected_groups=("qwen", "state_shared", "predictor"),
+    )
+
+    class _Engine:
+        optimizer = object()
+
+        @staticmethod
+        def zero_optimization_partition_gradients() -> bool:
+            return False
+
+        @staticmethod
+        def set_gradient_accumulation_boundary(*, is_boundary: bool) -> None:
+            assert is_boundary
+
+        @staticmethod
+        def backward(loss: torch.Tensor, **kwargs: object) -> None:
+            loss.backward(**kwargs)
+
+        @staticmethod
+        def step() -> None:
+            return None
+
+    def fake_all_gather(outputs: list[torch.Tensor], value: torch.Tensor) -> None:
+        outputs[0].copy_(value)
+        outputs[1].copy_(value if value.numel() == 1 else value.flip(0))
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    controller = SegmentBackwardController(
+        SimpleNamespace(
+            distributed_type="DistributedType.DEEPSPEED",
+            deepspeed_engine_wrapped=SimpleNamespace(engine=_Engine()),
+        ),
+        model,
+        expected_count=1,
+        gradient_controller=gradient_controller,
+    )
+
+    controller.backward(model.qwen.weight.square().sum())
+
+    assert controller.backward_count == 1
+    assert controller._requires_exact_rank_hook_order is False
 
 
 def test_a2_controlled_wrapper_clips_only_at_the_final_ga_boundary() -> None:
