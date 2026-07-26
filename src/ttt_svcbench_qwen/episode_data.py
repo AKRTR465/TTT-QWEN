@@ -1391,6 +1391,16 @@ def _episode_from_group(
     truncation_horizon: int,
     runtime_video_paths: Mapping[str, str] | None,
 ) -> A5EpisodeRecord:
+    group = tuple(
+        sorted(
+            group,
+            key=lambda item: (
+                item.query_time,
+                item.identity.query_index,
+                item.identity.query_id,
+            ),
+        )
+    )
     first = group[0]
     operator = official_operator(first.labels.counting_type, first.labels.counting_subtype)
     if any(
