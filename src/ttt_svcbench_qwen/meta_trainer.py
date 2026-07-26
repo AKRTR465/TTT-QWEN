@@ -1779,7 +1779,8 @@ class MetaTTTEpisodeRunner:
             )
             trace_event(
                 "a5_query_aligned_segment_released",
-                episode_id=episode.owner,
+                video_ids=episode.owner.video_ids,
+                trajectory_ids=episode.owner.trajectory_ids,
                 segment_index=segment_index,
                 segment_count=len(episode.segment_lengths),
                 query_roles=query_roles,
@@ -1850,7 +1851,8 @@ class MetaTTTEpisodeRunner:
         query_count = len(episode.query_points)
         trace_event(
             "a5_ttt_numerical_audit",
-            episode_id=episode.owner,
+            video_ids=episode.owner.video_ids,
+            trajectory_ids=episode.owner.trajectory_ids,
             support_count=support_count,
             query_count=query_count,
             support_ttt_raw_mean=support_ttt_raw_mean,
