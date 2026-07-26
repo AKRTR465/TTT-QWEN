@@ -27,8 +27,8 @@ from ttt_svcbench_qwen.losses import (
     IdentityConsistencyAudit,
     LossSkipReason,
     LossTerm,
-    TTTLossOutput,
     TemporalPredictionScaleAudit,
+    TTTLossOutput,
 )
 
 MATRIX_SIZE = 768
