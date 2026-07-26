@@ -1895,7 +1895,7 @@ class MetaTTTEpisodeRunner:
             ),
             temporal_error_max_abs=float(temporal_error_max_abs.item()),
         )
-        audit = TruncatedMetaTTTEpisodeAudit(
+        episode_audit = TruncatedMetaTTTEpisodeAudit(
             active_terms=self.enabled_terms,
             loss_weight=episode_weight,
             support_count=support_count,
@@ -1949,7 +1949,7 @@ class MetaTTTEpisodeRunner:
             final_fast_states=adapted.fast_states,
             final_optimizer_states=adapted.optimizer_states,
             final_runtime=adapted.runtime,
-            audit=audit,
+            audit=episode_audit,
         )
 
     def _validate_truncated_episode(self, episode: MetaTTTEpisode) -> None:

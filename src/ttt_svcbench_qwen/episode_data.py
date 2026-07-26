@@ -1435,6 +1435,7 @@ def _episode_from_group(
         original_supports,
         truncation_horizon,
     )
+    supervised_segments: tuple[A5SupervisedSegmentRecord, ...]
     if split_episode:
         assert split_index is not None
         pivot_query = query_records[split_index]
