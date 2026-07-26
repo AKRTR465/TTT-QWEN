@@ -476,13 +476,7 @@ def _frame_budget(start: float, end: float, maximum: int, sample_fps: float = 2.
 
 
 def _segment_lengths(record: A5EpisodeRecord) -> tuple[int, ...]:
-    remaining = record.support_count
-    values: list[int] = []
-    while remaining:
-        length = min(record.truncation_horizon, remaining)
-        values.append(length)
-        remaining -= length
-    return tuple(values)
+    return record.segment_lengths
 
 
 if __name__ == "__main__":

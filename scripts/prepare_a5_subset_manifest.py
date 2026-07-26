@@ -66,7 +66,21 @@ def main() -> int:
         "real_train_episode_count": len(real_train),
         "train_padding_episode_count": len(padding_train),
         "train_support_count": sum(episode.support_count for episode in real_train),
-        "train_query_count": sum(episode.query_count for episode in real_train),
+        "train_meta_query_count": sum(
+            episode.meta_query_count for episode in real_train
+        ),
+        "train_diagnostic_query_count": sum(
+            episode.diagnostic_query_count for episode in real_train
+        ),
+        "train_single_segment_count": sum(
+            episode.meta_query_count == 1 for episode in real_train
+        ),
+        "train_double_segment_count": sum(
+            episode.meta_query_count == 2 for episode in real_train
+        ),
+        "train_execution_shapes": sorted(
+            {episode.segment_lengths for episode in real_train}
+        ),
         "train_unique_video_count": len(
             {episode.relative_video_path for episode in real_train}
         ),

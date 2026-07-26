@@ -1122,8 +1122,10 @@ class TTTQwenTrainerMixin:
                         enriched[name] = float(value)
         if self.ttt_runtime.stage is ProductionStage.A5 and self.last_meta_output is not None:
             retrieval_metrics: dict[str, float] = {}
-            if self.last_meta_output.audit.loss_weight == 1.0:
-                for query in self.last_meta_output.audit.queries:
+            meta_output = self.last_meta_output
+            meta_audit = meta_output.audit
+            if meta_audit.loss_weight == 1.0:
+                for query in meta_audit.queries:
                     for name, value in query.metrics.metrics:
                         if name.startswith("retrieval/") and value is not None:
                             retrieval_metrics[name] = retrieval_metrics.get(name, 0.0) + value
@@ -1133,6 +1135,41 @@ class TTTQwenTrainerMixin:
                     balance.terms[2].global_valid_count.item()
                 )
             enriched.update(retrieval_metrics)
+            enriched.update(
+                {
+                    "a5/meta_query_count": float(meta_audit.query_count),
+                    "a5/diagnostic_query_count": float(meta_audit.diagnostic_query_count),
+                    "a5/zero_support_query_count": float(meta_audit.zero_support_query_count),
+                    "a5/support_segments_without_query": float(
+                        meta_audit.support_segments_without_query
+                    ),
+                    "a5/insufficient_inter_query_gap": float(
+                        meta_audit.insufficient_inter_query_gap
+                    ),
+                    "a5/loss/meta_query_sum": float(meta_output.query_loss.item()),
+                    "a5/loss/support_ttt_mean_x_0.1": float(
+                        meta_output.support_auxiliary_loss.item()
+                    ),
+                }
+            )
+            for query in meta_audit.queries:
+                proxy_norm = math.sqrt(
+                    sum(value * value for value in query.proxy_gradient_norms)
+                )
+                enriched[f"a5/query_weight/{query.query_role}"] = query.query_weight
+                enriched[
+                    f"a5/query_proxy_grad_norm/{query.query_role}"
+                ] = proxy_norm
+                enriched[
+                    f"a5/query_outer_loss/{query.query_role}"
+                ] = query.weighted_outer_loss
+            for segment in meta_audit.segments:
+                enriched[
+                    f"a5/deferred_vjp_norm/segment_{segment.segment_index}"
+                ] = segment.deferred_vjp_norm
+                enriched[
+                    f"a5/fast_version_at_query/segment_{segment.segment_index}"
+                ] = float(max(segment.fast_version_at_query))
         enriched.update(self.last_semantic_projector_metrics)
         controller = self.ttt_runtime.gradient_controller
         if isinstance(controller, OuterGradientController) and controller.last_audit is not None:
@@ -1216,15 +1253,9 @@ class TTTQwenTrainerMixin:
         if loss_weight not in (0.0, 1.0):
             raise ValueError("A5 episode loss weight must be one or deterministic-padding zero")
         runner = cast(MetaTTTEpisodeRunner, self.ttt_runtime.meta_runner)
-        expected_segments = math.ceil(
-            len(episode.support_chunks) / runner.config.a5.truncation_horizon
-        )
-        expected_backwards = expected_segments + len(episode.query_points)
-        horizon = runner.config.a5.truncation_horizon
-        segment_lengths = tuple(
-            min(horizon, len(episode.support_chunks) - start)
-            for start in range(0, len(episode.support_chunks), horizon)
-        )
+        segment_lengths = episode.segment_lengths
+        expected_segments = len(segment_lengths)
+        expected_backwards = 2 * expected_segments
         self._assert_rank_episode_parity(segment_lengths, len(episode.query_points))
 
         backward_controller = SegmentBackwardController(
