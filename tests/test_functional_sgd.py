@@ -27,6 +27,7 @@ from ttt_svcbench_qwen.losses import (
     IdentityConsistencyAudit,
     LossSkipReason,
     LossTerm,
+    TemporalPredictionScaleAudit,
     TTTLossOutput,
 )
 
@@ -123,6 +124,18 @@ def make_ttt_output(
             low_confidence_counts=zero_counts.clone(),
             invalid_source_counts=zero_counts.clone(),
             padding_counts=zero_counts.clone(),
+        ),
+        temporal_scale_audit=TemporalPredictionScaleAudit(
+            hidden_sum_squares=torch.zeros((), dtype=torch.float32),
+            hidden_element_count=torch.zeros((), dtype=torch.int64),
+            hidden_max_abs=torch.zeros((), dtype=torch.float32),
+            target_sum_squares=torch.zeros((), dtype=torch.float32),
+            prediction_sum_squares=torch.zeros((), dtype=torch.float32),
+            error_sum_squares=torch.zeros((), dtype=torch.float32),
+            pair_element_count=torch.zeros((), dtype=torch.int64),
+            target_max_abs=torch.zeros((), dtype=torch.float32),
+            prediction_max_abs=torch.zeros((), dtype=torch.float32),
+            error_max_abs=torch.zeros((), dtype=torch.float32),
         ),
     )
 

@@ -12,7 +12,7 @@ finetuning_type: full
 freeze_vision_tower: false
 freeze_multi_modal_projector: false
 freeze_language_model: false
-deepspeed: configs/h200/deepspeed_zero2_group_clip.json
+deepspeed: configs/h200/deepspeed_zero1_dynamic_graph.json
 
 dataset_dir: $DATASET_DIR
 dataset: $DATASET_NAME
@@ -95,4 +95,5 @@ ttt_qwen:
   runtime_trace_dir: null
   segment_prefetch_depth: 1
   semantic_projector_delta_audit_steps: 0
+  a5_parameter_delta_audit_steps: 320
   operator_diagnostics_interval: 10

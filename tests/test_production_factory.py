@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from enum import StrEnum
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
+import ttt_svcbench_qwen.llamafactory_trainer as trainer_module
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.llamafactory_trainer import (
     CheckpointPolicy,
@@ -24,6 +26,7 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     _aggregate_operator_diagnostics,
     _checkpoint_policy_from_environment,
     _ControlledDeepSpeedEngineWrapper,
+    _disable_smoke_checkpoints,
     _publish_epoch_two_four_checkpoints,
     _reset_a2_to_a5_balance,
     _validate_checkpoint_tree,
@@ -76,6 +79,60 @@ class _OuterToy(nn.Module):
         super().__init__()
         self.backbone = nn.Linear(3, 4)
         self.predictor = nn.Linear(4, 4)
+
+
+def test_trainer_main_destroys_initialized_process_group_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed: list[bool] = []
+    monkeypatch.setattr(trainer_module, "_run_main", lambda _argv: 0)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "destroy_process_group",
+        lambda: destroyed.append(True),
+    )
+
+    assert trainer_module.main(["config.yaml"]) == 0
+    assert destroyed == [True]
+
+
+def test_trainer_main_destroys_initialized_process_group_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed: list[bool] = []
+
+    def fail(_argv: list[str] | None) -> int:
+        raise RuntimeError("training failed")
+
+    monkeypatch.setattr(trainer_module, "_run_main", fail)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "destroy_process_group",
+        lambda: destroyed.append(True),
+    )
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        trainer_module.main(["config.yaml"])
+    assert destroyed == [True]
+
+
+def test_trainer_main_skips_process_group_teardown_when_uninitialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(trainer_module, "_run_main", lambda _argv: 0)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    def unexpected_destroy() -> None:
+        raise AssertionError("uninitialized process group must not be destroyed")
+
+    monkeypatch.setattr(torch.distributed, "destroy_process_group", unexpected_destroy)
+
+    assert trainer_module.main(["config.yaml"]) == 0
 
 
 def test_a5_outer_parameter_audit_allows_partial_qwen_with_full_state_training() -> None:
@@ -488,6 +545,7 @@ def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
         "runtime_trace_mode",
         "segment_prefetch_depth",
         "semantic_projector_delta_audit_steps",
+        "a5_parameter_delta_audit_steps",
         "operator_diagnostics_interval",
     }
 
@@ -1215,6 +1273,7 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
     assert native["save_steps"] == 0.5
     assert native["save_total_limit"] == 2
     assert native["save_only_model"] is False
+    assert native["deepspeed"] == "configs/h200/deepspeed_zero1_dynamic_graph.json"
     assert extension.stage == "a5"
     assert policy.mode == "partial"
     assert policy.vision_freeze_first_blocks == 13
@@ -1231,8 +1290,9 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
     )
     assert 'TTT_CHECKPOINT_POLICY="epoch_2_and_epoch_4"' in launcher
     assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
+    assert 'TTT_DATALOADER_TRACE="${TTT_DATALOADER_TRACE:-1}"' in launcher
     assert "[[ $# -eq 2 ]] || usage" in launcher
-    assert "<half_dataset_manifest.json>" in launcher
+    assert "<dataset_manifest.json>" in launcher
 
 
 def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoint(
@@ -1632,6 +1692,65 @@ def test_a5_rank_stable_hook_order_audit_is_fail_closed(
     assert step_calls == 0
 
 
+def test_a5_zero1_rank_audit_allows_order_drift_with_identical_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.qwen = nn.Linear(1, 1, bias=False)
+            self.state = nn.Linear(1, 1, bias=False)
+            self.predictor = nn.Linear(1, 1, bias=False)
+
+    model = _Model()
+    gradient_controller = OuterGradientController(
+        load_config().outer_gradient_control,
+        expected_groups=("qwen", "state_shared", "predictor"),
+    )
+
+    class _Engine:
+        optimizer = object()
+
+        @staticmethod
+        def zero_optimization_partition_gradients() -> bool:
+            return False
+
+        @staticmethod
+        def set_gradient_accumulation_boundary(*, is_boundary: bool) -> None:
+            assert is_boundary
+
+        @staticmethod
+        def backward(loss: torch.Tensor, **kwargs: object) -> None:
+            loss.backward(**kwargs)
+
+        @staticmethod
+        def step() -> None:
+            return None
+
+    def fake_all_gather(outputs: list[torch.Tensor], value: torch.Tensor) -> None:
+        outputs[0].copy_(value)
+        outputs[1].copy_(value if value.numel() == 1 else value.flip(0))
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    controller = SegmentBackwardController(
+        SimpleNamespace(
+            distributed_type="DistributedType.DEEPSPEED",
+            deepspeed_engine_wrapped=SimpleNamespace(engine=_Engine()),
+        ),
+        model,
+        expected_count=1,
+        gradient_controller=gradient_controller,
+    )
+
+    controller.backward(model.qwen.weight.square().sum())
+
+    assert controller.backward_count == 1
+    assert controller._requires_exact_rank_hook_order is False
+
+
 def test_a2_controlled_wrapper_clips_only_at_the_final_ga_boundary() -> None:
     events: list[object] = []
 
@@ -1904,6 +2023,19 @@ def test_checkpoint_policy_environment_defaults_and_rejects_unknown(
     monkeypatch.setenv("TTT_CHECKPOINT_POLICY", "unknown")
     with pytest.raises(ValueError, match="TTT_CHECKPOINT_POLICY"):
         _checkpoint_policy_from_environment()
+
+
+def test_explicit_smoke_disables_all_periodic_checkpoints() -> None:
+    class _Strategy(StrEnum):
+        STEPS = "steps"
+        NO = "no"
+
+    arguments = SimpleNamespace(save_strategy=_Strategy.STEPS, save_steps=0.5)
+
+    _disable_smoke_checkpoints(arguments)
+
+    assert arguments.save_strategy is _Strategy.NO
+    assert arguments.save_steps == 0
 
 
 @pytest.mark.parametrize(

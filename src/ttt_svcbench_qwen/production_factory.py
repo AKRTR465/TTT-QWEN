@@ -121,6 +121,7 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     runtime_trace_dir: str | None = Field(default=None, min_length=1)
     segment_prefetch_depth: Literal[0, 1] = 0
     semantic_projector_delta_audit_steps: int = Field(default=0, ge=0)
+    a5_parameter_delta_audit_steps: int = Field(default=0, ge=0)
     operator_diagnostics_interval: int = Field(default=10, gt=0)
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]

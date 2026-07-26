@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 usage:
-  bash scripts/h200/train_a5_vithalf_decoder8.sh <a2_final_checkpoint> <half_dataset_manifest.json>
+  bash scripts/h200/train_a5_vithalf_decoder8.sh <a2_final_checkpoint> <dataset_manifest.json>
 
 Starts four-GPU A5 Meta-TTT with this Qwen Outer policy:
   - freeze ViT patch embedding and blocks 0-12
@@ -13,8 +13,8 @@ Starts four-GPU A5 Meta-TTT with this Qwen Outer policy:
   - train Decoder layers 28-35 and the final language-model norm
   - train for 4 epochs and retain complete checkpoints at epochs 2 and 4 only
 
-The A2 checkpoint must contain the complete Outer model. The manifest must be the same deterministic
-half-data manifest used to prewarm the strict A5 cache. Environment overrides accepted by
+The A2 checkpoint must contain the complete Outer model. The v3 manifest must be the same
+Support-aligned manifest used to prewarm the strict A5 cache. Environment overrides accepted by
 scripts/h200/train_a2_a5.sh remain available, including TTT_PROJECT_ROOT,
 TTT_PREPROCESS_CACHE_ROOT, TTT_RESUME_CHECKPOINT, RUN_ID, SESSION, and DRY_RUN.
 EOF
@@ -33,12 +33,16 @@ if [[ ! -f "$PARTIAL_YAML" ]]; then
 fi
 
 export YAML="$PARTIAL_YAML"
+export TTT_H200_VENV="${TTT_H200_VENV:-$PLAY_ROOT/projects/ttt_qwen/.venv-h200-uv-py312-torch28}"
 export TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"
-export TTT_PREPROCESS_CACHE_ROOT="${TTT_PREPROCESS_CACHE_ROOT:-$PROJECT_ROOT/.cache/preprocess/260725_a5_half_support_statequery_fp16}"
-export TTT_PREPROCESS_CACHE_NAMESPACE="${TTT_PREPROCESS_CACHE_NAMESPACE:-a5_half_seed42_support_statequery_fp16_v2}"
+export TTT_PREPROCESS_CACHE_ROOT="${TTT_PREPROCESS_CACHE_ROOT:-$PLAY_ROOT/projects/ttt_qwen/.cache/preprocess/260726_a5_support_aligned_v3_fp16}"
+export TTT_PREPROCESS_CACHE_NAMESPACE="${TTT_PREPROCESS_CACHE_NAMESPACE:-a5_support_aligned_train_support_statequery_fp16_v3}"
 if [[ -n "${TTT_SMOKE_MAX_STEPS:-}" ]]; then
   # Max-step acceptance runs use the atomic smoke path and do not publish epoch checkpoints.
   export TTT_CHECKPOINT_POLICY="atomic_final_only"
+  # Acceptance needs per-rank segment/update evidence. CUDA-event tracing is buffered and
+  # therefore does not synchronize the hot path per event.
+  export TTT_DATALOADER_TRACE="${TTT_DATALOADER_TRACE:-1}"
 else
   export TTT_CHECKPOINT_POLICY="epoch_2_and_epoch_4"
 fi

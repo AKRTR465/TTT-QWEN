@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -28,6 +29,7 @@ from ttt_svcbench_qwen.losses import (
     RetrievalLossInput,
     StateLossInput,
     TemporalPredictionInput,
+    TemporalPredictionScaleAudit,
     TimeLossInput,
     TrainingLossInput,
     TTTLossInput,
@@ -41,6 +43,7 @@ from ttt_svcbench_qwen.losses import (
     compute_state_loss,
     compute_temporal_prediction_loss,
     compute_ttt_loss,
+    compute_ttt_outer_auxiliary_loss,
 )
 
 
@@ -192,7 +195,82 @@ def _fake_ttt(values: list[float], valid: list[bool]) -> TTTLossOutput:
             invalid_source_counts=zeros.clone(),
             padding_counts=zeros.clone(),
         ),
+        temporal_scale_audit=_zero_temporal_scale_audit(),
     )
+
+
+def _zero_temporal_scale_audit() -> TemporalPredictionScaleAudit:
+    zero = torch.zeros((), dtype=torch.float32)
+    count = torch.zeros((), dtype=torch.int64)
+    return TemporalPredictionScaleAudit(
+        hidden_sum_squares=zero.clone(),
+        hidden_element_count=count.clone(),
+        hidden_max_abs=zero.clone(),
+        target_sum_squares=zero.clone(),
+        prediction_sum_squares=zero.clone(),
+        error_sum_squares=zero.clone(),
+        pair_element_count=count.clone(),
+        target_max_abs=zero.clone(),
+        prediction_max_abs=zero.clone(),
+        error_max_abs=zero.clone(),
+    )
+
+
+def test_outer_ttt_normalizes_only_large_temporal_target_scale() -> None:
+    prediction_value = torch.tensor(4.0, dtype=torch.float32, requires_grad=True)
+    prediction_rows = prediction_value.expand(2)
+    valid_mask = torch.ones(2, dtype=torch.bool)
+    counts = torch.ones(2, dtype=torch.int64)
+    prediction = LossTerm(
+        value=prediction_rows.mean(),
+        per_row=prediction_rows,
+        row_valid_mask=valid_mask,
+        valid_counts=counts,
+        mask_counts=counts,
+        skip_reasons=(None, None),
+    )
+    identity = _loss_term([2.0, 2.0], [True, True])
+    zero = _loss_term([0.0, 0.0], [True, True])
+    per_row_total = prediction_rows + 0.5 * identity.per_row
+    output = TTTLossOutput(
+        pred=prediction,
+        identity=identity,
+        e1_event=zero,
+        e2_event=zero,
+        event=zero,
+        total=per_row_total.mean(),
+        per_row_total=per_row_total,
+        update_valid_mask=valid_mask,
+        identity_audit=IdentityConsistencyAudit(
+            matched_counts=counts,
+            mismatch_counts=torch.zeros_like(counts),
+            duplicate_counts=torch.zeros_like(counts),
+            low_confidence_counts=torch.zeros_like(counts),
+            invalid_source_counts=torch.zeros_like(counts),
+            padding_counts=torch.zeros_like(counts),
+        ),
+        temporal_scale_audit=replace(
+            _zero_temporal_scale_audit(),
+            target_sum_squares=torch.tensor(8.0, dtype=torch.float32),
+            pair_element_count=torch.tensor(2, dtype=torch.int64),
+        ),
+    )
+
+    outer = compute_ttt_outer_auxiliary_loss(output)
+
+    assert outer.item() == pytest.approx(2.0)
+    outer.backward()
+    assert prediction_value.grad is not None
+    assert prediction_value.grad.item() == pytest.approx(0.25)
+
+    small_target_output = replace(
+        output,
+        temporal_scale_audit=replace(
+            output.temporal_scale_audit,
+            target_sum_squares=torch.tensor(0.5, dtype=torch.float32),
+        ),
+    )
+    assert compute_ttt_outer_auxiliary_loss(small_target_output).item() == pytest.approx(5.0)
 
 
 def _minimal_state_output() -> tuple[StateLossInput, Tensor]:
@@ -473,6 +551,21 @@ def test_ttt_weights_are_exact_and_no_o1_term_exists() -> None:
     assert torch.allclose(output.total, expected)
     assert (output.pred_weight, output.identity_weight, output.event_weight) == (1.0, 0.5, 0.5)
     assert output.o1_unlabeled_weight == 0.0
+    scale = output.temporal_scale_audit
+    assert scale.hidden_element_count.item() == 2 * 768
+    assert scale.pair_element_count.item() == 768
+    assert scale.hidden_sum_squares.item() == pytest.approx(hidden.detach().square().sum().item())
+    expected_predictions = predictor(hidden[:, :-1]).detach().float()
+    expected_targets = hidden[:, 1:].detach().float()
+    assert scale.prediction_sum_squares.item() == pytest.approx(
+        expected_predictions.square().sum().item()
+    )
+    assert scale.target_sum_squares.item() == pytest.approx(
+        expected_targets.square().sum().item()
+    )
+    assert scale.error_sum_squares.item() == pytest.approx(
+        (expected_predictions - expected_targets).square().sum().item()
+    )
 
 
 def test_ttt_scalar_uses_union_valid_per_row_mean_for_mixed_batch() -> None:

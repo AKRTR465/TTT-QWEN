@@ -14,7 +14,10 @@ from ttt_svcbench_qwen.functional_sgd import (
     initialize_optimizer_state,
     snapshot_gradient_delta_group,
 )
-from ttt_svcbench_qwen.llamafactory_trainer import _SemanticProjectorStepAuditor
+from ttt_svcbench_qwen.llamafactory_trainer import (
+    _A5ParameterGroupStepAuditor,
+    _SemanticProjectorStepAuditor,
+)
 from ttt_svcbench_qwen.losses import O1StateTarget, StateLossInput, compute_state_loss
 from ttt_svcbench_qwen.observation_heads import O1CurrentCountDecoder
 from ttt_svcbench_qwen.outer_gradient_control import GroupGradientAudit, OuterGradientAudit
@@ -74,6 +77,39 @@ def test_semantic_projector_training_log_uses_pre_step_group_and_real_delta() ->
     )
     with pytest.raises(RuntimeError, match="must equal"):
         _SemanticProjectorStepAuditor(wrapper).before_step(wrong, audit)
+
+
+def test_a5_parameter_group_audit_measures_real_post_optimizer_delta() -> None:
+    model = nn.Module()
+    model.add_module("predictor", nn.Linear(3, 2))
+    meta_fast = nn.Module()
+    meta_fast.register_parameter("w0_1", nn.Parameter(torch.ones(2, 2)))
+    meta_fast.register_parameter("w0_2", nn.Parameter(torch.ones(2, 2)))
+    model.add_module("meta_fast", meta_fast)
+    model.add_module("temporal_encoder", nn.Linear(3, 3))
+    audit = OuterGradientAudit(
+        attempted_update_count=1,
+        successful_update_count=1,
+        skipped_update_count=0,
+        within_initial_audit_window=True,
+        skipped_nonfinite=False,
+        skipped_nonfinite_loss=False,
+        nonfinite_loss_sources=(),
+        groups=(),
+    )
+    auditor = _A5ParameterGroupStepAuditor(model, delta_audit_steps=2)
+    snapshot = auditor.before_step(audit)
+    assert snapshot is not None
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(0.25)
+    auditor.after_step(snapshot, audit)
+
+    for group in ("predictor", "w0", "state_shared"):
+        prefix = f"a5/parameter_delta/{group}"
+        assert auditor.last_metrics[f"{prefix}/l2"] > 0.0
+        assert auditor.last_metrics[f"{prefix}/rms"] == pytest.approx(0.25)
+        assert auditor.last_metrics[f"{prefix}/nonzero_fraction"] == 1.0
 
 
 def test_actual_fast_bridge_observation_chain_has_exact_inner_update_boundary() -> None:

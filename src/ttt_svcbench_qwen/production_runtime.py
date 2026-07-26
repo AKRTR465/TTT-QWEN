@@ -1945,18 +1945,22 @@ class ProductionEpisodeMaterializer:
             "s0",
             episode_nonce,
         )
-        supports = tuple(
-            self._meta_chunk(
-                owner,
-                runtime,
-                video_path,
-                primary,
-                chunk,
-                f"s{index + 1}",
-                episode_nonce,
-            )
-            for index, chunk in enumerate(record.supports)
-        )
+        supports_list: list[MetaCausalChunk] = []
+        for segment in record.supervised_segments:
+            runtime_query = segment.queries[0].runtime
+            for chunk in segment.supports:
+                supports_list.append(
+                    self._meta_chunk(
+                        owner,
+                        runtime,
+                        video_path,
+                        runtime_query,
+                        chunk,
+                        f"s{len(supports_list) + 1}",
+                        episode_nonce,
+                    )
+                )
+        supports = tuple(supports_list)
         queries: list[MetaTTTQueryPoint] = []
         for index, query in enumerate(record.queries):
             state_spec = _query_chunk_spec(
@@ -2020,6 +2024,20 @@ class ProductionEpisodeMaterializer:
             support_chunks=supports,
             query_points=tuple(queries),
             seed=self.config.a5.seed,
+            segment_lengths=record.segment_lengths,
+            segment_query_counts=record.segment_query_counts,
+            query_roles=tuple(
+                role.value
+                for segment in record.supervised_segments
+                for role in segment.query_roles
+            ),
+            query_weights=tuple(
+                weight
+                for segment in record.supervised_segments
+                for weight in segment.query_weights
+            ),
+            diagnostic_query_count=record.diagnostic_query_count,
+            insufficient_inter_query_gap=record.insufficient_inter_query_gap,
         )
 
     def _meta_chunk(

@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 import time
+import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
@@ -159,6 +160,7 @@ class SegmentBackwardController:
         expected_count: int,
         gradient_controller: OuterGradientController | None = None,
         semantic_projector_delta_audit_steps: int = 0,
+        a5_parameter_delta_audit_steps: int = 0,
     ) -> None:
         if type(expected_count) is not int or expected_count <= 0:
             raise ValueError("segment backward count must be a positive integer")
@@ -173,6 +175,14 @@ class SegmentBackwardController:
             )
             if isinstance(gradient_controller, OuterGradientController)
             and "state_retrieval" in gradient_controller.expected_groups
+            else None
+        )
+        self.a5_parameter_delta_auditor = (
+            _A5ParameterGroupStepAuditor(
+                model, delta_audit_steps=a5_parameter_delta_audit_steps
+            )
+            if isinstance(gradient_controller, OuterGradientController)
+            and a5_parameter_delta_audit_steps > 0
             else None
         )
         self.is_deepspeed = (
@@ -206,6 +216,10 @@ class SegmentBackwardController:
             and torch.distributed.is_available()
             and torch.distributed.is_initialized()
             and torch.distributed.get_world_size() > 1
+        )
+        self._requires_exact_rank_hook_order = (
+            self.is_deepspeed
+            and _deepspeed_partitions_gradients(cast(Any, self.engine))
         )
 
     @property
@@ -307,9 +321,19 @@ class SegmentBackwardController:
         torch.distributed.all_gather(gathered_orders, local_order)
         reference = gathered_orders[0]
         for rank, candidate in enumerate(gathered_orders[1:], start=1):
-            if not torch.equal(candidate, reference):
+            if self._requires_exact_rank_hook_order and not torch.equal(
+                candidate, reference
+            ):
                 raise RuntimeError(
                     "A5 parameter hook order diverged across ranks before Outer step: "
+                    f"segment={self.backward_count}, rank=0/{rank}"
+                )
+            if not self._requires_exact_rank_hook_order and not torch.equal(
+                candidate.sort().values,
+                reference.sort().values,
+            ):
+                raise RuntimeError(
+                    "A5 parameter hook coverage diverged across ranks before Outer step: "
                     f"segment={self.backward_count}, rank=0/{rank}"
                 )
 
@@ -328,16 +352,28 @@ class SegmentBackwardController:
                 if self.semantic_projector_auditor is not None and audit is not None
                 else None
             )
+            a5_snapshot = (
+                self.a5_parameter_delta_auditor.before_step(audit)
+                if self.a5_parameter_delta_auditor is not None and audit is not None
+                else None
+            )
             engine.step()
             if self.semantic_projector_auditor is not None and audit is not None:
                 self.semantic_projector_auditor.after_step(snapshot, audit)
+            if self.a5_parameter_delta_auditor is not None and audit is not None:
+                self.a5_parameter_delta_auditor.after_step(a5_snapshot, audit)
             self.step_count = 1
 
     @property
     def semantic_projector_metrics(self) -> dict[str, float]:
-        if self.semantic_projector_auditor is None:
-            return {}
-        return dict(self.semantic_projector_auditor.last_metrics)
+        metrics = (
+            dict(self.semantic_projector_auditor.last_metrics)
+            if self.semantic_projector_auditor is not None
+            else {}
+        )
+        if self.a5_parameter_delta_auditor is not None:
+            metrics.update(self.a5_parameter_delta_auditor.last_metrics)
+        return metrics
 
 
 def _unique_trainable_parameters(model: nn.Module) -> tuple[nn.Parameter, ...]:
@@ -354,6 +390,28 @@ def _unique_trainable_parameters(model: nn.Module) -> tuple[nn.Parameter, ...]:
         seen.add(parameter_id)
         parameters.append(parameter)
     return tuple(parameters)
+
+
+def _deepspeed_partitions_gradients(engine: object) -> bool:
+    """Return whether DeepSpeed communicates gradient partitions from autograd hooks.
+
+    ZeRO-2 appends gradients to collective buckets as parameter hooks fire, so every rank
+    must observe the exact same hook order.  ZeRO-1 performs the reduction at the accumulation
+    boundary by iterating optimizer parameters in a fixed order; for that profile the
+    rank-stable anchor only needs to guarantee identical hook coverage.
+    """
+
+    partitions_gradients = getattr(engine, "zero_optimization_partition_gradients", None)
+    if not callable(partitions_gradients):
+        # Existing tests and third-party wrappers historically omitted this query.  Preserve
+        # the fail-closed ZeRO-2 behavior unless the engine explicitly identifies ZeRO-1.
+        return True
+    result = partitions_gradients()
+    if type(result) is not bool:
+        raise TypeError(
+            "DeepSpeed zero_optimization_partition_gradients() must return bool"
+        )
+    return result
 
 
 def _rank_stable_conditional_parameters(
@@ -476,7 +534,11 @@ class _SemanticProjectorStepAuditor:
         local_delta = squared.sqrt().float()
         minimum = local_delta.clone()
         maximum = local_delta.clone()
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
             torch.distributed.all_reduce(minimum, op=torch.distributed.ReduceOp.MIN)
             torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX)
         min_value = float(minimum.item())
@@ -522,6 +584,162 @@ class _SemanticProjectorStepAuditor:
                 "state_retrieval optimizer group must equal the SemanticProjector parameter set"
             )
         self._optimizer_validated = True
+
+
+class _A5ParameterGroupStepAuditor:
+    """Measure real post-Adam deltas for the groups implicated in A5 TTT drift."""
+
+    _GROUP_NAMES = ("predictor", "w0", "state_shared")
+
+    def __init__(self, model: nn.Module, *, delta_audit_steps: int) -> None:
+        if type(delta_audit_steps) is not int or delta_audit_steps <= 0:
+            raise ValueError("A5 parameter delta audit steps must be positive")
+        grouped: dict[str, list[nn.Parameter]] = {
+            name: [] for name in self._GROUP_NAMES
+        }
+        seen: set[int] = set()
+        for name, parameter in model.named_parameters(remove_duplicate=False):
+            parameter_id = id(parameter)
+            if not parameter.requires_grad or parameter_id in seen:
+                continue
+            group = self._classify_parameter(name)
+            if group in grouped:
+                grouped[group].append(parameter)
+            seen.add(parameter_id)
+        empty = tuple(name for name, values in grouped.items() if not values)
+        if empty:
+            raise RuntimeError(f"A5 parameter delta audit groups are empty: {empty}")
+        self.parameters = {
+            name: tuple(values) for name, values in grouped.items()
+        }
+        self.delta_audit_steps = delta_audit_steps
+        self.last_metrics: dict[str, float] = {}
+
+    @staticmethod
+    def _classify_parameter(name: str) -> str:
+        lowered = name.casefold()
+        if "predictor" in lowered:
+            return "predictor"
+        if lowered.endswith(("w0_1", "w0_2")) or "meta_fast" in lowered:
+            return "w0"
+        if (
+            lowered.startswith(("qwen.", "module.qwen."))
+            or ".visual_stage.qwen.qwen_model." in lowered
+        ):
+            return "qwen"
+        if "component_modules.observation_heads" in lowered:
+            return "state_task"
+        if "operator_router" in lowered or "time_resolver" in lowered:
+            return "state_router_time"
+        if "semantic_projector" in lowered or "component_modules.retriever" in lowered:
+            return "state_retrieval"
+        return "state_shared"
+
+    def before_step(
+        self,
+        audit: OuterGradientAudit,
+    ) -> dict[str, tuple[Tensor, ...]] | None:
+        self.last_metrics = {}
+        if (
+            audit.skipped_nonfinite
+            or audit.successful_update_count > self.delta_audit_steps
+        ):
+            return None
+        return {
+            name: tuple(parameter.detach().float().clone() for parameter in parameters)
+            for name, parameters in self.parameters.items()
+        }
+
+    def after_step(
+        self,
+        snapshot: dict[str, tuple[Tensor, ...]] | None,
+        audit: OuterGradientAudit,
+    ) -> None:
+        if snapshot is None:
+            return
+        local_l2: list[Tensor] = []
+        group_metrics: dict[str, tuple[float, float, float, float, float, int]] = {}
+        for name in self._GROUP_NAMES:
+            parameters = self.parameters[name]
+            before_values = snapshot.get(name)
+            if before_values is None or len(before_values) != len(parameters):
+                raise RuntimeError(f"A5 {name} parameter snapshot drifted")
+            device = parameters[0].device
+            delta_squared = torch.zeros((), dtype=torch.float64, device=device)
+            before_squared = torch.zeros((), dtype=torch.float64, device=device)
+            delta_max_abs = torch.zeros((), dtype=torch.float32, device=device)
+            nonzero_count = torch.zeros((), dtype=torch.int64, device=device)
+            element_count = 0
+            for before, parameter in zip(before_values, parameters, strict=True):
+                if before.shape != parameter.shape or before.device != parameter.device:
+                    raise RuntimeError(
+                        f"A5 {name} parameter topology changed across step"
+                    )
+                delta = parameter.detach().float() - before
+                delta_squared.add_(delta.square().sum(dtype=torch.float64))
+                before_squared.add_(before.square().sum(dtype=torch.float64))
+                delta_max_abs = torch.maximum(delta_max_abs, delta.abs().amax())
+                nonzero_count.add_(torch.count_nonzero(delta))
+                element_count += parameter.numel()
+            delta_l2 = delta_squared.sqrt().float()
+            before_l2 = before_squared.sqrt().float()
+            delta_rms = delta_l2 / math.sqrt(element_count)
+            relative_l2 = delta_l2 / before_l2.clamp_min(
+                torch.finfo(torch.float32).tiny
+            )
+            nonzero_fraction = nonzero_count.float() / element_count
+            local_l2.append(delta_l2)
+            group_metrics[name] = (
+                float(delta_l2.item()),
+                float(delta_rms.item()),
+                float(relative_l2.item()),
+                float(delta_max_abs.item()),
+                float(nonzero_fraction.item()),
+                element_count,
+            )
+        local = torch.stack(local_l2)
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            gathered = [
+                torch.empty_like(local)
+                for _ in range(torch.distributed.get_world_size())
+            ]
+            torch.distributed.all_gather(gathered, local)
+            reference = gathered[0]
+            tolerance = 1.0e-6 + 1.0e-4 * torch.maximum(
+                reference.abs(),
+                torch.stack(gathered[1:]).abs().amax(dim=0),
+            )
+            for rank, candidate in enumerate(gathered[1:], start=1):
+                if bool(torch.any((candidate - reference).abs() > tolerance).item()):
+                    raise RuntimeError(
+                        "A5 parameter delta diverged across ranks: "
+                        f"rank=0/{rank}, local={reference.tolist()}, "
+                        f"candidate={candidate.tolist()}"
+                    )
+        for name, (
+            delta_l2,
+            delta_rms,
+            relative_l2,
+            delta_max_abs,
+            nonzero_fraction,
+            element_count,
+        ) in group_metrics.items():
+            prefix = f"a5/parameter_delta/{name}"
+            self.last_metrics.update(
+                {
+                    f"{prefix}/l2": delta_l2,
+                    f"{prefix}/rms": delta_rms,
+                    f"{prefix}/relative_l2": relative_l2,
+                    f"{prefix}/max_abs": delta_max_abs,
+                    f"{prefix}/nonzero_fraction": nonzero_fraction,
+                    f"{prefix}/element_count": float(element_count),
+                    f"{prefix}/audit_step": float(audit.successful_update_count),
+                }
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,6 +806,7 @@ class ProductionTrainerRuntime:
     train_sampler_factory: TrainSamplerFactory | None = None
     callbacks: tuple[object, ...] = ()
     semantic_projector_delta_audit_steps: int = 0
+    a5_parameter_delta_audit_steps: int = 0
     operator_diagnostics_interval: int = 10
 
     def __post_init__(self) -> None:
@@ -600,6 +819,13 @@ class ProductionTrainerRuntime:
             or self.semantic_projector_delta_audit_steps < 0
         ):
             raise ValueError("SemanticProjector delta audit steps must be non-negative")
+        if (
+            type(self.a5_parameter_delta_audit_steps) is not int
+            or self.a5_parameter_delta_audit_steps < 0
+        ):
+            raise ValueError("A5 parameter delta audit steps must be non-negative")
+        if self.stage is ProductionStage.A2 and self.a5_parameter_delta_audit_steps:
+            raise ValueError("A2 cannot enable the A5 parameter delta audit")
         if (
             type(self.operator_diagnostics_interval) is not int
             or self.operator_diagnostics_interval <= 0
@@ -1035,6 +1261,9 @@ class TTTQwenTrainerMixin:
         self.last_meta_output: TruncatedMetaTTTEpisodeOutput | None = None
         self.last_semantic_projector_metrics: dict[str, float] = {}
         self._a2_audit_accumulator = _A2AuditAccumulator()
+        self._last_a5_training_seconds: float | None = None
+        self._last_optimizer_log_time: float | None = None
+        self._last_timed_global_step = -1
         super().__init__(*args, **kwargs)
 
     def _install_a2_deepspeed_gradient_control(self) -> None:
@@ -1121,9 +1350,22 @@ class TTTQwenTrainerMixin:
                     if value is not None:
                         enriched[name] = float(value)
         if self.ttt_runtime.stage is ProductionStage.A5 and self.last_meta_output is not None:
+            now = time.perf_counter()
+            global_step = int(getattr(getattr(self, "state", None), "global_step", 0))
+            if global_step != self._last_timed_global_step:
+                if self._last_optimizer_log_time is not None:
+                    enriched["a5/optimizer_step_seconds"] = (
+                        now - self._last_optimizer_log_time
+                    )
+                self._last_optimizer_log_time = now
+                self._last_timed_global_step = global_step
+            if self._last_a5_training_seconds is not None:
+                enriched["a5/training_step_seconds"] = self._last_a5_training_seconds
             retrieval_metrics: dict[str, float] = {}
-            if self.last_meta_output.audit.loss_weight == 1.0:
-                for query in self.last_meta_output.audit.queries:
+            meta_output = self.last_meta_output
+            meta_audit = meta_output.audit
+            if meta_audit.loss_weight == 1.0:
+                for query in meta_audit.queries:
                     for name, value in query.metrics.metrics:
                         if name.startswith("retrieval/") and value is not None:
                             retrieval_metrics[name] = retrieval_metrics.get(name, 0.0) + value
@@ -1133,6 +1375,124 @@ class TTTQwenTrainerMixin:
                     balance.terms[2].global_valid_count.item()
                 )
             enriched.update(retrieval_metrics)
+            enriched.update(
+                {
+                    "a5/meta_query_count": float(meta_audit.query_count),
+                    "a5/diagnostic_query_count": float(meta_audit.diagnostic_query_count),
+                    "a5/zero_support_query_count": float(meta_audit.zero_support_query_count),
+                    "a5/support_segments_without_query": float(
+                        meta_audit.support_segments_without_query
+                    ),
+                    "a5/meta_ttt_segment_count": float(
+                        meta_audit.meta_ttt_segment_count
+                    ),
+                    "a5/outer_only_segment_count": float(
+                        meta_audit.outer_only_segment_count
+                    ),
+                    "a5/insufficient_inter_query_gap": float(
+                        meta_audit.insufficient_inter_query_gap
+                    ),
+                    "a5/loss/meta_query_sum": float(meta_output.query_loss.item()),
+                    "a5/loss/support_ttt_mean_x_0.1": float(
+                        meta_output.support_auxiliary_loss.item()
+                    ),
+                    "a5/ttt/raw_mean": meta_audit.support_ttt_raw_mean,
+                    "a5/ttt/outer_effective_mean": (
+                        meta_audit.support_ttt_outer_mean
+                    ),
+                    "a5/ttt/pred_mean": meta_audit.support_pred_mean,
+                    "a5/ttt/identity_weighted_mean": (
+                        meta_audit.support_identity_weighted_mean
+                    ),
+                    "a5/ttt/event_weighted_mean": (
+                        meta_audit.support_event_weighted_mean
+                    ),
+                    "a5/ttt/temporal_hidden_rms": meta_audit.temporal_hidden_rms,
+                    "a5/ttt/temporal_target_rms": meta_audit.temporal_target_rms,
+                    "a5/ttt/temporal_prediction_rms": (
+                        meta_audit.temporal_prediction_rms
+                    ),
+                    "a5/ttt/temporal_error_rms": meta_audit.temporal_error_rms,
+                    "a5/ttt/temporal_hidden_max_abs": (
+                        meta_audit.temporal_hidden_max_abs
+                    ),
+                    "a5/ttt/temporal_target_max_abs": (
+                        meta_audit.temporal_target_max_abs
+                    ),
+                    "a5/ttt/temporal_prediction_max_abs": (
+                        meta_audit.temporal_prediction_max_abs
+                    ),
+                    "a5/ttt/temporal_error_max_abs": (
+                        meta_audit.temporal_error_max_abs
+                    ),
+                    "a5/ttt/temporal_hidden_element_count": float(
+                        meta_audit.temporal_hidden_element_count
+                    ),
+                    "a5/ttt/temporal_pair_element_count": float(
+                        meta_audit.temporal_pair_element_count
+                    ),
+                }
+            )
+            role_norms: dict[str, list[float]] = {}
+            role_losses: dict[str, list[float]] = {}
+            for query in meta_audit.queries:
+                proxy_norm = math.sqrt(
+                    sum(value * value for value in query.proxy_gradient_norms)
+                )
+                enriched[f"a5/query_weight/{query.query_role}"] = query.query_weight
+                enriched[
+                    f"a5/query_proxy_grad_norm/query_{query.query_index}_{query.query_role}"
+                ] = proxy_norm
+                enriched[
+                    f"a5/query_proxy_grad_nonzero/query_{query.query_index}_{query.query_role}"
+                ] = float(query.proxy_gradient_status == "nonzero")
+                status_key = (
+                    f"a5/query_proxy_grad_status/{query.proxy_gradient_status}"
+                )
+                enriched[status_key] = enriched.get(status_key, 0.0) + 1.0
+                enriched[
+                    f"a5/query_outer_loss/query_{query.query_index}_{query.query_role}"
+                ] = query.weighted_outer_loss
+                role_norms.setdefault(query.query_role, []).append(proxy_norm)
+                role_losses.setdefault(query.query_role, []).append(
+                    query.weighted_outer_loss
+                )
+            for role, values in role_norms.items():
+                enriched[f"a5/query_proxy_grad_norm/{role}"] = sum(values) / len(values)
+            for role, values in role_losses.items():
+                enriched[f"a5/query_outer_loss/{role}"] = sum(values) / len(values)
+            for segment in meta_audit.segments:
+                enriched[
+                    f"a5/deferred_vjp_norm/segment_{segment.segment_index}"
+                ] = segment.deferred_vjp_norm
+                enriched[
+                    f"a5/fast_version_at_query/segment_{segment.segment_index}"
+                ] = float(max(segment.fast_version_at_query))
+                enriched[
+                    f"a5/fast_version_delta/segment_{segment.segment_index}"
+                ] = float(
+                    max(segment.fast_version_at_query)
+                    - max(segment.fast_version_before_segment)
+                )
+                enriched[
+                    f"a5/update_count/segment_{segment.segment_index}"
+                ] = float(segment.update_count)
+                enriched[
+                    f"a5/skip_count/segment_{segment.segment_index}"
+                ] = float(segment.skip_count)
+                enriched[
+                    f"a5/query_count/segment_{segment.segment_index}"
+                ] = float(segment.query_count)
+                enriched[
+                    f"a5/meta_ttt_active/segment_{segment.segment_index}"
+                ] = float(segment.training_mode == "meta_ttt")
+                enriched[
+                    f"a5/outer_only/segment_{segment.segment_index}"
+                ] = float(segment.training_mode == "outer_only")
+                for reason, count in segment.skip_reason_counts:
+                    enriched[
+                        f"a5/skip_reason/segment_{segment.segment_index}/{reason}"
+                    ] = float(count)
         enriched.update(self.last_semantic_projector_metrics)
         controller = self.ttt_runtime.gradient_controller
         if isinstance(controller, OuterGradientController) and controller.last_audit is not None:
@@ -1216,16 +1576,13 @@ class TTTQwenTrainerMixin:
         if loss_weight not in (0.0, 1.0):
             raise ValueError("A5 episode loss weight must be one or deterministic-padding zero")
         runner = cast(MetaTTTEpisodeRunner, self.ttt_runtime.meta_runner)
-        expected_segments = math.ceil(
-            len(episode.support_chunks) / runner.config.a5.truncation_horizon
+        segment_lengths = episode.segment_lengths
+        expected_segments = len(segment_lengths)
+        expected_backwards = len(episode.query_points) + expected_segments
+        self._assert_rank_episode_parity(
+            segment_lengths,
+            episode.segment_query_counts,
         )
-        expected_backwards = expected_segments + len(episode.query_points)
-        horizon = runner.config.a5.truncation_horizon
-        segment_lengths = tuple(
-            min(horizon, len(episode.support_chunks) - start)
-            for start in range(0, len(episode.support_chunks), horizon)
-        )
-        self._assert_rank_episode_parity(segment_lengths, len(episode.query_points))
 
         backward_controller = SegmentBackwardController(
             self.accelerator,  # type: ignore[attr-defined]
@@ -1234,6 +1591,9 @@ class TTTQwenTrainerMixin:
             gradient_controller=self.ttt_runtime.gradient_controller,
             semantic_projector_delta_audit_steps=(
                 self.ttt_runtime.semantic_projector_delta_audit_steps
+            ),
+            a5_parameter_delta_audit_steps=(
+                self.ttt_runtime.a5_parameter_delta_audit_steps
             ),
         )
 
@@ -1256,7 +1616,15 @@ class TTTQwenTrainerMixin:
         backward_controller.finalize()
         self.last_semantic_projector_metrics = backward_controller.semantic_projector_metrics
         self.last_meta_output = output
-        self._observe_runtime_cost(inputs, time.perf_counter() - step_started)
+        local_training_seconds = time.perf_counter() - step_started
+        timing = torch.tensor(
+            [local_training_seconds],
+            dtype=torch.float64,
+            device=self.args.device,  # type: ignore[attr-defined]
+        )
+        gathered_timing = self.accelerator.gather(timing)  # type: ignore[attr-defined]
+        self._last_a5_training_seconds = float(gathered_timing.max().item())
+        self._observe_runtime_cost(inputs, local_training_seconds)
         return (output.total * loss_weight).detach().to(self.args.device)  # type: ignore[attr-defined]
 
     def _observe_runtime_cost(
@@ -1302,11 +1670,19 @@ class TTTQwenTrainerMixin:
     def _assert_rank_episode_parity(
         self,
         segment_lengths: tuple[int, ...],
-        query_count: int,
+        segment_query_counts: tuple[int, ...],
     ) -> None:
         device = self.args.device  # type: ignore[attr-defined]
         local = torch.tensor(
-            (query_count, *segment_lengths),
+            tuple(
+                value
+                for pair in zip(
+                    segment_lengths,
+                    segment_query_counts,
+                    strict=True,
+                )
+                for value in pair
+            ),
             dtype=torch.int64,
             device=device,
         )
@@ -1356,7 +1732,36 @@ def build_production_trainer(
     )
 
 
+def _destroy_default_process_group() -> None:
+    """Best-effort teardown for the process group created by Accelerate/DeepSpeed.
+
+    Do not add a final barrier here: when one rank raises, a cleanup barrier would turn the
+    original failure into another distributed hang.  ``destroy_process_group`` is local
+    teardown and is safe to call from the entrypoint ``finally`` block on both success and
+    failure paths.
+    """
+
+    distributed = torch.distributed
+    if not distributed.is_available() or not distributed.is_initialized():
+        return
+    try:
+        distributed.destroy_process_group()
+    except Exception as error:  # pragma: no cover - backend-specific defensive boundary
+        warnings.warn(
+            f"failed to destroy the default distributed process group: {error}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _run_main(argv)
+    finally:
+        _destroy_default_process_group()
+
+
+def _run_main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if len(arguments) != 1:
         raise ValueError("usage: python -m ttt_svcbench_qwen.llamafactory_trainer CONFIG.yaml")
@@ -1486,6 +1891,9 @@ def main(argv: list[str] | None = None) -> int:
         semantic_projector_delta_audit_steps=(
             backbone.ttt_config.semantic_projector_delta_audit_steps
         ),
+        a5_parameter_delta_audit_steps=(
+            backbone.ttt_config.a5_parameter_delta_audit_steps
+        ),
         operator_diagnostics_interval=backbone.ttt_config.operator_diagnostics_interval,
         train_sampler_factory=(
             lambda dataset, rank, world_size: build_production_train_sampler(
@@ -1523,6 +1931,8 @@ def main(argv: list[str] | None = None) -> int:
     checkpoint_policy = _checkpoint_policy_from_environment()
     if skip_final_checkpoint and checkpoint_policy is not CheckpointPolicy.ATOMIC_FINAL_ONLY:
         raise ValueError("a smoke run cannot retain epoch checkpoints")
+    if checkpoint_policy is CheckpointPolicy.ATOMIC_FINAL_ONLY:
+        _disable_smoke_checkpoints(training_args)
     if checkpoint_policy is CheckpointPolicy.EPOCH_2_AND_EPOCH_4:
         _validate_epoch_two_four_training_arguments(training_args)
     trainer = cast(Any, build_production_trainer(backbone, runtime_raw))
@@ -1644,6 +2054,16 @@ def _checkpoint_policy_from_environment() -> CheckpointPolicy:
     except ValueError as error:
         choices = ", ".join(policy.value for policy in CheckpointPolicy)
         raise ValueError(f"TTT_CHECKPOINT_POLICY must be one of: {choices}") from error
+
+
+def _disable_smoke_checkpoints(training_args: object) -> None:
+    """Disable periodic saves when the atomic policy publishes only the final checkpoint."""
+
+    arguments = cast(Any, training_args)
+    strategy = arguments.save_strategy
+    strategy_type = type(strategy)
+    arguments.save_strategy = "no" if strategy_type is str else strategy_type("no")
+    arguments.save_steps = 0
 
 
 def _validate_epoch_two_four_training_arguments(training_args: object) -> None:

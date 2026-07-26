@@ -122,7 +122,7 @@ def test_production_manifest_has_fold0_buckets_padding_and_explicit_failures(
     )
     stored = json.loads((output / "dataset_manifest.json").read_text(encoding="utf-8"))
     failures = (output / "failed.jsonl").read_text(encoding="utf-8").splitlines()
-    assert stored["schema_version"] == "svcbench_a2_a5_v2"
+    assert stored["schema_version"] == "svcbench_a2_a5_v4"
     assert set(stored["a2_queries"][0]["query"]) == {"runtime", "answer", "weak"}
     assert len(failures) == 1
     assert load_production_episode_manifest(output / "dataset_manifest.json") == failed_manifest
@@ -190,6 +190,73 @@ def test_a5_half_subset_is_deterministic_reweighted_and_rank_aligned(
             and episode.task_class == task
         ]
         assert weights == pytest.approx([1.0 / count] * count)
+
+
+def test_a5_supervised_segments_align_every_meta_query_to_new_supports(
+    tmp_path: Path,
+) -> None:
+    rows = (
+        _row("double", "double.mp4", [50.0, 52.0, 70.0]),
+        _row("collapsed", "collapsed.mp4", [50.0, 52.0]),
+        *tuple(
+            _row(f"regular-{index}", f"regular-{index}.mp4", [50.0, 70.0])
+            for index in range(3)
+        ),
+    )
+    annotations = _annotations(tmp_path, rows=rows, name="aligned.jsonl")
+    durations = {
+        "Demo/double.mp4": 100.0,
+        "Demo/collapsed.mp4": 100.0,
+        **{
+            f"Demo/regular-{index}.mp4": 100.0
+            for index in range(3)
+        },
+    }
+    manifest = build_production_episode_manifest(
+        annotations,
+        video_durations=durations,
+    )
+    real = {
+        episode.trajectory_id: episode
+        for episode in manifest.episodes
+        if episode.loss_weight == 1.0
+    }
+
+    double = real["double"]
+    assert double.segment_lengths == (8, 3)
+    assert tuple(segment.role.value for segment in double.supervised_segments) == (
+        "intermediate",
+        "final",
+    )
+    assert tuple(segment.query_weight for segment in double.supervised_segments) == (
+        1.0,
+        1.0,
+    )
+    assert [query.runtime.query_time for query in double.queries] == [50.0, 52.0, 70.0]
+    assert double.segment_query_counts == (2, 1)
+    assert not double.diagnostic_queries
+    assert all(
+        chunk.end_time < segment.queries[0].runtime.query_time
+        for segment in double.supervised_segments
+        for chunk in segment.supports
+    )
+    assert all(
+        chunk.end_time > double.queries[0].runtime.query_time
+        for chunk in double.supervised_segments[1].supports
+    )
+
+    collapsed = real["collapsed"]
+    assert collapsed.segment_lengths == (8,)
+    assert tuple(segment.role.value for segment in collapsed.supervised_segments) == (
+        "final",
+    )
+    assert [query.runtime.query_time for query in collapsed.queries] == [50.0, 52.0]
+    assert collapsed.segment_query_counts == (2,)
+    assert not collapsed.diagnostic_queries
+    assert collapsed.insufficient_inter_query_gap
+    assert all(1 <= length <= 8 for episode in real.values() for length in episode.segment_lengths)
+    assert sum(episode.meta_query_count for episode in real.values()) == 11
+    assert sum(episode.diagnostic_query_count for episode in real.values()) == 0
 
 
 def test_remote_query_video_mapping_uses_each_a2_clip_and_latest_a5_clip(
@@ -320,13 +387,7 @@ def test_distributed_manifest_samplers_balance_a2_and_align_a5_segments(tmp_path
         rows = [a5_dataset[local_indices[rank][step]] for rank in range(4)]
         segment_counts = {row.tbptt_segment_count for row in rows}
         shapes = {
-            (
-                tuple(
-                    min(row.truncation_horizon, row.support_count - start)
-                    for start in range(0, row.support_count, row.truncation_horizon)
-                ),
-                row.query_count,
-            )
+            (row.segment_lengths, row.meta_query_count)
             for row in rows
         }
         assert len(segment_counts) == 1

@@ -106,7 +106,12 @@ def main() -> int:
                     "episode_id": episode.episode_id,
                     "split": episode.split,
                     "support_count": episode.support_count,
-                    "query_count": episode.query_count,
+                    "segment_lengths": episode.segment_lengths,
+                    "meta_query_count": episode.meta_query_count,
+                    "diagnostic_query_count": episode.diagnostic_query_count,
+                    "insufficient_inter_query_gap": (
+                        episode.insufficient_inter_query_gap
+                    ),
                     "tbptt_segment_count": episode.tbptt_segment_count,
                 },
                 ensure_ascii=False,
@@ -121,7 +126,38 @@ def main() -> int:
         "run_id": run_id,
         "a2_query_count": len(manifest.a2_query_ids),
         "a5_episode_count": len(real_episodes),
-        "a5_query_count": sum(episode.query_count for episode in real_episodes),
+        "a5_support_count": sum(episode.support_count for episode in real_episodes),
+        "a5_meta_query_count": sum(
+            episode.meta_query_count for episode in real_episodes
+        ),
+        "a5_diagnostic_query_count": sum(
+            episode.diagnostic_query_count for episode in real_episodes
+        ),
+        "a5_single_segment_count": sum(
+            episode.tbptt_segment_count == 1 for episode in real_episodes
+        ),
+        "a5_double_segment_count": sum(
+            episode.tbptt_segment_count == 2 for episode in real_episodes
+        ),
+        "a5_execution_shapes": sorted(
+            {
+                tuple(
+                    value
+                    for pair in zip(
+                        episode.segment_lengths,
+                        episode.segment_query_counts,
+                        strict=True,
+                    )
+                    for value in pair
+                )
+                for episode in real_episodes
+            }
+        ),
+        "a5_zero_support_query_count": 0,
+        "a5_support_segments_without_query": 0,
+        "a5_insufficient_inter_query_gap_count": sum(
+            episode.insufficient_inter_query_gap for episode in real_episodes
+        ),
         "padding_episode_count": len(manifest.episodes) - len(real_episodes),
         "failed_query_count": len(manifest.failures),
         "task_query_counts": dict(manifest.task_query_counts),

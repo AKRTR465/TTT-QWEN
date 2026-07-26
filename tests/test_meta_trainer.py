@@ -662,79 +662,83 @@ def _system(
     return runner, fast, predictor, resetter
 
 
-def _episode(
-    config: ProjectConfig,
-    *,
-    support_count: int,
-    query_count: int,
-    invalid_first_support: bool = False,
-) -> MetaTTTEpisode:
-    owner = RuntimeOwner(("video-a",), ("trajectory-a",))
-    supports = tuple(
-        _chunk(
-            owner,
-            chunk_index=index,
-            end_time=float(index + 1),
-            width=1 if index == 0 and invalid_first_support else 2,
-        )
-        for index in range(support_count)
-    )
-    queries = tuple(
-        MetaTTTQueryPoint(
-            chunk=_chunk(
-                owner,
-                chunk_index=support_count + index,
-                end_time=float(support_count + index + 1),
-                width=2,
-            ),
-            query_time=float(support_count + index + 1),
-            answer=_answer_inputs(),
-            supervision=_supervision(),
-            task_name="synthetic-count",
-            case_id=f"case-{index}",
-        )
-        for index in range(query_count)
-    )
-    return MetaTTTEpisode(owner, supports, queries, config.a5.seed)
-
-
 def _truncated_episode(
     config: ProjectConfig,
     *,
     support_count: int,
-    query_count: int = 2,
     invalid_first_support: bool = False,
+    diagnostic_query_count: int = 0,
 ) -> MetaTTTEpisode:
-    base = _episode(
-        config,
-        support_count=support_count,
-        query_count=query_count,
-        invalid_first_support=invalid_first_support,
+    if not 1 <= support_count <= 16:
+        raise ValueError("support-aligned test episode supports must be in [1, 16]")
+    segment_lengths = (
+        (support_count,) if support_count <= 8 else (8, support_count - 8)
     )
-    prewarm = _chunk(base.owner, chunk_index=0, end_time=0.5, width=2)
-    supports = tuple(
-        _chunk(
-            base.owner,
-            chunk_index=index + 1,
-            end_time=float(index) + 1.5,
-            width=1 if index == 0 and invalid_first_support else 2,
+    owner = RuntimeOwner(("video-a",), ("trajectory-a",))
+    prewarm = _chunk(owner, chunk_index=0, end_time=0.5, width=2)
+    supports: list[MetaCausalChunk] = []
+    queries: list[MetaTTTQueryPoint] = []
+    current_time = 0.5
+    chunk_index = 1
+    for segment_index, segment_length in enumerate(segment_lengths):
+        for _ in range(segment_length):
+            current_time += 1.0
+            supports.append(
+                _chunk(
+                    owner,
+                    chunk_index=chunk_index,
+                    end_time=current_time,
+                    width=(
+                        1
+                        if not supports and invalid_first_support
+                        else 2
+                    ),
+                )
+            )
+            chunk_index += 1
+        current_time += 0.5
+        query_chunk = _chunk(
+            owner,
+            chunk_index=chunk_index,
+            end_time=current_time,
+            width=2,
         )
-        for index in range(support_count)
-    )
-    queries = tuple(
-        replace(
-            query,
-            chunk=_chunk(
-                base.owner,
-                chunk_index=support_count + index + 1,
-                end_time=float(support_count + index) + 2.0,
-                width=2,
-            ),
-            query_time=float(support_count + index) + 2.0,
+        queries.append(
+            MetaTTTQueryPoint(
+                chunk=query_chunk,
+                query_time=current_time,
+                answer=_answer_inputs(),
+                supervision=_supervision(),
+                task_name="synthetic-count",
+                case_id=f"case-{segment_index}",
+            )
         )
-        for index, query in enumerate(base.query_points)
+        query_input = query_chunk.query_input
+        segment_start = len(supports) - segment_length
+        supports[segment_start:] = [
+            replace(
+                chunk,
+                request=replace(chunk.request, query_input=query_input),
+                query_input=query_input,
+            )
+            for chunk in supports[segment_start:]
+        ]
+        chunk_index += 1
+    return MetaTTTEpisode(
+        owner=owner,
+        support_chunks=tuple(supports),
+        query_points=tuple(queries),
+        seed=config.a5.seed,
+        prewarm_chunk=prewarm,
+        segment_lengths=segment_lengths,
+        query_roles=(
+            ("final",)
+            if len(segment_lengths) == 1
+            else ("intermediate", "final")
+        ),
+        query_weights=(1.0,) * len(segment_lengths),
+        diagnostic_query_count=diagnostic_query_count,
     )
-    return replace(base, prewarm_chunk=prewarm, support_chunks=supports, query_points=queries)
 
 
 def _with_shared_query_key(episode: MetaTTTEpisode) -> MetaTTTEpisode:
@@ -929,7 +933,27 @@ def test_stage_c_invalid_chunk_skips_then_later_supports_continue(
     ]
     assert output.final_fast_states[0].update_count == 3
     assert output.final_fast_states[0].skip_count == 1
-    assert len(output.audit.queries) == 2
+    assert len(output.audit.queries) == 1
+
+
+def test_a5_all_skipped_segment_is_explicit_outer_only(
+    config: ProjectConfig,
+) -> None:
+    runner, _, _, _ = _system(config)
+
+    output = runner.run_truncated(
+        _truncated_episode(config, support_count=1, invalid_first_support=True)
+    )
+
+    segment = output.audit.segments[0]
+    assert segment.training_mode == "outer_only"
+    assert segment.update_attempt_count == 1
+    assert segment.update_count == 0
+    assert segment.skip_count == 1
+    assert output.audit.meta_ttt_segment_count == 0
+    assert output.audit.outer_only_segment_count == 1
+    assert output.audit.query_backward_count == 1
+    assert output.audit.queries[0].query_weight == 1.0
 
 
 @pytest.mark.parametrize("support_count", [1, 4, 8])
@@ -954,30 +978,42 @@ def test_a5_support_schedule_is_bounded_and_next_only(
         assert output.audit.updates[1].match.identity_decision_storage_free
 
 
-def test_truncated_a5_t17_k8_has_two_numeric_truncations_and_bounded_graphs(
+def test_truncated_a5_two_k8_segments_each_close_with_a_query(
     config: ProjectConfig,
 ) -> None:
     runner, fast, predictor, resetter = _system(config)
-    episode = _truncated_episode(config, support_count=17)
+    episode = _truncated_episode(config, support_count=16)
     output = runner.run_truncated(episode)
 
-    assert output.audit.support_count == 17
+    assert output.audit.support_count == 16
     assert output.audit.truncation_horizon == 8
     assert output.audit.truncation_count == 2
-    assert output.audit.segment_count == 3
-    assert output.audit.backward_count == 5
+    assert output.audit.segment_count == 2
+    assert output.audit.backward_count == 4
     assert output.audit.query_backward_count == 2
-    assert output.audit.deferred_vjp_backward_count == 1
+    assert output.audit.deferred_vjp_backward_count == 2
     assert output.audit.maximum_retained_support_graphs == 8
-    assert [segment.support_count for segment in output.audit.segments] == [8, 8, 1]
-    assert [segment.includes_query_backward for segment in output.audit.segments] == [
-        False,
-        False,
-        True,
-    ]
+    assert [segment.support_count for segment in output.audit.segments] == [8, 8]
+    assert all(segment.training_mode == "meta_ttt" for segment in output.audit.segments)
+    assert output.audit.meta_ttt_segment_count == 2
+    assert output.audit.outer_only_segment_count == 0
+    assert all(segment.includes_query_backward for segment in output.audit.segments)
     assert all(segment.reanchored for segment in output.audit.segments)
-    assert output.final_fast_states[0].fast_version == 17
-    assert output.final_fast_states[0].update_count == 17
+    assert output.final_fast_states[0].fast_version == 16
+    assert output.final_fast_states[0].update_count == 16
+    assert [query.query_role for query in output.audit.queries] == [
+        "intermediate",
+        "final",
+    ]
+    assert all(query.query_weight == 1.0 for query in output.audit.queries)
+    assert output.query_loss.item() == pytest.approx(
+        sum(query.weighted_outer_loss for query in output.audit.queries)
+    )
+    assert [segment.fast_version_at_query for segment in output.audit.segments] == [
+        (8,),
+        (16,),
+    ]
+    assert all(segment.deferred_vjp_norm > 0.0 for segment in output.audit.segments)
     assert output.final_fast_states[0].w_t_1.grad_fn is not None
     assert output.final_fast_states[0].w_t_2.grad_fn is not None
     assert output.total.grad_fn is None and not output.total.requires_grad
@@ -985,6 +1021,47 @@ def test_truncated_a5_t17_k8_has_two_numeric_truncations_and_bounded_graphs(
     assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
     assert predictor.scale.grad is not None and float(predictor.scale.grad.abs()) > 0.0
     assert resetter.calls == 1
+
+
+def test_truncated_a5_query_bundle_sums_proxy_gradients_then_closes_once(
+    config: ProjectConfig,
+) -> None:
+    runner, fast, _, _ = _system(config)
+    base = _truncated_episode(config, support_count=8)
+    first = base.query_points[0]
+    second_chunk = _chunk(
+        base.owner,
+        chunk_index=99,
+        end_time=first.query_time + 0.5,
+        width=2,
+    )
+    second = replace(
+        first,
+        chunk=second_chunk,
+        query_time=first.query_time + 0.5,
+        case_id="case-bundle-final",
+    )
+    episode = replace(
+        base,
+        query_points=(first, second),
+        segment_query_counts=(2,),
+        query_roles=("intermediate", "final"),
+        query_weights=(1.0, 1.0),
+    )
+
+    output = runner.run_truncated(episode)
+
+    assert output.audit.segment_count == 1
+    assert output.audit.query_count == 2
+    assert output.audit.backward_count == 3
+    assert output.audit.query_backward_count == 2
+    assert output.audit.deferred_vjp_backward_count == 1
+    assert output.audit.segments[0].query_count == 2
+    assert output.audit.segments[0].query_roles == ("intermediate", "final")
+    assert output.audit.segments[0].update_count == 8
+    assert output.audit.segments[0].skip_count == 0
+    assert output.audit.segments[0].deferred_vjp_norm > 0.0
+    assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
 
 
 def test_truncated_a5_batches_raw_visuals_only_within_each_k_segment(
@@ -1005,12 +1082,12 @@ def test_truncated_a5_batches_raw_visuals_only_within_each_k_segment(
         support_visual_batch_size=2,
     )
 
-    output = runner.run_truncated(_truncated_episode(config, support_count=17))
+    output = runner.run_truncated(_truncated_episode(config, support_count=16))
 
-    assert calls == [(8, 2), (8, 2), (1, 2)]
-    assert [segment.support_count for segment in output.audit.segments] == [8, 8, 1]
+    assert calls == [(8, 2), (8, 2)]
+    assert [segment.support_count for segment in output.audit.segments] == [8, 8]
     assert all(update.next_only_verified for update in output.audit.updates)
-    assert output.final_fast_states[0].fast_version == 17
+    assert output.final_fast_states[0].fast_version == 16
 
 
 def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectConfig) -> None:
@@ -1019,8 +1096,8 @@ def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectCon
     output = runner.run_truncated(_truncated_episode(config, support_count=8))
 
     assert output.audit.segment_count == 1
-    assert output.audit.backward_count == 3
-    assert output.audit.query_backward_count == 2
+    assert output.audit.backward_count == 2
+    assert output.audit.query_backward_count == 1
     assert output.audit.deferred_vjp_backward_count == 1
     assert output.audit.truncation_count == 1
     assert output.audit.segments[0].support_count == 8
@@ -1041,14 +1118,15 @@ def test_truncated_queries_and_deferred_vjp_never_retain_local_graph(
         loss.backward(retain_graph=retain_graph)
 
     output = runner.run_truncated(
-        _truncated_episode(config, support_count=1, query_count=4),
+        _truncated_episode(config, support_count=9, diagnostic_query_count=4),
         backward=backward,
     )
 
-    assert retain_flags == [False] * 5  # four local Queries plus one deferred VJP
-    assert output.audit.backward_count == 5
-    assert output.audit.query_backward_count == 4
-    assert output.audit.deferred_vjp_backward_count == 1
+    assert retain_flags == [False] * 4
+    assert output.audit.backward_count == 4
+    assert output.audit.query_backward_count == 2
+    assert output.audit.deferred_vjp_backward_count == 2
+    assert output.audit.diagnostic_query_count == 4
     assert all(query.proxy_storage_isolated for query in output.audit.queries)
     assert all(query.proxy_max_abs_value_drift == 0.0 for query in output.audit.queries)
 
@@ -1065,18 +1143,22 @@ def test_zero_weight_padding_keeps_backward_schedule_but_contributes_zero(
         loss.backward()
 
     output = runner.run_truncated(
-        _truncated_episode(config, support_count=9, query_count=3),
+        _truncated_episode(config, support_count=9, diagnostic_query_count=3),
         backward=backward,
         episode_loss_weight=0.0,
     )
 
     assert output.audit.loss_weight == 0.0
-    assert output.audit.backward_count == 5
-    assert len(backward_values) == 5
-    assert backward_values == pytest.approx([0.0] * 5)
+    assert output.audit.backward_count == 4
+    assert len(backward_values) == 4
+    assert backward_values == pytest.approx([0.0] * 4)
     assert output.total == pytest.approx(0.0)
     assert output.query_loss == pytest.approx(0.0)
     assert output.support_auxiliary_loss == pytest.approx(0.0)
+    assert all(
+        query.proxy_gradient_status == "zero_padding"
+        for query in output.audit.queries
+    )
     assert fast.w0_1.grad is not None and torch.count_nonzero(fast.w0_1.grad) == 0
     assert fast.w0_2.grad is not None and torch.count_nonzero(fast.w0_2.grad) == 0
     assert predictor.scale.grad is not None and torch.count_nonzero(predictor.scale.grad) == 0
@@ -1090,7 +1172,7 @@ def test_truncated_a5_ema_balance_composes_all_queries_once(
         query_loss_builder=_TinyOfficialWeakQueryLossBuilder(),
     )
 
-    output = runner.run_truncated(_truncated_episode(config, support_count=1, query_count=2))
+    output = runner.run_truncated(_truncated_episode(config, support_count=9))
 
     assert runner.last_balance_audit is not None
     assert (
@@ -1113,7 +1195,7 @@ def test_truncated_a5_reuses_one_query_graph_per_segment_and_final_key(
         config,
         query_encoder_reuse=True,
     )
-    episode = _with_shared_query_key(_truncated_episode(config, support_count=17))
+    episode = _with_shared_query_key(_truncated_episode(config, support_count=16))
 
     serial_output = serial.run_truncated(episode)
     reused_output = reused.run_truncated(episode)
@@ -1122,9 +1204,9 @@ def test_truncated_a5_reuses_one_query_graph_per_segment_and_final_key(
     reused_query = reused.model.components.query_encoder
     assert isinstance(serial_query, _QueryStage)
     assert isinstance(reused_query, _QueryStage)
-    assert serial_query.calls == 20  # prewarm + 17 Supports + 2 final Queries
-    # Query-local no-retain backward requires a fresh grad-bearing Query graph per final point.
-    assert reused_query.calls == 5
+    assert serial_query.calls == 21  # prewarm + 16 Supports + two calibrated Meta Queries
+    # Every segment and Meta Query receives one fresh grad-bearing Query graph.
+    assert reused_query.calls == 6
     assert torch.equal(serial_output.total, reused_output.total)
     assert torch.equal(serial_output.query_loss, reused_output.query_loss)
     assert torch.equal(serial_fast.w0_1.grad, reused_fast.w0_1.grad)
@@ -1182,12 +1264,12 @@ def test_truncated_a5_does_not_reuse_different_final_query_ids(
         config,
         query_encoder_reuse=True,
     )
-    episode = _truncated_episode(config, support_count=1, query_count=2)
+    episode = _truncated_episode(config, support_count=9)
     runner.run_truncated(episode)
 
     query = runner.model.components.query_encoder
     assert isinstance(query, _QueryStage)
-    assert query.calls == 4  # prewarm + one segment + two distinct final keys
+    assert query.calls == 7  # prewarm + two segments + calibration and Meta Query pairs
 
 
 def test_query_future_and_prefill_reuse_are_rejected(config: ProjectConfig) -> None:
@@ -1210,7 +1292,7 @@ def test_query_future_and_prefill_reuse_are_rejected(config: ProjectConfig) -> N
 def test_later_query_labels_cannot_change_earlier_query_path(config: ProjectConfig) -> None:
     clean_runner, _, _, _ = _system(config)
     changed_runner, _, _, _ = _system(config)
-    clean_episode = _truncated_episode(config, support_count=4)
+    clean_episode = _truncated_episode(config, support_count=9)
     changed_episode = replace(
         clean_episode,
         query_points=(
@@ -1223,6 +1305,35 @@ def test_later_query_labels_cannot_change_earlier_query_path(config: ProjectConf
 
     assert clean.audit.queries[0].metrics == changed.audit.queries[0].metrics
     assert clean.audit.queries[1].metrics != changed.audit.queries[1].metrics
+
+
+def test_later_support_cannot_change_earlier_intermediate_query(
+    config: ProjectConfig,
+) -> None:
+    torch.manual_seed(17)
+    clean_runner, _, _, _ = _system(config)
+    torch.manual_seed(17)
+    changed_runner, _, _, _ = _system(config)
+    clean_episode = _truncated_episode(config, support_count=9)
+    changed_supports = list(clean_episode.support_chunks)
+    later = changed_supports[-1]
+    payload = later.request.video_input
+    assert isinstance(payload, _VideoChunk)
+    changed_payload = replace(payload, features=payload.features + 100.0)
+    changed_supports[-1] = replace(
+        later,
+        request=replace(later.request, video_input=changed_payload),
+    )
+    changed_episode = replace(
+        clean_episode,
+        support_chunks=tuple(changed_supports),
+    )
+
+    clean = clean_runner.run_truncated(clean_episode)
+    changed = changed_runner.run_truncated(changed_episode)
+
+    assert clean.audit.queries[0] == changed.audit.queries[0]
+    assert clean.audit.queries[1] != changed.audit.queries[1]
 
 
 @pytest.mark.parametrize("denied", ["answer", "count", "occurrence_times"])
