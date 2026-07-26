@@ -1590,6 +1590,8 @@ def main(argv: list[str] | None = None) -> int:
     checkpoint_policy = _checkpoint_policy_from_environment()
     if skip_final_checkpoint and checkpoint_policy is not CheckpointPolicy.ATOMIC_FINAL_ONLY:
         raise ValueError("a smoke run cannot retain epoch checkpoints")
+    if skip_final_checkpoint:
+        _disable_smoke_checkpoints(training_args)
     if checkpoint_policy is CheckpointPolicy.EPOCH_2_AND_EPOCH_4:
         _validate_epoch_two_four_training_arguments(training_args)
     trainer = cast(Any, build_production_trainer(backbone, runtime_raw))
@@ -1711,6 +1713,16 @@ def _checkpoint_policy_from_environment() -> CheckpointPolicy:
     except ValueError as error:
         choices = ", ".join(policy.value for policy in CheckpointPolicy)
         raise ValueError(f"TTT_CHECKPOINT_POLICY must be one of: {choices}") from error
+
+
+def _disable_smoke_checkpoints(training_args: object) -> None:
+    """Disable Trainer's periodic saves when an explicit smoke keeps no checkpoint."""
+
+    arguments = cast(Any, training_args)
+    strategy = arguments.save_strategy
+    strategy_type = type(strategy)
+    arguments.save_strategy = "no" if strategy_type is str else strategy_type("no")
+    arguments.save_steps = 0
 
 
 def _validate_epoch_two_four_training_arguments(training_args: object) -> None:

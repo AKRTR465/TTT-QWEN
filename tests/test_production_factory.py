@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from enum import StrEnum
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     _aggregate_operator_diagnostics,
     _checkpoint_policy_from_environment,
     _ControlledDeepSpeedEngineWrapper,
+    _disable_smoke_checkpoints,
     _publish_epoch_two_four_checkpoints,
     _reset_a2_to_a5_balance,
     _validate_checkpoint_tree,
@@ -1964,6 +1966,19 @@ def test_checkpoint_policy_environment_defaults_and_rejects_unknown(
     monkeypatch.setenv("TTT_CHECKPOINT_POLICY", "unknown")
     with pytest.raises(ValueError, match="TTT_CHECKPOINT_POLICY"):
         _checkpoint_policy_from_environment()
+
+
+def test_explicit_smoke_disables_all_periodic_checkpoints() -> None:
+    class _Strategy(StrEnum):
+        STEPS = "steps"
+        NO = "no"
+
+    arguments = SimpleNamespace(save_strategy=_Strategy.STEPS, save_steps=0.5)
+
+    _disable_smoke_checkpoints(arguments)
+
+    assert arguments.save_strategy is _Strategy.NO
+    assert arguments.save_steps == 0
 
 
 @pytest.mark.parametrize(
