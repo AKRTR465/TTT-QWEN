@@ -13,6 +13,7 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
+import ttt_svcbench_qwen.llamafactory_trainer as trainer_module
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.llamafactory_trainer import (
     CheckpointPolicy,
@@ -78,6 +79,60 @@ class _OuterToy(nn.Module):
         super().__init__()
         self.backbone = nn.Linear(3, 4)
         self.predictor = nn.Linear(4, 4)
+
+
+def test_trainer_main_destroys_initialized_process_group_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed: list[bool] = []
+    monkeypatch.setattr(trainer_module, "_run_main", lambda _argv: 0)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "destroy_process_group",
+        lambda: destroyed.append(True),
+    )
+
+    assert trainer_module.main(["config.yaml"]) == 0
+    assert destroyed == [True]
+
+
+def test_trainer_main_destroys_initialized_process_group_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed: list[bool] = []
+
+    def fail(_argv: list[str] | None) -> int:
+        raise RuntimeError("training failed")
+
+    monkeypatch.setattr(trainer_module, "_run_main", fail)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "destroy_process_group",
+        lambda: destroyed.append(True),
+    )
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        trainer_module.main(["config.yaml"])
+    assert destroyed == [True]
+
+
+def test_trainer_main_skips_process_group_teardown_when_uninitialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(trainer_module, "_run_main", lambda _argv: 0)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    def unexpected_destroy() -> None:
+        raise AssertionError("uninitialized process group must not be destroyed")
+
+    monkeypatch.setattr(torch.distributed, "destroy_process_group", unexpected_destroy)
+
+    assert trainer_module.main(["config.yaml"]) == 0
 
 
 def test_a5_outer_parameter_audit_allows_partial_qwen_with_full_state_training() -> None:

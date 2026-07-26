@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 import time
+import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
@@ -1423,7 +1424,36 @@ def build_production_trainer(
     )
 
 
+def _destroy_default_process_group() -> None:
+    """Best-effort teardown for the process group created by Accelerate/DeepSpeed.
+
+    Do not add a final barrier here: when one rank raises, a cleanup barrier would turn the
+    original failure into another distributed hang.  ``destroy_process_group`` is local
+    teardown and is safe to call from the entrypoint ``finally`` block on both success and
+    failure paths.
+    """
+
+    distributed = torch.distributed
+    if not distributed.is_available() or not distributed.is_initialized():
+        return
+    try:
+        distributed.destroy_process_group()
+    except Exception as error:  # pragma: no cover - backend-specific defensive boundary
+        warnings.warn(
+            f"failed to destroy the default distributed process group: {error}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _run_main(argv)
+    finally:
+        _destroy_default_process_group()
+
+
+def _run_main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if len(arguments) != 1:
         raise ValueError("usage: python -m ttt_svcbench_qwen.llamafactory_trainer CONFIG.yaml")
