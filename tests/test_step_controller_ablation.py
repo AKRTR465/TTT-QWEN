@@ -18,6 +18,7 @@ from ttt_svcbench_qwen.step_controller import (
 ROOT = Path(__file__).resolve().parents[1]
 BASE_CONFIG = ROOT / "configs" / "model_state_ttt_8b.yaml"
 CONFIG_BUILDER = ROOT / "scripts" / "build_a5_ttt_effect_config.py"
+LEARNED_LAUNCHER = ROOT / "scripts" / "h200" / "train_a5_learned_step_ablation.sh"
 
 
 def test_fixed_mode_has_no_controller_module_or_parameters() -> None:
@@ -114,3 +115,15 @@ def test_config_builder_keeps_learned_step_as_explicit_ablation_layer(
             capture_output=True,
             text=True,
         )
+
+
+def test_learned_step_launcher_matches_variant_a_v4_training_contract() -> None:
+    launcher = LEARNED_LAUNCHER.read_text(encoding="utf-8")
+
+    assert "[[ $# -eq 2 ]] || usage" in launcher
+    assert 'exec bash "$ABLATION_LAUNCHER" A learned "$@"' in launcher
+    assert "a5_dense_querybundle_train_support_statequery_fp16_v4" in launcher
+    assert "260726_a5_dense_querybundle_v4_fp16" in launcher
+    assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
+    assert 'TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"' in launcher
+    assert "a5_learned_step_dense_querybundle_v4_4epoch_finalonly" in launcher
