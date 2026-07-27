@@ -11,8 +11,8 @@ cross-video runtime reuse, observe-after-prefill, or carrying differentiable run
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, fields, is_dataclass, replace
 from itertools import pairwise
 from typing import Protocol, cast
@@ -2335,7 +2335,13 @@ class MetaTTTEpisodeRunner:
             _fork_retrieval_runtime(query_runtime_snapshot).with_fast_states(reference_states)
         )
         lifecycle = PrefillLifecycle(query.chunk.request.owner)
-        with _seeded_rng(seed, reference_states), torch.no_grad():
+        if not isinstance(self.fast_controller, nn.Module):
+            raise TypeError("counterfactual audit requires an nn.Module fast controller")
+        with (
+            _temporarily_clear_module_parameter_gradients(self.fast_controller),
+            _seeded_rng(seed, reference_states),
+            torch.no_grad(),
+        ):
             prepared_query = (
                 self._prepare_query(query.chunk, reference, with_grad=False)
                 if self.query_encoder_reuse
@@ -2671,6 +2677,27 @@ def _snapshot_reference_fast_states(
             )
         )
     return tuple(snapshots)
+
+
+@contextmanager
+def _temporarily_clear_module_parameter_gradients(
+    module: nn.Module,
+) -> Iterator[None]:
+    """Permit a read-only online-state binding without losing accumulated outer gradients."""
+
+    parameters = tuple(module.parameters())
+    saved_gradients = tuple(parameter.grad for parameter in parameters)
+    for parameter in parameters:
+        parameter.grad = None
+    try:
+        yield
+    finally:
+        for parameter, gradient in zip(parameters, saved_gradients, strict=True):
+            if parameter.grad is not None:
+                raise RuntimeError(
+                    "read-only counterfactual forward unexpectedly produced module gradients"
+                )
+            parameter.grad = gradient
 
 
 def _query_descent_cosine(

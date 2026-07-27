@@ -172,7 +172,12 @@ class _TinyFastController(nn.Module):
     ) -> Iterator[object]:
         if self._active is not None:
             raise RuntimeError("tiny fast binding is not re-entrant")
-        self._active = (state,) if isinstance(state, FastWeightsState) else tuple(state)
+        states = (state,) if isinstance(state, FastWeightsState) else tuple(state)
+        if not states[0].differentiable and any(
+            parameter.grad is not None for parameter in self.parameters()
+        ):
+            raise ValueError("clear stale module gradients before binding online Fast TTT state")
+        self._active = states
         try:
             yield self
         finally:
@@ -1424,8 +1429,30 @@ def test_diagnostic_counterfactual_is_no_grad_and_does_not_change_training(
             query_selector=0,
         ),
     )
+    baseline_fast_gradients = tuple(
+        parameter.grad.detach().clone() if parameter.grad is not None else None
+        for parameter in baseline_runner.fast_controller.parameters()
+    )
+    audited_fast_gradients = tuple(
+        parameter.grad.detach().clone() if parameter.grad is not None else None
+        for parameter in audited_runner.fast_controller.parameters()
+    )
 
     assert torch.equal(baseline.total, audited.total)
+    assert len(baseline_fast_gradients) == len(audited_fast_gradients)
+    assert all(
+        (left is None and right is None)
+        or (
+            isinstance(left, Tensor)
+            and isinstance(right, Tensor)
+            and torch.equal(left, right)
+        )
+        for left, right in zip(
+            baseline_fast_gradients,
+            audited_fast_gradients,
+            strict=True,
+        )
+    )
     assert baseline.audit.training_counterfactual_executed is False
     assert baseline.audit.diagnostic_counterfactual_executed is False
     assert audited.audit.training_counterfactual_executed is False
