@@ -1576,6 +1576,11 @@ class TTTQwenTrainerMixin:
                         count
                     )
         enriched.update(self.last_semantic_projector_metrics)
+        step_controller_delta_key = "a5/parameter_delta/step_controller/l2"
+        if step_controller_delta_key in enriched:
+            enriched["a5/step_controller/parameter_delta"] = enriched[
+                step_controller_delta_key
+            ]
         controller = self.ttt_runtime.gradient_controller
         if isinstance(controller, OuterGradientController) and controller.last_audit is not None:
             enriched.update(dict(controller.last_audit.metrics()))

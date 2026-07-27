@@ -352,6 +352,27 @@ PY
   exit 0
 fi
 
+GPU_MONITOR_PID=""
+if [[ -n "${TTT_GPU_SAMPLE_LOG:-}" ]]; then
+  if [[ "$TTT_GPU_SAMPLE_LOG" != /* ]]; then
+    echo "TTT_GPU_SAMPLE_LOG must be an absolute path" >&2
+    exit 2
+  fi
+  mkdir -p "$(dirname "$TTT_GPU_SAMPLE_LOG")"
+  nvidia-smi \
+    --query-gpu=timestamp,index,utilization.gpu,memory.used,power.draw \
+    --format=csv,noheader,nounits -l 1 > "$TTT_GPU_SAMPLE_LOG" 2>&1 &
+  GPU_MONITOR_PID="$!"
+fi
+cleanup_gpu_monitor() {
+  if [[ -n "$GPU_MONITOR_PID" ]]; then
+    kill "$GPU_MONITOR_PID" 2>/dev/null || true
+    wait "$GPU_MONITOR_PID" 2>/dev/null || true
+    GPU_MONITOR_PID=""
+  fi
+}
+trap cleanup_gpu_monitor EXIT INT TERM
+
 set +e
 TRAIN_COMMAND=(
   "$PYTHON" -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=4
@@ -369,6 +390,8 @@ else
 fi
 STATUS="${PIPESTATUS[0]}"
 set -e
+cleanup_gpu_monitor
+trap - EXIT INT TERM
 
 ELAPSED="$(( $(date +%s) - START_EPOCH ))"
 if [[ "$STATUS" -eq 0 ]]; then
@@ -378,8 +401,12 @@ else
 fi
 
 "$PYTHON" - "$RUN_ROOT" "$STAGE" "$STATUS" "$ELAPSED" <<'PY'
+import csv
 import json
+import os
+import statistics
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 root = Path(sys.argv[1])
@@ -402,6 +429,44 @@ summary.update(
         "successful_run_count": 1 if status == 0 else 0,
     }
 )
+gpu_log_value = os.environ.get("TTT_GPU_SAMPLE_LOG")
+if gpu_log_value:
+    gpu_log = Path(gpu_log_value)
+    rows = defaultdict(lambda: {"utilization": [], "memory_mib": [], "power_w": []})
+    if gpu_log.is_file():
+        with gpu_log.open(encoding="utf-8", errors="replace") as handle:
+            for row in csv.reader(handle):
+                if len(row) != 5:
+                    continue
+                try:
+                    index = int(row[1].strip())
+                    rows[index]["utilization"].append(float(row[2].strip()))
+                    rows[index]["memory_mib"].append(float(row[3].strip()))
+                    rows[index]["power_w"].append(float(row[4].strip()))
+                except ValueError:
+                    continue
+    per_gpu = {
+        str(index): {
+            "sample_count": len(values["utilization"]),
+            "utilization_mean_percent": statistics.fmean(values["utilization"]),
+            "memory_peak_mib": max(values["memory_mib"]),
+            "power_mean_w": statistics.fmean(values["power_w"]),
+        }
+        for index, values in sorted(rows.items())
+        if values["utilization"]
+    }
+    gpu_summary = {
+        "sample_log": str(gpu_log),
+        "per_gpu": per_gpu,
+        "memory_gate_mib": 136 * 1024,
+        "memory_gate_passed": bool(per_gpu)
+        and all(item["memory_peak_mib"] <= 136 * 1024 for item in per_gpu.values()),
+    }
+    (root / "gpu_summary.json").write_text(
+        json.dumps(gpu_summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    summary["gpu_summary"] = gpu_summary
 summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
 
 if status == 0:
