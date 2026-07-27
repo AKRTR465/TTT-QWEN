@@ -1321,7 +1321,7 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
     assert not policy.train_lm_head
 
     launcher = (root / "scripts/h200/train_a5_vithalf_decoder8.sh").read_text(encoding="utf-8")
-    assert 'TTT_CHECKPOINT_POLICY="epoch_2_and_epoch_4"' in launcher
+    assert 'TTT_CHECKPOINT_POLICY="${TTT_CHECKPOINT_POLICY:-epoch_2_and_epoch_4}"' in launcher
     assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
     assert 'TTT_DATALOADER_TRACE="${TTT_DATALOADER_TRACE:-1}"' in launcher
     assert "[[ $# -eq 2 ]] || usage" in launcher

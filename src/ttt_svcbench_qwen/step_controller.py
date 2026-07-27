@@ -9,6 +9,7 @@ import torch
 from torch import Tensor, nn
 
 from ttt_svcbench_qwen.config import FastTTTStepControllerConfig
+from ttt_svcbench_qwen.losses import TTTLossOutput
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,8 +99,74 @@ def build_inner_step_controller(
     return InnerStepController(config)
 
 
+def build_step_controller_features(
+    *,
+    ttt_output: TTTLossOutput,
+    start_time: float,
+    end_time: float,
+    previous_end_time: float,
+    segment_offset: int,
+    segment_length: int,
+    support_index: int,
+    support_count: int,
+    controller: InnerStepController,
+) -> Tensor:
+    """Build the shared seven detached causal features for training and inference."""
+
+    times = (start_time, end_time, previous_end_time)
+    if any(not math.isfinite(value) or value < 0.0 for value in times):
+        raise ValueError("step controller times must be finite and non-negative")
+    if start_time > end_time or previous_end_time > end_time:
+        raise ValueError("step controller received a future causal boundary")
+    counts = (segment_offset, segment_length, support_index, support_count)
+    if any(type(value) is not int for value in counts):
+        raise TypeError("step controller positions/counts must be exact integers")
+    if (
+        segment_offset < 0
+        or segment_length <= 0
+        or segment_offset >= segment_length
+        or support_index < 0
+        or support_count <= 0
+        or support_index >= support_count
+    ):
+        raise ValueError("step controller positions must lie inside their causal sequence")
+    per_row = ttt_output.per_row_total.detach().float()
+    batch_size = per_row.shape[0]
+    device = per_row.device
+    dtype = next(controller.parameters()).dtype
+
+    def repeated(value: float) -> Tensor:
+        return torch.full((batch_size,), value, dtype=torch.float32, device=device)
+
+    scale = ttt_output.temporal_scale_audit
+    pair_count = scale.pair_element_count.detach().float().clamp_min(1.0)
+    target_rms = torch.sqrt(scale.target_sum_squares.detach().float() / pair_count)
+    error_rms = torch.sqrt(scale.error_sum_squares.detach().float() / pair_count)
+    valid_ratio = (
+        (ttt_output.pred.valid_counts.detach() > 0).float()
+        + (ttt_output.identity.valid_counts.detach() > 0).float()
+        + (ttt_output.event.valid_counts.detach() > 0).float()
+    ) / 3.0
+    features = torch.stack(
+        (
+            repeated((segment_offset + 1) / segment_length),
+            repeated((support_index + 1) / support_count),
+            torch.log1p(repeated(end_time - start_time)),
+            torch.log1p(repeated(end_time - previous_end_time)),
+            torch.log1p(per_row.clamp_min(0.0)),
+            valid_ratio,
+            torch.log1p((target_rms + error_rms).expand(batch_size)),
+        ),
+        dim=1,
+    )
+    if features.shape != (batch_size, 7):
+        raise RuntimeError("step controller feature topology drifted")
+    return features.detach().to(dtype=dtype)
+
+
 __all__ = [
     "InnerStepController",
     "StepControllerAudit",
     "build_inner_step_controller",
+    "build_step_controller_features",
 ]

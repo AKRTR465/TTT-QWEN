@@ -2704,13 +2704,23 @@ def build_inference_runtime_bundle(
         ModelFeatureFlags(),
     )
     predictor = build_temporal_predictor(config.predictor)
+    step_controller = build_inner_step_controller(config.fast_ttt.step_controller)
+    if step_controller is not None:
+        step_controller.to(device=torch.device(device))
+        step_controller.requires_grad_(False)
+        step_controller.eval()
     outer = ProductionOuterModel(
         state_model,
         predictor,
         qwen_model,
         OfficialWeakOuterLossComposer(config.loss.official_weak_balance),
+        step_controller,
     )
     load_outer_checkpoint(outer, checkpoint)
+    # The Qwen backbone was moved above before the state stack was constructed.
+    # Move the complete checkpoint owner so Query/State/TTT/controller modules
+    # share the requested inference device and precision.
+    outer.to(device=torch.device(device), dtype=dtype)
     outer.eval()
     manager = PerVideoRuntimeManager(
         fast_adapter=fast,
@@ -2725,7 +2735,7 @@ def build_inference_runtime_bundle(
         state_model=state_model,
         outer_model=outer,
         manager=manager,
-        updater=OnlineTTTUpdater(config, predictor),
+        updater=OnlineTTTUpdater(config, predictor, step_controller),
         processor=processor,
         tokenizer=tokenizer,
         video_materializer=materializer,

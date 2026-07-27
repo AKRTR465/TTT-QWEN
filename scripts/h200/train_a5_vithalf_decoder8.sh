@@ -45,7 +45,7 @@ if [[ -n "${TTT_SMOKE_MAX_STEPS:-}" ]]; then
   # therefore does not synchronize the hot path per event.
   export TTT_DATALOADER_TRACE="${TTT_DATALOADER_TRACE:-1}"
 else
-  export TTT_CHECKPOINT_POLICY="epoch_2_and_epoch_4"
+  export TTT_CHECKPOINT_POLICY="${TTT_CHECKPOINT_POLICY:-epoch_2_and_epoch_4}"
 fi
 export RUN_ID="${RUN_ID:-$(date +%y%m%d_%H%M%S)_a5_k8_vithalf_decoder8_4h200}"
 export SESSION="${SESSION:-a5_k8_vithalf_decoder8_${RUN_ID}}"

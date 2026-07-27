@@ -91,7 +91,10 @@ from ttt_svcbench_qwen.stage_a_targets import (
 )
 from ttt_svcbench_qwen.state_encoder import TemporalEncoderOutput
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
-from ttt_svcbench_qwen.step_controller import InnerStepController
+from ttt_svcbench_qwen.step_controller import (
+    InnerStepController,
+    build_step_controller_features,
+)
 from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
 from ttt_svcbench_qwen.trainer import (
     StageAEpisodeAnswerInputs,
@@ -1591,9 +1594,10 @@ class MetaTTTEpisodeRunner:
                     None
                     if self.step_controller is None
                     else self.step_controller(
-                        _step_controller_features(
+                        build_step_controller_features(
                             ttt_output=ttt_output,
-                            chunk=chunk,
+                            start_time=chunk.start_time,
+                            end_time=chunk.end_time,
                             previous_end_time=previous_snapshot.end_time,
                             segment_offset=segment_offset,
                             segment_length=segment_length,
@@ -2447,55 +2451,6 @@ class MetaTTTEpisodeRunner:
                 )
             )
         return tuple(outputs)
-
-
-def _step_controller_features(
-    *,
-    ttt_output: TTTLossOutput,
-    chunk: MetaCausalChunk,
-    previous_end_time: float,
-    segment_offset: int,
-    segment_length: int,
-    support_index: int,
-    support_count: int,
-    controller: InnerStepController,
-) -> Tensor:
-    """Build the seven detached causal features without opening a third-order path."""
-
-    if previous_end_time > chunk.end_time:
-        raise ValueError("step controller received a future previous observation")
-    per_row = ttt_output.per_row_total.detach().float()
-    batch_size = per_row.shape[0]
-    device = per_row.device
-    dtype = next(controller.parameters()).dtype
-
-    def repeated(value: float) -> Tensor:
-        return torch.full((batch_size,), value, dtype=torch.float32, device=device)
-
-    scale = ttt_output.temporal_scale_audit
-    pair_count = scale.pair_element_count.detach().float().clamp_min(1.0)
-    target_rms = torch.sqrt(scale.target_sum_squares.detach().float() / pair_count)
-    error_rms = torch.sqrt(scale.error_sum_squares.detach().float() / pair_count)
-    valid_ratio = (
-        (ttt_output.pred.valid_counts.detach() > 0).float()
-        + (ttt_output.identity.valid_counts.detach() > 0).float()
-        + (ttt_output.event.valid_counts.detach() > 0).float()
-    ) / 3.0
-    features = torch.stack(
-        (
-            repeated((segment_offset + 1) / segment_length),
-            repeated((support_index + 1) / support_count),
-            torch.log1p(repeated(max(0.0, chunk.end_time - chunk.start_time))),
-            torch.log1p(repeated(max(0.0, chunk.end_time - previous_end_time))),
-            torch.log1p(per_row.clamp_min(0.0)),
-            valid_ratio,
-            torch.log1p((target_rms + error_rms).expand(batch_size)),
-        ),
-        dim=1,
-    )
-    if features.shape != (batch_size, 7):
-        raise RuntimeError("step controller feature topology drifted")
-    return features.detach().to(dtype=dtype)
 
 
 def _make_inner_update_audit(

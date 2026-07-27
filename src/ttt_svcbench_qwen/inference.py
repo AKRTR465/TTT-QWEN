@@ -49,6 +49,7 @@ from ttt_svcbench_qwen.model import (
     ObservationChunkOutput,
     ObservationChunkRequest,
     PrefillLifecycle,
+    PreparedQueryOutput,
     RuntimeOwner,
     StateTTTModel,
     TrajectoryRuntimeState,
@@ -56,6 +57,10 @@ from ttt_svcbench_qwen.model import (
 from ttt_svcbench_qwen.state_bank import StructuredStateBank, TensorizedRetrievalHistory
 from ttt_svcbench_qwen.state_encoder import TemporalCache
 from ttt_svcbench_qwen.state_reader import ReaderResult
+from ttt_svcbench_qwen.step_controller import (
+    InnerStepController,
+    build_step_controller_features,
+)
 
 type AuditValue = str | int | float | bool | None
 
@@ -163,12 +168,15 @@ class InferenceRequest:
     chunks: tuple[CausalChunk, ...]
     answer_inputs: AnswerInputs
     attempt: QueryAttempt
+    prepared_query: PreparedQueryOutput | None = None
     query_observation: CausalChunk | None = None
     max_new_tokens: int = 16
 
     def __post_init__(self) -> None:
         if self.query_input.query_id != self.attempt.query_id:
             raise ValueError("inference request Query identity must match the attempt")
+        if self.prepared_query is not None:
+            self.prepared_query.validate_for(self.query_input)
         if (
             self.query_signature.shape != (512,)
             or not torch.is_floating_point(self.query_signature)
@@ -329,6 +337,7 @@ class TTTUpdateOutcome:
     skip_reason: str | None
     valid_term_count: int
     loss_value: float | None = None
+    step_size: float | None = None
 
     def __post_init__(self) -> None:
         if type(self.did_update) is not bool:
@@ -342,6 +351,10 @@ class TTTUpdateOutcome:
             raise ValueError("skipped TTT update requires a skip reason")
         if self.loss_value is not None and not math.isfinite(self.loss_value):
             raise ValueError("TTT update loss audit must be finite")
+        if self.step_size is not None and (
+            not math.isfinite(self.step_size) or not 0.0 < self.step_size < 3.0e-4
+        ):
+            raise ValueError("TTT update step size must be finite and in (0, 3e-4)")
 
 
 class TTTUpdateStage(Protocol):
@@ -350,6 +363,7 @@ class TTTUpdateStage(Protocol):
         observation: ObservationChunkOutput,
         runtime_state: TrajectoryRuntimeState,
         *,
+        current_start_time: float,
         current_end_time: float,
     ) -> TTTUpdateOutcome: ...
 
@@ -357,7 +371,12 @@ class TTTUpdateStage(Protocol):
 class OnlineTTTUpdater:
     """Apply label-free adjacent-chunk State-TTT and publish W_(t+1)."""
 
-    def __init__(self, config: ProjectConfig, predictor: TemporalPredictor) -> None:
+    def __init__(
+        self,
+        config: ProjectConfig,
+        predictor: TemporalPredictor,
+        step_controller: InnerStepController | None = None,
+    ) -> None:
         if not isinstance(config, ProjectConfig):
             raise TypeError("online updater requires validated ProjectConfig")
         if not isinstance(predictor, TemporalPredictor):
@@ -365,12 +384,30 @@ class OnlineTTTUpdater:
         self.config = config
         self.predictor = predictor
         self.input_builder = CausalOverlapTTTInputBuilder(config)
+        self.step_controller_mode = config.fast_ttt.step_controller.mode
+        if self.step_controller_mode == "learned":
+            if not isinstance(step_controller, InnerStepController):
+                raise ValueError("learned online TTT requires its checkpointed step controller")
+        elif step_controller is not None:
+            raise ValueError("fixed online TTT must not register a step controller")
+        self.step_controller = step_controller
+        self._support_count: int | None = None
+        self._support_index = 0
+
+    def begin_query(self, support_count: int) -> None:
+        """Reset query-local causal positions used only by the learned ablation."""
+
+        if type(support_count) is not int or support_count <= 0:
+            raise ValueError("online TTT query support_count must be a positive integer")
+        self._support_count = support_count
+        self._support_index = 0
 
     def __call__(
         self,
         observation: ObservationChunkOutput,
         runtime_state: TrajectoryRuntimeState,
         *,
+        current_start_time: float,
         current_end_time: float,
     ) -> TTTUpdateOutcome:
         if observation.owner != runtime_state.owner:
@@ -383,12 +420,38 @@ class OnlineTTTUpdater:
             enabled_terms=("pred", "identity", "event"),
         )
         output = compute_ttt_loss(self.predictor, built.inputs)
+        step_sizes: Tensor | None = None
+        if self.step_controller is not None:
+            if self._support_count is None:
+                raise InferenceProtocolError(
+                    "learned online TTT requires begin_query before Support updates"
+                )
+            if self._support_index >= self._support_count:
+                raise InferenceProtocolError("online TTT exceeded its declared Support count")
+            with torch.no_grad():
+                step_sizes = self.step_controller(
+                    build_step_controller_features(
+                        ttt_output=output,
+                        start_time=current_start_time,
+                        end_time=current_end_time,
+                        previous_end_time=(
+                            current_start_time if previous is None else previous.end_time
+                        ),
+                        segment_offset=self._support_index,
+                        segment_length=self._support_count,
+                        support_index=self._support_index,
+                        support_count=self._support_count,
+                        controller=self.step_controller,
+                    )
+                )
         result = functional_sgd_steps_from_ttt(
             ttt_output=output,
             fast_states=(_require_fast_state(runtime_state),),
             optimizer_config=self.config.fast_ttt.optimizer,
             optimizer_states=(_require_optimizer_state(runtime_state),),
+            step_sizes=step_sizes,
         )[0]
+        self._support_index += 1
         updated = replace(
             runtime_state,
             fast_weights=result.fast_state,
@@ -401,6 +464,7 @@ class OnlineTTTUpdater:
             skip_reason=None if result.skip_reason is None else result.skip_reason.value,
             valid_term_count=result.valid_term_count,
             loss_value=float(output.total.detach().item()),
+            step_size=result.step_size,
         )
 
 
@@ -423,6 +487,7 @@ class ChunkAudit:
     state_before: RuntimeAuditSnapshot
     state_after_observe: RuntimeAuditSnapshot
     state_after_update: RuntimeAuditSnapshot
+    step_size: float | None = None
 
     def __post_init__(self) -> None:
         counts = (
@@ -443,6 +508,10 @@ class ChunkAudit:
             raise ValueError("accepted chunk update must advance fast version exactly once")
         if not self.did_update and self.next_fast_version != self.fast_version_used:
             raise ValueError("skipped chunk update cannot change fast version")
+        if self.step_size is not None and (
+            not math.isfinite(self.step_size) or not 0.0 < self.step_size < 3.0e-4
+        ):
+            raise ValueError("chunk audit step size must be finite and in (0, 3e-4)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -632,6 +701,7 @@ class PerVideoRuntimeManager:
         query_input: RuntimeQueryInput,
         query_time: float,
         updater: TTTUpdateStage,
+        prepared_query: PreparedQueryOutput | None = None,
     ) -> ChunkExecution:
         """Observe with W_t, write hard state, then create W_(t+1) for the next chunk."""
 
@@ -679,6 +749,7 @@ class PerVideoRuntimeManager:
                         query_input=query_input,
                         runtime_state=model_runtime,
                         bank_states=model_bank_states,
+                        prepared_query=prepared_query,
                         inference=True,
                     ),
                     lifecycle,
@@ -719,7 +790,12 @@ class PerVideoRuntimeManager:
                 )
             after_observe_snapshot = self._snapshot(observed)
             hard_stamp = _hard_state_stamp(observed)
-            outcome = updater(observation, observed, current_end_time=causal.end_time)
+            outcome = updater(
+                observation,
+                observed,
+                current_start_time=causal.start_time,
+                current_end_time=causal.end_time,
+            )
             updated = _require_trajectory_runtime(outcome.runtime_state, owner)
             if _hard_state_stamp(updated) != hard_stamp:
                 raise InferenceProtocolError(
@@ -750,6 +826,7 @@ class PerVideoRuntimeManager:
                 state_before=before_snapshot,
                 state_after_observe=after_observe_snapshot,
                 state_after_update=after_update_snapshot,
+                step_size=outcome.step_size,
             )
             self._runtime = updated
             self._chunk_audits.append(audit)
@@ -859,6 +936,7 @@ class PerVideoRuntimeManager:
         chunk: CausalChunk,
         query_input: RuntimeQueryInput,
         query_time: float,
+        prepared_query: PreparedQueryOutput | None = None,
     ) -> ObservationChunkOutput:
         """Observe one Query feature set with current W_t without committing Bank/FSM state."""
 
@@ -880,6 +958,7 @@ class PerVideoRuntimeManager:
                         query_input=query_input,
                         runtime_state=BatchRuntimeState((runtime,)),
                         bank_states=(runtime.state_bank,),
+                        prepared_query=prepared_query,
                         inference=True,
                         retrieval_history_write_enabled=False,
                     ),
@@ -1019,6 +1098,8 @@ def run_inference(
         raise TypeError("run_inference requires StateTTTModel")
     if not isinstance(request, InferenceRequest):
         raise TypeError("run_inference requires InferenceRequest")
+    if isinstance(updater, OnlineTTTUpdater):
+        updater.begin_query(len(request.chunks))
     manager.reset(request.video_id, request.trajectory_id, request.query_signature)
     latest_observation: ObservationChunkOutput | None = None
     try:
@@ -1029,6 +1110,7 @@ def run_inference(
                 query_input=request.query_input,
                 query_time=request.query_time,
                 updater=updater,
+                prepared_query=request.prepared_query,
             )
             if execution.observation is not None:
                 latest_observation = execution.observation
@@ -1038,6 +1120,7 @@ def run_inference(
                 chunk=request.query_observation,
                 query_input=request.query_input,
                 query_time=request.query_time,
+                prepared_query=request.prepared_query,
             )
         if latest_observation is None:
             raise InferenceProtocolError("no causal frame was available before query_time")
@@ -1707,9 +1790,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             video_grid_thw=answer_materialized.video_grid_thw,
             tokenizer=bundle.tokenizer,
             embedding_owner=bundle.qwen_adapter.qwen_model,
-            rope_indexer=bundle.qwen_adapter.qwen_model,
+            rope_indexer=getattr(
+                bundle.qwen_adapter.qwen_model,
+                "model",
+                bundle.qwen_adapter.qwen_model,
+            ),
         ),
         attempt=QueryAttempt(query.query_id),
+        prepared_query=PreparedQueryOutput.bind(query, encoded),
         query_observation=query_observation,
         max_new_tokens=16,
     )
