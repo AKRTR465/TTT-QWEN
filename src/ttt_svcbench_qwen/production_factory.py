@@ -358,6 +358,11 @@ def load_training_yaml(path: str | Path) -> tuple[dict[str, object], ProductionT
             raise ValueError("visual-cost preflight is allowed only for an explicit smoke run")
         extension["visual_cost_mode"] = "proxy"
         extension.pop("visual_cost_index", None)
+    project_config_override = os.environ.get("TTT_PROJECT_CONFIG")
+    if project_config_override is not None:
+        if not project_config_override.strip():
+            raise ValueError("TTT_PROJECT_CONFIG must be non-empty when set")
+        extension["project_config"] = project_config_override
     return values, ProductionTTTConfig.model_validate(extension)
 
 
@@ -692,13 +697,25 @@ def load_outer_checkpoint(
 def initialize_outer_model_from_a2(
     model: nn.Module,
     checkpoint: str | Path,
+    *,
+    allowed_missing_prefixes: tuple[str, ...] = (),
 ) -> OuterCheckpointAudit:
     """Load A2 weights only, leaving A5 optimizer/scheduler/RNG freshly initialized."""
 
     root = Path(checkpoint).resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"A2 checkpoint directory does not exist: {root}")
-    expected_keys = set(audit_outer_checkpoint_boundary(model))
+    expected_all = set(audit_outer_checkpoint_boundary(model))
+    if any(not prefix for prefix in allowed_missing_prefixes):
+        raise ValueError("allowed A2 initialization prefixes must be non-empty")
+    allowed_missing = {
+        key
+        for key in expected_all
+        if any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
+    }
+    if allowed_missing_prefixes and not allowed_missing:
+        raise ValueError("allowed A2 initialization prefix matched no model parameters")
+    expected_keys = expected_all - allowed_missing
     safe_index = root / "model.safetensors.index.json"
     torch_index = root / "pytorch_model.bin.index.json"
     safe_weights = root / "model.safetensors"
@@ -706,8 +723,8 @@ def initialize_outer_model_from_a2(
     missing: tuple[str, ...]
     unexpected: tuple[str, ...]
     if safe_index.is_file() or torch_index.is_file():
-        result = load_sharded_checkpoint(model, str(root), strict=True, prefer_safe=True)
-        missing = tuple(result.missing_keys)
+        result = load_sharded_checkpoint(model, str(root), strict=False, prefer_safe=True)
+        missing = tuple(key for key in result.missing_keys if key not in allowed_missing)
         unexpected = tuple(result.unexpected_keys)
         index_path = safe_index if safe_index.is_file() else torch_index
         index = json.loads(index_path.read_text(encoding="utf-8"))
@@ -718,8 +735,8 @@ def initialize_outer_model_from_a2(
         checkpoint_format = "sharded_safetensors" if safe_index.is_file() else "sharded_torch"
     elif safe_weights.is_file():
         state = load_file(str(safe_weights), device="cpu")
-        result = model.load_state_dict(state, strict=True)
-        missing = tuple(result.missing_keys)
+        result = model.load_state_dict(state, strict=False)
+        missing = tuple(key for key in result.missing_keys if key not in allowed_missing)
         unexpected = tuple(result.unexpected_keys)
         loaded_keys = set(state)
         checkpoint_format = "safetensors"
@@ -728,8 +745,8 @@ def initialize_outer_model_from_a2(
         if not isinstance(raw, dict) or not all(isinstance(key, str) for key in raw):
             raise ValueError("A2 torch checkpoint must contain a string-keyed state dict")
         state = cast(dict[str, torch.Tensor], raw)
-        result = model.load_state_dict(state, strict=True)
-        missing = tuple(result.missing_keys)
+        result = model.load_state_dict(state, strict=False)
+        missing = tuple(key for key in result.missing_keys if key not in allowed_missing)
         unexpected = tuple(result.unexpected_keys)
         loaded_keys = set(state)
         checkpoint_format = "torch"

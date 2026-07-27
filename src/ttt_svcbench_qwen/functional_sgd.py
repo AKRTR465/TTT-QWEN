@@ -126,6 +126,7 @@ class FunctionalSGDResult:
     skip_reason: UpdateSkipReason | None
     skip_detail: str | None
     gradient_mode: GradientMode
+    step_size: float = 1.0e-4
 
     def __post_init__(self) -> None:
         if type(self.did_update) is not bool:
@@ -136,6 +137,8 @@ class FunctionalSGDResult:
             raise ValueError("valid_term_count must be a non-negative exact integer")
         if not math.isfinite(self.update_norm) or self.update_norm < 0.0:
             raise ValueError("update_norm must be finite and non-negative")
+        if not math.isfinite(self.step_size) or not 0.0 < self.step_size < 3.0e-4:
+            raise ValueError("functional SGD step_size must be finite and in (0, 3e-4)")
         scalars = (self.gradient_norm, self.clipped_gradient_norm)
         pairs = (self.per_matrix_gradient_norms, self.per_matrix_clipped_norms)
         for value in scalars:
@@ -288,6 +291,7 @@ def functional_sgd_step_from_ttt_row(
     fast_state: FastWeightsState,
     optimizer_config: InnerSGDConfig,
     optimizer_state: OptimizerRuntimeState,
+    step_size: Tensor | None = None,
     _retain_graph: bool = False,
 ) -> FunctionalSGDResult:
     """Update exactly one video's state from its authoritative TTT row."""
@@ -311,6 +315,7 @@ def functional_sgd_step_from_ttt_row(
             optimizer_config=optimizer_config,
             optimizer_state=optimizer_state,
             valid_term_count=valid_term_count,
+            step_size=step_size,
             _retain_graph=_retain_graph,
         )
     return functional_sgd_step(
@@ -319,6 +324,7 @@ def functional_sgd_step_from_ttt_row(
         optimizer_config=optimizer_config,
         optimizer_state=optimizer_state,
         valid_term_count=0,
+        step_size=step_size,
         invalid_reason=_invalid_ttt_row_reason(ttt_output, row),
     )
 
@@ -329,6 +335,7 @@ def functional_sgd_steps_from_ttt(
     fast_states: Sequence[FastWeightsState],
     optimizer_config: InnerSGDConfig,
     optimizer_states: Sequence[OptimizerRuntimeState],
+    step_sizes: Tensor | None = None,
 ) -> tuple[FunctionalSGDResult, ...]:
     """Apply independent row losses to a storage-isolated batch of video states."""
 
@@ -337,6 +344,21 @@ def functional_sgd_steps_from_ttt(
     runtimes = tuple(optimizer_states)
     if len(states) != batch_size or len(runtimes) != batch_size:
         raise ValueError("TTT batch, fast states, and optimizer states must have identical B")
+    if step_sizes is not None:
+        if (
+            not isinstance(step_sizes, Tensor)
+            or step_sizes.ndim != 1
+            or step_sizes.shape[0] != batch_size
+        ):
+            raise ValueError("learned Inner-SGD step sizes must have shape [B]")
+        if (
+            not torch.is_floating_point(step_sizes)
+            or step_sizes.device != states[0].w_t_1.device
+            or not bool(torch.isfinite(step_sizes.detach()).all())
+        ):
+            raise ValueError("learned Inner-SGD step sizes must be finite on the fast device")
+        if bool(torch.any(step_sizes.detach() <= 0.0) or torch.any(step_sizes.detach() >= 3.0e-4)):
+            raise ValueError("learned Inner-SGD step sizes must lie strictly inside (0, 3e-4)")
     if not all(isinstance(state, FastWeightsState) for state in states):
         raise TypeError("TTT batch bridge requires only FastWeightsState values")
     if not all(isinstance(state, OptimizerRuntimeState) for state in runtimes):
@@ -357,6 +379,7 @@ def functional_sgd_steps_from_ttt(
                 fast_state=states[row],
                 optimizer_config=optimizer_config,
                 optimizer_state=runtimes[row],
+                step_size=None if step_sizes is None else step_sizes[row],
                 _retain_graph=row in valid_rows and row != last_valid_row,
             )
         )
@@ -370,6 +393,7 @@ def functional_sgd_step(
     optimizer_config: InnerSGDConfig,
     optimizer_state: OptimizerRuntimeState,
     valid_term_count: int,
+    step_size: Tensor | None = None,
     invalid_reason: UpdateSkipReason | None = None,
     _retain_graph: bool = False,
 ) -> FunctionalSGDResult:
@@ -386,6 +410,24 @@ def functional_sgd_step(
         raise TypeError("functional SGD retain-graph control must be bool")
     _validate_optimizer_config(optimizer_config)
     _validate_optimizer_runtime(optimizer_config, optimizer_state, fast_state)
+    effective_step_size: float | Tensor = optimizer_config.learning_rate
+    audited_step_size = float(optimizer_config.learning_rate)
+    if step_size is not None:
+        if (
+            not isinstance(step_size, Tensor)
+            or step_size.ndim != 0
+            or not torch.is_floating_point(step_size)
+            or step_size.device != fast_state.w_t_1.device
+        ):
+            raise ValueError("learned Inner-SGD step size must be one floating device scalar")
+        detached_step = step_size.detach()
+        if (
+            not bool(torch.isfinite(detached_step).item())
+            or not 0.0 < float(detached_step.item()) < 3.0e-4
+        ):
+            raise ValueError("learned Inner-SGD step size must lie strictly inside (0, 3e-4)")
+        effective_step_size = step_size
+        audited_step_size = float(detached_step.item())
     if type(valid_term_count) is not int or valid_term_count < 0:
         raise ValueError("valid_term_count must be a non-negative exact integer")
 
@@ -403,6 +445,7 @@ def functional_sgd_step(
             reason=invalid_reason,
             detail=invalid_reason.value,
             valid_term_count=0,
+            step_size=audited_step_size,
         )
     if invalid_reason is not None:
         raise ValueError("valid TTT terms cannot carry a caller-supplied skip reason")
@@ -416,6 +459,7 @@ def functional_sgd_step(
             reason=UpdateSkipReason.NONFINITE_LOSS,
             detail="loss_is_not_finite",
             valid_term_count=valid_term_count,
+            step_size=audited_step_size,
         )
 
     gradient_mode = _gradient_mode(fast_state, optimizer_config)
@@ -441,6 +485,7 @@ def functional_sgd_step(
             reason=UpdateSkipReason.NONFINITE_GRADIENT,
             detail="one_or_more_fast_gradients_are_not_finite",
             valid_term_count=valid_term_count,
+            step_size=audited_step_size,
         )
 
     gradient_norm_tensor, per_matrix_norm_tensors = _global_norm(gradients)
@@ -451,6 +496,7 @@ def functional_sgd_step(
             reason=UpdateSkipReason.NONFINITE_GRADIENT,
             detail="fp32_global_gradient_norm_is_not_finite",
             valid_term_count=valid_term_count,
+            step_size=audited_step_size,
         )
     gradient_norm = _audit_float(gradient_norm_tensor)
     per_matrix_norms = tuple(_audit_float(value) for value in per_matrix_norm_tensors)
@@ -468,6 +514,7 @@ def functional_sgd_step(
             valid_term_count=valid_term_count,
             gradient_norm=gradient_norm,
             per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
+            step_size=audited_step_size,
         )
     clipped_norm_tensor, clipped_per_matrix_tensors = _global_norm(clipped)
     if not bool(torch.isfinite(clipped_norm_tensor.detach()).item()):
@@ -479,6 +526,7 @@ def functional_sgd_step(
             valid_term_count=valid_term_count,
             gradient_norm=gradient_norm,
             per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
+            step_size=audited_step_size,
         )
     clipped_norm = _audit_float(clipped_norm_tensor)
     clipped_per_matrix = tuple(_audit_float(value) for value in clipped_per_matrix_tensors)
@@ -493,10 +541,17 @@ def functional_sgd_step(
             clipped_gradient_norm=clipped_norm,
             per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
             per_matrix_clipped_norms=cast_norm_pair(clipped_per_matrix),
+            step_size=audited_step_size,
         )
 
     candidates = tuple(
-        parameter - optimizer_config.learning_rate * gradient
+        parameter
+        - (
+            effective_step_size.to(dtype=gradient.dtype)
+            if isinstance(effective_step_size, Tensor)
+            else effective_step_size
+        )
+        * gradient
         for parameter, gradient in zip(parameters, clipped, strict=True)
     )
     if any(not bool(torch.isfinite(candidate.detach()).all()) for candidate in candidates):
@@ -510,6 +565,7 @@ def functional_sgd_step(
             clipped_gradient_norm=clipped_norm,
             per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
             per_matrix_clipped_norms=cast_norm_pair(clipped_per_matrix),
+            step_size=audited_step_size,
         )
     deltas = tuple(
         candidate - parameter for candidate, parameter in zip(candidates, parameters, strict=True)
@@ -530,6 +586,7 @@ def functional_sgd_step(
             clipped_gradient_norm=clipped_norm,
             per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
             per_matrix_clipped_norms=cast_norm_pair(clipped_per_matrix),
+            step_size=audited_step_size,
         )
 
     next_parameters = _next_parameters(candidates, differentiable=fast_state.differentiable)
@@ -554,6 +611,7 @@ def functional_sgd_step(
         per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
         per_matrix_clipped_norms=cast_norm_pair(clipped_per_matrix),
         update_norm=update_norm,
+        step_size=audited_step_size,
         skip_reason=None,
         skip_detail=None,
         gradient_mode=gradient_mode,
@@ -571,6 +629,7 @@ def _skip_result(
     clipped_gradient_norm: float | None = None,
     per_matrix_gradient_norms: tuple[float, float] | None = None,
     per_matrix_clipped_norms: tuple[float, float] | None = None,
+    step_size: float | None = None,
 ) -> FunctionalSGDResult:
     next_parameters = _next_parameters(
         fast_state.fast_parameters,
@@ -597,6 +656,7 @@ def _skip_result(
         per_matrix_gradient_norms=per_matrix_gradient_norms,
         per_matrix_clipped_norms=per_matrix_clipped_norms,
         update_norm=0.0,
+        step_size=optimizer_state.learning_rate if step_size is None else step_size,
         skip_reason=reason,
         skip_detail=detail,
         gradient_mode=_gradient_mode_from_state(fast_state),
@@ -746,7 +806,6 @@ def _validate_optimizer_config(config: InnerSGDConfig) -> None:
         raise TypeError("functional SGD requires InnerSGDConfig")
     expected = {
         "name": "sgd",
-        "learning_rate": 1.0e-4,
         "momentum": 0.0,
         "weight_decay": 0.0,
         "steps_per_chunk": 1,
@@ -757,6 +816,8 @@ def _validate_optimizer_config(config: InnerSGDConfig) -> None:
     for name, required in expected.items():
         if getattr(config, name) != required:
             raise ValueError(f"inner SGD {name} must be {required!r}")
+    if config.learning_rate not in {1.0e-4, 2.0e-4}:
+        raise ValueError("inner SGD learning_rate must be 1e-4 or 2e-4")
 
 
 def _validate_optimizer_runtime(

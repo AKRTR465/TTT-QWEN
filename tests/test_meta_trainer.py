@@ -26,6 +26,7 @@ from ttt_svcbench_qwen.losses import (
     TemporalPredictor,
 )
 from ttt_svcbench_qwen.meta_trainer import (
+    CounterfactualAuditRequest,
     MetaCausalChunk,
     MetaQueryLossBuilder,
     MetaQueryLossInput,
@@ -76,6 +77,7 @@ from ttt_svcbench_qwen.state_bank import (
     build_state_bank,
 )
 from ttt_svcbench_qwen.state_encoder import TemporalCache, TemporalEncoderOutput
+from ttt_svcbench_qwen.step_controller import InnerStepController
 from ttt_svcbench_qwen.trainer import StageAEpisodeAnswerInputs, StageASupervisionBatch
 
 
@@ -621,6 +623,7 @@ def _system(
     raw_support_visual_batcher: object | None = None,
     support_visual_batch_size: int = 1,
     adaptation_mode: str = "meta_ttt",
+    step_controller: InnerStepController | None = None,
 ) -> tuple[MetaTTTEpisodeRunner, _TinyFastController, _TinyPredictor, _RuntimeResetter]:
     fast = _TinyFastController()
     predictor = _TinyPredictor()
@@ -662,6 +665,7 @@ def _system(
         raw_support_visual_batcher=raw_support_visual_batcher,  # type: ignore[arg-type]
         support_visual_batch_size=support_visual_batch_size,
         adaptation_mode=adaptation_mode,
+        step_controller=step_controller,
     )
     return runner, fast, predictor, resetter
 
@@ -1398,6 +1402,69 @@ def test_later_support_cannot_change_earlier_intermediate_query(
 
     assert clean.audit.queries[0] == changed.audit.queries[0]
     assert clean.audit.queries[1] != changed.audit.queries[1]
+
+
+def test_diagnostic_counterfactual_is_no_grad_and_does_not_change_training(
+    config: ProjectConfig,
+) -> None:
+    raw = config.model_dump(mode="python")
+    raw["a5"]["counterfactual_audit"]["enabled"] = True
+    audit_config = ProjectConfig.model_validate(raw)
+    torch.manual_seed(23)
+    baseline_runner, _, _, _ = _system(audit_config)
+    torch.manual_seed(23)
+    audited_runner, _, _, _ = _system(audit_config)
+    episode = _truncated_episode(audit_config, support_count=4)
+
+    baseline = baseline_runner.run_truncated(episode)
+    audited = audited_runner.run_truncated(
+        episode,
+        counterfactual_audit=CounterfactualAuditRequest(
+            optimizer_step=8,
+            query_selector=0,
+        ),
+    )
+
+    assert torch.equal(baseline.total, audited.total)
+    assert baseline.audit.training_counterfactual_executed is False
+    assert baseline.audit.diagnostic_counterfactual_executed is False
+    assert audited.audit.training_counterfactual_executed is False
+    assert audited.audit.diagnostic_counterfactual_executed is True
+    assert audited.audit.counterfactual_audited_query_count == 1
+    counterfactual = audited.audit.queries[0].counterfactual
+    assert counterfactual is not None
+    assert counterfactual.optimizer_step == 8
+    assert tuple(item.reference for item in counterfactual.references) == (
+        "episode_w0",
+        "segment_start",
+    )
+    assert all(torch.equal(left.w_t_1, right.w_t_1) for left, right in zip(
+        baseline.final_fast_states,
+        audited.final_fast_states,
+        strict=True,
+    ))
+
+
+def test_learned_step_controller_is_explicit_and_receives_query_gradient(
+    config: ProjectConfig,
+) -> None:
+    raw = config.model_dump(mode="python")
+    raw["fast_ttt"]["step_controller"]["mode"] = "learned"
+    learned_config = ProjectConfig.model_validate(raw)
+    controller = InnerStepController(learned_config.fast_ttt.step_controller)
+    runner, _, _, _ = _system(learned_config, step_controller=controller)
+
+    output = runner.run_truncated(_truncated_episode(learned_config, support_count=4))
+
+    step_sizes = tuple(value for update in output.audit.updates for value in update.step_sizes)
+    assert step_sizes == pytest.approx((1.0e-4,) * len(step_sizes), rel=1.0e-6)
+    gradients = tuple(parameter.grad for parameter in controller.parameters())
+    assert all(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients)
+    assert any(
+        float(torch.linalg.vector_norm(gradient).item()) > 0.0
+        for gradient in gradients
+        if gradient is not None
+    )
 
 
 @pytest.mark.parametrize("denied", ["answer", "count", "occurrence_times"])

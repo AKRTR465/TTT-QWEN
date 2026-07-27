@@ -184,11 +184,14 @@ from pathlib import Path
 
 path, stage, config = sys.argv[1:]
 adaptation_mode = None
+step_controller_mode = "fixed"
 if stage == "a5":
+    from ttt_svcbench_qwen.config import load_config
     from ttt_svcbench_qwen.production_factory import load_training_yaml
 
     _, extension = load_training_yaml(config)
     adaptation_mode = extension.a5_adaptation_mode
+    step_controller_mode = load_config(extension.project_config).fast_ttt.step_controller.mode
     requested_mode = os.environ.get("TTT_A5_ADAPTATION_MODE")
     if requested_mode is not None and requested_mode != adaptation_mode:
         raise ValueError(
@@ -197,6 +200,7 @@ if stage == "a5":
 payload = {
     "stage": stage,
     "a5_adaptation_mode": adaptation_mode,
+    "a5_step_controller_mode": step_controller_mode,
     "config": config,
     "working_directory": os.getcwd(),
     "host": socket.gethostname(),

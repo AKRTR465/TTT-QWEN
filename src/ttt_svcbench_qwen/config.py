@@ -11,7 +11,7 @@ import argparse
 import platform
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Self, cast
+from typing import Annotated, Literal, Self, cast
 
 import torch
 import transformers
@@ -131,6 +131,28 @@ class InnerSGDConfig(FrozenModel):
     meta_gradient_mode: str
 
 
+class FastTTTStepControllerConfig(FrozenModel):
+    """Explicit ablation switch for a bounded learned Inner-SGD step size."""
+
+    mode: Literal["fixed", "learned"] = "fixed"
+    input_dim: PositiveInt = 7
+    hidden_dim: PositiveInt = 32
+    maximum_step_size: PositiveFloat = 3.0e-4
+    initial_step_size: PositiveFloat = 1.0e-4
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_controller_contract(self) -> Self:
+        if self.input_dim != 7 or self.hidden_dim != 32:
+            raise ValueError("InnerStepController topology must remain 7 -> 32 -> 1")
+        if self.maximum_step_size != 3.0e-4:
+            raise ValueError("InnerStepController maximum_step_size must remain 3e-4")
+        if self.initial_step_size != 1.0e-4:
+            raise ValueError("InnerStepController initial_step_size must remain 1e-4")
+        if self.initial_step_size >= self.maximum_step_size:
+            raise ValueError("InnerStepController initial step must be below its upper bound")
+        return self
+
+
 class FastTTTConfig(FrozenModel):
     input_dim: PositiveInt
     bottleneck_dim: PositiveInt
@@ -144,6 +166,7 @@ class FastTTTConfig(FrozenModel):
     online_parameter_count: PositiveInt
     update_order: str
     optimizer: InnerSGDConfig
+    step_controller: FastTTTStepControllerConfig = FastTTTStepControllerConfig()
 
 
 class SpatialEncoderConfig(FrozenModel):
@@ -587,6 +610,7 @@ class OuterMaxGradNormConfig(FrozenModel):
     state_retrieval: PositiveFloat
     w0: PositiveFloat
     predictor: PositiveFloat
+    step_controller: PositiveFloat = 0.05
 
 
 class OuterGradientControlConfig(FrozenModel):
@@ -614,6 +638,29 @@ class A5OptimizerConfig(FrozenModel):
     state_learning_rate: PositiveFloat
     w0_learning_rate: PositiveFloat
     predictor_learning_rate: PositiveFloat
+    step_controller_learning_rate: PositiveFloat = 1.0e-4
+
+
+class A5CounterfactualAuditConfig(FrozenModel):
+    """No-grad Query references used only for diagnostic causal-effect measurement."""
+
+    enabled: bool = False
+    interval_steps: PositiveInt = 8
+    queries_per_rank: PositiveInt = 1
+    references: tuple[Literal["episode_w0", "segment_start"], ...] = (
+        "episode_w0",
+        "segment_start",
+    )
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_audit_contract(self) -> Self:
+        if self.queries_per_rank != 1:
+            raise ValueError("counterfactual audit must select exactly one Query per rank")
+        if self.references != ("episode_w0", "segment_start"):
+            raise ValueError(
+                "counterfactual audit references must be episode_w0 and segment_start"
+            )
+        return self
 
 
 class A5TrainingConfig(FrozenModel):
@@ -622,6 +669,7 @@ class A5TrainingConfig(FrozenModel):
     truncation_horizon: PositiveInt
     seed: NonNegativeInt
     optimizer: A5OptimizerConfig
+    counterfactual_audit: A5CounterfactualAuditConfig = A5CounterfactualAuditConfig()
 
 
 class InferenceRuntimeConfig(FrozenModel):
@@ -773,7 +821,6 @@ class ProjectConfig(FrozenModel):
                 "observe_state_then_update_for_next_chunk",
             ),
             ("fast_ttt.optimizer.name", self.fast_ttt.optimizer.name, "sgd"),
-            ("fast_ttt.optimizer.learning_rate", self.fast_ttt.optimizer.learning_rate, 1.0e-4),
             ("fast_ttt.optimizer.momentum", self.fast_ttt.optimizer.momentum, 0.0),
             ("fast_ttt.optimizer.weight_decay", self.fast_ttt.optimizer.weight_decay, 0.0),
             ("fast_ttt.optimizer.steps_per_chunk", self.fast_ttt.optimizer.steps_per_chunk, 1),
@@ -783,6 +830,18 @@ class ProjectConfig(FrozenModel):
                 "fast_ttt.optimizer.meta_gradient_mode",
                 self.fast_ttt.optimizer.meta_gradient_mode,
                 "full_second_order",
+            ),
+            ("fast_ttt.step_controller.input_dim", self.fast_ttt.step_controller.input_dim, 7),
+            ("fast_ttt.step_controller.hidden_dim", self.fast_ttt.step_controller.hidden_dim, 32),
+            (
+                "fast_ttt.step_controller.maximum_step_size",
+                self.fast_ttt.step_controller.maximum_step_size,
+                3.0e-4,
+            ),
+            (
+                "fast_ttt.step_controller.initial_step_size",
+                self.fast_ttt.step_controller.initial_step_size,
+                1.0e-4,
             ),
             ("spatial_encoder.input_dim", self.spatial_encoder.input_dim, 4096),
             ("spatial_encoder.hidden_dim", self.spatial_encoder.hidden_dim, 768),
@@ -1547,7 +1606,6 @@ class ProjectConfig(FrozenModel):
             ("loss.operator_weight", self.loss.operator_weight, 1.0),
             ("loss.retrieval_weight", self.loss.retrieval_weight, 1.0),
             ("loss.time_weight", self.loss.time_weight, 1.0),
-            ("loss.auxiliary_outer_weight", self.loss.auxiliary_outer_weight, 0.1),
             ("loss.answer_causal_shift", self.loss.answer_causal_shift, True),
             ("loss.answer_ignore_index", self.loss.answer_ignore_index, -100),
             (
@@ -1626,14 +1684,14 @@ class ProjectConfig(FrozenModel):
                 0.05,
             ),
             (
-                "outer_gradient_control.max_grad_norm.w0",
-                self.outer_gradient_control.max_grad_norm.w0,
-                0.1,
-            ),
-            (
                 "outer_gradient_control.max_grad_norm.predictor",
                 self.outer_gradient_control.max_grad_norm.predictor,
                 0.1,
+            ),
+            (
+                "outer_gradient_control.max_grad_norm.step_controller",
+                self.outer_gradient_control.max_grad_norm.step_controller,
+                0.05,
             ),
             (
                 "outer_gradient_control.nonfinite_policy",
@@ -1669,15 +1727,40 @@ class ProjectConfig(FrozenModel):
                 5.0e-5,
             ),
             (
-                "a5.optimizer.predictor_learning_rate",
-                self.a5.optimizer.predictor_learning_rate,
-                5.0e-5,
+                "a5.optimizer.step_controller_learning_rate",
+                self.a5.optimizer.step_controller_learning_rate,
+                1.0e-4,
             ),
             ("inference.audit_level", self.inference.audit_level, AuditLevel.BOUNDARY),
         )
         for path, actual, expected in checks:
             if actual != expected:
                 raise ValueError(f"{path} must be {expected!r}; got {actual!r}")
+        experimental_choices = (
+            (
+                "fast_ttt.optimizer.learning_rate",
+                self.fast_ttt.optimizer.learning_rate,
+                (1.0e-4, 2.0e-4),
+            ),
+            (
+                "loss.auxiliary_outer_weight",
+                self.loss.auxiliary_outer_weight,
+                (0.1, 0.2),
+            ),
+            (
+                "outer_gradient_control.max_grad_norm.w0",
+                self.outer_gradient_control.max_grad_norm.w0,
+                (0.1, 0.15),
+            ),
+            (
+                "a5.optimizer.predictor_learning_rate",
+                self.a5.optimizer.predictor_learning_rate,
+                (5.0e-5, 1.0e-4),
+            ),
+        )
+        for path, actual, allowed in experimental_choices:
+            if actual not in allowed:
+                raise ValueError(f"{path} must be one of {allowed!r}; got {actual!r}")
 
         self._validate_attention_dimensions()
         self._validate_video_preprocessing_contract()

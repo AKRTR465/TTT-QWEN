@@ -73,6 +73,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     OfficialWeakLossAudit,
     OperatorDiagnosticAudit,
 )
+from ttt_svcbench_qwen.step_controller import InnerStepController
 
 
 class _OuterToy(nn.Module):
@@ -1536,6 +1537,45 @@ def test_production_runtime_defers_optimizer_and_sampler_to_central_bridge() -> 
     assert runtime.train_sampler_factory is None
 
 
+def test_a2_initialization_allows_only_new_learned_step_controller_keys(
+    tmp_path: Path,
+) -> None:
+    source = _OuterToy()
+    checkpoint = tmp_path / "a2-final-without-controller"
+    checkpoint.mkdir()
+    save_file(
+        {name: value.detach().clone() for name, value in source.state_dict().items()},
+        str(checkpoint / "model.safetensors"),
+    )
+    target = _OuterToy()
+    learned_config = load_config().fast_ttt.step_controller.model_copy(
+        update={"mode": "learned"}
+    )
+    target.step_controller = InnerStepController(learned_config)
+    initial_controller = {
+        name: value.detach().clone()
+        for name, value in target.step_controller.state_dict().items()
+    }
+
+    audit = initialize_outer_model_from_a2(
+        target,
+        checkpoint,
+        allowed_missing_prefixes=("step_controller.",),
+    )
+
+    assert audit.missing_keys == ()
+    assert all(
+        torch.equal(source.state_dict()[name], target.state_dict()[name])
+        for name in source.state_dict()
+    )
+    assert all(
+        torch.equal(initial_controller[name], target.step_controller.state_dict()[name])
+        for name in initial_controller
+    )
+    with pytest.raises(ValueError, match="exactly match"):
+        initialize_outer_model_from_a2(target, checkpoint)
+
+
 def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Path) -> None:
     run = tmp_path / "runs" / "0715_010203_a5"
     checkpoint = run / "checkpoints" / "checkpoint-20"
@@ -1585,6 +1625,38 @@ def test_same_stage_resume_accepts_only_matching_static_w0_mode(tmp_path: Path) 
         == checkpoint
     )
     with pytest.raises(ValueError, match="adaptation mode"):
+        resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
+
+
+def test_same_stage_resume_rejects_step_controller_ablation_mismatch(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "runs" / "learned-step"
+    checkpoint = run / "checkpoints" / "checkpoint-20"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "scheduler.pt").write_bytes(b"scheduler")
+    (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
+    (run / "run_config.json").write_text(
+        json.dumps(
+            {
+                "stage": "a5",
+                "a5_adaptation_mode": "meta_ttt",
+                "a5_step_controller_mode": "learned",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        resolve_same_stage_resume(
+            str(checkpoint),
+            ProductionStage.A5,
+            a5_step_controller_mode="learned",
+        )
+        == checkpoint
+    )
+    with pytest.raises(ValueError, match="step-controller mode"):
         resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
 
 
@@ -2290,3 +2362,76 @@ def test_central_outer_optimizer_has_exact_stage_groups(
     assert actual_lrs == expected_lrs
     owned = {id(parameter) for group in optimizer.param_groups for parameter in group["params"]}
     assert owned == {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+
+
+def test_learned_step_controller_has_its_own_outer_optimizer_group(
+    tmp_path: Path,
+) -> None:
+    qwen = nn.Linear(4, 4)
+    checkout = tmp_path / "lf"
+    checkout.mkdir()
+    symbols = LlamaFactorySymbols(
+        get_train_args=lambda *_args, **_kwargs: (),
+        load_tokenizer=lambda *_args, **_kwargs: {},
+        load_model=lambda *_args, **_kwargs: qwen,
+        trainer_base=object,
+        checkout=LlamaFactoryCheckoutAudit(checkout, "523f801", False, True),
+    )
+    project = load_config()
+    bundle = LlamaFactoryBackboneBundle(
+        model=qwen,
+        tokenizer=object(),
+        processor=None,
+        model_args=object(),
+        data_args=object(),
+        training_args=SimpleNamespace(
+            learning_rate=5.0e-6,
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_epsilon=1.0e-8,
+            weight_decay=0.01,
+        ),
+        finetuning_args=object(),
+        generating_args=object(),
+        project_config=project,
+        ttt_config=ProductionTTTConfig(
+            stage="a5",
+            a5_adaptation_mode="meta_ttt",
+            project_config="configs/model_state_ttt_8b.yaml",
+            dataset_manifest="manifest.json",
+            initialize_from_a2_checkpoint="a2-final",
+            support_prefetch_depth=2,
+            support_decode_coalesce=True,
+            support_materialization="segment_double_buffer",
+            segment_prefetch_depth=1,
+            state_query_visual_mode="recent_chunk",
+            state_query_max_frames=16,
+            answer_query_visual_mode="causal_prefix",
+            answer_query_max_frames=256,
+            state_query_cache_mode="inherit",
+            answer_query_cache_mode="disabled",
+            preprocess_cache_mode="read_write",
+            preprocess_cache_miss_policy="decode",
+            preprocess_cache_root_env="TTT_PREPROCESS_CACHE_ROOT",
+            preprocess_cache_max_gb=200.0,
+            preprocess_cache_dtype="float32",
+        ),
+        symbols=symbols,
+    )
+    model = _GroupedOuterToy(qwen, predictor_trainable=True)
+    model.step_controller = InnerStepController(project.fast_ttt.step_controller.model_copy(
+        update={"mode": "learned"}
+    ))
+
+    optimizer = make_production_outer_optimizer_factory(
+        bundle,
+        ProductionStage.A5,
+        a5_adaptation_mode="meta_ttt",
+        a5_step_controller_mode="learned",
+    )(model)
+
+    groups = {group["group_name"]: group for group in optimizer.param_groups}
+    assert groups["step_controller"]["lr"] == 1.0e-4
+    assert {id(parameter) for parameter in groups["step_controller"]["params"]} == {
+        id(parameter) for parameter in model.step_controller.parameters()
+    }

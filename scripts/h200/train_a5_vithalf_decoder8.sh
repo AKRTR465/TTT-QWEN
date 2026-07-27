@@ -33,6 +33,7 @@ if [[ ! -f "$PARTIAL_YAML" ]]; then
 fi
 
 export YAML="$PARTIAL_YAML"
+export TTT_PROJECT_CONFIG="${TTT_PROJECT_CONFIG:-$PROJECT_ROOT/configs/model_state_ttt_8b.yaml}"
 export TTT_H200_VENV="${TTT_H200_VENV:-$PLAY_ROOT/projects/ttt_qwen/.venv-h200-uv-py312-torch28}"
 export TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"
 export TTT_PREPROCESS_CACHE_ROOT="${TTT_PREPROCESS_CACHE_ROOT:-$PLAY_ROOT/projects/ttt_qwen/.cache/preprocess/260726_a5_support_aligned_v3_fp16}"

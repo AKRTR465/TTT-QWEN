@@ -91,6 +91,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
 )
 from ttt_svcbench_qwen.state_encoder import TemporalEncoderOutput
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
+from ttt_svcbench_qwen.step_controller import InnerStepController
 from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
 from ttt_svcbench_qwen.trainer import (
     StageAEpisodeAnswerInputs,
@@ -835,6 +836,7 @@ class InnerUpdateAudit:
     skip_reasons: tuple[str | None, ...]
     gradient_norms: tuple[float | None, ...]
     update_norms: tuple[float, ...]
+    step_sizes: tuple[float, ...]
     pred_valid_counts: tuple[int, ...]
     identity_valid_counts: tuple[int, ...]
     e1_valid_counts: tuple[int, ...]
@@ -852,6 +854,7 @@ class InnerUpdateAudit:
             self.skip_reasons,
             self.gradient_norms,
             self.update_norms,
+            self.step_sizes,
             self.pred_valid_counts,
             self.identity_valid_counts,
             self.e1_valid_counts,
@@ -955,6 +958,62 @@ class TruncatedSegmentAudit:
 
 
 @dataclass(frozen=True, slots=True)
+class CounterfactualAuditRequest:
+    """One deterministic diagnostic Query selection for the current optimizer step."""
+
+    optimizer_step: int
+    query_selector: int
+
+    def __post_init__(self) -> None:
+        if self.optimizer_step <= 0 or self.query_selector < 0:
+            raise ValueError("counterfactual audit request indices must be positive/non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class CounterfactualReferenceAudit:
+    reference: str
+    adapted_loss: float
+    reference_loss: float
+    gain_abs: float
+    gain_rel: float
+    descent_cosine: float
+
+    def __post_init__(self) -> None:
+        if self.reference not in {"episode_w0", "segment_start"}:
+            raise ValueError("counterfactual reference is invalid")
+        if any(
+            not math.isfinite(value)
+            for value in (
+                self.adapted_loss,
+                self.reference_loss,
+                self.gain_abs,
+                self.gain_rel,
+                self.descent_cosine,
+            )
+        ):
+            raise ValueError("counterfactual audit values must be finite")
+        if self.adapted_loss < 0.0 or self.reference_loss < 0.0:
+            raise ValueError("counterfactual Query losses must be non-negative")
+        if not -1.0 <= self.descent_cosine <= 1.0:
+            raise ValueError("counterfactual descent cosine must be in [-1, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class QueryCounterfactualAudit:
+    optimizer_step: int
+    references: tuple[CounterfactualReferenceAudit, ...]
+
+    def __post_init__(self) -> None:
+        if self.optimizer_step <= 0:
+            raise ValueError("counterfactual optimizer step must be positive")
+        if tuple(item.reference for item in self.references) != (
+            "episode_w0",
+            "segment_start",
+        ):
+            raise ValueError("counterfactual Query audit must contain both ordered references")
+
+
+@dataclass(frozen=True, slots=True)
 class TruncatedQueryPointAudit:
     """Adapted-only Query audit used by the production A5 path."""
 
@@ -975,6 +1034,7 @@ class TruncatedQueryPointAudit:
     proxy_gradient_status: str
     proxy_storage_isolated: bool
     proxy_max_abs_value_drift: float
+    counterfactual: QueryCounterfactualAudit | None = None
 
     def __post_init__(self) -> None:
         if type(self.query_index) is not int or self.query_index < 0:
@@ -1062,6 +1122,8 @@ class TruncatedMetaTTTEpisodeAudit:
     overlap_graph_detached: bool
     support_supervision_reachable: bool
     training_counterfactual_executed: bool
+    diagnostic_counterfactual_executed: bool
+    counterfactual_audited_query_count: int
     segments: tuple[TruncatedSegmentAudit, ...]
     updates: tuple[InnerUpdateAudit, ...]
     queries: tuple[TruncatedQueryPointAudit, ...]
@@ -1075,6 +1137,17 @@ class TruncatedMetaTTTEpisodeAudit:
             raise ValueError("A5 TTT valid count must be a non-negative integer")
         if self.ttt_enabled != (self.adaptation_mode == "meta_ttt"):
             raise ValueError("A5 TTT enabled audit disagrees with adaptation mode")
+        if self.training_counterfactual_executed:
+            raise ValueError("training counterfactual remains forbidden")
+        if type(self.diagnostic_counterfactual_executed) is not bool:
+            raise TypeError("diagnostic counterfactual flag must be bool")
+        if (
+            type(self.counterfactual_audited_query_count) is not int
+            or self.counterfactual_audited_query_count not in {0, 1}
+            or self.diagnostic_counterfactual_executed
+            != (self.counterfactual_audited_query_count == 1)
+        ):
+            raise ValueError("diagnostic counterfactual Query count is invalid")
         if self.loss_weight not in (0.0, 1.0):
             raise ValueError("A5 episode audit loss weight must be deterministic zero or one")
         if self.prewarm_count != 1:
@@ -1260,6 +1333,7 @@ class MetaTTTEpisodeRunner:
         query_activation_offload: bool = False,
         outer_composer: OfficialWeakOuterLossComposer | None = None,
         adaptation_mode: str = "meta_ttt",
+        step_controller: InnerStepController | None = None,
     ) -> None:
         if not isinstance(config, ProjectConfig):
             raise TypeError("Meta-TTT runner requires validated ProjectConfig")
@@ -1292,6 +1366,15 @@ class MetaTTTEpisodeRunner:
             raise ValueError("A5 adaptation mode must be meta_ttt or static_w0")
         self.adaptation_mode = adaptation_mode
         self.ttt_enabled = adaptation_mode == "meta_ttt"
+        self.step_controller_mode = config.fast_ttt.step_controller.mode
+        if self.step_controller_mode == "learned":
+            if not self.ttt_enabled:
+                raise ValueError("learned InnerStepController is forbidden in static-W0")
+            if not isinstance(step_controller, InnerStepController):
+                raise TypeError("learned step mode requires InnerStepController")
+        elif step_controller is not None:
+            raise ValueError("fixed step mode must not register InnerStepController")
+        self.step_controller = step_controller
         if not self.ttt_enabled:
             self.predictor.requires_grad_(False)
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
@@ -1305,6 +1388,7 @@ class MetaTTTEpisodeRunner:
         backward: Callable[[Tensor, bool], None] | None = None,
         backward_gradient_scale: float = 1.0,
         episode_loss_weight: float = 1.0,
+        counterfactual_audit: CounterfactualAuditRequest | None = None,
     ) -> TruncatedMetaTTTEpisodeOutput:
         """Run one Query-aligned deferred-VJP closure per bounded Support segment."""
 
@@ -1322,12 +1406,31 @@ class MetaTTTEpisodeRunner:
         ):
             raise ValueError("A5 episode loss weight must be deterministic zero or one")
         episode_weight = float(episode_loss_weight)
+        audit_config = self.config.a5.counterfactual_audit
+        if counterfactual_audit is not None:
+            if not audit_config.enabled:
+                raise ValueError("counterfactual audit request requires enabled diagnostic config")
+            if not self.ttt_enabled:
+                raise ValueError("counterfactual Query audit requires Meta-TTT")
+            if not isinstance(counterfactual_audit, CounterfactualAuditRequest):
+                raise TypeError("counterfactual audit request is invalid")
+        selected_query_index = (
+            None
+            if counterfactual_audit is None
+            else counterfactual_audit.query_selector % len(episode.query_points)
+        )
         backward_fn = backward or _plain_backward
         self.model.train()
         self.predictor.train(self.ttt_enabled)
+        if self.step_controller is not None:
+            self.step_controller.train()
         adapted = self._reset_trajectory(episode.owner, differentiable=True)
         tracked_parameters = _unique_parameters(
-            (*self.model.parameters(), *self.predictor.parameters())
+            (
+                *self.model.parameters(),
+                *self.predictor.parameters(),
+                *(() if self.step_controller is None else self.step_controller.parameters()),
+            )
         )
         versions_before = tuple(parameter._version for parameter in tracked_parameters)
         horizon = self.config.a5.truncation_horizon
@@ -1396,6 +1499,11 @@ class MetaTTTEpisodeRunner:
         if any(prewarm_fast_audit.fast_versions):
             raise ValueError("the no-update prewarm must observe the initial W0 generation")
         adapted.runtime = _runtime_from_observation(prewarm_observation, episode.owner)
+        episode_w0_reference = (
+            _snapshot_reference_fast_states(adapted.fast_states)
+            if counterfactual_audit is not None and episode_weight == 1.0
+            else None
+        )
         previous_snapshot = (
             OnlineOverlapSnapshot.capture(
                 prewarm_observation,
@@ -1417,6 +1525,11 @@ class MetaTTTEpisodeRunner:
             segment_start = support_offset
             segment_update_start = len(update_audits)
             fast_version_before_segment = tuple(state.fast_version for state in adapted.fast_states)
+            segment_start_reference = (
+                _snapshot_reference_fast_states(adapted.fast_states)
+                if counterfactual_audit is not None and episode_weight == 1.0
+                else None
+            )
             queries = episode.query_points[query_offset : query_offset + segment_query_count]
             query_roles = episode.query_roles[query_offset : query_offset + segment_query_count]
             query_weights = episode.query_weights[query_offset : query_offset + segment_query_count]
@@ -1474,11 +1587,28 @@ class MetaTTTEpisodeRunner:
                 _validate_variant_loss_terms(ttt_output, self.enabled_terms)
                 outer_ttt_loss = compute_ttt_outer_auxiliary_loss(ttt_output)
                 before_versions = tuple(state.fast_version for state in adapted.fast_states)
+                step_sizes = (
+                    None
+                    if self.step_controller is None
+                    else self.step_controller(
+                        _step_controller_features(
+                            ttt_output=ttt_output,
+                            chunk=chunk,
+                            previous_end_time=previous_snapshot.end_time,
+                            segment_offset=segment_offset,
+                            segment_length=segment_length,
+                            support_index=support_index,
+                            support_count=support_count,
+                            controller=self.step_controller,
+                        )
+                    )
+                )
                 results = functional_sgd_steps_from_ttt(
                     ttt_output=ttt_output,
                     fast_states=adapted.fast_states,
                     optimizer_config=self.config.fast_ttt.optimizer,
                     optimizer_states=adapted.optimizer_states,
+                    step_sizes=step_sizes,
                 )
                 adapted.fast_states = tuple(result.fast_state for result in results)
                 adapted.optimizer_states = tuple(result.optimizer_state for result in results)
@@ -1558,7 +1688,7 @@ class MetaTTTEpisodeRunner:
                 temporal_error_max_abs = torch.maximum(
                     temporal_error_max_abs, scale_audit.error_max_abs
                 )
-                del results, ttt_output, built, observation
+                del results, step_sizes, ttt_output, built, observation
 
             query_runtime_snapshot = adapted.runtime
             authoritative_fast_states = query_runtime_snapshot.fast_states
@@ -1670,6 +1800,68 @@ class MetaTTTEpisodeRunner:
                     proxy_states,
                     backward_gradient_scale=float(backward_gradient_scale),
                 )
+                query_counterfactual: QueryCounterfactualAudit | None = None
+                if (
+                    global_query_index == selected_query_index
+                    and episode_weight == 1.0
+                    and counterfactual_audit is not None
+                ):
+                    if episode_w0_reference is None or segment_start_reference is None:
+                        raise RuntimeError("counterfactual reference fast states were not captured")
+                    adapted_audit_loss = float(
+                        (query_weight * objective.outer.outer).detach().float().item()
+                    )
+                    reference_items: list[CounterfactualReferenceAudit] = []
+                    for reference_name, reference_states in (
+                        ("episode_w0", episode_w0_reference),
+                        ("segment_start", segment_start_reference),
+                    ):
+                        reference_loss = self._counterfactual_query_loss(
+                            query=query,
+                            query_weight=query_weight,
+                            query_runtime_snapshot=query_runtime_snapshot,
+                            reference_states=reference_states,
+                            balance_audit=balance_audit,
+                            seed=episode.seed + 10_000 + global_query_index,
+                        )
+                        gain_abs = reference_loss - adapted_audit_loss
+                        reference_items.append(
+                            CounterfactualReferenceAudit(
+                                reference=reference_name,
+                                adapted_loss=adapted_audit_loss,
+                                reference_loss=reference_loss,
+                                gain_abs=gain_abs,
+                                gain_rel=gain_abs / max(abs(reference_loss), 1.0e-6),
+                                descent_cosine=_query_descent_cosine(
+                                    authoritative_fast_states,
+                                    reference_states,
+                                    captured_gradients,
+                                ),
+                            )
+                        )
+                    query_counterfactual = QueryCounterfactualAudit(
+                        optimizer_step=counterfactual_audit.optimizer_step,
+                        references=tuple(reference_items),
+                    )
+                    trace_event(
+                        "a5_diagnostic_counterfactual",
+                        optimizer_step=counterfactual_audit.optimizer_step,
+                        query_index=global_query_index,
+                        query_role=query_role,
+                        support_count=segment_length,
+                        segment_index=segment_index,
+                        references=tuple(
+                            {
+                                "reference": item.reference,
+                                "adapted_loss": item.adapted_loss,
+                                "reference_loss": item.reference_loss,
+                                "gain_abs": item.gain_abs,
+                                "gain_rel": item.gain_rel,
+                                "descent_cosine": item.descent_cosine,
+                            }
+                            for item in reference_items
+                        ),
+                    )
                 if accumulated_gradients is None:
                     accumulated_gradients = captured_gradients
                 else:
@@ -1717,6 +1909,7 @@ class MetaTTTEpisodeRunner:
                             audit.storage_isolated for audit in proxy_audits
                         ),
                         proxy_max_abs_value_drift=maximum_proxy_drift,
+                        counterfactual=query_counterfactual,
                     )
                 )
                 for state in proxy_states:
@@ -1725,6 +1918,7 @@ class MetaTTTEpisodeRunner:
                 adapted.runtime = query_runtime_snapshot
                 del (
                     captured_gradients,
+                    query_counterfactual,
                     gradient_statistics,
                     query_loss,
                     objective,
@@ -1938,6 +2132,12 @@ class MetaTTTEpisodeRunner:
             overlap_graph_detached=all(item.match.snapshot_detached for item in update_audits),
             support_supervision_reachable=False,
             training_counterfactual_executed=False,
+            diagnostic_counterfactual_executed=any(
+                query.counterfactual is not None for query in query_audits
+            ),
+            counterfactual_audited_query_count=sum(
+                query.counterfactual is not None for query in query_audits
+            ),
             segments=tuple(segment_audits),
             updates=tuple(update_audits),
             queries=tuple(query_audits),
@@ -2115,6 +2315,54 @@ class MetaTTTEpisodeRunner:
                 lifecycle,
             )
 
+    def _counterfactual_query_loss(
+        self,
+        *,
+        query: MetaTTTQueryPoint,
+        query_weight: float,
+        query_runtime_snapshot: BatchRuntimeState,
+        reference_states: tuple[FastWeightsState, ...],
+        balance_audit: OfficialWeakBalanceAudit | None,
+        seed: int,
+    ) -> float:
+        """Evaluate one no-grad fast-weight reference without committing any runtime state."""
+
+        reference = _Trajectory(
+            _fork_retrieval_runtime(query_runtime_snapshot).with_fast_states(reference_states)
+        )
+        lifecycle = PrefillLifecycle(query.chunk.request.owner)
+        with _seeded_rng(seed, reference_states), torch.no_grad():
+            prepared_query = (
+                self._prepare_query(query.chunk, reference, with_grad=False)
+                if self.query_encoder_reuse
+                else None
+            )
+            observation, _ = self._observe(
+                query.chunk,
+                reference,
+                lifecycle,
+                seed=seed,
+                with_grad=False,
+                prepared_query=prepared_query,
+            )
+            output = self._answer(query, observation, lifecycle, with_grad=False)
+            objective = self._query_objective(query, output, ())
+            if balance_audit is not None:
+                outer = self.outer_composer.compose_one_from_audit(
+                    objective.answer,
+                    cast(OfficialWeakStateLossOutput, objective.state),
+                    query_count=1,
+                    audit=balance_audit,
+                )
+                objective = replace(objective, outer=outer)
+            value = query_weight * objective.outer.outer
+        scalar = float(value.detach().float().item())
+        if not math.isfinite(scalar) or scalar < 0.0:
+            raise ValueError("counterfactual Query loss must be finite and non-negative")
+        if lifecycle.audit().prefill_count != 1:
+            raise ValueError("counterfactual reference must execute exactly one prefill")
+        return scalar
+
     def _query_objective(
         self,
         query: MetaTTTQueryPoint,
@@ -2201,6 +2449,55 @@ class MetaTTTEpisodeRunner:
         return tuple(outputs)
 
 
+def _step_controller_features(
+    *,
+    ttt_output: TTTLossOutput,
+    chunk: MetaCausalChunk,
+    previous_end_time: float,
+    segment_offset: int,
+    segment_length: int,
+    support_index: int,
+    support_count: int,
+    controller: InnerStepController,
+) -> Tensor:
+    """Build the seven detached causal features without opening a third-order path."""
+
+    if previous_end_time > chunk.end_time:
+        raise ValueError("step controller received a future previous observation")
+    per_row = ttt_output.per_row_total.detach().float()
+    batch_size = per_row.shape[0]
+    device = per_row.device
+    dtype = next(controller.parameters()).dtype
+
+    def repeated(value: float) -> Tensor:
+        return torch.full((batch_size,), value, dtype=torch.float32, device=device)
+
+    scale = ttt_output.temporal_scale_audit
+    pair_count = scale.pair_element_count.detach().float().clamp_min(1.0)
+    target_rms = torch.sqrt(scale.target_sum_squares.detach().float() / pair_count)
+    error_rms = torch.sqrt(scale.error_sum_squares.detach().float() / pair_count)
+    valid_ratio = (
+        (ttt_output.pred.valid_counts.detach() > 0).float()
+        + (ttt_output.identity.valid_counts.detach() > 0).float()
+        + (ttt_output.event.valid_counts.detach() > 0).float()
+    ) / 3.0
+    features = torch.stack(
+        (
+            repeated((segment_offset + 1) / segment_length),
+            repeated((support_index + 1) / support_count),
+            torch.log1p(repeated(max(0.0, chunk.end_time - chunk.start_time))),
+            torch.log1p(repeated(max(0.0, chunk.end_time - previous_end_time))),
+            torch.log1p(per_row.clamp_min(0.0)),
+            valid_ratio,
+            torch.log1p((target_rms + error_rms).expand(batch_size)),
+        ),
+        dim=1,
+    )
+    if features.shape != (batch_size, 7):
+        raise RuntimeError("step controller feature topology drifted")
+    return features.detach().to(dtype=dtype)
+
+
 def _make_inner_update_audit(
     *,
     support_index: int,
@@ -2233,6 +2530,7 @@ def _make_inner_update_audit(
         ),
         gradient_norms=tuple(result.gradient_norm for result in results),
         update_norms=tuple(result.update_norm for result in results),
+        step_sizes=tuple(result.step_size for result in results),
         pred_valid_counts=tuple(int(value.item()) for value in ttt_output.pred.valid_counts),
         identity_valid_counts=tuple(
             int(value.item()) for value in ttt_output.identity.valid_counts
@@ -2396,6 +2694,56 @@ def _runtime_from_observation(
     if tuple(observation.bank_states) != runtime.bank_states:
         raise ValueError("Meta-TTT observation Bank states disagree with runtime rows")
     return runtime
+
+
+def _snapshot_reference_fast_states(
+    states: Sequence[FastWeightsState],
+) -> tuple[FastWeightsState, ...]:
+    """Copy numeric fast state into isolated leaves with no edge to the Support graph."""
+
+    snapshots: list[FastWeightsState] = []
+    for state in states:
+        snapshots.append(
+            FastWeightsState(
+                w0_1=state.w0_1.detach().clone(),
+                w0_2=state.w0_2.detach().clone(),
+                w_t_1=state.w_t_1.detach().clone().requires_grad_(True),
+                w_t_2=state.w_t_2.detach().clone().requires_grad_(True),
+                fast_version=state.fast_version,
+                update_count=state.update_count,
+                skip_count=state.skip_count,
+                differentiable=False,
+            )
+        )
+    return tuple(snapshots)
+
+
+def _query_descent_cosine(
+    adapted_states: Sequence[FastWeightsState],
+    reference_states: Sequence[FastWeightsState],
+    gradients: Sequence[Tensor],
+) -> float:
+    adapted = tuple(value for state in adapted_states for value in state.fast_parameters)
+    references = tuple(value for state in reference_states for value in state.fast_parameters)
+    captured = tuple(gradients)
+    if not adapted or len(adapted) != len(references) or len(adapted) != len(captured):
+        raise ValueError("counterfactual cosine tensors must be non-empty and aligned")
+    dot = 0.0
+    gradient_squared = 0.0
+    delta_squared = 0.0
+    for current, reference, gradient in zip(adapted, references, captured, strict=True):
+        if current.shape != reference.shape or current.shape != gradient.shape:
+            raise ValueError("counterfactual cosine tensor shapes drifted")
+        negative_gradient = -gradient.detach().float()
+        delta = current.detach().float() - reference.detach().float()
+        dot += float((negative_gradient * delta).sum(dtype=torch.float64).item())
+        gradient_squared += float(negative_gradient.square().sum(dtype=torch.float64).item())
+        delta_squared += float(delta.square().sum(dtype=torch.float64).item())
+    denominator = math.sqrt(gradient_squared * delta_squared)
+    cosine = 0.0 if denominator == 0.0 else dot / denominator
+    if not math.isfinite(cosine):
+        raise ValueError("counterfactual descent cosine is non-finite")
+    return max(-1.0, min(1.0, cosine))
 
 
 def _unique_parameters(parameters: Sequence[nn.Parameter]) -> tuple[nn.Parameter, ...]:

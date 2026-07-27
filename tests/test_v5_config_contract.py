@@ -665,6 +665,7 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
             "state_retrieval": 0.05,
             "w0": 0.1,
             "predictor": 0.1,
+            "step_controller": 0.05,
         },
         "nonfinite_policy": "skip_update",
         "audit_steps": 32,
@@ -683,6 +684,13 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
             "state_learning_rate": 5.0e-5,
             "w0_learning_rate": 5.0e-5,
             "predictor_learning_rate": 5.0e-5,
+            "step_controller_learning_rate": 1.0e-4,
+        },
+        "counterfactual_audit": {
+            "enabled": False,
+            "interval_steps": 8,
+            "queries_per_rank": 1,
+            "references": ("episode_w0", "segment_start"),
         },
     }
     assert config.inference.model_dump() == {"audit_level": AuditLevel.BOUNDARY}
@@ -1073,7 +1081,7 @@ def set_nested(*path_and_value: object) -> Mutation:
         (set_nested("loss", "retrieval_weight", 0.5), "loss.retrieval_weight"),
         (set_nested("loss", "time_weight", 0.5), "loss.time_weight"),
         (
-            set_nested("loss", "auxiliary_outer_weight", 0.2),
+                set_nested("loss", "auxiliary_outer_weight", 0.3),
             "loss.auxiliary_outer_weight",
         ),
         (
