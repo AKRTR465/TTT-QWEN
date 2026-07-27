@@ -1302,6 +1302,14 @@ def _counterfactual_query_selector(optimizer_step: int) -> int:
     return optimizer_step
 
 
+def _counterfactual_all_ranks_eligible(loss_weights: Sequence[float]) -> bool:
+    """Only audit a step when every rank owns a real, non-padding episode."""
+
+    if not loss_weights or any(weight not in (0.0, 1.0) for weight in loss_weights):
+        raise ValueError("counterfactual rank eligibility requires binary loss weights")
+    return all(weight == 1.0 for weight in loss_weights)
+
+
 class TTTQwenTrainerMixin:
     """Mixin dynamically combined with remote ``CustomSeq2SeqTrainer``."""
 
@@ -1319,6 +1327,7 @@ class TTTQwenTrainerMixin:
         self._last_optimizer_log_time: float | None = None
         self._last_timed_global_step = -1
         self._last_counterfactual_metrics: dict[str, float] = {}
+        self._counterfactual_audit_pending = False
         super().__init__(*args, **kwargs)
 
     def _install_a2_deepspeed_gradient_control(self) -> None:
@@ -1678,21 +1687,12 @@ class TTTQwenTrainerMixin:
         counterfactual_config = runner.config.a5.counterfactual_audit
         trainer_state = getattr(self, "state", None)
         next_optimizer_step = int(getattr(trainer_state, "global_step", 0)) + 1
-        counterfactual_request = (
-            CounterfactualAuditRequest(
-                optimizer_step=next_optimizer_step,
-                # Every rank in the exact-shape bucket must audit the same Query
-                # ordinal.  A rank-dependent ordinal can insert the local no-grad
-                # reference forwards between different distributed backward
-                # collectives and deadlock the process group.
-                query_selector=_counterfactual_query_selector(next_optimizer_step),
-            )
-            if (
-                counterfactual_config.enabled
-                and next_optimizer_step % counterfactual_config.interval_steps == 0
-                and loss_weight == 1.0
-            )
-            else None
+        audit_due_now = bool(
+            counterfactual_config.enabled
+            and next_optimizer_step % counterfactual_config.interval_steps == 0
+        )
+        self._counterfactual_audit_pending = (
+            self._counterfactual_audit_pending or audit_due_now
         )
         segment_lengths = episode.segment_lengths
         expected_segments = len(segment_lengths)
@@ -1701,6 +1701,36 @@ class TTTQwenTrainerMixin:
             segment_lengths,
             episode.segment_query_counts,
         )
+        counterfactual_request: CounterfactualAuditRequest | None = None
+        if counterfactual_config.enabled and self._counterfactual_audit_pending:
+            local_eligibility = torch.tensor(
+                [loss_weight],
+                dtype=torch.float32,
+                device=self.args.device,  # type: ignore[attr-defined]
+            )
+            gathered_eligibility = self.accelerator.gather(local_eligibility)  # type: ignore[attr-defined]
+            rank_loss_weights = tuple(
+                float(value)
+                for value in gathered_eligibility.detach().cpu().reshape(-1).tolist()
+            )
+            if _counterfactual_all_ranks_eligible(rank_loss_weights):
+                # Every rank in the exact-shape bucket must audit the same Query
+                # ordinal.  A rank-dependent ordinal, or auditing while one rank
+                # is deterministic padding, can interleave local no-grad forwards
+                # with different distributed backward collectives and deadlock.
+                counterfactual_request = CounterfactualAuditRequest(
+                    optimizer_step=next_optimizer_step,
+                    query_selector=_counterfactual_query_selector(next_optimizer_step),
+                )
+                self._counterfactual_audit_pending = False
+            else:
+                trace_event(
+                    "a5_diagnostic_counterfactual_deferred",
+                    optimizer_step=next_optimizer_step,
+                    scheduled_now=audit_due_now,
+                    reason="padding_rank",
+                    rank_loss_weights=rank_loss_weights,
+                )
 
         backward_controller = SegmentBackwardController(
             self.accelerator,  # type: ignore[attr-defined]
