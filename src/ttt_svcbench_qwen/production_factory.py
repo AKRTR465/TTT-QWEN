@@ -88,6 +88,7 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     stage: Literal["a2", "a5"]
+    a5_adaptation_mode: Literal["meta_ttt", "static_w0"] = "meta_ttt"
     project_config: str = Field(min_length=1)
     dataset_manifest: str = Field(min_length=1)
     qwen_outer_trainability: QwenOuterTrainabilityConfig = Field(
@@ -128,6 +129,8 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     def validate_stage_checkpoint(self) -> Self:
         if self.stage == "a2" and self.initialize_from_a2_checkpoint is not None:
             raise ValueError("A2 must not initialize from an A2 checkpoint")
+        if self.stage == "a2" and self.a5_adaptation_mode != "meta_ttt":
+            raise ValueError("a5_adaptation_mode applies only to A5")
         if self.stage == "a5" and self.initialize_from_a2_checkpoint is None:
             raise ValueError("A5 requires initialize_from_a2_checkpoint")
         if self.stage == "a2" and self.qwen_outer_trainability.mode != "full":
@@ -542,17 +545,13 @@ def configure_qwen_outer_trainability(
     if not named:
         raise ValueError("Qwen model exposes no parameters")
     frozen_vision = tuple(
-        index
-        for index, block in enumerate(vision_blocks)
-        if not _all_parameters_trainable(block)
+        index for index, block in enumerate(vision_blocks) if not _all_parameters_trainable(block)
     )
     trainable_vision = tuple(
         index for index, block in enumerate(vision_blocks) if _all_parameters_trainable(block)
     )
     frozen_decoder = tuple(
-        index
-        for index, layer in enumerate(decoder_layers)
-        if not _all_parameters_trainable(layer)
+        index for index, layer in enumerate(decoder_layers) if not _all_parameters_trainable(layer)
     )
     trainable_decoder = tuple(
         index for index, layer in enumerate(decoder_layers) if _all_parameters_trainable(layer)
@@ -591,9 +590,7 @@ def configure_qwen_outer_trainability(
             input_embeddings is not None and _all_parameters_trainable(input_embeddings)
         ),
         lm_head_trainable=lm_head is not None and _all_parameters_trainable(lm_head),
-        all_qwen_parameters_trainable=all(
-            parameter.requires_grad for _, parameter in named
-        ),
+        all_qwen_parameters_trainable=all(parameter.requires_grad for _, parameter in named),
     )
 
 

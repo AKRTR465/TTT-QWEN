@@ -210,9 +210,7 @@ class MetaTTTEpisode:
             or sum(self.segment_lengths) != support_count
         ):
             raise ValueError("Meta-TTT requires bounded 1-8 Support segments")
-        if not self.segment_query_counts and len(self.segment_lengths) == len(
-            self.query_points
-        ):
+        if not self.segment_query_counts and len(self.segment_lengths) == len(self.query_points):
             object.__setattr__(
                 self,
                 "segment_query_counts",
@@ -893,8 +891,8 @@ class TruncatedSegmentAudit:
     reanchor_audits: tuple[FastReanchorAudit, ...]
 
     def __post_init__(self) -> None:
-        if self.training_mode not in {"meta_ttt", "outer_only"}:
-            raise ValueError("A5 segment training mode must be meta_ttt or outer_only")
+        if self.training_mode not in {"meta_ttt", "outer_only", "static_w0"}:
+            raise ValueError("A5 segment training mode must be meta_ttt, outer_only, or static_w0")
         integers = (
             self.segment_index,
             self.support_start_index,
@@ -928,12 +926,18 @@ class TruncatedSegmentAudit:
             raise ValueError("segment update attempts must equal updates plus skips")
         if sum(count for _, count in self.skip_reason_counts) != self.skip_count:
             raise ValueError("segment skip-reason counts must equal skip count")
-        expected_mode = "meta_ttt" if self.update_count > 0 else "outer_only"
-        if self.training_mode != expected_mode:
-            raise ValueError("A5 segment training mode disagrees with its fast updates")
-        if not self.fast_version_before_segment or len(
-            self.fast_version_before_segment
-        ) != len(self.fast_version_at_query):
+        if self.training_mode == "static_w0":
+            if self.update_attempt_count or self.update_count or self.skip_count:
+                raise ValueError("static-W0 segments cannot attempt fast-weight updates")
+            if self.auxiliary_loss != 0.0:
+                raise ValueError("static-W0 segments cannot include Support TTT loss")
+        else:
+            expected_mode = "meta_ttt" if self.update_count > 0 else "outer_only"
+            if self.training_mode != expected_mode:
+                raise ValueError("A5 segment training mode disagrees with its fast updates")
+        if not self.fast_version_before_segment or len(self.fast_version_before_segment) != len(
+            self.fast_version_at_query
+        ):
             raise ValueError("segment fast-version boundaries must align")
         if not self.fast_version_at_query or any(
             type(value) is not int or value < 0 for value in self.fast_version_at_query
@@ -1018,6 +1022,9 @@ class TruncatedMetaTTTEpisodeAudit:
     """Bounded-memory evidence for an otherwise unbounded numeric fast trajectory."""
 
     active_terms: tuple[str, ...]
+    adaptation_mode: str
+    ttt_enabled: bool
+    ttt_valid_count: int
     loss_weight: float
     support_count: int
     query_count: int
@@ -1060,6 +1067,14 @@ class TruncatedMetaTTTEpisodeAudit:
     queries: tuple[TruncatedQueryPointAudit, ...]
 
     def __post_init__(self) -> None:
+        if self.adaptation_mode not in {"meta_ttt", "static_w0"}:
+            raise ValueError("A5 adaptation mode is invalid")
+        if type(self.ttt_enabled) is not bool:
+            raise TypeError("A5 TTT enabled audit must be bool")
+        if type(self.ttt_valid_count) is not int or self.ttt_valid_count < 0:
+            raise ValueError("A5 TTT valid count must be a non-negative integer")
+        if self.ttt_enabled != (self.adaptation_mode == "meta_ttt"):
+            raise ValueError("A5 TTT enabled audit disagrees with adaptation mode")
         if self.loss_weight not in (0.0, 1.0):
             raise ValueError("A5 episode audit loss weight must be deterministic zero or one")
         if self.prewarm_count != 1:
@@ -1126,8 +1141,28 @@ class TruncatedMetaTTTEpisodeAudit:
             raise ValueError("A5 TTT component means do not reconstruct the raw mean")
         if len(self.segments) != self.segment_count:
             raise ValueError("A5 segment audit count drifted")
-        if len(self.updates) != self.support_count or len(self.queries) != self.query_count:
+        expected_update_audits = self.support_count if self.ttt_enabled else 0
+        if len(self.updates) != expected_update_audits or len(self.queries) != self.query_count:
             raise ValueError("A5 detailed audit counts drifted")
+        if not self.ttt_enabled and (
+            self.update_attempt_count
+            or self.update_count
+            or self.skip_count
+            or self.ttt_valid_count
+            or self.maximum_retained_support_graphs
+            or any(
+                value != 0.0
+                for value in (
+                    self.support_ttt_raw_mean,
+                    self.support_ttt_outer_mean,
+                    self.support_pred_mean,
+                    self.support_identity_weighted_mean,
+                    self.support_event_weighted_mean,
+                )
+            )
+            or any(segment.training_mode != "static_w0" for segment in self.segments)
+        ):
+            raise ValueError("static-W0 audit contains Meta-TTT activity")
         query_offset = 0
         for segment in self.segments:
             queries = self.queries[query_offset : query_offset + segment.query_count]
@@ -1154,6 +1189,10 @@ class TruncatedMetaTTTEpisodeAudit:
     @property
     def outer_only_segment_count(self) -> int:
         return sum(segment.training_mode == "outer_only" for segment in self.segments)
+
+    @property
+    def static_w0_segment_count(self) -> int:
+        return sum(segment.training_mode == "static_w0" for segment in self.segments)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1220,6 +1259,7 @@ class MetaTTTEpisodeRunner:
         support_visual_batch_size: int = 1,
         query_activation_offload: bool = False,
         outer_composer: OfficialWeakOuterLossComposer | None = None,
+        adaptation_mode: str = "meta_ttt",
     ) -> None:
         if not isinstance(config, ProjectConfig):
             raise TypeError("Meta-TTT runner requires validated ProjectConfig")
@@ -1248,6 +1288,12 @@ class MetaTTTEpisodeRunner:
         self.outer_composer = outer_composer or OfficialWeakOuterLossComposer(
             config.loss.official_weak_balance
         )
+        if adaptation_mode not in {"meta_ttt", "static_w0"}:
+            raise ValueError("A5 adaptation mode must be meta_ttt or static_w0")
+        self.adaptation_mode = adaptation_mode
+        self.ttt_enabled = adaptation_mode == "meta_ttt"
+        if not self.ttt_enabled:
+            self.predictor.requires_grad_(False)
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
         if config.fast_ttt.optimizer.meta_gradient_mode != "full_second_order":
             raise ValueError("the training runner only permits full_second_order inner updates")
@@ -1278,7 +1324,7 @@ class MetaTTTEpisodeRunner:
         episode_weight = float(episode_loss_weight)
         backward_fn = backward or _plain_backward
         self.model.train()
-        self.predictor.train()
+        self.predictor.train(self.ttt_enabled)
         adapted = self._reset_trajectory(episode.owner, differentiable=True)
         tracked_parameters = _unique_parameters(
             (*self.model.parameters(), *self.predictor.parameters())
@@ -1286,7 +1332,11 @@ class MetaTTTEpisodeRunner:
         versions_before = tuple(parameter._version for parameter in tracked_parameters)
         horizon = self.config.a5.truncation_horizon
         support_count = len(episode.support_chunks)
-        auxiliary_scale = float(self.config.loss.auxiliary_outer_weight) / support_count
+        auxiliary_scale = (
+            float(self.config.loss.auxiliary_outer_weight) / support_count
+            if self.ttt_enabled
+            else 0.0
+        )
         update_audits: list[InnerUpdateAudit] = []
         segment_audits: list[TruncatedSegmentAudit] = []
         query_audits: list[TruncatedQueryPointAudit] = []
@@ -1295,37 +1345,19 @@ class MetaTTTEpisodeRunner:
         device = adapted.fast_states[0].w_t_1.device
         query_loss_detached = torch.zeros((), dtype=torch.float32, device=device)
         support_total_detached = torch.zeros((), dtype=torch.float32, device=device)
-        support_outer_total_detached = torch.zeros(
-            (), dtype=torch.float32, device=device
-        )
+        support_outer_total_detached = torch.zeros((), dtype=torch.float32, device=device)
         support_pred_total_detached = torch.zeros((), dtype=torch.float32, device=device)
-        support_identity_total_detached = torch.zeros(
-            (), dtype=torch.float32, device=device
-        )
+        support_identity_total_detached = torch.zeros((), dtype=torch.float32, device=device)
         support_event_total_detached = torch.zeros((), dtype=torch.float32, device=device)
-        temporal_hidden_sum_squares = torch.zeros(
-            (), dtype=torch.float32, device=device
-        )
-        temporal_target_sum_squares = torch.zeros(
-            (), dtype=torch.float32, device=device
-        )
-        temporal_prediction_sum_squares = torch.zeros(
-            (), dtype=torch.float32, device=device
-        )
-        temporal_error_sum_squares = torch.zeros(
-            (), dtype=torch.float32, device=device
-        )
-        temporal_hidden_element_count = torch.zeros(
-            (), dtype=torch.int64, device=device
-        )
-        temporal_pair_element_count = torch.zeros(
-            (), dtype=torch.int64, device=device
-        )
+        temporal_hidden_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
+        temporal_target_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
+        temporal_prediction_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
+        temporal_error_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
+        temporal_hidden_element_count = torch.zeros((), dtype=torch.int64, device=device)
+        temporal_pair_element_count = torch.zeros((), dtype=torch.int64, device=device)
         temporal_hidden_max_abs = torch.zeros((), dtype=torch.float32, device=device)
         temporal_target_max_abs = torch.zeros((), dtype=torch.float32, device=device)
-        temporal_prediction_max_abs = torch.zeros(
-            (), dtype=torch.float32, device=device
-        )
+        temporal_prediction_max_abs = torch.zeros((), dtype=torch.float32, device=device)
         temporal_error_max_abs = torch.zeros((), dtype=torch.float32, device=device)
         support_lifecycle = PrefillLifecycle(episode.owner)
         query_offload_budget = (
@@ -1345,7 +1377,7 @@ class MetaTTTEpisodeRunner:
                 first_segment_query = self._prepare_query(
                     first_support,
                     adapted,
-                    with_grad=True,
+                    with_grad=self.ttt_enabled,
                 )
                 prewarm_query = (
                     first_segment_query.detached()
@@ -1364,9 +1396,13 @@ class MetaTTTEpisodeRunner:
         if any(prewarm_fast_audit.fast_versions):
             raise ValueError("the no-update prewarm must observe the initial W0 generation")
         adapted.runtime = _runtime_from_observation(prewarm_observation, episode.owner)
-        previous_snapshot = OnlineOverlapSnapshot.capture(
-            prewarm_observation,
-            end_time=prewarm.end_time,
+        previous_snapshot = (
+            OnlineOverlapSnapshot.capture(
+                prewarm_observation,
+                end_time=prewarm.end_time,
+            )
+            if self.ttt_enabled
+            else None
         )
         del prewarm_observation
 
@@ -1380,21 +1416,11 @@ class MetaTTTEpisodeRunner:
         ):
             segment_start = support_offset
             segment_update_start = len(update_audits)
-            fast_version_before_segment = tuple(
-                state.fast_version for state in adapted.fast_states
-            )
-            queries = episode.query_points[
-                query_offset : query_offset + segment_query_count
-            ]
-            query_roles = episode.query_roles[
-                query_offset : query_offset + segment_query_count
-            ]
-            query_weights = episode.query_weights[
-                query_offset : query_offset + segment_query_count
-            ]
-            raw_segment = episode.support_chunks[
-                support_offset : support_offset + segment_length
-            ]
+            fast_version_before_segment = tuple(state.fast_version for state in adapted.fast_states)
+            queries = episode.query_points[query_offset : query_offset + segment_query_count]
+            query_roles = episode.query_roles[query_offset : query_offset + segment_query_count]
+            query_weights = episode.query_weights[query_offset : query_offset + segment_query_count]
+            raw_segment = episode.support_chunks[support_offset : support_offset + segment_length]
             active_segment = raw_segment
             if self.raw_support_visual_batcher is not None and self.support_visual_batch_size > 1:
                 with _seeded_rng(
@@ -1413,7 +1439,11 @@ class MetaTTTEpisodeRunner:
             for segment_offset, chunk in enumerate(active_segment):
                 support_index = support_offset + segment_offset
                 if self.query_encoder_reuse and segment_query is None:
-                    segment_query = self._prepare_query(chunk, adapted, with_grad=True)
+                    segment_query = self._prepare_query(
+                        chunk,
+                        adapted,
+                        with_grad=self.ttt_enabled,
+                    )
                 elif segment_query is not None:
                     segment_query.validate_for(chunk.request.query_input)
                 observation, fast_audit = self._observe(
@@ -1421,10 +1451,19 @@ class MetaTTTEpisodeRunner:
                     adapted,
                     support_lifecycle,
                     seed=episode.seed + support_index + 1,
-                    with_grad=True,
+                    with_grad=self.ttt_enabled,
                     prepared_query=segment_query,
                 )
                 adapted.runtime = _runtime_from_observation(observation, episode.owner)
+                if not self.ttt_enabled:
+                    if tuple(state.fast_version for state in adapted.fast_states) != (
+                        fast_version_before_segment
+                    ):
+                        raise RuntimeError("static-W0 Support changed fast-weight versions")
+                    del observation
+                    continue
+                if previous_snapshot is None:
+                    raise RuntimeError("Meta-TTT Support lost its overlap snapshot")
                 built = self.ttt_input_builder(
                     observation,
                     previous=previous_snapshot,
@@ -1461,8 +1500,8 @@ class MetaTTTEpisodeRunner:
                 segment_outputs.append(ttt_output)
                 segment_outer_losses.append(outer_ttt_loss)
                 maximum_retained = max(maximum_retained, len(segment_outputs))
-                support_total_detached = (
-                    support_total_detached + ttt_output.total.detach().to(torch.float32)
+                support_total_detached = support_total_detached + ttt_output.total.detach().to(
+                    torch.float32
                 )
                 support_outer_total_detached = (
                     support_outer_total_detached + outer_ttt_loss.detach()
@@ -1471,28 +1510,21 @@ class MetaTTTEpisodeRunner:
                 valid_denominator = valid_rows.sum().clamp_min(1)
                 support_pred_total_detached = (
                     support_pred_total_detached
-                    + (
-                        ttt_output.pred.per_row
-                        * valid_rows.to(dtype=torch.float32)
-                    ).sum().detach()
+                    + (ttt_output.pred.per_row * valid_rows.to(dtype=torch.float32)).sum().detach()
                     / valid_denominator
                 )
                 support_identity_total_detached = (
                     support_identity_total_detached
                     + 0.5
-                    * (
-                        ttt_output.identity.per_row
-                        * valid_rows.to(dtype=torch.float32)
-                    ).sum().detach()
+                    * (ttt_output.identity.per_row * valid_rows.to(dtype=torch.float32))
+                    .sum()
+                    .detach()
                     / valid_denominator
                 )
                 support_event_total_detached = (
                     support_event_total_detached
                     + 0.5
-                    * (
-                        ttt_output.event.per_row
-                        * valid_rows.to(dtype=torch.float32)
-                    ).sum().detach()
+                    * (ttt_output.event.per_row * valid_rows.to(dtype=torch.float32)).sum().detach()
                     / valid_denominator
                 )
                 scale_audit = ttt_output.temporal_scale_audit
@@ -1503,8 +1535,7 @@ class MetaTTTEpisodeRunner:
                     temporal_target_sum_squares + scale_audit.target_sum_squares
                 )
                 temporal_prediction_sum_squares = (
-                    temporal_prediction_sum_squares
-                    + scale_audit.prediction_sum_squares
+                    temporal_prediction_sum_squares + scale_audit.prediction_sum_squares
                 )
                 temporal_error_sum_squares = (
                     temporal_error_sum_squares + scale_audit.error_sum_squares
@@ -1532,9 +1563,7 @@ class MetaTTTEpisodeRunner:
             query_runtime_snapshot = adapted.runtime
             authoritative_fast_states = query_runtime_snapshot.fast_states
             accumulated_gradients: tuple[Tensor, ...] | None = None
-            fast_versions = tuple(
-                state.fast_version for state in authoritative_fast_states
-            )
+            fast_versions = tuple(state.fast_version for state in authoritative_fast_states)
             for bundle_offset, (query, query_role, query_weight) in enumerate(
                 zip(queries, query_roles, query_weights, strict=True)
             ):
@@ -1583,15 +1612,12 @@ class MetaTTTEpisodeRunner:
                     )
 
                 proxy_pairs = tuple(
-                    make_query_proxy_fast_state(state)
-                    for state in authoritative_fast_states
+                    make_query_proxy_fast_state(state) for state in authoritative_fast_states
                 )
                 proxy_states = tuple(state for state, _ in proxy_pairs)
                 proxy_audits = tuple(audit for _, audit in proxy_pairs)
                 query_trajectory = _Trajectory(
-                    _fork_retrieval_runtime(query_runtime_snapshot).with_fast_states(
-                        proxy_states
-                    )
+                    _fork_retrieval_runtime(query_runtime_snapshot).with_fast_states(proxy_states)
                 )
                 query_lifecycle = PrefillLifecycle(episode.owner)
                 prepared_query = (
@@ -1638,15 +1664,11 @@ class MetaTTTEpisodeRunner:
                     )
                     objective = replace(objective, outer=balanced_outer)
                 query_loss = episode_weight * query_weight * objective.outer.outer
-                query_loss_detached = (
-                    query_loss_detached + query_loss.detach().to(torch.float32)
-                )
+                query_loss_detached = query_loss_detached + query_loss.detach().to(torch.float32)
                 backward_fn(query_loss, False)
-                captured_gradients, proxy_gradient_norms = (
-                    _capture_query_proxy_gradients(
-                        proxy_states,
-                        backward_gradient_scale=float(backward_gradient_scale),
-                    )
+                captured_gradients, proxy_gradient_norms = _capture_query_proxy_gradients(
+                    proxy_states,
+                    backward_gradient_scale=float(backward_gradient_scale),
                 )
                 if accumulated_gradients is None:
                     accumulated_gradients = captured_gradients
@@ -1668,9 +1690,7 @@ class MetaTTTEpisodeRunner:
                     )
                     self.last_balance_audit = balance_audit
                 maximum_proxy_drift = max(
-                    value
-                    for audit in proxy_audits
-                    for value in audit.max_abs_value_drift
+                    value for audit in proxy_audits for value in audit.max_abs_value_drift
                 )
                 query_audits.append(
                     TruncatedQueryPointAudit(
@@ -1738,19 +1758,15 @@ class MetaTTTEpisodeRunner:
                 accumulated_gradients,
             )
             segment_loss = (
-                episode_weight
-                * auxiliary_scale
-                * torch.stack(tuple(segment_outer_losses)).sum()
+                episode_weight * auxiliary_scale * torch.stack(tuple(segment_outer_losses)).sum()
+                if self.ttt_enabled
+                else deferred_vjp.new_zeros(())
             )
             backward_fn(segment_loss + deferred_vjp, False)
             reanchor_audits = self._reanchor_trajectory(adapted)
             segment_updates = update_audits[segment_update_start:]
-            segment_update_attempts = sum(
-                len(audit.did_update) for audit in segment_updates
-            )
-            segment_update_count = sum(
-                sum(audit.did_update) for audit in segment_updates
-            )
+            segment_update_attempts = sum(len(audit.did_update) for audit in segment_updates)
+            segment_update_count = sum(sum(audit.did_update) for audit in segment_updates)
             segment_skip_reasons: dict[str, int] = {}
             for audit in segment_updates:
                 for did_update, reason in zip(
@@ -1760,14 +1776,15 @@ class MetaTTTEpisodeRunner:
                 ):
                     if not did_update:
                         key = reason or "unspecified"
-                        segment_skip_reasons[key] = (
-                            segment_skip_reasons.get(key, 0) + 1
-                        )
+                        segment_skip_reasons[key] = segment_skip_reasons.get(key, 0) + 1
+            segment_training_mode = (
+                ("meta_ttt" if segment_update_count > 0 else "outer_only")
+                if self.ttt_enabled
+                else "static_w0"
+            )
             segment_audits.append(
                 TruncatedSegmentAudit(
-                    training_mode=(
-                        "meta_ttt" if segment_update_count > 0 else "outer_only"
-                    ),
+                    training_mode=segment_training_mode,
                     segment_index=segment_index,
                     support_start_index=segment_start,
                     support_end_index=segment_start + segment_length - 1,
@@ -1800,11 +1817,10 @@ class MetaTTTEpisodeRunner:
                 support_count=segment_length,
                 query_weights=query_weights,
                 diagnostic_query_count=episode.diagnostic_query_count,
-                training_mode=(
-                    "meta_ttt" if segment_update_count > 0 else "outer_only"
-                ),
-                fast_version_delta=max(fast_versions)
-                - max(fast_version_before_segment),
+                training_mode=segment_training_mode,
+                ttt_enabled=self.ttt_enabled,
+                fast_version_delta=max(fast_versions) - max(fast_version_before_segment),
+                update_attempt_count=segment_update_attempts,
                 update_count=segment_update_count,
                 skip_count=segment_update_attempts - segment_update_count,
                 skip_reason_counts=tuple(sorted(segment_skip_reasons.items())),
@@ -1816,9 +1832,7 @@ class MetaTTTEpisodeRunner:
                     torch.cuda.memory_reserved(device) if device.type == "cuda" else 0
                 ),
                 offload_live_bytes=(
-                    query_offload_budget.claimed_bytes
-                    if query_offload_budget is not None
-                    else 0
+                    query_offload_budget.claimed_bytes if query_offload_budget is not None else 0
                 ),
             )
             support_offset += segment_length
@@ -1842,22 +1856,16 @@ class MetaTTTEpisodeRunner:
         updated = sum(sum(audit.did_update) for audit in update_audits)
         detached_query = query_loss_detached.detach().clone()
         detached_auxiliary = (
-            episode_weight * auxiliary_scale * support_outer_total_detached
-        ).detach().clone()
+            (episode_weight * auxiliary_scale * support_outer_total_detached).detach().clone()
+        )
         detached_total = (detached_query + detached_auxiliary).detach().clone()
         support_ttt_raw_mean = float((support_total_detached / support_count).item())
-        support_ttt_outer_mean = float(
-            (support_outer_total_detached / support_count).item()
-        )
-        support_pred_mean = float(
-            (support_pred_total_detached / support_count).item()
-        )
+        support_ttt_outer_mean = float((support_outer_total_detached / support_count).item())
+        support_pred_mean = float((support_pred_total_detached / support_count).item())
         support_identity_weighted_mean = float(
             (support_identity_total_detached / support_count).item()
         )
-        support_event_weighted_mean = float(
-            (support_event_total_detached / support_count).item()
-        )
+        support_event_weighted_mean = float((support_event_total_detached / support_count).item())
         hidden_elements = int(temporal_hidden_element_count.item())
         pair_elements = int(temporal_pair_element_count.item())
 
@@ -1871,32 +1879,28 @@ class MetaTTTEpisodeRunner:
             trajectory_ids=episode.owner.trajectory_ids,
             support_count=support_count,
             query_count=query_count,
+            adaptation_mode=self.adaptation_mode,
+            ttt_enabled=self.ttt_enabled,
+            ttt_valid_count=updated,
             support_ttt_raw_mean=support_ttt_raw_mean,
             support_ttt_outer_mean=support_ttt_outer_mean,
             support_pred_mean=support_pred_mean,
             support_identity_weighted_mean=support_identity_weighted_mean,
             support_event_weighted_mean=support_event_weighted_mean,
-            temporal_hidden_rms=rms(
-                temporal_hidden_sum_squares, hidden_elements
-            ),
-            temporal_target_rms=rms(
-                temporal_target_sum_squares, pair_elements
-            ),
-            temporal_prediction_rms=rms(
-                temporal_prediction_sum_squares, pair_elements
-            ),
-            temporal_error_rms=rms(
-                temporal_error_sum_squares, pair_elements
-            ),
+            temporal_hidden_rms=rms(temporal_hidden_sum_squares, hidden_elements),
+            temporal_target_rms=rms(temporal_target_sum_squares, pair_elements),
+            temporal_prediction_rms=rms(temporal_prediction_sum_squares, pair_elements),
+            temporal_error_rms=rms(temporal_error_sum_squares, pair_elements),
             temporal_hidden_max_abs=float(temporal_hidden_max_abs.item()),
             temporal_target_max_abs=float(temporal_target_max_abs.item()),
-            temporal_prediction_max_abs=float(
-                temporal_prediction_max_abs.item()
-            ),
+            temporal_prediction_max_abs=float(temporal_prediction_max_abs.item()),
             temporal_error_max_abs=float(temporal_error_max_abs.item()),
         )
         episode_audit = TruncatedMetaTTTEpisodeAudit(
-            active_terms=self.enabled_terms,
+            active_terms=self.enabled_terms if self.ttt_enabled else (),
+            adaptation_mode=self.adaptation_mode,
+            ttt_enabled=self.ttt_enabled,
+            ttt_valid_count=updated,
             loss_weight=episode_weight,
             support_count=support_count,
             query_count=query_count,
@@ -1922,15 +1926,11 @@ class MetaTTTEpisodeRunner:
             support_event_weighted_mean=support_event_weighted_mean,
             temporal_hidden_rms=rms(temporal_hidden_sum_squares, hidden_elements),
             temporal_target_rms=rms(temporal_target_sum_squares, pair_elements),
-            temporal_prediction_rms=rms(
-                temporal_prediction_sum_squares, pair_elements
-            ),
+            temporal_prediction_rms=rms(temporal_prediction_sum_squares, pair_elements),
             temporal_error_rms=rms(temporal_error_sum_squares, pair_elements),
             temporal_hidden_max_abs=float(temporal_hidden_max_abs.item()),
             temporal_target_max_abs=float(temporal_target_max_abs.item()),
-            temporal_prediction_max_abs=float(
-                temporal_prediction_max_abs.item()
-            ),
+            temporal_prediction_max_abs=float(temporal_prediction_max_abs.item()),
             temporal_error_max_abs=float(temporal_error_max_abs.item()),
             temporal_hidden_element_count=hidden_elements,
             temporal_pair_element_count=pair_elements,
@@ -2055,11 +2055,7 @@ class MetaTTTEpisodeRunner:
         video_input = chunk.request.video_input
         spec = getattr(video_input, "spec", video_input)
         reset_soft_state = bool(getattr(spec, "reset_soft_state", False))
-        if (
-            isinstance(output, QueryEncoderOutput)
-            and cache is not None
-            and not reset_soft_state
-        ):
+        if isinstance(output, QueryEncoderOutput) and cache is not None and not reset_soft_state:
             output = replace(
                 output,
                 embeddings=replace(

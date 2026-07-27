@@ -183,8 +183,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 path, stage, config = sys.argv[1:]
+adaptation_mode = None
+if stage == "a5":
+    from ttt_svcbench_qwen.production_factory import load_training_yaml
+
+    _, extension = load_training_yaml(config)
+    adaptation_mode = extension.a5_adaptation_mode
+    requested_mode = os.environ.get("TTT_A5_ADAPTATION_MODE")
+    if requested_mode is not None and requested_mode != adaptation_mode:
+        raise ValueError(
+            "TTT_A5_ADAPTATION_MODE disagrees with ttt_qwen.a5_adaptation_mode"
+        )
 payload = {
     "stage": stage,
+    "a5_adaptation_mode": adaptation_mode,
     "config": config,
     "working_directory": os.getcwd(),
     "host": socket.gethostname(),
@@ -270,6 +282,9 @@ START_EPOCH="$(date +%s)"
   if [[ -n "${TTT_RESUME_CHECKPOINT:-}" ]]; then
     echo "same_stage_resume_from=$TTT_RESUME_CHECKPOINT"
   fi
+  if [[ "$STAGE" == "a5" ]]; then
+    echo "a5_adaptation_mode=${TTT_A5_ADAPTATION_MODE:-from_yaml}"
+  fi
   echo "launch world_size=4 config=$CONFIG"
 } > "$RUN_ROOT/experiment.log"
 
@@ -308,6 +323,7 @@ train, validation = load_production_manifest_views(
 payload = {
     "status": "preflight_completed",
     "stage": stage.value,
+    "a5_adaptation_mode": extension.a5_adaptation_mode,
     "train_records": len(train),
     "validation_records": len(validation),
     "llamafactory_commit": symbols.checkout.commit,

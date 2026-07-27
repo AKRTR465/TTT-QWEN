@@ -795,9 +795,7 @@ class VideoChunkMaterializer:
                 else 0
             )
             cached = (
-                cache.get(fingerprint)
-                if cache is not None and fingerprint is not None
-                else None
+                cache.get(fingerprint) if cache is not None and fingerprint is not None else None
             )
             _loader_trace(
                 "support_cache_read",
@@ -2027,14 +2025,10 @@ class ProductionEpisodeMaterializer:
             segment_lengths=record.segment_lengths,
             segment_query_counts=record.segment_query_counts,
             query_roles=tuple(
-                role.value
-                for segment in record.supervised_segments
-                for role in segment.query_roles
+                role.value for segment in record.supervised_segments for role in segment.query_roles
             ),
             query_weights=tuple(
-                weight
-                for segment in record.supervised_segments
-                for weight in segment.query_weights
+                weight for segment in record.supervised_segments for weight in segment.query_weights
             ),
             diagnostic_query_count=record.diagnostic_query_count,
             insufficient_inter_query_gap=record.insufficient_inter_query_gap,
@@ -2572,7 +2566,7 @@ def build_runtime(
         maximum_pixels=maximum_pixels,
         preprocess_cache=preprocess_cache,
     )
-    predictor.requires_grad_(True)
+    predictor.requires_grad_(config.a5_adaptation_mode == "meta_ttt")
     meta_runner = MetaTTTEpisodeRunner(
         config=project,
         model=state_model,
@@ -2584,9 +2578,11 @@ def build_runtime(
         support_visual_batch_size=config.support_visual_batch_size,
         query_activation_offload=config.query_activation_offload,
         outer_composer=official_weak_balancer,
+        adaptation_mode=config.a5_adaptation_mode,
     )
     return ProductionTrainerRuntime(
         stage=stage,
+        a5_adaptation_mode=config.a5_adaptation_mode,
         model=outer,
         train_dataset=(),
         eval_dataset=None,
