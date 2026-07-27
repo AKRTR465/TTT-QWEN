@@ -1294,6 +1294,14 @@ def _set_optional_metric(metrics: dict[str, float], name: str, value: float | No
         metrics[name] = value
 
 
+def _counterfactual_query_selector(optimizer_step: int) -> int:
+    """Select one shared Query ordinal for every rank in an exact-shape bucket."""
+
+    if type(optimizer_step) is not int or optimizer_step <= 0:
+        raise ValueError("counterfactual optimizer step must be a positive integer")
+    return optimizer_step
+
+
 class TTTQwenTrainerMixin:
     """Mixin dynamically combined with remote ``CustomSeq2SeqTrainer``."""
 
@@ -1673,7 +1681,11 @@ class TTTQwenTrainerMixin:
         counterfactual_request = (
             CounterfactualAuditRequest(
                 optimizer_step=next_optimizer_step,
-                query_selector=next_optimizer_step + int(self.args.process_index),  # type: ignore[attr-defined]
+                # Every rank in the exact-shape bucket must audit the same Query
+                # ordinal.  A rank-dependent ordinal can insert the local no-grad
+                # reference forwards between different distributed backward
+                # collectives and deadlock the process group.
+                query_selector=_counterfactual_query_selector(next_optimizer_step),
             )
             if (
                 counterfactual_config.enabled
