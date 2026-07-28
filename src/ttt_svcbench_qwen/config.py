@@ -2310,19 +2310,16 @@ def _normalize_schema_eight(value: dict[str, object]) -> dict[str, object]:
 
 
 def _normalize_schema_seven(value: dict[str, object]) -> dict[str, object]:
-    """Upgrade fixed-step schema 7 through the canonical schema-8 contract."""
+    """Upgrade only the original fixed-step schema 7 through schema 8."""
 
     raw = copy.deepcopy(value)
     fast_ttt = raw.get("fast_ttt")
     if not isinstance(fast_ttt, dict):
         raise ValueError("schema 7 fast_ttt must be a mapping")
-    controller = fast_ttt.get("step_controller")
-    if controller is not None and (
-        not isinstance(controller, dict) or controller.get("mode", "fixed") != "fixed"
-    ):
+    if "step_controller" in fast_ttt:
         raise ValueError(
-            "schema 7 learned step-controller configuration is incompatible; "
-            "rebuild the config and retrain"
+            "schema 7 does not accept fast_ttt.step_controller; rebuild the config "
+            "with the canonical schema-9 fixed-step contract"
         )
     fast_ttt["step_controller"] = {
         "mode": "fixed",
@@ -2335,6 +2332,11 @@ def _normalize_schema_seven(value: dict[str, object]) -> dict[str, object]:
     a5 = raw.get("a5")
     if not isinstance(a5, dict):
         raise ValueError("schema 7 a5 must be a mapping")
+    if "effect_ablation" in a5:
+        raise ValueError(
+            "schema 7 does not accept a5.effect_ablation; rebuild the config "
+            "with the canonical schema-9 fixed-step contract"
+        )
     a5["effect_ablation"] = {"fixed_variant": "A"}
     raw["config_schema_version"] = 8
     return _normalize_schema_eight(raw)

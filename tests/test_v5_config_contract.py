@@ -100,7 +100,7 @@ def test_formal_schema6_normalizes_once_to_schema9() -> None:
     }
 
 
-def test_schema7_fixed_normalizes_but_learned_is_rejected() -> None:
+def test_schema7_fixed_normalizes_without_schema8_only_fields() -> None:
     fixed = load_raw_config()
     fixed["config_schema_version"] = 7
 
@@ -110,10 +110,33 @@ def test_schema7_fixed_normalizes_but_learned_is_rejected() -> None:
     assert "step_controller" not in normalized.fast_ttt.model_dump()
     assert "effect_ablation" not in normalized.a5.model_dump()
 
-    learned = copy.deepcopy(fixed)
-    learned["fast_ttt"]["step_controller"] = {"mode": "learned"}
-    with pytest.raises(ValidationError, match="learned step-controller configuration"):
-        ProjectConfig.model_validate(learned)
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("fast_ttt", "step_controller", None),
+        ("fast_ttt", "step_controller", {"mode": "learned"}),
+        (
+            "fast_ttt",
+            "step_controller",
+            {"mode": "fixed", "initial_step_size": 2.0e-4},
+        ),
+        ("a5", "effect_ablation", None),
+        ("a5", "effect_ablation", {"fixed_variant": "A"}),
+        ("a5", "effect_ablation", {"fixed_variant": "E"}),
+    ],
+)
+def test_schema7_rejects_fields_introduced_by_schema8(
+    section: str,
+    key: str,
+    value: object,
+) -> None:
+    raw = load_raw_config()
+    raw["config_schema_version"] = 7
+    raw[section][key] = value
+
+    with pytest.raises(ValidationError, match="schema 7 does not accept"):
+        ProjectConfig.model_validate(raw)
 
 
 def test_schema8_only_upgrades_canonical_a_fixed() -> None:
