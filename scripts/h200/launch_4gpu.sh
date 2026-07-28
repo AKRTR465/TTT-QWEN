@@ -176,6 +176,7 @@ export LAUNCHER_PID="$$"
 
 "$PYTHON" - "$RUN_ROOT/run_config.json" "$STAGE" "$CONFIG" <<'PY'
 import json
+import math
 import os
 import socket
 import sys
@@ -185,22 +186,56 @@ from pathlib import Path
 path, stage, config = sys.argv[1:]
 adaptation_mode = None
 step_controller_mode = "fixed"
-if stage == "a5":
-    from ttt_svcbench_qwen.config import load_config
-    from ttt_svcbench_qwen.production_factory import load_training_yaml
+from ttt_svcbench_qwen.config import load_config
+from ttt_svcbench_qwen.production_factory import load_training_yaml
 
-    _, extension = load_training_yaml(config)
+native, extension = load_training_yaml(config)
+project = load_config(extension.project_config)
+if stage == "a5":
     adaptation_mode = extension.a5_adaptation_mode
-    step_controller_mode = load_config(extension.project_config).fast_ttt.step_controller.mode
+    step_controller_mode = project.fast_ttt.step_controller.mode
     requested_mode = os.environ.get("TTT_A5_ADAPTATION_MODE")
     if requested_mode is not None and requested_mode != adaptation_mode:
         raise ValueError(
             "TTT_A5_ADAPTATION_MODE disagrees with ttt_qwen.a5_adaptation_mode"
         )
+caps = project.outer_gradient_control.max_grad_norm
+if stage == "a2":
+    qwen_lr = float(project.a2.optimizer.qwen_learning_rate)
+    state_lr = float(project.a2.optimizer.state_learning_rate)
+    w0_lr = float(project.a2.optimizer.w0_learning_rate)
+    independent_budgets = {"w0": w0_lr * float(caps.w0)}
+else:
+    qwen_lr = float(native["learning_rate"])
+    state_lr = float(project.a5.optimizer.state_learning_rate)
+    w0_lr = float(project.a5.optimizer.w0_learning_rate)
+    independent_budgets = {"w0": w0_lr * float(caps.w0)}
+    if adaptation_mode == "meta_ttt":
+        independent_budgets["predictor"] = (
+            float(project.a5.optimizer.predictor_learning_rate) * float(caps.predictor)
+        )
+    if step_controller_mode == "learned":
+        independent_budgets["step_controller"] = (
+            float(project.a5.optimizer.step_controller_learning_rate)
+            * float(caps.step_controller)
+        )
+state_names = ("state_shared", "state_task", "state_router_time", "state_retrieval")
+budget_audit = {
+    "fixed_variant": project.a5.effect_ablation.fixed_variant,
+    "mode": project.outer_gradient_control.mode.value,
+    "reference": qwen_lr * float(caps.qwen),
+    "independent": independent_budgets,
+    "state_rss": math.sqrt(
+        sum((state_lr * float(getattr(caps, name))) ** 2 for name in state_names)
+    ),
+}
 payload = {
     "stage": stage,
     "a5_adaptation_mode": adaptation_mode,
     "a5_step_controller_mode": step_controller_mode,
+    "a5_fixed_variant": project.a5.effect_ablation.fixed_variant,
+    "a5_step_controller_feature_contract": project.fast_ttt.step_controller.feature_contract,
+    "outer_update_norm_budget_audit": budget_audit,
     "config": config,
     "working_directory": os.getcwd(),
     "host": socket.gethostname(),

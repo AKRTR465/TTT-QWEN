@@ -15,8 +15,8 @@ ablation. The fixed variants change exactly one strength parameter:
   D Outer TTT coefficient 0.1 -> 0.2
   E W0 gradient cap 0.1 -> 0.15
 
-The learned step controller is a separate, explicit ablation layer. Normal A5
-training remains fixed-step and does not instantiate controller parameters.
+The learned step controller is a separate, explicit Variant-A-only ablation layer.
+Normal A5 training remains fixed-step and does not instantiate controller parameters.
 Set TTT_SMOKE_MAX_STEPS and TTT_SKIP_FINAL_CHECKPOINT=1 for acceptance runs.
 EOF
   exit 2
@@ -30,6 +30,10 @@ A2_CHECKPOINT="$3"
 MANIFEST="$4"
 [[ "$FIXED_VARIANT" =~ ^[A-E]$ ]] || usage
 [[ "$STEP_CONTROLLER_MODE" == "fixed" || "$STEP_CONTROLLER_MODE" == "learned" ]] || usage
+if [[ "$STEP_CONTROLLER_MODE" == "learned" && "$FIXED_VARIANT" != "A" ]]; then
+  echo "learned step controller may be combined only with fixed variant A" >&2
+  exit 2
+fi
 
 PLAY_ROOT="/mnt/shared-storage-user/mineru2-shared/niujunbo/play"
 PROJECT_ROOT="${TTT_PROJECT_ROOT:-$PLAY_ROOT/projects/ttt_qwen}"

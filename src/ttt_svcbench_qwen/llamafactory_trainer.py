@@ -33,6 +33,11 @@ import transformers
 from safetensors import safe_open
 from torch import Tensor, nn
 
+from ttt_svcbench_qwen.config import (
+    STEP_CONTROLLER_FEATURE_CONTRACT,
+    OuterGradientControlMode,
+    ProjectConfig,
+)
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
     A5EpisodeRecord,
@@ -1995,6 +2000,9 @@ def _run_main(argv: list[str] | None = None) -> int:
         configured_stage,
         a5_adaptation_mode=backbone.ttt_config.a5_adaptation_mode,
         a5_step_controller_mode=backbone.project_config.fast_ttt.step_controller.mode,
+        a5_step_controller_feature_contract=(
+            backbone.project_config.fast_ttt.step_controller.feature_contract
+        ),
     )
     if same_stage_resume is not None:
         _validate_resume_balance_schema(same_stage_resume)
@@ -2135,6 +2143,34 @@ def _run_main(argv: list[str] | None = None) -> int:
     parameter_audit = _audit_outer_parameters(backbone, runtime_raw)
     audit_outer_checkpoint_boundary(runtime_raw.model)
     training_args = cast(Any, backbone.training_args)
+    project = backbone.project_config
+    if configured_stage is ProductionStage.A2:
+        budget_lrs = (
+            float(project.a2.optimizer.qwen_learning_rate),
+            float(project.a2.optimizer.state_learning_rate),
+            float(project.a2.optimizer.w0_learning_rate),
+            float(project.a2.optimizer.state_learning_rate),
+            float(project.a2.optimizer.state_learning_rate),
+        )
+    else:
+        budget_lrs = (
+            float(training_args.learning_rate),
+            float(project.a5.optimizer.state_learning_rate),
+            float(project.a5.optimizer.w0_learning_rate),
+            float(project.a5.optimizer.predictor_learning_rate),
+            float(project.a5.optimizer.step_controller_learning_rate),
+        )
+    budget_audit = _outer_update_norm_budget_audit(
+        project,
+        configured_stage,
+        qwen_lr=budget_lrs[0],
+        state_lr=budget_lrs[1],
+        w0_lr=budget_lrs[2],
+        predictor_lr=budget_lrs[3],
+        step_controller_lr=budget_lrs[4],
+        a5_adaptation_mode=runtime_raw.a5_adaptation_mode,
+        a5_step_controller_mode=runtime_raw.a5_step_controller_mode,
+    )
     raw_smoke_steps = os.environ.get("TTT_SMOKE_MAX_STEPS")
     smoke_max_steps: int | None = None
     if raw_smoke_steps is not None:
@@ -2183,6 +2219,11 @@ def _run_main(argv: list[str] | None = None) -> int:
         if full_unfreeze_audit is not None:
             environment["full_unfreeze_audit"] = asdict(full_unfreeze_audit)
         environment["outer_parameter_audit"] = asdict(parameter_audit)
+        environment["a5_fixed_variant"] = project.a5.effect_ablation.fixed_variant
+        environment["a5_step_controller_feature_contract"] = (
+            project.fast_ttt.step_controller.feature_contract
+        )
+        environment["outer_update_norm_budget_audit"] = budget_audit
         checkpoint_environment = None
         if checkpoint_audit is not None:
             checkpoint_environment = asdict(checkpoint_audit)
@@ -2209,6 +2250,11 @@ def _run_main(argv: list[str] | None = None) -> int:
                     "stage": runtime_raw.stage.value,
                     "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
                     "a5_step_controller_mode": runtime_raw.a5_step_controller_mode,
+                    "a5_fixed_variant": project.a5.effect_ablation.fixed_variant,
+                    "a5_step_controller_feature_contract": (
+                        project.fast_ttt.step_controller.feature_contract
+                    ),
+                    "outer_update_norm_budget_audit": budget_audit,
                     "global_step": int(trainer.state.global_step),
                     "elapsed_seconds": time.monotonic() - started,
                     "metrics": result.metrics,
@@ -2238,6 +2284,11 @@ def _run_main(argv: list[str] | None = None) -> int:
                     "stage": runtime_raw.stage.value,
                     "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
                     "a5_step_controller_mode": runtime_raw.a5_step_controller_mode,
+                    "a5_fixed_variant": project.a5.effect_ablation.fixed_variant,
+                    "a5_step_controller_feature_contract": (
+                        project.fast_ttt.step_controller.feature_contract
+                    ),
+                    "outer_update_norm_budget_audit": budget_audit,
                     "global_step": int(trainer.state.global_step),
                     "elapsed_seconds": time.monotonic() - started,
                     "metrics": result.metrics,
@@ -2282,6 +2333,11 @@ def _run_main(argv: list[str] | None = None) -> int:
                 "stage": runtime_raw.stage.value,
                 "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
                 "a5_step_controller_mode": runtime_raw.a5_step_controller_mode,
+                "a5_fixed_variant": project.a5.effect_ablation.fixed_variant,
+                "a5_step_controller_feature_contract": (
+                    project.fast_ttt.step_controller.feature_contract
+                ),
+                "outer_update_norm_budget_audit": budget_audit,
                 "global_step": int(trainer.state.global_step),
                 "elapsed_seconds": time.monotonic() - started,
                 "metrics": result.metrics,
@@ -2456,6 +2512,7 @@ def resolve_same_stage_resume(
     *,
     a5_adaptation_mode: str = "meta_ttt",
     a5_step_controller_mode: str = "fixed",
+    a5_step_controller_feature_contract: str = STEP_CONTROLLER_FEATURE_CONTRACT,
 ) -> Path | None:
     """Validate a standard Trainer checkpoint without conflating it with A2→A5 init."""
 
@@ -2497,6 +2554,12 @@ def resolve_same_stage_resume(
             raise ValueError(
                 "resume checkpoint step-controller mode does not match the configured mode"
             )
+        if a5_step_controller_mode == "learned":
+            checkpoint_feature_contract = raw.get("a5_step_controller_feature_contract")
+            if checkpoint_feature_contract != a5_step_controller_feature_contract:
+                raise ValueError(
+                    "resume checkpoint learned step-controller feature contract is incompatible"
+                )
     return root
 
 
@@ -2605,6 +2668,83 @@ def _audit_outer_parameters(
         transient_parameter_names=transient,
         backbone_registered=bool(backbone_ids) and backbone_ids <= runtime_ids,
     )
+
+
+def _outer_update_norm_budget_audit(
+    project: ProjectConfig,
+    stage: ProductionStage,
+    *,
+    qwen_lr: float,
+    state_lr: float,
+    w0_lr: float,
+    predictor_lr: float,
+    step_controller_lr: float,
+    a5_adaptation_mode: str,
+    a5_step_controller_mode: str,
+) -> dict[str, object]:
+    caps = project.outer_gradient_control.max_grad_norm
+    reference_budget = qwen_lr * float(caps.qwen)
+    independent_budgets = {
+        "w0": w0_lr * float(caps.w0),
+        **(
+            {"predictor": predictor_lr * float(caps.predictor)}
+            if stage is ProductionStage.A5 and a5_adaptation_mode == "meta_ttt"
+            else {}
+        ),
+        **(
+            {"step_controller": step_controller_lr * float(caps.step_controller)}
+            if stage is ProductionStage.A5 and a5_step_controller_mode == "learned"
+            else {}
+        ),
+    }
+    variant = project.a5.effect_ablation.fixed_variant
+    mode = project.outer_gradient_control.mode
+    if stage is ProductionStage.A2:
+        if variant != "A" or mode is not OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP:
+            raise ValueError("A2 requires the canonical equal-budget variant A configuration")
+        expected_budgets = {name: reference_budget for name in independent_budgets}
+    elif mode is OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP:
+        expected_budgets = {name: reference_budget for name in independent_budgets}
+    else:
+        if (
+            a5_adaptation_mode != "meta_ttt"
+            or a5_step_controller_mode != "fixed"
+            or variant not in {"C", "E"}
+        ):
+            raise ValueError(
+                "single-factor budget mode requires fixed-step Meta-TTT variant C or E"
+            )
+        expected_budgets = {name: reference_budget for name in independent_budgets}
+        if variant == "C":
+            expected_budgets["predictor"] = 2.0 * reference_budget
+        else:
+            expected_budgets["w0"] = 1.5 * reference_budget
+    if any(
+        name not in expected_budgets
+        or not math.isclose(value, expected_budgets[name], rel_tol=1.0e-6)
+        for name, value in independent_budgets.items()
+    ):
+        raise ValueError(
+            "Qwen/W0/Predictor/StepController update-norm budgets violate the configured policy"
+        )
+    state_names = (
+        "state_shared",
+        "state_task",
+        "state_router_time",
+        "state_retrieval",
+    )
+    state_rss_budget = math.sqrt(
+        sum((state_lr * float(getattr(caps, name))) ** 2 for name in state_names)
+    )
+    if not math.isclose(state_rss_budget, reference_budget, rel_tol=1.0e-6):
+        raise ValueError("state subgroup RSS update-norm budget drifted from the formal cap")
+    return {
+        "fixed_variant": variant,
+        "mode": mode.value,
+        "reference": reference_budget,
+        "independent": independent_budgets,
+        "state_rss": state_rss_budget,
+    }
 
 
 def make_production_outer_optimizer_factory(
@@ -2741,42 +2881,18 @@ def make_production_outer_optimizer_factory(
             for name, values in groups.items()
             if values
         ]
-        caps = backbone.project_config.outer_gradient_control.max_grad_norm
-        reference_budget = qwen_lr * float(caps.qwen)
-        independent_budgets = {
-            "w0": w0_lr * float(caps.w0),
-            **(
-                {"predictor": predictor_lr * float(caps.predictor)}
-                if stage is ProductionStage.A5 and a5_adaptation_mode == "meta_ttt"
-                else {}
-            ),
-            **(
-                {
-                    "step_controller": step_controller_lr
-                    * float(caps.step_controller)
-                }
-                if stage is ProductionStage.A5 and a5_step_controller_mode == "learned"
-                else {}
-            ),
-        }
-        if any(
-            not math.isclose(value, reference_budget, rel_tol=1.0e-6)
-            for value in independent_budgets.values()
-        ):
-            raise ValueError(
-                "Qwen/W0/Predictor/StepController update-norm budgets must remain aligned"
-            )
-        state_names = (
-            "state_shared",
-            "state_task",
-            "state_router_time",
-            "state_retrieval",
+        budget_audit = _outer_update_norm_budget_audit(
+            backbone.project_config,
+            stage,
+            qwen_lr=qwen_lr,
+            state_lr=state_lr,
+            w0_lr=w0_lr,
+            predictor_lr=predictor_lr,
+            step_controller_lr=step_controller_lr,
+            a5_adaptation_mode=a5_adaptation_mode,
+            a5_step_controller_mode=a5_step_controller_mode,
         )
-        state_rss_budget = math.sqrt(
-            sum((state_lr * float(getattr(caps, name))) ** 2 for name in state_names)
-        )
-        if not math.isclose(state_rss_budget, reference_budget, rel_tol=1.0e-6):
-            raise ValueError("state subgroup RSS update-norm budget drifted from the formal cap")
+        trace_event("outer_optimizer_update_norm_budgets", **budget_audit)
         optimizer = torch.optim.AdamW(
             parameter_groups,
             betas=(float(training_args.adam_beta1), float(training_args.adam_beta2)),

@@ -24,6 +24,7 @@ from ttt_svcbench_qwen.inference import (
     QueryAttemptKind,
     TTTUpdateOutcome,
     assert_inference_runtime_payload,
+    build_causal_support_positions,
     run_inference,
     runtime_boundary_stamp,
 )
@@ -74,7 +75,7 @@ from ttt_svcbench_qwen.state_encoder import (
     TemporalEncoderOutput,
 )
 from ttt_svcbench_qwen.state_reader import ReaderResult, ReaderStatus
-from ttt_svcbench_qwen.step_controller import InnerStepController
+from ttt_svcbench_qwen.step_controller import CausalSupportPosition, InnerStepController
 
 
 class _Dependencies(SimpleNamespace):
@@ -627,6 +628,7 @@ class _Updater:
     def __init__(self, skip_calls: set[int] | None = None) -> None:
         self.calls = 0
         self.skip_calls = skip_calls or set()
+        self.positions: list[CausalSupportPosition | None] = []
 
     def __call__(
         self,
@@ -635,9 +637,11 @@ class _Updater:
         *,
         current_start_time: float,
         current_end_time: float,
+        causal_position: CausalSupportPosition | None,
     ) -> TTTUpdateOutcome:
         assert 0.0 <= current_start_time <= current_end_time
         assert current_end_time >= 0.0
+        self.positions.append(causal_position)
         call = self.calls
         self.calls += 1
         fast = runtime.fast_weights
@@ -774,6 +778,43 @@ def test_causal_chunks_next_only_updates_and_generation_immutability(
     assert result.generate_audit.state_before == result.generate_audit.state_after
     assert result.reader_result.status is ReaderStatus.OK
     assert result.selected_record_ids == ("record-0",)
+    assert result.state_attention is not None
+    assert result.runtime_state.released
+    assert result.release_audit is not None
+    assert manager.active_runtime is None
+
+
+def test_causal_support_positions_exclude_future_only_chunks_without_gaps(
+    dependencies: _Dependencies,
+) -> None:
+    chunks = (
+        CausalChunk("full", ("a", "b"), (0.0, 1.0), (0, 1)),
+        CausalChunk("partial", ("c", "future"), (2.0, 4.0), (2, 3)),
+        CausalChunk("future", ("d", "e"), (3.0, 5.0), (4, 5)),
+    )
+    positions = build_causal_support_positions(
+        chunks,
+        query_time=2.0,
+        truncation_horizon=8,
+    )
+
+    assert positions == {
+        "full": CausalSupportPosition(0, 2, 8),
+        "partial": CausalSupportPosition(1, 2, 8),
+    }
+
+    updater = _Updater()
+    request = replace(_request(), chunks=chunks)
+    manager = _manager(dependencies)
+    result = run_inference(
+        manager=manager,
+        model=_model(dependencies, _FakeSuite()),
+        request=request,
+        updater=updater,
+    )
+
+    assert updater.positions == [positions["full"], positions["partial"]]
+    assert tuple(audit.update_attempted for audit in result.chunk_audit) == (True, True, False)
     assert result.state_attention is not None
     assert result.runtime_state.released
     assert result.release_audit is not None
@@ -1039,7 +1080,6 @@ def test_learned_online_updater_is_explicit_and_uses_checkpointed_step_size(
         build_temporal_predictor(config.predictor),
         controller,
     )
-    updater.begin_query(2)
     manager = _manager(dependencies)
     model = _stage_a_model(dependencies, _TypedStageSuite())
     manager.reset("video-a", "trajectory-a", torch.zeros(512))
@@ -1050,6 +1090,7 @@ def test_learned_online_updater_is_explicit_and_uses_checkpointed_step_size(
         query_input=_request().query_input,
         query_time=3.0,
         updater=updater,
+        causal_position=CausalSupportPosition(0, 2, 8),
     )
     second = manager.observe_chunk(
         model=model,
@@ -1057,10 +1098,35 @@ def test_learned_online_updater_is_explicit_and_uses_checkpointed_step_size(
         query_input=_request().query_input,
         query_time=3.0,
         updater=updater,
+        causal_position=CausalSupportPosition(1, 2, 8),
     )
 
     assert first.audit.step_size == pytest.approx(1.5e-4)
     assert second.audit.step_size == pytest.approx(1.5e-4)
+    manager.release()
+
+
+def test_learned_online_updater_requires_explicit_position_without_query_state(
+    dependencies: _Dependencies,
+) -> None:
+    raw = dependencies.config.model_dump(mode="python")
+    raw["fast_ttt"]["step_controller"]["mode"] = "learned"
+    config = ProjectConfig.model_validate(raw)
+    controller = InnerStepController(config.fast_ttt.step_controller)
+    updater = OnlineTTTUpdater(config, build_temporal_predictor(config.predictor), controller)
+    manager = _manager(dependencies)
+    manager.reset("video-a", "trajectory-a", torch.zeros(512))
+
+    with pytest.raises(InferenceProtocolError, match="causal Support position"):
+        manager.observe_chunk(
+            model=_stage_a_model(dependencies, _TypedStageSuite()),
+            chunk=CausalChunk("chunk", ("a", "b"), (0.0, 1.0), (0, 1)),
+            query_input=_request().query_input,
+            query_time=2.0,
+            updater=updater,
+        )
+    assert not hasattr(updater, "_support_index")
+    assert not hasattr(updater, "_support_count")
     manager.release()
 
 

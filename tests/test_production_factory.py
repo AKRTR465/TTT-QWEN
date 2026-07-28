@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 from collections.abc import Iterator
 from enum import StrEnum
 from fractions import Fraction
@@ -15,7 +17,7 @@ from safetensors.torch import save_file
 from torch import nn
 
 import ttt_svcbench_qwen.llamafactory_trainer as trainer_module
-from ttt_svcbench_qwen.config import load_config
+from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.llamafactory_trainer import (
     CheckpointPolicy,
     OuterParameterAudit,
@@ -74,6 +76,8 @@ from ttt_svcbench_qwen.stage_a_targets import (
     OperatorDiagnosticAudit,
 )
 from ttt_svcbench_qwen.step_controller import InnerStepController
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class _OuterToy(nn.Module):
@@ -267,6 +271,65 @@ class _GroupedStateBankToy(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.semantic_projector = nn.Linear(4, 4)
+
+
+def _grouped_bundle(
+    tmp_path: Path,
+    project: ProjectConfig,
+    *,
+    adaptation_mode: str = "meta_ttt",
+) -> tuple[LlamaFactoryBackboneBundle, nn.Module]:
+    qwen = nn.Linear(4, 4)
+    checkout = tmp_path / "lf"
+    checkout.mkdir()
+    symbols = LlamaFactorySymbols(
+        get_train_args=lambda *_args, **_kwargs: (),
+        load_tokenizer=lambda *_args, **_kwargs: {},
+        load_model=lambda *_args, **_kwargs: qwen,
+        trainer_base=object,
+        checkout=LlamaFactoryCheckoutAudit(checkout, "523f801", False, True),
+    )
+    bundle = LlamaFactoryBackboneBundle(
+        model=qwen,
+        tokenizer=object(),
+        processor=None,
+        model_args=object(),
+        data_args=object(),
+        training_args=SimpleNamespace(
+            learning_rate=5.0e-6,
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_epsilon=1.0e-8,
+            weight_decay=0.01,
+        ),
+        finetuning_args=object(),
+        generating_args=object(),
+        project_config=project,
+        ttt_config=ProductionTTTConfig(
+            stage="a5",
+            a5_adaptation_mode=adaptation_mode,
+            project_config="configs/model_state_ttt_8b.yaml",
+            dataset_manifest="manifest.json",
+            initialize_from_a2_checkpoint="a2-final",
+            support_prefetch_depth=2,
+            support_decode_coalesce=True,
+            support_materialization="segment_double_buffer",
+            segment_prefetch_depth=1,
+            state_query_visual_mode="recent_chunk",
+            state_query_max_frames=16,
+            answer_query_visual_mode="causal_prefix",
+            answer_query_max_frames=256,
+            state_query_cache_mode="inherit",
+            answer_query_cache_mode="disabled",
+            preprocess_cache_mode="read_write",
+            preprocess_cache_miss_policy="decode",
+            preprocess_cache_root_env="TTT_PREPROCESS_CACHE_ROOT",
+            preprocess_cache_max_gb=200.0,
+            preprocess_cache_dtype="float32",
+        ),
+        symbols=symbols,
+    )
+    return bundle, _GroupedOuterToy(qwen, predictor_trainable=adaptation_mode == "meta_ttt")
 
 
 class _QwenOwnerToy(nn.Module):
@@ -1643,6 +1706,7 @@ def test_same_stage_resume_rejects_step_controller_ablation_mismatch(
                 "stage": "a5",
                 "a5_adaptation_mode": "meta_ttt",
                 "a5_step_controller_mode": "learned",
+                "a5_step_controller_feature_contract": "causal_k8_v2",
             }
         ),
         encoding="utf-8",
@@ -1658,6 +1722,16 @@ def test_same_stage_resume_rejects_step_controller_ablation_mismatch(
     )
     with pytest.raises(ValueError, match="step-controller mode"):
         resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
+
+    raw = json.loads((run / "run_config.json").read_text(encoding="utf-8"))
+    del raw["a5_step_controller_feature_contract"]
+    (run / "run_config.json").write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="feature contract is incompatible"):
+        resolve_same_stage_resume(
+            str(checkpoint),
+            ProductionStage.A5,
+            a5_step_controller_mode="learned",
+        )
 
 
 def test_a5_global_sample_sequence_hash_is_mode_independent(
@@ -2362,6 +2436,92 @@ def test_central_outer_optimizer_has_exact_stage_groups(
     assert actual_lrs == expected_lrs
     owned = {id(parameter) for group in optimizer.param_groups for parameter in group["params"]}
     assert owned == {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+
+
+@pytest.mark.parametrize(
+    ("variant", "expected_w0_budget", "expected_predictor_budget"),
+    [
+        ("A", 5.0e-6, 5.0e-6),
+        ("B", 5.0e-6, 5.0e-6),
+        ("C", 5.0e-6, 1.0e-5),
+        ("D", 5.0e-6, 5.0e-6),
+        ("E", 7.5e-6, 5.0e-6),
+    ],
+)
+def test_each_generated_a5_variant_builds_the_production_optimizer(
+    tmp_path: Path,
+    variant: str,
+    expected_w0_budget: float,
+    expected_predictor_budget: float,
+) -> None:
+    output = tmp_path / "project.yaml"
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "build_a5_ttt_effect_config.py"),
+            "--base",
+            str(ROOT / "configs" / "model_state_ttt_8b.yaml"),
+            "--output",
+            str(output),
+            "--fixed-variant",
+            variant,
+            "--step-controller",
+            "fixed",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    project = load_config(output)
+    bundle, model = _grouped_bundle(tmp_path, project)
+
+    optimizer = make_production_outer_optimizer_factory(
+        bundle,
+        ProductionStage.A5,
+    )(model)
+
+    groups = {str(group["group_name"]): group for group in optimizer.param_groups}
+    caps = project.outer_gradient_control.max_grad_norm
+    assert project.a5.effect_ablation.fixed_variant == variant
+    assert float(groups["w0"]["lr"]) * float(caps.w0) == pytest.approx(
+        expected_w0_budget
+    )
+    assert float(groups["predictor"]["lr"]) * float(caps.predictor) == pytest.approx(
+        expected_predictor_budget
+    )
+
+
+def test_optimizer_rejects_unlicensed_c_budget_drift(tmp_path: Path) -> None:
+    base = load_config()
+    c_project = ProjectConfig.model_validate(
+        {
+            **base.model_dump(mode="python"),
+            "a5": {
+                **base.a5.model_dump(mode="python"),
+                "effect_ablation": {"fixed_variant": "C"},
+                "optimizer": {
+                    **base.a5.optimizer.model_dump(mode="python"),
+                    "predictor_learning_rate": 1.0e-4,
+                },
+            },
+            "outer_gradient_control": {
+                **base.outer_gradient_control.model_dump(mode="python"),
+                "mode": "per_group_l2_single_factor_ablation",
+            },
+        }
+    )
+    wrong_mode = c_project.model_copy(
+        update={
+            "outer_gradient_control": c_project.outer_gradient_control.model_copy(
+                update={"mode": base.outer_gradient_control.mode}
+            )
+        }
+    )
+    bundle, model = _grouped_bundle(tmp_path, wrong_mode)
+
+    with pytest.raises(ValueError, match="configured policy"):
+        make_production_outer_optimizer_factory(bundle, ProductionStage.A5)(model)
 
 
 def test_learned_step_controller_has_its_own_outer_optimizer_group(

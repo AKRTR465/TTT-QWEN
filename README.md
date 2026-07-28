@@ -5,7 +5,7 @@
 - A2 全量状态模型训练，再初始化 A5 Meta-TTT；
 - 按视频隔离、按 chunk 因果更新的在线推理。
 
-当前架构规范为 `state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history`，正式配置 schema 为 7；历史阶段 gate 与 synthetic 报告不再随源码分发。
+当前架构规范为 `state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history`，正式配置 schema 为 8；历史阶段 gate 与 synthetic 报告不再随源码分发。
 
 ## 架构摘要
 

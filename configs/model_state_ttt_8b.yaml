@@ -1,5 +1,5 @@
 spec_version: state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history
-config_schema_version: 7
+config_schema_version: 8
 
 paths:
   model_root_env: QWEN_MODEL_ROOT
@@ -80,6 +80,7 @@ fast_ttt:
     hidden_dim: 32
     maximum_step_size: 3.0e-4
     initial_step_size: 1.0e-4
+    feature_contract: causal_k8_v2
 
 spatial_encoder:
   input_dim: 4096
@@ -496,6 +497,8 @@ a2:
 a5:
   truncation_horizon: 8
   seed: 42
+  effect_ablation:
+    fixed_variant: A
   optimizer:
     state_learning_rate: 5.0e-5
     w0_learning_rate: 5.0e-5

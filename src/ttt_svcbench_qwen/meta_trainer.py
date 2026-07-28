@@ -92,6 +92,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
 from ttt_svcbench_qwen.state_encoder import TemporalEncoderOutput
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
 from ttt_svcbench_qwen.step_controller import (
+    CausalSupportPosition,
     InnerStepController,
     build_step_controller_features,
 )
@@ -1599,10 +1600,11 @@ class MetaTTTEpisodeRunner:
                             start_time=chunk.start_time,
                             end_time=chunk.end_time,
                             previous_end_time=previous_snapshot.end_time,
-                            segment_offset=segment_offset,
-                            segment_length=segment_length,
-                            support_index=support_index,
-                            support_count=support_count,
+                            position=CausalSupportPosition(
+                                support_index=support_index,
+                                support_count=support_count,
+                                truncation_horizon=self.config.a5.truncation_horizon,
+                            ),
                             controller=self.step_controller,
                         )
                     )

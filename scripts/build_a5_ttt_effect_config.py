@@ -45,9 +45,21 @@ def main() -> int:
     if not isinstance(raw_object, dict):
         raise ValueError("base project config must be one mapping")
     raw = cast(dict[str, Any], raw_object)
+    if arguments.step_controller == "learned" and arguments.fixed_variant != "A":
+        raise ValueError("learned step controller may be combined only with fixed variant A")
     mutation = _FIXED_VARIANTS[arguments.fixed_variant]
     if mutation is not None:
         _set_path(raw, mutation[0], mutation[1])
+    _set_path(raw, "a5.effect_ablation.fixed_variant", arguments.fixed_variant)
+    _set_path(
+        raw,
+        "outer_gradient_control.mode",
+        (
+            "per_group_l2_single_factor_ablation"
+            if arguments.fixed_variant in {"C", "E"}
+            else "per_group_l2_equal_update_cap"
+        ),
+    )
     _set_path(raw, "fast_ttt.step_controller.mode", arguments.step_controller)
     _set_path(raw, "a5.counterfactual_audit.enabled", True)
     config = ProjectConfig.model_validate(raw)

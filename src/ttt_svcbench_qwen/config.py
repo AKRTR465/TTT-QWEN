@@ -8,6 +8,7 @@ Forbidden: model forward logic, training logic, secret values, or platform absol
 from __future__ import annotations
 
 import argparse
+import copy
 import platform
 from enum import StrEnum
 from pathlib import Path
@@ -19,7 +20,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SPEC_VERSION = "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history"
-CONFIG_SCHEMA_VERSION = 7
+CONFIG_SCHEMA_VERSION = 8
+STEP_CONTROLLER_FEATURE_CONTRACT = "causal_k8_v2"
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -139,6 +141,7 @@ class FastTTTStepControllerConfig(FrozenModel):
     hidden_dim: PositiveInt = 32
     maximum_step_size: PositiveFloat = 3.0e-4
     initial_step_size: PositiveFloat = 1.0e-4
+    feature_contract: Literal["causal_k8_v2"] = "causal_k8_v2"
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
     def validate_controller_contract(self) -> Self:
@@ -596,6 +599,7 @@ class LossConfig(FrozenModel):
 
 class OuterGradientControlMode(StrEnum):
     PER_GROUP_L2_EQUAL_UPDATE_CAP = "per_group_l2_equal_update_cap"
+    PER_GROUP_L2_SINGLE_FACTOR_ABLATION = "per_group_l2_single_factor_ablation"
 
 
 class OuterNonfinitePolicy(StrEnum):
@@ -663,12 +667,19 @@ class A5CounterfactualAuditConfig(FrozenModel):
         return self
 
 
+class A5TTTEffectAblationConfig(FrozenModel):
+    """Identity of the one-factor A5 TTT-effect experiment."""
+
+    fixed_variant: Literal["A", "B", "C", "D", "E"]
+
+
 class A5TrainingConfig(FrozenModel):
     """Direct A5 contract with K-step truncation and one episode seed."""
 
     truncation_horizon: PositiveInt
     seed: NonNegativeInt
     optimizer: A5OptimizerConfig
+    effect_ablation: A5TTTEffectAblationConfig
     counterfactual_audit: A5CounterfactualAuditConfig = A5CounterfactualAuditConfig()
 
 
@@ -679,7 +690,7 @@ class InferenceRuntimeConfig(FrozenModel):
 
 
 class ProjectConfig(FrozenModel):
-    """Schema-7 production configuration with cross-component contract validation."""
+    """Schema-8 production configuration with cross-component contract validation."""
 
     spec_version: str
     config_schema_version: int
@@ -842,6 +853,11 @@ class ProjectConfig(FrozenModel):
                 "fast_ttt.step_controller.initial_step_size",
                 self.fast_ttt.step_controller.initial_step_size,
                 1.0e-4,
+            ),
+            (
+                "fast_ttt.step_controller.feature_contract",
+                self.fast_ttt.step_controller.feature_contract,
+                STEP_CONTROLLER_FEATURE_CONTRACT,
             ),
             ("spatial_encoder.input_dim", self.spatial_encoder.input_dim, 4096),
             ("spatial_encoder.hidden_dim", self.spatial_encoder.hidden_dim, 768),
@@ -1654,11 +1670,6 @@ class ProjectConfig(FrozenModel):
                 10.0,
             ),
             (
-                "outer_gradient_control.mode",
-                self.outer_gradient_control.mode,
-                OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP,
-            ),
-            (
                 "outer_gradient_control.max_grad_norm.qwen",
                 self.outer_gradient_control.max_grad_norm.qwen,
                 1.0,
@@ -1761,6 +1772,40 @@ class ProjectConfig(FrozenModel):
         for path, actual, allowed in experimental_choices:
             if actual not in allowed:
                 raise ValueError(f"{path} must be one of {allowed!r}; got {actual!r}")
+
+        variant = self.a5.effect_ablation.fixed_variant
+        actual_effect = (
+            float(self.fast_ttt.optimizer.learning_rate),
+            float(self.a5.optimizer.predictor_learning_rate),
+            float(self.loss.auxiliary_outer_weight),
+            float(self.outer_gradient_control.max_grad_norm.w0),
+        )
+        expected_effects = {
+            "A": (1.0e-4, 5.0e-5, 0.1, 0.1),
+            "B": (2.0e-4, 5.0e-5, 0.1, 0.1),
+            "C": (1.0e-4, 1.0e-4, 0.1, 0.1),
+            "D": (1.0e-4, 5.0e-5, 0.2, 0.1),
+            "E": (1.0e-4, 5.0e-5, 0.1, 0.15),
+        }
+        if actual_effect != expected_effects[variant]:
+            raise ValueError(
+                f"A5 fixed variant {variant} must change exactly its declared factor; "
+                f"got {actual_effect!r}"
+            )
+        expected_gradient_mode = (
+            OuterGradientControlMode.PER_GROUP_L2_SINGLE_FACTOR_ABLATION
+            if variant in {"C", "E"}
+            else OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP
+        )
+        if self.outer_gradient_control.mode is not expected_gradient_mode:
+            raise ValueError(
+                f"A5 fixed variant {variant} requires outer gradient mode "
+                f"{expected_gradient_mode.value!r}"
+            )
+        if self.fast_ttt.step_controller.mode == "learned" and variant != "A":
+            raise ValueError(
+                "learned InnerStepController may be combined only with fixed variant A"
+            )
 
         self._validate_attention_dimensions()
         self._validate_video_preprocessing_contract()
@@ -2291,14 +2336,50 @@ def _require_schema6_block(raw: dict[str, object], name: str, expected: object) 
     return actual
 
 
+def _normalize_schema_seven(value: dict[str, object]) -> dict[str, object]:
+    """Upgrade fixed-step schema 7; learned checkpoints/configs need an explicit retrain."""
+
+    raw = copy.deepcopy(value)
+    fast_ttt = raw.get("fast_ttt")
+    if not isinstance(fast_ttt, dict):
+        raise ValueError("schema 7 fast_ttt must be a mapping")
+    controller = fast_ttt.get("step_controller")
+    if controller is None:
+        controller = {}
+        fast_ttt["step_controller"] = controller
+    if not isinstance(controller, dict):
+        raise ValueError("schema 7 fast_ttt.step_controller must be a mapping")
+    if controller.get("mode", "fixed") == "learned":
+        raise ValueError(
+            "schema 7 learned step-controller feature contract is incompatible; "
+            "rebuild the config and retrain"
+        )
+    controller.setdefault("mode", "fixed")
+    controller.setdefault("input_dim", 7)
+    controller.setdefault("hidden_dim", 32)
+    controller.setdefault("maximum_step_size", 3.0e-4)
+    controller.setdefault("initial_step_size", 1.0e-4)
+    controller["feature_contract"] = STEP_CONTROLLER_FEATURE_CONTRACT
+    a5 = raw.get("a5")
+    if not isinstance(a5, dict):
+        raise ValueError("schema 7 a5 must be a mapping")
+    a5["effect_ablation"] = {"fixed_variant": "A"}
+    raw["config_schema_version"] = CONFIG_SCHEMA_VERSION
+    return raw
+
+
 def _normalize_project_schema(value: object) -> object:
     if not isinstance(value, dict):
         return value
     schema = value.get("config_schema_version")
     if schema == CONFIG_SCHEMA_VERSION:
         return value
+    if schema == 7:
+        return _normalize_schema_seven(cast(dict[str, object], value))
     if schema != 6:
-        raise ValueError("config_schema_version must be 7 or the strict formal schema 6")
+        raise ValueError(
+            "config_schema_version must be 8, fixed-step schema 7, or the strict formal schema 6"
+        )
 
     raw = dict(value)
     stage_a = cast(dict[str, object], _require_schema6_block(raw, "stage_a", _SCHEMA6_A2))
@@ -2328,7 +2409,7 @@ def _normalize_project_schema(value: object) -> object:
     optimizer_a5 = cast(dict[str, object], stage_c["optimizer"])
     for name in ("stage_a", "stage_b", "stage_c", "evaluation", "parameter_budget"):
         raw.pop(name)
-    raw["config_schema_version"] = CONFIG_SCHEMA_VERSION
+    raw["config_schema_version"] = 7
     raw["loss"] = normalized_loss
     raw["a2"] = {
         "optimizer": {
@@ -2342,7 +2423,7 @@ def _normalize_project_schema(value: object) -> object:
         "optimizer": optimizer_a5,
     }
     raw["inference"] = {"audit_level": inference["audit_level"]}
-    return raw
+    return _normalize_project_schema(raw)
 
 
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:
@@ -2370,7 +2451,7 @@ def environment_summary() -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Validate and print the schema-7 configuration")
+    parser = argparse.ArgumentParser(description="Validate and print the schema-8 configuration")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     args = parser.parse_args(argv)
     print(load_config(args.config).model_dump_json(indent=2))

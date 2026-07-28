@@ -8,8 +8,34 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from ttt_svcbench_qwen.config import FastTTTStepControllerConfig
+from ttt_svcbench_qwen.config import (
+    STEP_CONTROLLER_FEATURE_CONTRACT,
+    FastTTTStepControllerConfig,
+)
 from ttt_svcbench_qwen.losses import TTTLossOutput
+
+STEP_CONTROLLER_FEATURE_CONTRACT_VERSION = 2
+
+
+@dataclass(frozen=True, slots=True)
+class CausalSupportPosition:
+    """Deployable causal position shared by Meta-TTT training and online inference."""
+
+    support_index: int
+    support_count: int
+    truncation_horizon: int
+
+    def __post_init__(self) -> None:
+        values = (self.support_index, self.support_count, self.truncation_horizon)
+        if any(type(value) is not int for value in values):
+            raise TypeError("causal Support positions must be exact integers")
+        if (
+            self.support_index < 0
+            or self.support_count <= 0
+            or self.support_index >= self.support_count
+            or self.truncation_horizon <= 0
+        ):
+            raise ValueError("causal Support position must lie inside a positive sequence")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +70,13 @@ class InnerStepController(nn.Module):  # type: ignore[misc]
         self.output = nn.Linear(config.hidden_dim, 1)
         self.maximum_step_size = float(config.maximum_step_size)
         self.initial_step_size = float(config.initial_step_size)
+        if config.feature_contract != STEP_CONTROLLER_FEATURE_CONTRACT:
+            raise ValueError("InnerStepController feature contract is incompatible")
+        self.register_buffer(
+            "feature_contract_version",
+            torch.tensor(STEP_CONTROLLER_FEATURE_CONTRACT_VERSION, dtype=torch.int64),
+            persistent=True,
+        )
         nn.init.zeros_(self.output.weight)
         initial_probability = self.initial_step_size / self.maximum_step_size
         nn.init.constant_(
@@ -105,10 +138,7 @@ def build_step_controller_features(
     start_time: float,
     end_time: float,
     previous_end_time: float,
-    segment_offset: int,
-    segment_length: int,
-    support_index: int,
-    support_count: int,
+    position: CausalSupportPosition,
     controller: InnerStepController,
 ) -> Tensor:
     """Build the shared seven detached causal features for training and inference."""
@@ -118,18 +148,8 @@ def build_step_controller_features(
         raise ValueError("step controller times must be finite and non-negative")
     if start_time > end_time or previous_end_time > end_time:
         raise ValueError("step controller received a future causal boundary")
-    counts = (segment_offset, segment_length, support_index, support_count)
-    if any(type(value) is not int for value in counts):
-        raise TypeError("step controller positions/counts must be exact integers")
-    if (
-        segment_offset < 0
-        or segment_length <= 0
-        or segment_offset >= segment_length
-        or support_index < 0
-        or support_count <= 0
-        or support_index >= support_count
-    ):
-        raise ValueError("step controller positions must lie inside their causal sequence")
+    if not isinstance(position, CausalSupportPosition):
+        raise TypeError("step controller requires a CausalSupportPosition")
     per_row = ttt_output.per_row_total.detach().float()
     batch_size = per_row.shape[0]
     device = per_row.device
@@ -149,8 +169,11 @@ def build_step_controller_features(
     ) / 3.0
     features = torch.stack(
         (
-            repeated((segment_offset + 1) / segment_length),
-            repeated((support_index + 1) / support_count),
+            repeated(
+                ((position.support_index % position.truncation_horizon) + 1)
+                / position.truncation_horizon
+            ),
+            repeated((position.support_index + 1) / position.support_count),
             torch.log1p(repeated(end_time - start_time)),
             torch.log1p(repeated(end_time - previous_end_time)),
             torch.log1p(per_row.clamp_min(0.0)),
@@ -165,7 +188,9 @@ def build_step_controller_features(
 
 
 __all__ = [
+    "CausalSupportPosition",
     "InnerStepController",
+    "STEP_CONTROLLER_FEATURE_CONTRACT_VERSION",
     "StepControllerAudit",
     "build_inner_step_controller",
     "build_step_controller_features",

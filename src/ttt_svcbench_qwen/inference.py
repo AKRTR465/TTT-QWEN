@@ -58,6 +58,7 @@ from ttt_svcbench_qwen.state_bank import StructuredStateBank, TensorizedRetrieva
 from ttt_svcbench_qwen.state_encoder import TemporalCache
 from ttt_svcbench_qwen.state_reader import ReaderResult
 from ttt_svcbench_qwen.step_controller import (
+    CausalSupportPosition,
     InnerStepController,
     build_step_controller_features,
 )
@@ -244,6 +245,24 @@ class InferenceRequest:
         return self.query_input.query_time
 
 
+def build_causal_support_positions(
+    chunks: tuple[CausalChunk, ...],
+    *,
+    query_time: float,
+    truncation_horizon: int,
+) -> dict[str, CausalSupportPosition]:
+    """Index only chunks that expose at least one frame at or before the Query time."""
+
+    causal_ids = tuple(
+        chunk.chunk_id for chunk in chunks if chunk.causal_prefix(query_time) is not None
+    )
+    support_count = len(causal_ids)
+    return {
+        chunk_id: CausalSupportPosition(index, support_count, truncation_horizon)
+        for index, chunk_id in enumerate(causal_ids)
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeBoundaryStamp:
     """CPU-copy-free lifecycle identity for the authoritative runtime."""
@@ -365,6 +384,7 @@ class TTTUpdateStage(Protocol):
         *,
         current_start_time: float,
         current_end_time: float,
+        causal_position: CausalSupportPosition | None,
     ) -> TTTUpdateOutcome: ...
 
 
@@ -391,16 +411,6 @@ class OnlineTTTUpdater:
         elif step_controller is not None:
             raise ValueError("fixed online TTT must not register a step controller")
         self.step_controller = step_controller
-        self._support_count: int | None = None
-        self._support_index = 0
-
-    def begin_query(self, support_count: int) -> None:
-        """Reset query-local causal positions used only by the learned ablation."""
-
-        if type(support_count) is not int or support_count <= 0:
-            raise ValueError("online TTT query support_count must be a positive integer")
-        self._support_count = support_count
-        self._support_index = 0
 
     def __call__(
         self,
@@ -409,6 +419,7 @@ class OnlineTTTUpdater:
         *,
         current_start_time: float,
         current_end_time: float,
+        causal_position: CausalSupportPosition | None,
     ) -> TTTUpdateOutcome:
         if observation.owner != runtime_state.owner:
             raise InferenceProtocolError("online update owner does not match observation")
@@ -422,12 +433,10 @@ class OnlineTTTUpdater:
         output = compute_ttt_loss(self.predictor, built.inputs)
         step_sizes: Tensor | None = None
         if self.step_controller is not None:
-            if self._support_count is None:
+            if not isinstance(causal_position, CausalSupportPosition):
                 raise InferenceProtocolError(
-                    "learned online TTT requires begin_query before Support updates"
+                    "learned online TTT requires a causal Support position"
                 )
-            if self._support_index >= self._support_count:
-                raise InferenceProtocolError("online TTT exceeded its declared Support count")
             with torch.no_grad():
                 step_sizes = self.step_controller(
                     build_step_controller_features(
@@ -437,10 +446,7 @@ class OnlineTTTUpdater:
                         previous_end_time=(
                             current_start_time if previous is None else previous.end_time
                         ),
-                        segment_offset=self._support_index,
-                        segment_length=self._support_count,
-                        support_index=self._support_index,
-                        support_count=self._support_count,
+                        position=causal_position,
                         controller=self.step_controller,
                     )
                 )
@@ -451,7 +457,6 @@ class OnlineTTTUpdater:
             optimizer_states=(_require_optimizer_state(runtime_state),),
             step_sizes=step_sizes,
         )[0]
-        self._support_index += 1
         updated = replace(
             runtime_state,
             fast_weights=result.fast_state,
@@ -701,6 +706,7 @@ class PerVideoRuntimeManager:
         query_input: RuntimeQueryInput,
         query_time: float,
         updater: TTTUpdateStage,
+        causal_position: CausalSupportPosition | None = None,
         prepared_query: PreparedQueryOutput | None = None,
     ) -> ChunkExecution:
         """Observe with W_t, write hard state, then create W_(t+1) for the next chunk."""
@@ -713,6 +719,10 @@ class PerVideoRuntimeManager:
             before_fast_stamp = _fast_state_stamp(fast)
             causal = chunk.causal_prefix(query_time)
             if causal is None:
+                if causal_position is not None:
+                    raise InferenceProtocolError(
+                        "future-only chunk cannot carry a causal Support position"
+                    )
                 audit = ChunkAudit(
                     chunk_id=chunk.chunk_id,
                     original_start_time=chunk.start_time,
@@ -795,6 +805,7 @@ class PerVideoRuntimeManager:
                 observed,
                 current_start_time=causal.start_time,
                 current_end_time=causal.end_time,
+                causal_position=causal_position,
             )
             updated = _require_trajectory_runtime(outcome.runtime_state, owner)
             if _hard_state_stamp(updated) != hard_stamp:
@@ -1098,8 +1109,11 @@ def run_inference(
         raise TypeError("run_inference requires StateTTTModel")
     if not isinstance(request, InferenceRequest):
         raise TypeError("run_inference requires InferenceRequest")
-    if isinstance(updater, OnlineTTTUpdater):
-        updater.begin_query(len(request.chunks))
+    causal_positions = build_causal_support_positions(
+        request.chunks,
+        query_time=request.query_time,
+        truncation_horizon=model.config.a5.truncation_horizon,
+    )
     manager.reset(request.video_id, request.trajectory_id, request.query_signature)
     latest_observation: ObservationChunkOutput | None = None
     try:
@@ -1110,6 +1124,7 @@ def run_inference(
                 query_input=request.query_input,
                 query_time=request.query_time,
                 updater=updater,
+                causal_position=causal_positions.get(chunk.chunk_id),
                 prepared_query=request.prepared_query,
             )
             if execution.observation is not None:

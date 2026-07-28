@@ -1,8 +1,8 @@
 # Qwen3-VL-8B State-TTT v6 架构
 
 > 规范版本：state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history
-> 配置 schema：7（只对当前正式 schema 6 做一次性内存归一化）
-> 修订日期：2026-07-22
+> 配置 schema：8（schema 6/固定步 schema 7 可一次性内存归一化；schema 7 learned 拒绝）
+> 修订日期：2026-07-28
 > 状态：A2/A5 TRAINING MAINLINE IMPLEMENTED；ONLINE INFERENCE WIRED
 
 ## 1. 固定目标
@@ -87,6 +87,10 @@ Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由�
 - Support 不设人工数值上限；
 - 每 8 个 Support 截断二阶图并重锚 W0；
 - 每个 segment backward，episode 末由 Outer optimizer 单次 step；
+- A–E 固定步实验由 `a5.effect_ablation.fixed_variant` 标识；正式预算保持等值，C 仅允许
+  Predictor `LR × cap` 为基准的 2 倍，E 仅允许 W0 为基准的 1.5 倍；
+- learned controller 仅可叠加 Variant A，其七维输入使用 `causal_k8_v2`：第一维为固定
+  K=8 因果窗口进度，第二维为仅计入含因果帧 chunk 的 episode 进度；
 - 不运行 static-W0 counterfactual。
 
 ## 5. 在线推理主线
@@ -106,6 +110,7 @@ load checkpoint
 约束：
 
 - query_time 之后帧在进入模型前裁剪；
+- learned updater 的 Support 位置由请求预先计算并显式传入，纯未来 chunk 不计数；
 - updater 只允许修改 fast/optimizer/overlap memory；
 - 更新后的 Wt 不得回溯影响当前 chunk；
 - generation 不重跑视频状态路径、不修改 Bank/FSM/Fast；
