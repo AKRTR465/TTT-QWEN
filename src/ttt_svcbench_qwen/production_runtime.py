@@ -151,6 +151,10 @@ from ttt_svcbench_qwen.state_reader import (
     build_state_resampler,
 )
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput, build_state_retriever
+from ttt_svcbench_qwen.step_controller import (
+    InnerStepController,
+    build_inner_step_controller,
+)
 from ttt_svcbench_qwen.trainer import (
     StageAEpisodeAnswerInputs,
     StageAEpisodeInputs,
@@ -795,9 +799,7 @@ class VideoChunkMaterializer:
                 else 0
             )
             cached = (
-                cache.get(fingerprint)
-                if cache is not None and fingerprint is not None
-                else None
+                cache.get(fingerprint) if cache is not None and fingerprint is not None else None
             )
             _loader_trace(
                 "support_cache_read",
@@ -1576,12 +1578,15 @@ class ProductionOuterModel(nn.Module):  # type: ignore[misc]
         predictor: TemporalPredictor,
         qwen_model: nn.Module,
         official_weak_balancer: OfficialWeakOuterLossComposer | None = None,
+        step_controller: InnerStepController | None = None,
     ) -> None:
         super().__init__()
         self.state_model = state_model
         self.predictor = predictor
         if official_weak_balancer is not None:
             self.official_weak_balancer = official_weak_balancer
+        if step_controller is not None:
+            self.step_controller = step_controller
         # Qwen is already registered below ``state_model``.  Keep only a weak reference here so
         # Hugging Face lifecycle methods can be forwarded without duplicating checkpoint keys.
         self._qwen_model_ref = weakref.ref(qwen_model)
@@ -2027,14 +2032,10 @@ class ProductionEpisodeMaterializer:
             segment_lengths=record.segment_lengths,
             segment_query_counts=record.segment_query_counts,
             query_roles=tuple(
-                role.value
-                for segment in record.supervised_segments
-                for role in segment.query_roles
+                role.value for segment in record.supervised_segments for role in segment.query_roles
             ),
             query_weights=tuple(
-                weight
-                for segment in record.supervised_segments
-                for weight in segment.query_weights
+                weight for segment in record.supervised_segments for weight in segment.query_weights
             ),
             diagnostic_query_count=record.diagnostic_query_count,
             insufficient_inter_query_gap=record.insufficient_inter_query_gap,
@@ -2513,11 +2514,21 @@ def build_runtime(
     )
     predictor = build_temporal_predictor(project.predictor)
     official_weak_balancer = OfficialWeakOuterLossComposer(project.loss.official_weak_balance)
+    step_controller = (
+        build_inner_step_controller(project.fast_ttt.step_controller)
+        if (
+            stage is ProductionStage.A5
+            and config.a5_adaptation_mode == "meta_ttt"
+            and project.fast_ttt.step_controller.mode == "learned"
+        )
+        else None
+    )
     outer = ProductionOuterModel(
         state_model,
         predictor,
         backbone.model,
         official_weak_balancer,
+        step_controller,
     )
     materializer = ProductionEpisodeMaterializer(backbone, writer, chunk_materializer)
     if stage is ProductionStage.A2:
@@ -2572,7 +2583,9 @@ def build_runtime(
         maximum_pixels=maximum_pixels,
         preprocess_cache=preprocess_cache,
     )
-    predictor.requires_grad_(True)
+    predictor.requires_grad_(config.a5_adaptation_mode == "meta_ttt")
+    if step_controller is not None:
+        step_controller.requires_grad_(True)
     meta_runner = MetaTTTEpisodeRunner(
         config=project,
         model=state_model,
@@ -2584,9 +2597,13 @@ def build_runtime(
         support_visual_batch_size=config.support_visual_batch_size,
         query_activation_offload=config.query_activation_offload,
         outer_composer=official_weak_balancer,
+        adaptation_mode=config.a5_adaptation_mode,
+        step_controller=step_controller,
     )
     return ProductionTrainerRuntime(
         stage=stage,
+        a5_adaptation_mode=config.a5_adaptation_mode,
+        a5_step_controller_mode=project.fast_ttt.step_controller.mode,
         model=outer,
         train_dataset=(),
         eval_dataset=None,
@@ -2687,13 +2704,23 @@ def build_inference_runtime_bundle(
         ModelFeatureFlags(),
     )
     predictor = build_temporal_predictor(config.predictor)
+    step_controller = build_inner_step_controller(config.fast_ttt.step_controller)
+    if step_controller is not None:
+        step_controller.to(device=torch.device(device))
+        step_controller.requires_grad_(False)
+        step_controller.eval()
     outer = ProductionOuterModel(
         state_model,
         predictor,
         qwen_model,
         OfficialWeakOuterLossComposer(config.loss.official_weak_balance),
+        step_controller,
     )
     load_outer_checkpoint(outer, checkpoint)
+    # The Qwen backbone was moved above before the state stack was constructed.
+    # Move the complete checkpoint owner so Query/State/TTT/controller modules
+    # share the requested inference device and precision.
+    outer.to(device=torch.device(device), dtype=dtype)
     outer.eval()
     manager = PerVideoRuntimeManager(
         fast_adapter=fast,
@@ -2708,7 +2735,7 @@ def build_inference_runtime_bundle(
         state_model=state_model,
         outer_model=outer,
         manager=manager,
-        updater=OnlineTTTUpdater(config, predictor),
+        updater=OnlineTTTUpdater(config, predictor, step_controller),
         processor=processor,
         tokenizer=tokenizer,
         video_materializer=materializer,

@@ -57,7 +57,7 @@ resume_from_checkpoint: null
 
 ttt_qwen:
   stage: a5
-  a5_adaptation_mode: meta_ttt
+  a5_adaptation_mode: static_w0
   project_config: configs/model_state_ttt_8b.yaml
   dataset_manifest: $SVCBENCH_DATASET_MANIFEST
   initialize_from_a2_checkpoint: $A2_CHECKPOINT

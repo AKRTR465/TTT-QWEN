@@ -26,6 +26,7 @@ from ttt_svcbench_qwen.losses import (
     TemporalPredictor,
 )
 from ttt_svcbench_qwen.meta_trainer import (
+    CounterfactualAuditRequest,
     MetaCausalChunk,
     MetaQueryLossBuilder,
     MetaQueryLossInput,
@@ -76,6 +77,7 @@ from ttt_svcbench_qwen.state_bank import (
     build_state_bank,
 )
 from ttt_svcbench_qwen.state_encoder import TemporalCache, TemporalEncoderOutput
+from ttt_svcbench_qwen.step_controller import InnerStepController
 from ttt_svcbench_qwen.trainer import StageAEpisodeAnswerInputs, StageASupervisionBatch
 
 
@@ -170,7 +172,12 @@ class _TinyFastController(nn.Module):
     ) -> Iterator[object]:
         if self._active is not None:
             raise RuntimeError("tiny fast binding is not re-entrant")
-        self._active = (state,) if isinstance(state, FastWeightsState) else tuple(state)
+        states = (state,) if isinstance(state, FastWeightsState) else tuple(state)
+        if not states[0].differentiable and any(
+            parameter.grad is not None for parameter in self.parameters()
+        ):
+            raise ValueError("clear stale module gradients before binding online Fast TTT state")
+        self._active = states
         try:
             yield self
         finally:
@@ -526,8 +533,10 @@ class _TinyPredictor(TemporalPredictor):
         self.input_dim = 768
         self.output_dim = 768
         self.scale = nn.Parameter(torch.tensor(0.5))
+        self.forward_calls = 0
 
     def forward(self, hidden: Tensor) -> Tensor:
+        self.forward_calls += 1
         return hidden * self.scale
 
 
@@ -618,6 +627,8 @@ def _system(
     query_encoder_reuse: bool = False,
     raw_support_visual_batcher: object | None = None,
     support_visual_batch_size: int = 1,
+    adaptation_mode: str = "meta_ttt",
+    step_controller: InnerStepController | None = None,
 ) -> tuple[MetaTTTEpisodeRunner, _TinyFastController, _TinyPredictor, _RuntimeResetter]:
     fast = _TinyFastController()
     predictor = _TinyPredictor()
@@ -658,6 +669,8 @@ def _system(
         query_encoder_reuse=query_encoder_reuse,
         raw_support_visual_batcher=raw_support_visual_batcher,  # type: ignore[arg-type]
         support_visual_batch_size=support_visual_batch_size,
+        adaptation_mode=adaptation_mode,
+        step_controller=step_controller,
     )
     return runner, fast, predictor, resetter
 
@@ -671,9 +684,7 @@ def _truncated_episode(
 ) -> MetaTTTEpisode:
     if not 1 <= support_count <= 16:
         raise ValueError("support-aligned test episode supports must be in [1, 16]")
-    segment_lengths = (
-        (support_count,) if support_count <= 8 else (8, support_count - 8)
-    )
+    segment_lengths = (support_count,) if support_count <= 8 else (8, support_count - 8)
     owner = RuntimeOwner(("video-a",), ("trajectory-a",))
     prewarm = _chunk(owner, chunk_index=0, end_time=0.5, width=2)
     supports: list[MetaCausalChunk] = []
@@ -688,11 +699,7 @@ def _truncated_episode(
                     owner,
                     chunk_index=chunk_index,
                     end_time=current_time,
-                    width=(
-                        1
-                        if not supports and invalid_first_support
-                        else 2
-                    ),
+                    width=(1 if not supports and invalid_first_support else 2),
                 )
             )
             chunk_index += 1
@@ -731,11 +738,7 @@ def _truncated_episode(
         seed=config.a5.seed,
         prewarm_chunk=prewarm,
         segment_lengths=segment_lengths,
-        query_roles=(
-            ("final",)
-            if len(segment_lengths) == 1
-            else ("intermediate", "final")
-        ),
+        query_roles=(("final",) if len(segment_lengths) == 1 else ("intermediate", "final")),
         query_weights=(1.0,) * len(segment_lengths),
         diagnostic_query_count=diagnostic_query_count,
     )
@@ -1064,6 +1067,79 @@ def test_truncated_a5_query_bundle_sums_proxy_gradients_then_closes_once(
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
 
 
+def test_static_w0_keeps_dense_queries_and_outer_trains_w0_without_ttt(
+    config: ProjectConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, fast, predictor, _ = _system(config, adaptation_mode="static_w0")
+    episode = _truncated_episode(config, support_count=16)
+    backward_values: list[float] = []
+
+    def unexpected_ttt_call(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("static-W0 must not construct or optimize a Support TTT target")
+
+    runner.ttt_input_builder = unexpected_ttt_call  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.meta_trainer.compute_ttt_loss",
+        unexpected_ttt_call,
+    )
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.meta_trainer.functional_sgd_steps_from_ttt",
+        unexpected_ttt_call,
+    )
+
+    def backward(loss: Tensor, retain_graph: bool) -> None:
+        assert not retain_graph
+        backward_values.append(float(loss.detach()))
+        loss.backward()
+
+    output = runner.run_truncated(episode, backward=backward)
+
+    assert output.audit.adaptation_mode == "static_w0"
+    assert not output.audit.ttt_enabled
+    assert output.audit.ttt_valid_count == 0
+    assert output.audit.query_count == len(episode.query_points) == 2
+    assert output.audit.query_backward_count == 2
+    assert output.audit.deferred_vjp_backward_count == 2
+    assert output.audit.backward_count == 4
+    assert output.audit.update_attempt_count == 0
+    assert output.audit.update_count == 0
+    assert output.audit.skip_count == 0
+    assert output.audit.updates == ()
+    assert output.audit.static_w0_segment_count == 2
+    assert output.audit.meta_ttt_segment_count == 0
+    assert output.audit.outer_only_segment_count == 0
+    assert all(
+        segment.training_mode == "static_w0"
+        and segment.update_attempt_count == 0
+        and segment.update_count == 0
+        and segment.skip_count == 0
+        and segment.auxiliary_loss == 0.0
+        for segment in output.audit.segments
+    )
+    assert output.audit.maximum_retained_support_graphs == 0
+    assert output.audit.support_ttt_raw_mean == 0.0
+    assert output.audit.support_ttt_outer_mean == 0.0
+    assert output.support_auxiliary_loss.item() == 0.0
+    assert output.total.item() == pytest.approx(output.query_loss.item())
+    assert [query.query_role for query in output.audit.queries] == [
+        "intermediate",
+        "final",
+    ]
+    assert all(query.query_weight == 1.0 for query in output.audit.queries)
+    assert output.final_fast_states[0].fast_version == 0
+    assert output.final_fast_states[0].update_count == 0
+    assert output.final_fast_states[0].skip_count == 0
+    assert output.final_runtime.next_chunk_index == 17
+    assert output.final_runtime.state_bank_states[0].version == 17
+    assert predictor.forward_calls == 0
+    assert not predictor.scale.requires_grad
+    assert predictor.scale.grad is None
+    assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
+    assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
+    assert len(backward_values) == 4
+
+
 def test_truncated_a5_batches_raw_visuals_only_within_each_k_segment(
     config: ProjectConfig,
 ) -> None:
@@ -1155,10 +1231,7 @@ def test_zero_weight_padding_keeps_backward_schedule_but_contributes_zero(
     assert output.total == pytest.approx(0.0)
     assert output.query_loss == pytest.approx(0.0)
     assert output.support_auxiliary_loss == pytest.approx(0.0)
-    assert all(
-        query.proxy_gradient_status == "zero_padding"
-        for query in output.audit.queries
-    )
+    assert all(query.proxy_gradient_status == "zero_padding" for query in output.audit.queries)
     assert fast.w0_1.grad is not None and torch.count_nonzero(fast.w0_1.grad) == 0
     assert fast.w0_2.grad is not None and torch.count_nonzero(fast.w0_2.grad) == 0
     assert predictor.scale.grad is not None and torch.count_nonzero(predictor.scale.grad) == 0
@@ -1334,6 +1407,91 @@ def test_later_support_cannot_change_earlier_intermediate_query(
 
     assert clean.audit.queries[0] == changed.audit.queries[0]
     assert clean.audit.queries[1] != changed.audit.queries[1]
+
+
+def test_diagnostic_counterfactual_is_no_grad_and_does_not_change_training(
+    config: ProjectConfig,
+) -> None:
+    raw = config.model_dump(mode="python")
+    raw["a5"]["counterfactual_audit"]["enabled"] = True
+    audit_config = ProjectConfig.model_validate(raw)
+    torch.manual_seed(23)
+    baseline_runner, _, _, _ = _system(audit_config)
+    torch.manual_seed(23)
+    audited_runner, _, _, _ = _system(audit_config)
+    episode = _truncated_episode(audit_config, support_count=4)
+
+    baseline = baseline_runner.run_truncated(episode)
+    audited = audited_runner.run_truncated(
+        episode,
+        counterfactual_audit=CounterfactualAuditRequest(
+            optimizer_step=8,
+            query_selector=0,
+        ),
+    )
+    baseline_fast_gradients = tuple(
+        parameter.grad.detach().clone() if parameter.grad is not None else None
+        for parameter in baseline_runner.fast_controller.parameters()
+    )
+    audited_fast_gradients = tuple(
+        parameter.grad.detach().clone() if parameter.grad is not None else None
+        for parameter in audited_runner.fast_controller.parameters()
+    )
+
+    assert torch.equal(baseline.total, audited.total)
+    assert len(baseline_fast_gradients) == len(audited_fast_gradients)
+    assert all(
+        (left is None and right is None)
+        or (
+            isinstance(left, Tensor)
+            and isinstance(right, Tensor)
+            and torch.equal(left, right)
+        )
+        for left, right in zip(
+            baseline_fast_gradients,
+            audited_fast_gradients,
+            strict=True,
+        )
+    )
+    assert baseline.audit.training_counterfactual_executed is False
+    assert baseline.audit.diagnostic_counterfactual_executed is False
+    assert audited.audit.training_counterfactual_executed is False
+    assert audited.audit.diagnostic_counterfactual_executed is True
+    assert audited.audit.counterfactual_audited_query_count == 1
+    counterfactual = audited.audit.queries[0].counterfactual
+    assert counterfactual is not None
+    assert counterfactual.optimizer_step == 8
+    assert tuple(item.reference for item in counterfactual.references) == (
+        "episode_w0",
+        "segment_start",
+    )
+    assert all(torch.equal(left.w_t_1, right.w_t_1) for left, right in zip(
+        baseline.final_fast_states,
+        audited.final_fast_states,
+        strict=True,
+    ))
+
+
+def test_learned_step_controller_is_explicit_and_receives_query_gradient(
+    config: ProjectConfig,
+) -> None:
+    raw = config.model_dump(mode="python")
+    raw["fast_ttt"]["step_controller"]["mode"] = "learned"
+    learned_config = ProjectConfig.model_validate(raw)
+    controller = InnerStepController(learned_config.fast_ttt.step_controller)
+    runner, _, _, _ = _system(learned_config, step_controller=controller)
+
+    output = runner.run_truncated(_truncated_episode(learned_config, support_count=4))
+
+    step_sizes = tuple(value for update in output.audit.updates for value in update.step_sizes)
+    assert step_sizes == pytest.approx((1.0e-4,) * len(step_sizes), rel=1.0e-6)
+    gradients = tuple(parameter.grad for parameter in controller.parameters())
+    assert all(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients)
+    assert any(
+        float(torch.linalg.vector_norm(gradient).item()) > 0.0
+        for gradient in gradients
+        if gradient is not None
+    )
 
 
 @pytest.mark.parametrize("denied", ["answer", "count", "occurrence_times"])

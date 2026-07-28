@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator
 from enum import StrEnum
@@ -72,6 +73,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     OfficialWeakLossAudit,
     OperatorDiagnosticAudit,
 )
+from ttt_svcbench_qwen.step_controller import InnerStepController
 
 
 class _OuterToy(nn.Module):
@@ -170,6 +172,40 @@ def test_a5_outer_parameter_audit_rejects_frozen_state_parameter() -> None:
         )
 
 
+def test_static_w0_outer_parameter_audit_requires_frozen_predictor() -> None:
+    audit = OuterParameterAudit(
+        stage=ProductionStage.A5,
+        a5_adaptation_mode="static_w0",
+        total_parameter_count=100,
+        trainable_parameter_count=60,
+        qwen_parameter_count=60,
+        qwen_trainable_count=30,
+        non_qwen_parameter_count=40,
+        non_qwen_trainable_count=30,
+        predictor_parameter_count=10,
+        predictor_trainable_count=0,
+        transient_parameter_names=(),
+        backbone_registered=True,
+    )
+
+    assert audit.predictor_trainable_count == 0
+    with pytest.raises(ValueError, match="Predictor must remain frozen"):
+        OuterParameterAudit(
+            stage=ProductionStage.A5,
+            a5_adaptation_mode="static_w0",
+            total_parameter_count=100,
+            trainable_parameter_count=61,
+            qwen_parameter_count=60,
+            qwen_trainable_count=30,
+            non_qwen_parameter_count=40,
+            non_qwen_trainable_count=31,
+            predictor_parameter_count=10,
+            predictor_trainable_count=1,
+            transient_parameter_names=(),
+            backbone_registered=True,
+        )
+
+
 def test_runtime_preprocess_cache_honors_explicit_namespace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -240,9 +276,7 @@ class _QwenOwnerToy(nn.Module):
         self.visual.patch_embed = nn.Linear(2, 2)
         self.visual.blocks = nn.ModuleList([nn.Linear(2, 2) for _ in range(27)])
         self.visual.merger = nn.Linear(2, 2)
-        self.visual.deepstack_merger_list = nn.ModuleList(
-            [nn.Linear(2, 2) for _ in range(3)]
-        )
+        self.visual.deepstack_merger_list = nn.ModuleList([nn.Linear(2, 2) for _ in range(3)])
         self.language_model = nn.Module()
         self.language_model.embed_tokens = nn.Embedding(8, 2)
         self.language_model.layers = nn.ModuleList([nn.Linear(2, 2) for _ in range(36)])
@@ -516,6 +550,7 @@ def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
     assert extension.stage == "a2"
     assert set(extension.model_dump(exclude_none=True)) == {
         "stage",
+        "a5_adaptation_mode",
         "project_config",
         "dataset_manifest",
         "qwen_outer_trainability",
@@ -1285,14 +1320,58 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
     assert not policy.train_input_embeddings
     assert not policy.train_lm_head
 
-    launcher = (root / "scripts/h200/train_a5_vithalf_decoder8.sh").read_text(
-        encoding="utf-8"
-    )
-    assert 'TTT_CHECKPOINT_POLICY="epoch_2_and_epoch_4"' in launcher
+    launcher = (root / "scripts/h200/train_a5_vithalf_decoder8.sh").read_text(encoding="utf-8")
+    assert 'TTT_CHECKPOINT_POLICY="${TTT_CHECKPOINT_POLICY:-epoch_2_and_epoch_4}"' in launcher
     assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
     assert 'TTT_DATALOADER_TRACE="${TTT_DATALOADER_TRACE:-1}"' in launcher
     assert "[[ $# -eq 2 ]] || usage" in launcher
     assert "<dataset_manifest.json>" in launcher
+
+
+def test_a5_static_w0_yaml_and_launcher_match_meta_ttt_data_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[1]
+    for key, value in {
+        "OUTPUT_DIR": "/tmp/output",
+        "SVCBENCH_DATASET_MANIFEST": "/tmp/v4_manifest.json",
+        "A2_CHECKPOINT": "/tmp/a2-final",
+        "MODEL": "/tmp/qwen3vl8b",
+        "DATASET_DIR": "/tmp/svcbench",
+        "DATASET_NAME": "svcbench_qwen3vl_sft",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    meta_native, meta = load_training_yaml(
+        root / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
+    )
+    static_native, static = load_training_yaml(
+        root / "configs/h200/a5_static_w0_k8_vithalf_decoder8_4gpu.yaml"
+    )
+
+    assert meta.a5_adaptation_mode == "meta_ttt"
+    assert static.a5_adaptation_mode == "static_w0"
+    assert static.stage == meta.stage == "a5"
+    assert static.dataset_manifest == meta.dataset_manifest == "/tmp/v4_manifest.json"
+    assert static.initialize_from_a2_checkpoint == meta.initialize_from_a2_checkpoint
+    assert static.qwen_outer_trainability == meta.qwen_outer_trainability
+    for key in (
+        "num_train_epochs",
+        "seed",
+        "data_seed",
+        "per_device_train_batch_size",
+        "gradient_accumulation_steps",
+        "learning_rate",
+        "deepspeed",
+    ):
+        assert static_native[key] == meta_native[key]
+
+    launcher = (root / "scripts/h200/train_a5_static_w0_ablation.sh").read_text(encoding="utf-8")
+    assert 'TTT_A5_ADAPTATION_MODE="static_w0"' in launcher
+    assert "a5_dense_querybundle_train_support_statequery_fp16_v4" in launcher
+    assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
+    assert 'TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"' in launcher
+    assert "[[ $# -eq 2 ]] || usage" in launcher
 
 
 def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoint(
@@ -1458,6 +1537,45 @@ def test_production_runtime_defers_optimizer_and_sampler_to_central_bridge() -> 
     assert runtime.train_sampler_factory is None
 
 
+def test_a2_initialization_allows_only_new_learned_step_controller_keys(
+    tmp_path: Path,
+) -> None:
+    source = _OuterToy()
+    checkpoint = tmp_path / "a2-final-without-controller"
+    checkpoint.mkdir()
+    save_file(
+        {name: value.detach().clone() for name, value in source.state_dict().items()},
+        str(checkpoint / "model.safetensors"),
+    )
+    target = _OuterToy()
+    learned_config = load_config().fast_ttt.step_controller.model_copy(
+        update={"mode": "learned"}
+    )
+    target.step_controller = InnerStepController(learned_config)
+    initial_controller = {
+        name: value.detach().clone()
+        for name, value in target.step_controller.state_dict().items()
+    }
+
+    audit = initialize_outer_model_from_a2(
+        target,
+        checkpoint,
+        allowed_missing_prefixes=("step_controller.",),
+    )
+
+    assert audit.missing_keys == ()
+    assert all(
+        torch.equal(source.state_dict()[name], target.state_dict()[name])
+        for name in source.state_dict()
+    )
+    assert all(
+        torch.equal(initial_controller[name], target.step_controller.state_dict()[name])
+        for name in initial_controller
+    )
+    with pytest.raises(ValueError, match="exactly match"):
+        initialize_outer_model_from_a2(target, checkpoint)
+
+
 def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Path) -> None:
     run = tmp_path / "runs" / "0715_010203_a5"
     checkpoint = run / "checkpoints" / "checkpoint-20"
@@ -1470,6 +1588,12 @@ def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Pa
     assert resolve_same_stage_resume(str(checkpoint), ProductionStage.A5) == checkpoint
     with pytest.raises(ValueError, match="stage does not match"):
         resolve_same_stage_resume(str(checkpoint), ProductionStage.A2)
+    with pytest.raises(ValueError, match="adaptation mode"):
+        resolve_same_stage_resume(
+            str(checkpoint),
+            ProductionStage.A5,
+            a5_adaptation_mode="static_w0",
+        )
 
     orphan = tmp_path / "checkpoint-orphan"
     orphan.mkdir()
@@ -1478,6 +1602,94 @@ def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Pa
     (orphan / "optimizer.pt").write_bytes(b"optimizer")
     with pytest.raises(FileNotFoundError, match="run_config"):
         resolve_same_stage_resume(str(orphan), ProductionStage.A5)
+
+
+def test_same_stage_resume_accepts_only_matching_static_w0_mode(tmp_path: Path) -> None:
+    run = tmp_path / "runs" / "static-w0"
+    checkpoint = run / "checkpoints" / "checkpoint-20"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "scheduler.pt").write_bytes(b"scheduler")
+    (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
+    (run / "run_config.json").write_text(
+        '{"stage": "a5", "a5_adaptation_mode": "static_w0"}',
+        encoding="utf-8",
+    )
+
+    assert (
+        resolve_same_stage_resume(
+            str(checkpoint),
+            ProductionStage.A5,
+            a5_adaptation_mode="static_w0",
+        )
+        == checkpoint
+    )
+    with pytest.raises(ValueError, match="adaptation mode"):
+        resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
+
+
+def test_same_stage_resume_rejects_step_controller_ablation_mismatch(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "runs" / "learned-step"
+    checkpoint = run / "checkpoints" / "checkpoint-20"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "scheduler.pt").write_bytes(b"scheduler")
+    (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
+    (run / "run_config.json").write_text(
+        json.dumps(
+            {
+                "stage": "a5",
+                "a5_adaptation_mode": "meta_ttt",
+                "a5_step_controller_mode": "learned",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        resolve_same_stage_resume(
+            str(checkpoint),
+            ProductionStage.A5,
+            a5_step_controller_mode="learned",
+        )
+        == checkpoint
+    )
+    with pytest.raises(ValueError, match="step-controller mode"):
+        resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
+
+
+def test_a5_global_sample_sequence_hash_is_mode_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Record:
+        def __init__(self, episode_id: str) -> None:
+            self.episode_id = episode_id
+
+    class _Sampler:
+        def __init__(self) -> None:
+            self.epoch = 0
+
+        def set_epoch(self, epoch: int) -> None:
+            self.epoch = epoch
+
+        def __iter__(self) -> Iterator[int]:
+            return iter((0, 1) if self.epoch == 0 else (1, 0))
+
+    records = (_Record("episode-a"), _Record("episode-b"))
+    monkeypatch.setattr(trainer_module, "A5EpisodeRecord", _Record)
+    digest, count = trainer_module._a5_global_sample_sequence_sha256(
+        records,
+        lambda _dataset, _rank, _world_size: _Sampler(),
+        epoch_count=2.0,
+    )
+    expected = hashlib.sha256(
+        b"0\tepisode-a\n0\tepisode-b\n1\tepisode-b\n1\tepisode-a\n"
+    ).hexdigest()
+
+    assert digest == expected
+    assert count == 4
 
 
 def test_deepspeed_segment_backward_steps_only_after_all_segments() -> None:
@@ -1663,9 +1875,7 @@ def test_a5_rank_stable_hook_order_audit_is_fail_closed(
 
     def fake_all_gather(outputs: list[torch.Tensor], value: torch.Tensor) -> None:
         outputs[0].copy_(value)
-        outputs[1].copy_(
-            value if not diverge or value.numel() == 1 else value.flip(0)
-        )
+        outputs[1].copy_(value if not diverge or value.numel() == 1 else value.flip(0))
 
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
@@ -2039,10 +2249,11 @@ def test_explicit_smoke_disables_all_periodic_checkpoints() -> None:
 
 
 @pytest.mark.parametrize(
-    ("stage", "predictor_trainable", "expected_lrs"),
+    ("stage", "adaptation_mode", "predictor_trainable", "expected_lrs"),
     [
         (
             ProductionStage.A2,
+            "meta_ttt",
             False,
             {
                 "qwen": 1.0e-5,
@@ -2055,6 +2266,7 @@ def test_explicit_smoke_disables_all_periodic_checkpoints() -> None:
         ),
         (
             ProductionStage.A5,
+            "meta_ttt",
             True,
             {
                 "qwen": 5.0e-6,
@@ -2066,11 +2278,25 @@ def test_explicit_smoke_disables_all_periodic_checkpoints() -> None:
                 "predictor": 5.0e-5,
             },
         ),
+        (
+            ProductionStage.A5,
+            "static_w0",
+            False,
+            {
+                "qwen": 5.0e-6,
+                "state_shared": 5.0e-5,
+                "state_task": 5.0e-5,
+                "state_router_time": 5.0e-5,
+                "state_retrieval": 5.0e-5,
+                "w0": 5.0e-5,
+            },
+        ),
     ],
 )
 def test_central_outer_optimizer_has_exact_stage_groups(
     tmp_path: Path,
     stage: ProductionStage,
+    adaptation_mode: str,
     predictor_trainable: bool,
     expected_lrs: dict[str, float],
 ) -> None:
@@ -2102,6 +2328,7 @@ def test_central_outer_optimizer_has_exact_stage_groups(
         project_config=load_config(),
         ttt_config=ProductionTTTConfig(
             stage="a5",
+            a5_adaptation_mode=adaptation_mode,
             project_config="configs/model_state_ttt_8b.yaml",
             dataset_manifest="manifest.json",
             initialize_from_a2_checkpoint="a2-final",
@@ -2125,9 +2352,86 @@ def test_central_outer_optimizer_has_exact_stage_groups(
     )
     model = _GroupedOuterToy(qwen, predictor_trainable=predictor_trainable)
 
-    optimizer = make_production_outer_optimizer_factory(bundle, stage)(model)
+    optimizer = make_production_outer_optimizer_factory(
+        bundle,
+        stage,
+        a5_adaptation_mode=adaptation_mode,
+    )(model)
 
     actual_lrs = {group["group_name"]: group["lr"] for group in optimizer.param_groups}
     assert actual_lrs == expected_lrs
     owned = {id(parameter) for group in optimizer.param_groups for parameter in group["params"]}
     assert owned == {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+
+
+def test_learned_step_controller_has_its_own_outer_optimizer_group(
+    tmp_path: Path,
+) -> None:
+    qwen = nn.Linear(4, 4)
+    checkout = tmp_path / "lf"
+    checkout.mkdir()
+    symbols = LlamaFactorySymbols(
+        get_train_args=lambda *_args, **_kwargs: (),
+        load_tokenizer=lambda *_args, **_kwargs: {},
+        load_model=lambda *_args, **_kwargs: qwen,
+        trainer_base=object,
+        checkout=LlamaFactoryCheckoutAudit(checkout, "523f801", False, True),
+    )
+    project = load_config()
+    bundle = LlamaFactoryBackboneBundle(
+        model=qwen,
+        tokenizer=object(),
+        processor=None,
+        model_args=object(),
+        data_args=object(),
+        training_args=SimpleNamespace(
+            learning_rate=5.0e-6,
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_epsilon=1.0e-8,
+            weight_decay=0.01,
+        ),
+        finetuning_args=object(),
+        generating_args=object(),
+        project_config=project,
+        ttt_config=ProductionTTTConfig(
+            stage="a5",
+            a5_adaptation_mode="meta_ttt",
+            project_config="configs/model_state_ttt_8b.yaml",
+            dataset_manifest="manifest.json",
+            initialize_from_a2_checkpoint="a2-final",
+            support_prefetch_depth=2,
+            support_decode_coalesce=True,
+            support_materialization="segment_double_buffer",
+            segment_prefetch_depth=1,
+            state_query_visual_mode="recent_chunk",
+            state_query_max_frames=16,
+            answer_query_visual_mode="causal_prefix",
+            answer_query_max_frames=256,
+            state_query_cache_mode="inherit",
+            answer_query_cache_mode="disabled",
+            preprocess_cache_mode="read_write",
+            preprocess_cache_miss_policy="decode",
+            preprocess_cache_root_env="TTT_PREPROCESS_CACHE_ROOT",
+            preprocess_cache_max_gb=200.0,
+            preprocess_cache_dtype="float32",
+        ),
+        symbols=symbols,
+    )
+    model = _GroupedOuterToy(qwen, predictor_trainable=True)
+    model.step_controller = InnerStepController(project.fast_ttt.step_controller.model_copy(
+        update={"mode": "learned"}
+    ))
+
+    optimizer = make_production_outer_optimizer_factory(
+        bundle,
+        ProductionStage.A5,
+        a5_adaptation_mode="meta_ttt",
+        a5_step_controller_mode="learned",
+    )(model)
+
+    groups = {group["group_name"]: group for group in optimizer.param_groups}
+    assert groups["step_controller"]["lr"] == 1.0e-4
+    assert {id(parameter) for parameter in groups["step_controller"]["params"]} == {
+        id(parameter) for parameter in model.step_controller.parameters()
+    }

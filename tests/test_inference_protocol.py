@@ -74,6 +74,7 @@ from ttt_svcbench_qwen.state_encoder import (
     TemporalEncoderOutput,
 )
 from ttt_svcbench_qwen.state_reader import ReaderResult, ReaderStatus
+from ttt_svcbench_qwen.step_controller import InnerStepController
 
 
 class _Dependencies(SimpleNamespace):
@@ -632,8 +633,10 @@ class _Updater:
         _observation: ObservationChunkOutput,
         runtime: TrajectoryRuntimeState,
         *,
+        current_start_time: float,
         current_end_time: float,
     ) -> TTTUpdateOutcome:
+        assert 0.0 <= current_start_time <= current_end_time
         assert current_end_time >= 0.0
         call = self.calls
         self.calls += 1
@@ -1020,6 +1023,60 @@ def test_online_updater_publishes_overlap_and_next_only_fast_state(
     assert second.runtime_state.online_overlap_memory is not None
     assert second.runtime_state.online_overlap_memory.end_time == 3.0
     manager.release()
+
+
+def test_learned_online_updater_is_explicit_and_uses_checkpointed_step_size(
+    dependencies: _Dependencies,
+) -> None:
+    raw = dependencies.config.model_dump(mode="python")
+    raw["fast_ttt"]["step_controller"]["mode"] = "learned"
+    config = ProjectConfig.model_validate(raw)
+    controller = InnerStepController(config.fast_ttt.step_controller)
+    with torch.no_grad():
+        controller.output.bias.zero_()
+    updater = OnlineTTTUpdater(
+        config,
+        build_temporal_predictor(config.predictor),
+        controller,
+    )
+    updater.begin_query(2)
+    manager = _manager(dependencies)
+    model = _stage_a_model(dependencies, _TypedStageSuite())
+    manager.reset("video-a", "trajectory-a", torch.zeros(512))
+
+    first = manager.observe_chunk(
+        model=model,
+        chunk=CausalChunk("chunk-0", ("a", "b"), (0.0, 1.0), (0, 1)),
+        query_input=_request().query_input,
+        query_time=3.0,
+        updater=updater,
+    )
+    second = manager.observe_chunk(
+        model=model,
+        chunk=CausalChunk("chunk-1", ("c", "d"), (2.0, 3.0), (2, 3)),
+        query_input=_request().query_input,
+        query_time=3.0,
+        updater=updater,
+    )
+
+    assert first.audit.step_size == pytest.approx(1.5e-4)
+    assert second.audit.step_size == pytest.approx(1.5e-4)
+    manager.release()
+
+
+def test_online_updater_rejects_hidden_step_controller_ablation(
+    dependencies: _Dependencies,
+) -> None:
+    controller = InnerStepController(dependencies.config.fast_ttt.step_controller)
+    predictor = build_temporal_predictor(dependencies.config.predictor)
+    with pytest.raises(ValueError, match="fixed online TTT"):
+        OnlineTTTUpdater(dependencies.config, predictor, controller)
+
+    raw = dependencies.config.model_dump(mode="python")
+    raw["fast_ttt"]["step_controller"]["mode"] = "learned"
+    learned = ProjectConfig.model_validate(raw)
+    with pytest.raises(ValueError, match="learned online TTT"):
+        OnlineTTTUpdater(learned, predictor)
 
 
 def test_inference_payload_recursively_rejects_labels() -> None:

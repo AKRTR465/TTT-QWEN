@@ -15,7 +15,7 @@ import shutil
 import sys
 import time
 import warnings
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -42,6 +42,7 @@ from ttt_svcbench_qwen.episode_data import (
     load_visual_cost_index,
 )
 from ttt_svcbench_qwen.meta_trainer import (
+    CounterfactualAuditRequest,
     MetaTTTEpisode,
     MetaTTTEpisodeRunner,
     TruncatedMetaTTTEpisodeOutput,
@@ -179,7 +180,13 @@ class SegmentBackwardController:
         )
         self.a5_parameter_delta_auditor = (
             _A5ParameterGroupStepAuditor(
-                model, delta_audit_steps=a5_parameter_delta_audit_steps
+                model,
+                delta_audit_steps=a5_parameter_delta_audit_steps,
+                group_names=tuple(
+                    name
+                    for name in _A5ParameterGroupStepAuditor._GROUP_NAMES
+                    if name in gradient_controller.expected_groups
+                ),
             )
             if isinstance(gradient_controller, OuterGradientController)
             and a5_parameter_delta_audit_steps > 0
@@ -200,9 +207,11 @@ class SegmentBackwardController:
                 )
         elif not callable(getattr(accelerator, "backward", None)):
             raise TypeError("segment controller requires accelerator.backward")
-        if self.is_deepspeed and isinstance(
-            self.gradient_controller, OuterGradientController
-        ) and "qwen" in self.gradient_controller.expected_groups:
+        if (
+            self.is_deepspeed
+            and isinstance(self.gradient_controller, OuterGradientController)
+            and "qwen" in self.gradient_controller.expected_groups
+        ):
             self._rank_stable_parameters = _rank_stable_conditional_parameters(
                 model,
                 expected_groups=self.gradient_controller.expected_groups,
@@ -218,8 +227,7 @@ class SegmentBackwardController:
             and torch.distributed.get_world_size() > 1
         )
         self._requires_exact_rank_hook_order = (
-            self.is_deepspeed
-            and _deepspeed_partitions_gradients(cast(Any, self.engine))
+            self.is_deepspeed and _deepspeed_partitions_gradients(cast(Any, self.engine))
         )
 
     @property
@@ -244,9 +252,7 @@ class SegmentBackwardController:
             raw_scale = raw_scale.detach().float().cpu().item()
         scale = float(raw_scale)
         if not math.isfinite(scale) or scale != 1.0:
-            raise ValueError(
-                "A5 deferred VJP currently requires unscaled BF16 DeepSpeed backward"
-            )
+            raise ValueError("A5 deferred VJP currently requires unscaled BF16 DeepSpeed backward")
         return scale
 
     def backward(self, loss: Tensor, retain_graph: bool = False) -> None:
@@ -273,9 +279,7 @@ class SegmentBackwardController:
                 engine = cast(Any, self.engine)
                 is_final_segment = self.backward_count + 1 == self.expected_count
                 engine.set_gradient_accumulation_boundary(is_boundary=is_final_segment)
-                hook_order: list[int] | None = (
-                    [] if self._rank_hook_order_audit_enabled else None
-                )
+                hook_order: list[int] | None = [] if self._rank_hook_order_audit_enabled else None
                 handles = (
                     tuple(
                         parameter.register_post_accumulate_grad_hook(
@@ -321,9 +325,7 @@ class SegmentBackwardController:
         torch.distributed.all_gather(gathered_orders, local_order)
         reference = gathered_orders[0]
         for rank, candidate in enumerate(gathered_orders[1:], start=1):
-            if self._requires_exact_rank_hook_order and not torch.equal(
-                candidate, reference
-            ):
+            if self._requires_exact_rank_hook_order and not torch.equal(candidate, reference):
                 raise RuntimeError(
                     "A5 parameter hook order diverged across ranks before Outer step: "
                     f"segment={self.backward_count}, rank=0/{rank}"
@@ -408,9 +410,7 @@ def _deepspeed_partitions_gradients(engine: object) -> bool:
         return True
     result = partitions_gradients()
     if type(result) is not bool:
-        raise TypeError(
-            "DeepSpeed zero_optimization_partition_gradients() must return bool"
-        )
+        raise TypeError("DeepSpeed zero_optimization_partition_gradients() must return bool")
     return result
 
 
@@ -589,14 +589,27 @@ class _SemanticProjectorStepAuditor:
 class _A5ParameterGroupStepAuditor:
     """Measure real post-Adam deltas for the groups implicated in A5 TTT drift."""
 
-    _GROUP_NAMES = ("predictor", "w0", "state_shared")
+    _GROUP_NAMES = ("step_controller", "predictor", "w0", "state_shared")
+    _DEFAULT_GROUP_NAMES = ("predictor", "w0", "state_shared")
 
-    def __init__(self, model: nn.Module, *, delta_audit_steps: int) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        delta_audit_steps: int,
+        group_names: Sequence[str] = _DEFAULT_GROUP_NAMES,
+    ) -> None:
         if type(delta_audit_steps) is not int or delta_audit_steps <= 0:
             raise ValueError("A5 parameter delta audit steps must be positive")
-        grouped: dict[str, list[nn.Parameter]] = {
-            name: [] for name in self._GROUP_NAMES
-        }
+        selected = tuple(group_names)
+        if (
+            not selected
+            or len(set(selected)) != len(selected)
+            or any(name not in self._GROUP_NAMES for name in selected)
+        ):
+            raise ValueError("A5 parameter delta audit groups are invalid")
+        self.group_names = selected
+        grouped: dict[str, list[nn.Parameter]] = {name: [] for name in self.group_names}
         seen: set[int] = set()
         for name, parameter in model.named_parameters(remove_duplicate=False):
             parameter_id = id(parameter)
@@ -609,15 +622,15 @@ class _A5ParameterGroupStepAuditor:
         empty = tuple(name for name, values in grouped.items() if not values)
         if empty:
             raise RuntimeError(f"A5 parameter delta audit groups are empty: {empty}")
-        self.parameters = {
-            name: tuple(values) for name, values in grouped.items()
-        }
+        self.parameters = {name: tuple(values) for name, values in grouped.items()}
         self.delta_audit_steps = delta_audit_steps
         self.last_metrics: dict[str, float] = {}
 
     @staticmethod
     def _classify_parameter(name: str) -> str:
         lowered = name.casefold()
+        if "step_controller" in lowered:
+            return "step_controller"
         if "predictor" in lowered:
             return "predictor"
         if lowered.endswith(("w0_1", "w0_2")) or "meta_fast" in lowered:
@@ -640,10 +653,7 @@ class _A5ParameterGroupStepAuditor:
         audit: OuterGradientAudit,
     ) -> dict[str, tuple[Tensor, ...]] | None:
         self.last_metrics = {}
-        if (
-            audit.skipped_nonfinite
-            or audit.successful_update_count > self.delta_audit_steps
-        ):
+        if audit.skipped_nonfinite or audit.successful_update_count > self.delta_audit_steps:
             return None
         return {
             name: tuple(parameter.detach().float().clone() for parameter in parameters)
@@ -659,7 +669,7 @@ class _A5ParameterGroupStepAuditor:
             return
         local_l2: list[Tensor] = []
         group_metrics: dict[str, tuple[float, float, float, float, float, int]] = {}
-        for name in self._GROUP_NAMES:
+        for name in self.group_names:
             parameters = self.parameters[name]
             before_values = snapshot.get(name)
             if before_values is None or len(before_values) != len(parameters):
@@ -672,9 +682,7 @@ class _A5ParameterGroupStepAuditor:
             element_count = 0
             for before, parameter in zip(before_values, parameters, strict=True):
                 if before.shape != parameter.shape or before.device != parameter.device:
-                    raise RuntimeError(
-                        f"A5 {name} parameter topology changed across step"
-                    )
+                    raise RuntimeError(f"A5 {name} parameter topology changed across step")
                 delta = parameter.detach().float() - before
                 delta_squared.add_(delta.square().sum(dtype=torch.float64))
                 before_squared.add_(before.square().sum(dtype=torch.float64))
@@ -684,9 +692,7 @@ class _A5ParameterGroupStepAuditor:
             delta_l2 = delta_squared.sqrt().float()
             before_l2 = before_squared.sqrt().float()
             delta_rms = delta_l2 / math.sqrt(element_count)
-            relative_l2 = delta_l2 / before_l2.clamp_min(
-                torch.finfo(torch.float32).tiny
-            )
+            relative_l2 = delta_l2 / before_l2.clamp_min(torch.finfo(torch.float32).tiny)
             nonzero_fraction = nonzero_count.float() / element_count
             local_l2.append(delta_l2)
             group_metrics[name] = (
@@ -703,10 +709,7 @@ class _A5ParameterGroupStepAuditor:
             and torch.distributed.is_initialized()
             and torch.distributed.get_world_size() > 1
         ):
-            gathered = [
-                torch.empty_like(local)
-                for _ in range(torch.distributed.get_world_size())
-            ]
+            gathered = [torch.empty_like(local) for _ in range(torch.distributed.get_world_size())]
             torch.distributed.all_gather(gathered, local)
             reference = gathered[0]
             tolerance = 1.0e-6 + 1.0e-4 * torch.maximum(
@@ -755,8 +758,16 @@ class OuterParameterAudit:
     predictor_trainable_count: int
     transient_parameter_names: tuple[str, ...]
     backbone_registered: bool
+    step_controller_parameter_count: int = 0
+    step_controller_trainable_count: int = 0
+    a5_adaptation_mode: str = "meta_ttt"
+    a5_step_controller_mode: str = "fixed"
 
     def __post_init__(self) -> None:
+        if self.a5_adaptation_mode not in {"meta_ttt", "static_w0"}:
+            raise ValueError("outer parameter audit has an invalid A5 adaptation mode")
+        if self.a5_step_controller_mode not in {"fixed", "learned"}:
+            raise ValueError("outer parameter audit has an invalid step-controller mode")
         if self.total_parameter_count <= 0 or self.trainable_parameter_count <= 0:
             raise ValueError("production outer model exposes no trainable parameters")
         if self.predictor_parameter_count <= 0:
@@ -775,18 +786,41 @@ class OuterParameterAudit:
         ):
             raise ValueError("Qwen/non-Qwen trainable audit does not cover the outer model")
         if self.stage is ProductionStage.A2:
+            if self.a5_step_controller_mode != "fixed" or self.step_controller_parameter_count:
+                raise ValueError("A2 cannot register InnerStepController")
             if self.predictor_trainable_count:
                 raise ValueError("A2 Predictor must remain frozen")
             expected = self.total_parameter_count - self.predictor_parameter_count
             if self.trainable_parameter_count != expected:
                 raise ValueError("A2 must train every registered non-Predictor parameter")
-        else:
+        elif self.a5_adaptation_mode == "meta_ttt":
             if self.qwen_trainable_count <= 0:
                 raise ValueError("A5 must train at least one configured Qwen parameter")
             if self.non_qwen_trainable_count != self.non_qwen_parameter_count:
                 raise ValueError("A5 must train every state, W0, and Predictor parameter")
             if self.predictor_trainable_count != self.predictor_parameter_count:
                 raise ValueError("A5 Predictor must be fully trainable")
+            if self.a5_step_controller_mode == "learned":
+                if (
+                    self.step_controller_parameter_count <= 0
+                    or self.step_controller_trainable_count
+                    != self.step_controller_parameter_count
+                ):
+                    raise ValueError("learned-step A5 must fully train InnerStepController")
+            elif self.step_controller_parameter_count or self.step_controller_trainable_count:
+                raise ValueError("fixed-step A5 must not register InnerStepController")
+        else:
+            if self.a5_step_controller_mode != "fixed" or self.step_controller_parameter_count:
+                raise ValueError("static-W0 must exclude InnerStepController")
+            if self.qwen_trainable_count <= 0:
+                raise ValueError("static-W0 A5 must train configured Qwen parameters")
+            if self.predictor_trainable_count:
+                raise ValueError("static-W0 A5 Predictor must remain frozen")
+            expected_non_qwen = self.non_qwen_parameter_count - self.predictor_parameter_count
+            if self.non_qwen_trainable_count != expected_non_qwen:
+                raise ValueError(
+                    "static-W0 A5 must train every non-Predictor state and W0 parameter"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -798,6 +832,8 @@ class ProductionTrainerRuntime:
     train_dataset: object
     eval_dataset: object | None
     data_collator: Callable[..., object]
+    a5_adaptation_mode: str = "meta_ttt"
+    a5_step_controller_mode: str = "fixed"
     stage_a_loss_step: StageALossStep | None = None
     meta_runner: MetaTTTEpisodeRunner | None = None
     episode_adapter: EpisodeAdapter | None = None
@@ -814,6 +850,16 @@ class ProductionTrainerRuntime:
             raise TypeError("production runtime stage/model is invalid")
         if not callable(self.data_collator):
             raise TypeError("production runtime requires a data collator")
+        if self.a5_adaptation_mode not in {"meta_ttt", "static_w0"}:
+            raise ValueError("production runtime has an invalid A5 adaptation mode")
+        if self.a5_step_controller_mode not in {"fixed", "learned"}:
+            raise ValueError("production runtime has an invalid step-controller mode")
+        if self.stage is ProductionStage.A2 and self.a5_adaptation_mode != "meta_ttt":
+            raise ValueError("A2 cannot select an A5 adaptation mode")
+        if self.stage is ProductionStage.A2 and self.a5_step_controller_mode != "fixed":
+            raise ValueError("A2 cannot select learned InnerStepController")
+        if self.a5_adaptation_mode == "static_w0" and self.a5_step_controller_mode != "fixed":
+            raise ValueError("static-W0 must exclude learned InnerStepController")
         if (
             type(self.semantic_projector_delta_audit_steps) is not int
             or self.semantic_projector_delta_audit_steps < 0
@@ -1248,6 +1294,22 @@ def _set_optional_metric(metrics: dict[str, float], name: str, value: float | No
         metrics[name] = value
 
 
+def _counterfactual_query_selector(optimizer_step: int) -> int:
+    """Select one shared Query ordinal for every rank in an exact-shape bucket."""
+
+    if type(optimizer_step) is not int or optimizer_step <= 0:
+        raise ValueError("counterfactual optimizer step must be a positive integer")
+    return optimizer_step
+
+
+def _counterfactual_all_ranks_eligible(loss_weights: Sequence[float]) -> bool:
+    """Only audit a step when every rank owns a real, non-padding episode."""
+
+    if not loss_weights or any(weight not in (0.0, 1.0) for weight in loss_weights):
+        raise ValueError("counterfactual rank eligibility requires binary loss weights")
+    return all(weight == 1.0 for weight in loss_weights)
+
+
 class TTTQwenTrainerMixin:
     """Mixin dynamically combined with remote ``CustomSeq2SeqTrainer``."""
 
@@ -1264,6 +1326,8 @@ class TTTQwenTrainerMixin:
         self._last_a5_training_seconds: float | None = None
         self._last_optimizer_log_time: float | None = None
         self._last_timed_global_step = -1
+        self._last_counterfactual_metrics: dict[str, float] = {}
+        self._counterfactual_audit_pending = False
         super().__init__(*args, **kwargs)
 
     def _install_a2_deepspeed_gradient_control(self) -> None:
@@ -1354,13 +1418,12 @@ class TTTQwenTrainerMixin:
             global_step = int(getattr(getattr(self, "state", None), "global_step", 0))
             if global_step != self._last_timed_global_step:
                 if self._last_optimizer_log_time is not None:
-                    enriched["a5/optimizer_step_seconds"] = (
-                        now - self._last_optimizer_log_time
-                    )
+                    enriched["a5/optimizer_step_seconds"] = now - self._last_optimizer_log_time
                 self._last_optimizer_log_time = now
                 self._last_timed_global_step = global_step
             if self._last_a5_training_seconds is not None:
                 enriched["a5/training_step_seconds"] = self._last_a5_training_seconds
+            enriched.update(self._last_counterfactual_metrics)
             retrieval_metrics: dict[str, float] = {}
             meta_output = self.last_meta_output
             meta_audit = meta_output.audit
@@ -1383,11 +1446,24 @@ class TTTQwenTrainerMixin:
                     "a5/support_segments_without_query": float(
                         meta_audit.support_segments_without_query
                     ),
-                    "a5/meta_ttt_segment_count": float(
-                        meta_audit.meta_ttt_segment_count
+                    "a5/meta_ttt_segment_count": float(meta_audit.meta_ttt_segment_count),
+                    "a5/outer_only_segment_count": float(meta_audit.outer_only_segment_count),
+                    "a5/static_w0_segment_count": float(meta_audit.static_w0_segment_count),
+                    "a5/ablation/ttt_enabled": float(meta_audit.ttt_enabled),
+                    "a5/ablation/ttt_valid": float(meta_audit.ttt_valid_count > 0),
+                    "a5/ablation/ttt_valid_count": float(meta_audit.ttt_valid_count),
+                    "a5/ablation/predictor_trainable": float(
+                        self.ttt_runtime.a5_adaptation_mode == "meta_ttt"
                     ),
-                    "a5/outer_only_segment_count": float(
-                        meta_audit.outer_only_segment_count
+                    "a5/ablation/predictor_gradient_enabled": float(
+                        self.ttt_runtime.a5_adaptation_mode == "meta_ttt"
+                    ),
+                    "a5/ablation/predictor_parameter_delta_enabled": float(
+                        self.ttt_runtime.a5_adaptation_mode == "meta_ttt"
+                    ),
+                    "a5/ablation/w0_outer_trainable": 1.0,
+                    "a5/ablation/step_controller_learned": float(
+                        self.ttt_runtime.a5_step_controller_mode == "learned"
                     ),
                     "a5/insufficient_inter_query_gap": float(
                         meta_audit.insufficient_inter_query_gap
@@ -1397,34 +1473,18 @@ class TTTQwenTrainerMixin:
                         meta_output.support_auxiliary_loss.item()
                     ),
                     "a5/ttt/raw_mean": meta_audit.support_ttt_raw_mean,
-                    "a5/ttt/outer_effective_mean": (
-                        meta_audit.support_ttt_outer_mean
-                    ),
+                    "a5/ttt/outer_effective_mean": (meta_audit.support_ttt_outer_mean),
                     "a5/ttt/pred_mean": meta_audit.support_pred_mean,
-                    "a5/ttt/identity_weighted_mean": (
-                        meta_audit.support_identity_weighted_mean
-                    ),
-                    "a5/ttt/event_weighted_mean": (
-                        meta_audit.support_event_weighted_mean
-                    ),
+                    "a5/ttt/identity_weighted_mean": (meta_audit.support_identity_weighted_mean),
+                    "a5/ttt/event_weighted_mean": (meta_audit.support_event_weighted_mean),
                     "a5/ttt/temporal_hidden_rms": meta_audit.temporal_hidden_rms,
                     "a5/ttt/temporal_target_rms": meta_audit.temporal_target_rms,
-                    "a5/ttt/temporal_prediction_rms": (
-                        meta_audit.temporal_prediction_rms
-                    ),
+                    "a5/ttt/temporal_prediction_rms": (meta_audit.temporal_prediction_rms),
                     "a5/ttt/temporal_error_rms": meta_audit.temporal_error_rms,
-                    "a5/ttt/temporal_hidden_max_abs": (
-                        meta_audit.temporal_hidden_max_abs
-                    ),
-                    "a5/ttt/temporal_target_max_abs": (
-                        meta_audit.temporal_target_max_abs
-                    ),
-                    "a5/ttt/temporal_prediction_max_abs": (
-                        meta_audit.temporal_prediction_max_abs
-                    ),
-                    "a5/ttt/temporal_error_max_abs": (
-                        meta_audit.temporal_error_max_abs
-                    ),
+                    "a5/ttt/temporal_hidden_max_abs": (meta_audit.temporal_hidden_max_abs),
+                    "a5/ttt/temporal_target_max_abs": (meta_audit.temporal_target_max_abs),
+                    "a5/ttt/temporal_prediction_max_abs": (meta_audit.temporal_prediction_max_abs),
+                    "a5/ttt/temporal_error_max_abs": (meta_audit.temporal_error_max_abs),
                     "a5/ttt/temporal_hidden_element_count": float(
                         meta_audit.temporal_hidden_element_count
                     ),
@@ -1433,12 +1493,52 @@ class TTTQwenTrainerMixin:
                     ),
                 }
             )
+            step_values = tuple(
+                value for update in meta_audit.updates for value in update.step_sizes
+            )
+            if step_values:
+                ordered_steps = sorted(step_values)
+
+                def step_quantile(probability: float) -> float:
+                    index = round(probability * (len(ordered_steps) - 1))
+                    return ordered_steps[index]
+
+                maximum_step = 3.0e-4
+                enriched.update(
+                    {
+                        "a5/step_size/mean": sum(step_values) / len(step_values),
+                        "a5/step_size/p50": step_quantile(0.50),
+                        "a5/step_size/p95": step_quantile(0.95),
+                        "a5/step_size/min": ordered_steps[0],
+                        "a5/step_size/max": ordered_steps[-1],
+                        "a5/step_size/saturation_low_rate": sum(
+                            value <= 0.05 * maximum_step for value in step_values
+                        )
+                        / len(step_values),
+                        "a5/step_size/saturation_high_rate": sum(
+                            value >= 0.95 * maximum_step for value in step_values
+                        )
+                        / len(step_values),
+                    }
+                )
+                by_position: dict[int, list[float]] = {}
+                for segment in meta_audit.segments:
+                    for update in meta_audit.updates:
+                        if (
+                            segment.support_start_index
+                            <= update.support_index
+                            <= segment.support_end_index
+                        ):
+                            position = update.support_index - segment.support_start_index + 1
+                            by_position.setdefault(position, []).extend(update.step_sizes)
+                for position, values in by_position.items():
+                    enriched[f"a5/step_size/by_support_position/{position}"] = (
+                        sum(values) / len(values)
+                    )
             role_norms: dict[str, list[float]] = {}
             role_losses: dict[str, list[float]] = {}
             for query in meta_audit.queries:
-                proxy_norm = math.sqrt(
-                    sum(value * value for value in query.proxy_gradient_norms)
-                )
+                proxy_norm = math.sqrt(sum(value * value for value in query.proxy_gradient_norms))
                 enriched[f"a5/query_weight/{query.query_role}"] = query.query_weight
                 enriched[
                     f"a5/query_proxy_grad_norm/query_{query.query_index}_{query.query_role}"
@@ -1446,57 +1546,65 @@ class TTTQwenTrainerMixin:
                 enriched[
                     f"a5/query_proxy_grad_nonzero/query_{query.query_index}_{query.query_role}"
                 ] = float(query.proxy_gradient_status == "nonzero")
-                status_key = (
-                    f"a5/query_proxy_grad_status/{query.proxy_gradient_status}"
-                )
+                status_key = f"a5/query_proxy_grad_status/{query.proxy_gradient_status}"
                 enriched[status_key] = enriched.get(status_key, 0.0) + 1.0
-                enriched[
-                    f"a5/query_outer_loss/query_{query.query_index}_{query.query_role}"
-                ] = query.weighted_outer_loss
-                role_norms.setdefault(query.query_role, []).append(proxy_norm)
-                role_losses.setdefault(query.query_role, []).append(
+                enriched[f"a5/query_outer_loss/query_{query.query_index}_{query.query_role}"] = (
                     query.weighted_outer_loss
                 )
+                role_norms.setdefault(query.query_role, []).append(proxy_norm)
+                role_losses.setdefault(query.query_role, []).append(query.weighted_outer_loss)
             for role, values in role_norms.items():
                 enriched[f"a5/query_proxy_grad_norm/{role}"] = sum(values) / len(values)
             for role, values in role_losses.items():
                 enriched[f"a5/query_outer_loss/{role}"] = sum(values) / len(values)
             for segment in meta_audit.segments:
-                enriched[
-                    f"a5/deferred_vjp_norm/segment_{segment.segment_index}"
-                ] = segment.deferred_vjp_norm
-                enriched[
-                    f"a5/fast_version_at_query/segment_{segment.segment_index}"
-                ] = float(max(segment.fast_version_at_query))
-                enriched[
-                    f"a5/fast_version_delta/segment_{segment.segment_index}"
-                ] = float(
-                    max(segment.fast_version_at_query)
-                    - max(segment.fast_version_before_segment)
+                enriched[f"a5/deferred_vjp_norm/segment_{segment.segment_index}"] = (
+                    segment.deferred_vjp_norm
                 )
-                enriched[
-                    f"a5/update_count/segment_{segment.segment_index}"
-                ] = float(segment.update_count)
-                enriched[
-                    f"a5/skip_count/segment_{segment.segment_index}"
-                ] = float(segment.skip_count)
-                enriched[
-                    f"a5/query_count/segment_{segment.segment_index}"
-                ] = float(segment.query_count)
-                enriched[
-                    f"a5/meta_ttt_active/segment_{segment.segment_index}"
-                ] = float(segment.training_mode == "meta_ttt")
-                enriched[
-                    f"a5/outer_only/segment_{segment.segment_index}"
-                ] = float(segment.training_mode == "outer_only")
+                enriched[f"a5/fast_version_at_query/segment_{segment.segment_index}"] = float(
+                    max(segment.fast_version_at_query)
+                )
+                enriched[f"a5/fast_version_delta/segment_{segment.segment_index}"] = float(
+                    max(segment.fast_version_at_query) - max(segment.fast_version_before_segment)
+                )
+                enriched[f"a5/update_attempt_count/segment_{segment.segment_index}"] = float(
+                    segment.update_attempt_count
+                )
+                enriched[f"a5/update_count/segment_{segment.segment_index}"] = float(
+                    segment.update_count
+                )
+                enriched[f"a5/skip_count/segment_{segment.segment_index}"] = float(
+                    segment.skip_count
+                )
+                enriched[f"a5/query_count/segment_{segment.segment_index}"] = float(
+                    segment.query_count
+                )
+                enriched[f"a5/meta_ttt_active/segment_{segment.segment_index}"] = float(
+                    segment.training_mode == "meta_ttt"
+                )
+                enriched[f"a5/outer_only/segment_{segment.segment_index}"] = float(
+                    segment.training_mode == "outer_only"
+                )
+                enriched[f"a5/static_w0/segment_{segment.segment_index}"] = float(
+                    segment.training_mode == "static_w0"
+                )
                 for reason, count in segment.skip_reason_counts:
-                    enriched[
-                        f"a5/skip_reason/segment_{segment.segment_index}/{reason}"
-                    ] = float(count)
+                    enriched[f"a5/skip_reason/segment_{segment.segment_index}/{reason}"] = float(
+                        count
+                    )
         enriched.update(self.last_semantic_projector_metrics)
+        step_controller_delta_key = "a5/parameter_delta/step_controller/l2"
+        if step_controller_delta_key in enriched:
+            enriched["a5/step_controller/parameter_delta"] = enriched[
+                step_controller_delta_key
+            ]
         controller = self.ttt_runtime.gradient_controller
         if isinstance(controller, OuterGradientController) and controller.last_audit is not None:
             enriched.update(dict(controller.last_audit.metrics()))
+            if "step_controller" in controller.expected_groups:
+                enriched["a5/step_controller/gradient_norm"] = controller.last_audit.group(
+                    "step_controller"
+                ).pre_clip_norm
         super().log(enriched, *args, **kwargs)  # type: ignore[misc]
 
     def compute_loss(
@@ -1576,6 +1684,16 @@ class TTTQwenTrainerMixin:
         if loss_weight not in (0.0, 1.0):
             raise ValueError("A5 episode loss weight must be one or deterministic-padding zero")
         runner = cast(MetaTTTEpisodeRunner, self.ttt_runtime.meta_runner)
+        counterfactual_config = runner.config.a5.counterfactual_audit
+        trainer_state = getattr(self, "state", None)
+        next_optimizer_step = int(getattr(trainer_state, "global_step", 0)) + 1
+        audit_due_now = bool(
+            counterfactual_config.enabled
+            and next_optimizer_step % counterfactual_config.interval_steps == 0
+        )
+        self._counterfactual_audit_pending = (
+            self._counterfactual_audit_pending or audit_due_now
+        )
         segment_lengths = episode.segment_lengths
         expected_segments = len(segment_lengths)
         expected_backwards = len(episode.query_points) + expected_segments
@@ -1583,6 +1701,36 @@ class TTTQwenTrainerMixin:
             segment_lengths,
             episode.segment_query_counts,
         )
+        counterfactual_request: CounterfactualAuditRequest | None = None
+        if counterfactual_config.enabled and self._counterfactual_audit_pending:
+            local_eligibility = torch.tensor(
+                [loss_weight],
+                dtype=torch.float32,
+                device=self.args.device,  # type: ignore[attr-defined]
+            )
+            gathered_eligibility = self.accelerator.gather(local_eligibility)  # type: ignore[attr-defined]
+            rank_loss_weights = tuple(
+                float(value)
+                for value in gathered_eligibility.detach().cpu().reshape(-1).tolist()
+            )
+            if _counterfactual_all_ranks_eligible(rank_loss_weights):
+                # Every rank in the exact-shape bucket must audit the same Query
+                # ordinal.  A rank-dependent ordinal, or auditing while one rank
+                # is deterministic padding, can interleave local no-grad forwards
+                # with different distributed backward collectives and deadlock.
+                counterfactual_request = CounterfactualAuditRequest(
+                    optimizer_step=next_optimizer_step,
+                    query_selector=_counterfactual_query_selector(next_optimizer_step),
+                )
+                self._counterfactual_audit_pending = False
+            else:
+                trace_event(
+                    "a5_diagnostic_counterfactual_deferred",
+                    optimizer_step=next_optimizer_step,
+                    scheduled_now=audit_due_now,
+                    reason="padding_rank",
+                    rank_loss_weights=rank_loss_weights,
+                )
 
         backward_controller = SegmentBackwardController(
             self.accelerator,  # type: ignore[attr-defined]
@@ -1592,9 +1740,7 @@ class TTTQwenTrainerMixin:
             semantic_projector_delta_audit_steps=(
                 self.ttt_runtime.semantic_projector_delta_audit_steps
             ),
-            a5_parameter_delta_audit_steps=(
-                self.ttt_runtime.a5_parameter_delta_audit_steps
-            ),
+            a5_parameter_delta_audit_steps=(self.ttt_runtime.a5_parameter_delta_audit_steps),
         )
 
         def distributed_backward(loss: Tensor, retain_graph: bool) -> None:
@@ -1607,6 +1753,7 @@ class TTTQwenTrainerMixin:
                 backward=distributed_backward,
                 backward_gradient_scale=backward_controller.proxy_gradient_scale,
                 episode_loss_weight=loss_weight,
+                counterfactual_audit=counterfactual_request,
             )
         finally:
             if callable(end_prefetch):
@@ -1616,6 +1763,7 @@ class TTTQwenTrainerMixin:
         backward_controller.finalize()
         self.last_semantic_projector_metrics = backward_controller.semantic_projector_metrics
         self.last_meta_output = output
+        self._last_counterfactual_metrics = self._gather_counterfactual_metrics(output)
         local_training_seconds = time.perf_counter() - step_started
         timing = torch.tensor(
             [local_training_seconds],
@@ -1626,6 +1774,60 @@ class TTTQwenTrainerMixin:
         self._last_a5_training_seconds = float(gathered_timing.max().item())
         self._observe_runtime_cost(inputs, local_training_seconds)
         return (output.total * loss_weight).detach().to(self.args.device)  # type: ignore[attr-defined]
+
+    def _gather_counterfactual_metrics(
+        self,
+        output: TruncatedMetaTTTEpisodeOutput,
+    ) -> dict[str, float]:
+        references = {
+            item.reference: item
+            for query in output.audit.queries
+            if query.counterfactual is not None
+            for item in query.counterfactual.references
+        }
+        local = torch.zeros((9,), dtype=torch.float64, device=self.args.device)  # type: ignore[attr-defined]
+        if references:
+            if set(references) != {"episode_w0", "segment_start"}:
+                raise RuntimeError("counterfactual audit did not publish both references")
+            local[0] = 1.0
+            for offset, name in ((1, "episode_w0"), (5, "segment_start")):
+                item = references[name]
+                local[offset : offset + 4] = torch.tensor(
+                    (
+                        item.gain_abs,
+                        item.gain_rel,
+                        float(item.gain_abs > 0.0),
+                        item.descent_cosine,
+                    ),
+                    dtype=torch.float64,
+                    device=local.device,
+                )
+        gathered = self.accelerator.gather(local)  # type: ignore[attr-defined]
+        rows = gathered.reshape(int(self.args.world_size), 9)  # type: ignore[attr-defined]
+        count = float(rows[:, 0].sum().item())
+        if count == 0.0:
+            return {}
+        metrics = {"a5/cf/audited_query_count": count}
+        for offset, name in ((1, "episode_w0"), (5, "segment_start")):
+            metrics.update(
+                {
+                    f"a5/cf/query_gain_abs/{name}": float(rows[:, offset].sum().item())
+                    / count,
+                    f"a5/cf/query_gain_rel/{name}": float(
+                        rows[:, offset + 1].sum().item()
+                    )
+                    / count,
+                    f"a5/cf/gain_positive_rate/{name}": float(
+                        rows[:, offset + 2].sum().item()
+                    )
+                    / count,
+                    f"a5/cf/descent_cosine/{name}": float(
+                        rows[:, offset + 3].sum().item()
+                    )
+                    / count,
+                }
+            )
+        return metrics
 
     def _observe_runtime_cost(
         self,
@@ -1768,6 +1970,12 @@ def _run_main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     backbone = load_llamafactory_backbone(arguments[0])
     configured_stage = ProductionStage(backbone.ttt_config.stage)
+    requested_adaptation_mode = os.environ.get("TTT_A5_ADAPTATION_MODE")
+    if (
+        requested_adaptation_mode is not None
+        and requested_adaptation_mode != backbone.ttt_config.a5_adaptation_mode
+    ):
+        raise ValueError("TTT_A5_ADAPTATION_MODE disagrees with ttt_qwen.a5_adaptation_mode")
     trainability_audit = configure_qwen_outer_trainability(
         backbone.model,
         backbone.project_config,
@@ -1785,6 +1993,8 @@ def _run_main(argv: list[str] | None = None) -> int:
     same_stage_resume = resolve_same_stage_resume(
         os.environ.get("TTT_RESUME_CHECKPOINT"),
         configured_stage,
+        a5_adaptation_mode=backbone.ttt_config.a5_adaptation_mode,
+        a5_step_controller_mode=backbone.project_config.fast_ttt.step_controller.mode,
     )
     if same_stage_resume is not None:
         _validate_resume_balance_schema(same_stage_resume)
@@ -1856,7 +2066,15 @@ def _run_main(argv: list[str] | None = None) -> int:
         if checkpoint is None:
             raise RuntimeError("validated A5 config lost initialize_from_a2_checkpoint")
         _validate_resume_balance_schema(Path(checkpoint).expanduser().resolve())
-        checkpoint_audit = initialize_outer_model_from_a2(runtime_raw.model, checkpoint)
+        checkpoint_audit = initialize_outer_model_from_a2(
+            runtime_raw.model,
+            checkpoint,
+            allowed_missing_prefixes=(
+                ("step_controller.",)
+                if backbone.project_config.fast_ttt.step_controller.mode == "learned"
+                else ()
+            ),
+        )
         _reset_a2_to_a5_balance(runtime_raw.model)
     expected_gradient_groups = (
         (
@@ -1875,7 +2093,12 @@ def _run_main(argv: list[str] | None = None) -> int:
             "state_router_time",
             "state_retrieval",
             "w0",
-            "predictor",
+            *(("predictor",) if backbone.ttt_config.a5_adaptation_mode == "meta_ttt" else ()),
+            *(
+                ("step_controller",)
+                if backbone.project_config.fast_ttt.step_controller.mode == "learned"
+                else ()
+            ),
         )
     )
     runtime_raw = replace(
@@ -1883,6 +2106,8 @@ def _run_main(argv: list[str] | None = None) -> int:
         optimizer_factory=make_production_outer_optimizer_factory(
             backbone,
             configured_stage,
+            a5_adaptation_mode=backbone.ttt_config.a5_adaptation_mode,
+            a5_step_controller_mode=backbone.project_config.fast_ttt.step_controller.mode,
         ),
         gradient_controller=OuterGradientController(
             backbone.project_config.outer_gradient_control,
@@ -1891,9 +2116,7 @@ def _run_main(argv: list[str] | None = None) -> int:
         semantic_projector_delta_audit_steps=(
             backbone.ttt_config.semantic_projector_delta_audit_steps
         ),
-        a5_parameter_delta_audit_steps=(
-            backbone.ttt_config.a5_parameter_delta_audit_steps
-        ),
+        a5_parameter_delta_audit_steps=(backbone.ttt_config.a5_parameter_delta_audit_steps),
         operator_diagnostics_interval=backbone.ttt_config.operator_diagnostics_interval,
         train_sampler_factory=(
             lambda dataset, rank, world_size: build_production_train_sampler(
@@ -1938,8 +2161,24 @@ def _run_main(argv: list[str] | None = None) -> int:
     trainer = cast(Any, build_production_trainer(backbone, runtime_raw))
     output_dir = Path(str(training_args.output_dir))
     artifact_root = Path(os.environ.get("RUN_ROOT", str(output_dir)))
+    sequence_audit: tuple[str, int] | None = None
+    if configured_stage is ProductionStage.A5:
+        # The sampler synchronizes its runtime-cost EMA when advancing epochs. Every rank
+        # must therefore execute this preflight in the same collective order; running it
+        # only on world rank zero races DeepSpeed's process-group construction on peers.
+        sequence_audit = _a5_global_sample_sequence_sha256(
+            train_dataset,
+            runtime_raw.train_sampler_factory,
+            epoch_count=float(training_args.num_train_epochs),
+        )
     if trainer.is_world_process_zero():
         environment = environment_manifest(backbone)
+        if configured_stage is ProductionStage.A5:
+            if sequence_audit is None:
+                raise RuntimeError("A5 sample-sequence audit was not computed")
+            sequence_sha256, sequence_count = sequence_audit
+            environment["a5_global_sample_sequence_sha256"] = sequence_sha256
+            environment["a5_global_sample_sequence_count"] = sequence_count
         environment["qwen_trainability_audit"] = asdict(trainability_audit)
         if full_unfreeze_audit is not None:
             environment["full_unfreeze_audit"] = asdict(full_unfreeze_audit)
@@ -1950,6 +2189,8 @@ def _run_main(argv: list[str] | None = None) -> int:
             checkpoint_environment["checkpoint"] = str(checkpoint_audit.checkpoint)
         environment["a2_initialization_audit"] = checkpoint_environment
         _write_json(artifact_root / "environment.json", environment)
+    if configured_stage is ProductionStage.A5:
+        trainer.accelerator.wait_for_everyone()
     try:
         result = trainer.train(
             resume_from_checkpoint=None if same_stage_resume is None else str(same_stage_resume)
@@ -1966,6 +2207,8 @@ def _run_main(argv: list[str] | None = None) -> int:
                 {
                     "status": "smoke_completed",
                     "stage": runtime_raw.stage.value,
+                    "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
+                    "a5_step_controller_mode": runtime_raw.a5_step_controller_mode,
                     "global_step": int(trainer.state.global_step),
                     "elapsed_seconds": time.monotonic() - started,
                     "metrics": result.metrics,
@@ -1993,6 +2236,8 @@ def _run_main(argv: list[str] | None = None) -> int:
                 {
                     "status": "completed",
                     "stage": runtime_raw.stage.value,
+                    "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
+                    "a5_step_controller_mode": runtime_raw.a5_step_controller_mode,
                     "global_step": int(trainer.state.global_step),
                     "elapsed_seconds": time.monotonic() - started,
                     "metrics": result.metrics,
@@ -2035,6 +2280,8 @@ def _run_main(argv: list[str] | None = None) -> int:
             {
                 "status": "completed",
                 "stage": runtime_raw.stage.value,
+                "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
+                "a5_step_controller_mode": runtime_raw.a5_step_controller_mode,
                 "global_step": int(trainer.state.global_step),
                 "elapsed_seconds": time.monotonic() - started,
                 "metrics": result.metrics,
@@ -2206,6 +2453,9 @@ def _validate_checkpoint_tree(checkpoint: Path) -> None:
 def resolve_same_stage_resume(
     checkpoint: str | None,
     stage: ProductionStage,
+    *,
+    a5_adaptation_mode: str = "meta_ttt",
+    a5_step_controller_mode: str = "fixed",
 ) -> Path | None:
     """Validate a standard Trainer checkpoint without conflating it with A2→A5 init."""
 
@@ -2236,6 +2486,17 @@ def resolve_same_stage_resume(
     raw = cast(object, json.loads(run_config.read_text(encoding="utf-8")))
     if not isinstance(raw, dict) or raw.get("stage") != stage.value:
         raise ValueError("resume checkpoint stage does not match the configured production stage")
+    if stage is ProductionStage.A5:
+        checkpoint_mode = raw.get("a5_adaptation_mode", "meta_ttt")
+        if checkpoint_mode != a5_adaptation_mode:
+            raise ValueError(
+                "resume checkpoint A5 adaptation mode does not match the configured mode"
+            )
+        checkpoint_step_mode = raw.get("a5_step_controller_mode", "fixed")
+        if checkpoint_step_mode != a5_step_controller_mode:
+            raise ValueError(
+                "resume checkpoint step-controller mode does not match the configured mode"
+            )
     return root
 
 
@@ -2299,6 +2560,9 @@ def _audit_outer_parameters(
     predictor = tuple(
         (name, parameter) for name, parameter in named if "predictor" in name.casefold()
     )
+    step_controller = tuple(
+        (name, parameter) for name, parameter in named if "step_controller" in name.casefold()
+    )
     transient = tuple(
         name
         for name, _ in named
@@ -2306,14 +2570,14 @@ def _audit_outer_parameters(
     )
     backbone_ids = {id(parameter) for parameter in backbone.model.parameters()}
     runtime_ids = {id(parameter) for _, parameter in named}
-    qwen = tuple(
-        (name, parameter) for name, parameter in named if id(parameter) in backbone_ids
-    )
+    qwen = tuple((name, parameter) for name, parameter in named if id(parameter) in backbone_ids)
     non_qwen = tuple(
         (name, parameter) for name, parameter in named if id(parameter) not in backbone_ids
     )
     return OuterParameterAudit(
         stage=runtime.stage,
+        a5_adaptation_mode=runtime.a5_adaptation_mode,
+        a5_step_controller_mode=runtime.a5_step_controller_mode,
         total_parameter_count=sum(parameter.numel() for _, parameter in named),
         trainable_parameter_count=sum(
             parameter.numel() for _, parameter in named if parameter.requires_grad
@@ -2330,6 +2594,14 @@ def _audit_outer_parameters(
         predictor_trainable_count=sum(
             parameter.numel() for _, parameter in predictor if parameter.requires_grad
         ),
+        step_controller_parameter_count=sum(
+            parameter.numel() for _, parameter in step_controller
+        ),
+        step_controller_trainable_count=sum(
+            parameter.numel()
+            for _, parameter in step_controller
+            if parameter.requires_grad
+        ),
         transient_parameter_names=transient,
         backbone_registered=bool(backbone_ids) and backbone_ids <= runtime_ids,
     )
@@ -2338,7 +2610,20 @@ def _audit_outer_parameters(
 def make_production_outer_optimizer_factory(
     backbone: LlamaFactoryBackboneBundle,
     stage: ProductionStage,
+    *,
+    a5_adaptation_mode: str = "meta_ttt",
+    a5_step_controller_mode: str = "fixed",
 ) -> Callable[[nn.Module], torch.optim.Optimizer]:
+    if a5_adaptation_mode not in {"meta_ttt", "static_w0"}:
+        raise ValueError("A5 adaptation mode must be meta_ttt or static_w0")
+    if stage is ProductionStage.A2 and a5_adaptation_mode != "meta_ttt":
+        raise ValueError("A2 cannot select an A5 adaptation mode")
+    if a5_step_controller_mode not in {"fixed", "learned"}:
+        raise ValueError("A5 step-controller mode must be fixed or learned")
+    if stage is ProductionStage.A2 and a5_step_controller_mode != "fixed":
+        raise ValueError("A2 cannot select learned InnerStepController")
+    if a5_adaptation_mode == "static_w0" and a5_step_controller_mode != "fixed":
+        raise ValueError("static-W0 cannot select learned InnerStepController")
     qwen_ids = {id(parameter) for parameter in backbone.model.parameters()}
     training_args = cast(Any, backbone.training_args)
     if stage is ProductionStage.A2:
@@ -2346,12 +2631,14 @@ def make_production_outer_optimizer_factory(
         state_lr = backbone.project_config.a2.optimizer.state_learning_rate
         w0_lr = backbone.project_config.a2.optimizer.w0_learning_rate
         predictor_lr = state_lr
+        step_controller_lr = state_lr
     else:
         qwen_lr = float(training_args.learning_rate)
         optimizer = backbone.project_config.a5.optimizer
         state_lr = optimizer.state_learning_rate
         w0_lr = optimizer.w0_learning_rate
         predictor_lr = optimizer.predictor_learning_rate
+        step_controller_lr = optimizer.step_controller_learning_rate
 
     def factory(model: nn.Module) -> torch.optim.Optimizer:
         groups: dict[str, list[nn.Parameter]] = {
@@ -2362,6 +2649,7 @@ def make_production_outer_optimizer_factory(
             "state_retrieval": [],
             "w0": [],
             "predictor": [],
+            "step_controller": [],
         }
         ownership: dict[int, str] = {}
         for name, parameter in model.named_parameters(remove_duplicate=False):
@@ -2373,6 +2661,8 @@ def make_production_outer_optimizer_factory(
                 raise ValueError("transient W_t cannot enter the Outer optimizer")
             if parameter_id in qwen_ids:
                 group = "qwen"
+            elif "step_controller" in lowered:
+                group = "step_controller"
             elif "predictor" in lowered:
                 group = "predictor"
             elif lowered.endswith(("w0_1", "w0_2")) or "meta_fast" in lowered:
@@ -2407,8 +2697,15 @@ def make_production_outer_optimizer_factory(
             raise ValueError(f"Outer AdamW requires non-empty formal groups: {empty}")
         if stage is ProductionStage.A2 and groups["predictor"]:
             raise ValueError("A2 Outer AdamW cannot own Predictor")
-        if stage is ProductionStage.A5 and not groups["predictor"]:
-            raise ValueError("A5 Outer AdamW must own Predictor")
+        if stage is ProductionStage.A5:
+            if a5_adaptation_mode == "meta_ttt" and not groups["predictor"]:
+                raise ValueError("Meta-TTT A5 Outer AdamW must own Predictor")
+            if a5_adaptation_mode == "static_w0" and groups["predictor"]:
+                raise ValueError("static-W0 A5 Outer AdamW cannot own Predictor")
+            if a5_step_controller_mode == "learned" and not groups["step_controller"]:
+                raise ValueError("learned-step A5 Outer AdamW must own InnerStepController")
+            if a5_step_controller_mode == "fixed" and groups["step_controller"]:
+                raise ValueError("fixed-step A5 Outer AdamW cannot own InnerStepController")
         semantic_projector_ids = {
             id(parameter)
             for name, parameter in model.named_parameters(remove_duplicate=False)
@@ -2433,6 +2730,7 @@ def make_production_outer_optimizer_factory(
             "state_retrieval": state_lr,
             "w0": w0_lr,
             "predictor": predictor_lr,
+            "step_controller": step_controller_lr,
         }
         parameter_groups: list[dict[str, Any]] = [
             {
@@ -2449,7 +2747,15 @@ def make_production_outer_optimizer_factory(
             "w0": w0_lr * float(caps.w0),
             **(
                 {"predictor": predictor_lr * float(caps.predictor)}
-                if stage is ProductionStage.A5
+                if stage is ProductionStage.A5 and a5_adaptation_mode == "meta_ttt"
+                else {}
+            ),
+            **(
+                {
+                    "step_controller": step_controller_lr
+                    * float(caps.step_controller)
+                }
+                if stage is ProductionStage.A5 and a5_step_controller_mode == "learned"
                 else {}
             ),
         }
@@ -2457,7 +2763,9 @@ def make_production_outer_optimizer_factory(
             not math.isclose(value, reference_budget, rel_tol=1.0e-6)
             for value in independent_budgets.values()
         ):
-            raise ValueError("Qwen/W0/Predictor update-norm budgets must remain aligned")
+            raise ValueError(
+                "Qwen/W0/Predictor/StepController update-norm budgets must remain aligned"
+            )
         state_names = (
             "state_shared",
             "state_task",
@@ -2499,6 +2807,37 @@ def _reset_a2_to_a5_balance(model: nn.Module) -> None:
     if not isinstance(balancer, OfficialWeakOuterLossComposer):
         raise RuntimeError("A5 outer model lost the official-weak EMA reset boundary")
     balancer.reset_ema()
+
+
+def _a5_global_sample_sequence_sha256(
+    dataset: object,
+    sampler_factory: TrainSamplerFactory | None,
+    *,
+    epoch_count: float,
+) -> tuple[str, int]:
+    """Hash the exact four-rank global A5 record sequence before training starts."""
+
+    if sampler_factory is None:
+        raise RuntimeError("A5 sample-sequence audit requires the production sampler")
+    if not math.isfinite(epoch_count) or epoch_count <= 0.0 or not epoch_count.is_integer():
+        raise ValueError("A5 sample-sequence audit requires an integer epoch count")
+    sampler = sampler_factory(dataset, 0, 4)
+    set_epoch = getattr(sampler, "set_epoch", None)
+    if not callable(set_epoch):
+        raise TypeError("A5 sample-sequence audit requires an epoch-aware sampler")
+    digest = hashlib.sha256()
+    count = 0
+    for epoch in range(int(epoch_count)):
+        set_epoch(epoch)
+        for index in cast(Iterable[int], sampler):
+            record = cast(Any, dataset)[index]
+            if not isinstance(record, A5EpisodeRecord):
+                raise TypeError("A5 sample-sequence audit encountered a non-A5 record")
+            digest.update(f"{epoch}\t{record.episode_id}\n".encode())
+            count += 1
+    if count <= 0:
+        raise RuntimeError("A5 sample-sequence audit produced no records")
+    return digest.hexdigest(), count
 
 
 def _write_json(path: Path, value: object) -> None:

@@ -33,6 +33,7 @@ if [[ ! -f "$PARTIAL_YAML" ]]; then
 fi
 
 export YAML="$PARTIAL_YAML"
+export TTT_PROJECT_CONFIG="${TTT_PROJECT_CONFIG:-$PROJECT_ROOT/configs/model_state_ttt_8b.yaml}"
 export TTT_H200_VENV="${TTT_H200_VENV:-$PLAY_ROOT/projects/ttt_qwen/.venv-h200-uv-py312-torch28}"
 export TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"
 export TTT_PREPROCESS_CACHE_ROOT="${TTT_PREPROCESS_CACHE_ROOT:-$PLAY_ROOT/projects/ttt_qwen/.cache/preprocess/260726_a5_support_aligned_v3_fp16}"
@@ -44,7 +45,7 @@ if [[ -n "${TTT_SMOKE_MAX_STEPS:-}" ]]; then
   # therefore does not synchronize the hot path per event.
   export TTT_DATALOADER_TRACE="${TTT_DATALOADER_TRACE:-1}"
 else
-  export TTT_CHECKPOINT_POLICY="epoch_2_and_epoch_4"
+  export TTT_CHECKPOINT_POLICY="${TTT_CHECKPOINT_POLICY:-epoch_2_and_epoch_4}"
 fi
 export RUN_ID="${RUN_ID:-$(date +%y%m%d_%H%M%S)_a5_k8_vithalf_decoder8_4h200}"
 export SESSION="${SESSION:-a5_k8_vithalf_decoder8_${RUN_ID}}"

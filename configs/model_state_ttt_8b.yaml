@@ -74,6 +74,12 @@ fast_ttt:
     grad_clip_norm: 1.0
     reset_per_video: true
     meta_gradient_mode: full_second_order
+  step_controller:
+    mode: fixed
+    input_dim: 7
+    hidden_dim: 32
+    maximum_step_size: 3.0e-4
+    initial_step_size: 1.0e-4
 
 spatial_encoder:
   input_dim: 4096
@@ -477,6 +483,7 @@ outer_gradient_control:
     state_retrieval: 0.05
     w0: 0.1
     predictor: 0.1
+    step_controller: 0.05
   nonfinite_policy: skip_update
   audit_steps: 32
 
@@ -493,6 +500,14 @@ a5:
     state_learning_rate: 5.0e-5
     w0_learning_rate: 5.0e-5
     predictor_learning_rate: 5.0e-5
+    step_controller_learning_rate: 1.0e-4
+  counterfactual_audit:
+    enabled: false
+    interval_steps: 8
+    queries_per_rank: 1
+    references:
+      - episode_w0
+      - segment_start
 
 inference:
   audit_level: boundary

@@ -79,7 +79,7 @@ class OptimizerRuntimeState:
     def __post_init__(self) -> None:
         fixed = (
             self.optimizer_name == "sgd"
-            and self.learning_rate == 1.0e-4
+            and self.learning_rate in {1.0e-4, 2.0e-4}
             and self.momentum == 0.0
             and self.weight_decay == 0.0
             and self.steps_per_chunk == 1
