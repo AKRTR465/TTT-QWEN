@@ -1393,6 +1393,39 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
     assert "<dataset_manifest.json>" in launcher
 
 
+def test_a5_associative_lttt_finalonly_launcher_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[1]
+    for key, value in {
+        "OUTPUT_DIR": "/tmp/output",
+        "SVCBENCH_DATASET_MANIFEST": "/tmp/v4_manifest.json",
+        "A2_CHECKPOINT": "/tmp/a2-final",
+        "MODEL": "/tmp/qwen3vl8b",
+        "DATASET_DIR": "/tmp/svcbench",
+        "DATASET_NAME": "svcbench_qwen3vl_sft",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    native, extension = load_training_yaml(
+        root / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
+    )
+    launcher = (
+        root / "scripts/h200/train_a5_associative_lttt_finalonly.sh"
+    ).read_text(encoding="utf-8")
+
+    assert native["num_train_epochs"] == 4.0
+    assert extension.stage == "a5"
+    assert extension.a5_adaptation_mode == "meta_ttt"
+    assert extension.initialize_from_a2_checkpoint == "/tmp/a2-final"
+    assert 'TTT_A5_ADAPTATION_MODE="meta_ttt"' in launcher
+    assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
+    assert "a5_dense_querybundle_train_support_statequery_fp16_v4" in launcher
+    assert 'TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"' in launcher
+    assert "[[ $# -eq 2 ]] || usage" in launcher
+    assert 'train_a2_a5.sh" a5 "$@"' in launcher
+
+
 def test_a5_static_w0_yaml_and_launcher_match_meta_ttt_data_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
