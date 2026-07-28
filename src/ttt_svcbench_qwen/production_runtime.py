@@ -28,6 +28,10 @@ import transformers
 from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
 
+from ttt_svcbench_qwen.associative_ttt import (
+    AssociativeTTTIntermediates,
+    FastAssociativeContext,
+)
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.episode_data import (
@@ -37,7 +41,7 @@ from ttt_svcbench_qwen.episode_data import (
     ProductionQueryRecord,
     adaptive_support_schedule,
 )
-from ttt_svcbench_qwen.fast_ttt import build_fast_ttt_adapter
+from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter, build_fast_ttt_adapter
 from ttt_svcbench_qwen.identity_bank import build_identity_bank
 from ttt_svcbench_qwen.input_composer import (
     ComposedInput,
@@ -48,8 +52,6 @@ from ttt_svcbench_qwen.input_composer import (
 from ttt_svcbench_qwen.losses import (
     AnswerLossInput,
     ReaderCountMetricInput,
-    TemporalPredictor,
-    build_temporal_predictor,
     compute_answer_loss,
 )
 from ttt_svcbench_qwen.meta_trainer import (
@@ -1275,6 +1277,17 @@ class ProductionQueryRuntime(nn.Module):  # type: ignore[misc]
 
 
 class FastVisualPassThrough:
+    """Bind context to the Fast Adapter already executed inside Qwen vision."""
+
+    def __init__(self, adapter: FastTTTAdapter) -> None:
+        self.adapter = adapter
+
+    def use_associative_context(self, context: FastAssociativeContext) -> object:
+        return self.adapter.use_associative_context(context)
+
+    def consume_associative_intermediates(self) -> AssociativeTTTIntermediates:
+        return self.adapter.consume_associative_intermediates()
+
     def __call__(
         self,
         visual: VisualStageOutput,
@@ -1571,13 +1584,11 @@ class ProductionOuterModel(nn.Module):  # type: ignore[misc]
     def __init__(
         self,
         state_model: StateTTTModel,
-        predictor: TemporalPredictor,
         qwen_model: nn.Module,
         official_weak_balancer: OfficialWeakOuterLossComposer | None = None,
     ) -> None:
         super().__init__()
         self.state_model = state_model
-        self.predictor = predictor
         if official_weak_balancer is not None:
             self.official_weak_balancer = official_weak_balancer
         # Qwen is already registered below ``state_model``.  Keep only a weak reference here so
@@ -2456,6 +2467,11 @@ def build_runtime(
         support_prefetch_depth = (1 + config.segment_prefetch_depth) * project.a5.truncation_horizon
     support_decode_coalesce = config.support_decode_coalesce
     fast = build_fast_ttt_adapter(project)
+    associative_trainable = (
+        stage is ProductionStage.A5 and config.a5_adaptation_mode == "meta_ttt"
+    )
+    for parameter in fast.collect_associative_parameters():
+        parameter.requires_grad_(associative_trainable)
     qwen = Qwen3VLAdapter(
         backbone.model,
         project,
@@ -2493,7 +2509,7 @@ def build_runtime(
             composer=_compose_production_inputs,
             qwen_prefill=qwen_runtime,
             qwen_generate=qwen_runtime,
-            fast_adapter=FastVisualPassThrough(),
+            fast_adapter=FastVisualPassThrough(fast),
             spatial_encoder=spatial,
             temporal_encoder=temporal,
             observation_heads=observations,
@@ -2505,11 +2521,9 @@ def build_runtime(
         ),
         ModelFeatureFlags(),
     )
-    predictor = build_temporal_predictor(project.predictor)
     official_weak_balancer = OfficialWeakOuterLossComposer(project.loss.official_weak_balance)
     outer = ProductionOuterModel(
         state_model,
-        predictor,
         backbone.model,
         official_weak_balancer,
     )
@@ -2525,7 +2539,6 @@ def build_runtime(
             preprocess_cache=preprocess_cache,
             prepared_episode_max_bytes=config.prepared_episode_max_bytes,
         )
-        predictor.requires_grad_(False)
         world_size = int(getattr(backbone.training_args, "world_size", 1))
         graph_anchor_parameters = (
             tuple(parameter for parameter in outer.parameters() if parameter.requires_grad)
@@ -2566,12 +2579,10 @@ def build_runtime(
         maximum_pixels=maximum_pixels,
         preprocess_cache=preprocess_cache,
     )
-    predictor.requires_grad_(config.a5_adaptation_mode == "meta_ttt")
     meta_runner = MetaTTTEpisodeRunner(
         config=project,
         model=state_model,
         fast_controller=fast,
-        predictor=predictor,
         runtime_resetter=lambda owner: _reset_meta_runtime(writer, owner),
         query_encoder_reuse=config.query_encoder_reuse,
         raw_support_visual_batcher=qwen_runtime.prepare_raw_support_batch,
@@ -2670,7 +2681,7 @@ def build_inference_runtime_bundle(
             composer=_compose_production_inputs,
             qwen_prefill=qwen_runtime,
             qwen_generate=qwen_runtime,
-            fast_adapter=FastVisualPassThrough(),
+            fast_adapter=FastVisualPassThrough(fast),
             spatial_encoder=ProductionSpatialRuntime(build_spatial_encoder(config)),
             temporal_encoder=ProductionTemporalRuntime(build_temporal_encoder(config)),
             observation_heads=ProductionObservationRuntime(build_observation_heads(config)),
@@ -2682,10 +2693,8 @@ def build_inference_runtime_bundle(
         ),
         ModelFeatureFlags(),
     )
-    predictor = build_temporal_predictor(config.predictor)
     outer = ProductionOuterModel(
         state_model,
-        predictor,
         qwen_model,
         OfficialWeakOuterLossComposer(config.loss.official_weak_balance),
     )
@@ -2708,7 +2717,7 @@ def build_inference_runtime_bundle(
         state_model=state_model,
         outer_model=outer,
         manager=manager,
-        updater=OnlineTTTUpdater(config, predictor),
+        updater=OnlineTTTUpdater(config),
         processor=processor,
         tokenizer=tokenizer,
         video_materializer=materializer,

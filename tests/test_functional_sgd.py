@@ -8,6 +8,10 @@ import pytest
 import torch
 from torch import Tensor
 
+from ttt_svcbench_qwen.associative_ttt import (
+    AssociativeScaleAudit,
+    AssociativeTTTLossOutput,
+)
 from ttt_svcbench_qwen.config import InnerSGDConfig, load_config
 from ttt_svcbench_qwen.fast_ttt import (
     FastWeightsState,
@@ -19,17 +23,10 @@ from ttt_svcbench_qwen.functional_sgd import (
     GradientMode,
     UpdateSkipReason,
     functional_sgd_step,
-    functional_sgd_step_from_ttt_row,
-    functional_sgd_steps_from_ttt,
+    functional_sgd_step_from_associative_row,
+    functional_sgd_steps_from_associative,
     initialize_optimizer_state,
     reset_optimizer_state,
-)
-from ttt_svcbench_qwen.losses import (
-    IdentityConsistencyAudit,
-    LossSkipReason,
-    LossTerm,
-    TemporalPredictionScaleAudit,
-    TTTLossOutput,
 )
 
 MATRIX_SIZE = 768
@@ -74,67 +71,28 @@ def storage_pointer(tensor: Tensor) -> int:
     return int(tensor.untyped_storage().data_ptr())
 
 
-def make_ttt_output(
+def make_associative_output(
     states: tuple[FastWeightsState, ...],
     valid: tuple[bool, ...],
-) -> TTTLossOutput:
+) -> AssociativeTTTLossOutput:
     row_losses = torch.stack([state.w_t_1.sum() + state.w_t_2.sum() for state in states]).float()
     valid_mask = torch.tensor(valid, dtype=torch.bool)
     counts = valid_mask.to(torch.int64)
     per_row = torch.where(valid_mask, row_losses, torch.zeros_like(row_losses))
-    pred = LossTerm(
-        value=per_row[valid_mask].mean() if any(valid) else per_row.sum() * 0.0,
-        per_row=per_row,
-        row_valid_mask=valid_mask,
-        valid_counts=counts,
-        mask_counts=counts.clone(),
-        skip_reasons=tuple(
-            None if is_valid else LossSkipReason.INSUFFICIENT_TIME for is_valid in valid
-        ),
-    )
-    zero_rows = row_losses * 0.0
-    zero_counts = torch.zeros_like(counts)
-
-    def zero_term(reason: LossSkipReason) -> LossTerm:
-        return LossTerm(
-            value=zero_rows.sum() * 0.0,
-            per_row=zero_rows,
-            row_valid_mask=torch.zeros_like(valid_mask),
-            valid_counts=zero_counts,
-            mask_counts=zero_counts.clone(),
-            skip_reasons=(reason,) * len(states),
-        )
-
-    identity = zero_term(LossSkipReason.NO_RELIABLE_MATCH)
-    e1 = zero_term(LossSkipReason.NO_ALIGNED_EVENT)
-    e2 = zero_term(LossSkipReason.NO_ALIGNED_EVENT)
-    event = zero_term(LossSkipReason.NO_ALIGNED_EVENT)
-    return TTTLossOutput(
-        pred=pred,
-        identity=identity,
-        e1_event=e1,
-        e2_event=e2,
-        event=event,
+    zero = row_losses.detach().new_zeros(())
+    return AssociativeTTTLossOutput(
         total=per_row[valid_mask].mean() if any(valid) else per_row.sum() * 0.0,
         per_row_total=per_row,
         update_valid_mask=valid_mask,
-        identity_audit=IdentityConsistencyAudit(
-            matched_counts=zero_counts,
-            mismatch_counts=zero_counts.clone(),
-            duplicate_counts=zero_counts.clone(),
-            low_confidence_counts=zero_counts.clone(),
-            invalid_source_counts=zero_counts.clone(),
-            padding_counts=zero_counts.clone(),
-        ),
-        temporal_scale_audit=TemporalPredictionScaleAudit(
-            hidden_sum_squares=torch.zeros((), dtype=torch.float32),
-            hidden_element_count=torch.zeros((), dtype=torch.int64),
-            hidden_max_abs=torch.zeros((), dtype=torch.float32),
-            target_sum_squares=torch.zeros((), dtype=torch.float32),
+        valid_token_counts=counts,
+        scale_audit=AssociativeScaleAudit(
+            key_sum_squares=zero.clone(),
+            value_sum_squares=zero.clone(),
             prediction_sum_squares=torch.zeros((), dtype=torch.float32),
             error_sum_squares=torch.zeros((), dtype=torch.float32),
-            pair_element_count=torch.zeros((), dtype=torch.int64),
-            target_max_abs=torch.zeros((), dtype=torch.float32),
+            element_count=torch.zeros((), dtype=torch.int64),
+            key_max_abs=zero.clone(),
+            value_max_abs=zero.clone(),
             prediction_max_abs=torch.zeros((), dtype=torch.float32),
             error_max_abs=torch.zeros((), dtype=torch.float32),
         ),
@@ -147,7 +105,7 @@ def step(
     config: InnerSGDConfig,
     optimizer: OptimizerRuntimeState | None = None,
     *,
-    valid_term_count: int = 1,
+    valid_token_count: int = 1,
     invalid_reason: UpdateSkipReason | None = None,
 ) -> FunctionalSGDResult:
     return functional_sgd_step(
@@ -155,7 +113,7 @@ def step(
         fast_state=state,
         optimizer_config=config,
         optimizer_state=optimizer or initialize_optimizer_state(config),
-        valid_term_count=valid_term_count,
+        valid_token_count=valid_token_count,
         invalid_reason=invalid_reason,
     )
 
@@ -221,7 +179,7 @@ def test_joint_fp32_global_norm_clips_both_matrices_to_one(
 
 @pytest.mark.parametrize(
     "reason",
-    (UpdateSkipReason.NO_VALID_TERM, UpdateSkipReason.INSUFFICIENT_TIME),
+    (UpdateSkipReason.NO_VALID_TOKEN, UpdateSkipReason.NO_VALID_TOKEN),
 )
 def test_invalid_terms_skip_without_autograd_and_advance_audit_only(
     reason: UpdateSkipReason,
@@ -234,7 +192,7 @@ def test_invalid_terms_skip_without_autograd_and_advance_audit_only(
         state,
         None,
         optimizer_config,
-        valid_term_count=0,
+        valid_token_count=0,
         invalid_reason=reason,
     )
 
@@ -259,8 +217,8 @@ def test_invalid_terms_skip_without_autograd_and_advance_audit_only(
 
 def test_functional_sgd_public_signatures_have_no_step_override() -> None:
     assert "step_size" not in inspect.signature(functional_sgd_step).parameters
-    assert "step_size" not in inspect.signature(functional_sgd_step_from_ttt_row).parameters
-    assert "step_sizes" not in inspect.signature(functional_sgd_steps_from_ttt).parameters
+    assert "step_size" not in inspect.signature(functional_sgd_step_from_associative_row).parameters
+    assert "step_sizes" not in inspect.signature(functional_sgd_steps_from_associative).parameters
 
 
 def test_nonfinite_loss_skips_before_gradient_computation(
@@ -368,15 +326,15 @@ def test_attempted_update_accounting_and_optimizer_reset(
         None,
         optimizer_config,
         first.optimizer_state,
-        valid_term_count=0,
-        invalid_reason=UpdateSkipReason.NO_VALID_TERM,
+        valid_token_count=0,
+        invalid_reason=UpdateSkipReason.NO_VALID_TOKEN,
     )
     reset = reset_optimizer_state(optimizer_config)
 
     assert second.fast_state.update_count == 1
     assert second.fast_state.skip_count == 1
     assert second.optimizer_state.attempted_update_count == 2
-    assert second.optimizer_state.last_skip_reason == UpdateSkipReason.NO_VALID_TERM.value
+    assert second.optimizer_state.last_skip_reason == UpdateSkipReason.NO_VALID_TOKEN.value
     assert reset.attempted_update_count == 0
     assert reset.last_skip_reason is None
 
@@ -396,8 +354,8 @@ def test_p5_fast_and_optimizer_reset_jointly_restore_w0_and_all_counters() -> No
         None,
         optimizer_config,
         updated.optimizer_state,
-        valid_term_count=0,
-        invalid_reason=UpdateSkipReason.NO_VALID_TERM,
+        valid_token_count=0,
+        invalid_reason=UpdateSkipReason.NO_VALID_TOKEN,
     )
     pre_reset_storage = tuple(
         storage_pointer(value) for value in skipped.fast_state.fast_parameters
@@ -433,8 +391,8 @@ def test_two_video_update_and_skip_are_storage_and_counter_isolated(
         second,
         None,
         optimizer_config,
-        valid_term_count=0,
-        invalid_reason=UpdateSkipReason.NO_VALID_TERM,
+        valid_token_count=0,
+        invalid_reason=UpdateSkipReason.NO_VALID_TOKEN,
     )
 
     assert updated.fast_state.update_count == 1
@@ -453,11 +411,11 @@ def test_typed_ttt_batch_bridge_derives_mixed_row_update_and_skip(
     optimizer_config: InnerSGDConfig,
 ) -> None:
     states = (make_state(value=0.0), make_state(value=0.5))
-    ttt_output = make_ttt_output(states, (True, False))
+    ttt_output = make_associative_output(states, (True, False))
     optimizers = tuple(initialize_optimizer_state(optimizer_config) for _ in states)
 
-    results = functional_sgd_steps_from_ttt(
-        ttt_output=ttt_output,
+    results = functional_sgd_steps_from_associative(
+        associative_output=ttt_output,
         fast_states=states,
         optimizer_config=optimizer_config,
         optimizer_states=optimizers,
@@ -465,12 +423,12 @@ def test_typed_ttt_batch_bridge_derives_mixed_row_update_and_skip(
 
     updated, skipped = results
     assert updated.did_update is True
-    assert updated.valid_term_count == 1
+    assert updated.valid_token_count == 1
     assert updated.fast_state.update_count == 1
     assert updated.fast_state.skip_count == 0
     assert skipped.did_update is False
-    assert skipped.skip_reason is UpdateSkipReason.INSUFFICIENT_TIME
-    assert skipped.valid_term_count == 0
+    assert skipped.skip_reason is UpdateSkipReason.NO_VALID_TOKEN
+    assert skipped.valid_token_count == 0
     assert skipped.fast_state.update_count == 0
     assert skipped.fast_state.skip_count == 1
     assert torch.equal(skipped.fast_state.w_t_1, states[1].w_t_1)
@@ -482,17 +440,17 @@ def test_typed_ttt_batch_bridge_retains_one_shared_graph_between_valid_rows(
     optimizer_config: InnerSGDConfig,
 ) -> None:
     states = (make_state(), make_state())
-    ttt_output = make_ttt_output(states, (True, True))
+    ttt_output = make_associative_output(states, (True, True))
 
-    results = functional_sgd_steps_from_ttt(
-        ttt_output=ttt_output,
+    results = functional_sgd_steps_from_associative(
+        associative_output=ttt_output,
         fast_states=states,
         optimizer_config=optimizer_config,
         optimizer_states=tuple(initialize_optimizer_state(optimizer_config) for _ in states),
     )
 
     assert all(result.did_update for result in results)
-    assert all(result.valid_term_count == 1 for result in results)
+    assert all(result.valid_token_count == 1 for result in results)
     assert all(result.gradient_mode is GradientMode.ONLINE_LEAF for result in results)
 
 
@@ -500,28 +458,28 @@ def test_typed_ttt_bridge_rejects_row_and_batch_state_mismatches(
     optimizer_config: InnerSGDConfig,
 ) -> None:
     states = (make_state(), make_state(value=0.5))
-    ttt_output = make_ttt_output(states, (True, False))
+    ttt_output = make_associative_output(states, (True, False))
     optimizer = initialize_optimizer_state(optimizer_config)
 
     with pytest.raises(IndexError, match="in-range"):
-        functional_sgd_step_from_ttt_row(
-            ttt_output=ttt_output,
+        functional_sgd_step_from_associative_row(
+            associative_output=ttt_output,
             row=2,
             fast_state=states[0],
             optimizer_config=optimizer_config,
             optimizer_state=optimizer,
         )
     with pytest.raises(ValueError, match="identical B"):
-        functional_sgd_steps_from_ttt(
-            ttt_output=ttt_output,
+        functional_sgd_steps_from_associative(
+            associative_output=ttt_output,
             fast_states=states[:1],
             optimizer_config=optimizer_config,
             optimizer_states=(optimizer,),
         )
     aliased = (states[0], states[0])
     with pytest.raises(ValueError, match="storage-isolated"):
-        functional_sgd_steps_from_ttt(
-            ttt_output=ttt_output,
+        functional_sgd_steps_from_associative(
+            associative_output=ttt_output,
             fast_states=aliased,
             optimizer_config=optimizer_config,
             optimizer_states=(optimizer, optimizer),
@@ -593,21 +551,21 @@ def test_result_rejects_nonfinite_audit_values(
         state,
         None,
         optimizer_config,
-        valid_term_count=0,
-        invalid_reason=UpdateSkipReason.NO_VALID_TERM,
+        valid_token_count=0,
+        invalid_reason=UpdateSkipReason.NO_VALID_TOKEN,
     )
     with pytest.raises(ValueError, match="finite"):
         FunctionalSGDResult(
             fast_state=skipped.fast_state,
             optimizer_state=skipped.optimizer_state,
             did_update=False,
-            valid_term_count=0,
+            valid_token_count=0,
             gradient_norm=float("nan"),
             clipped_gradient_norm=None,
             per_matrix_gradient_norms=None,
             per_matrix_clipped_norms=None,
             update_norm=0.0,
-            skip_reason=UpdateSkipReason.NO_VALID_TERM,
+            skip_reason=UpdateSkipReason.NO_VALID_TOKEN,
             skip_detail="fault",
             gradient_mode=GradientMode.ONLINE_LEAF,
         )

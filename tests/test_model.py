@@ -400,7 +400,7 @@ def test_observe_chunk_is_composition_only_and_returns_soft_intermediates(
 
     output = run_observation(model, owner, lifecycle)
 
-    assert suite.events == ["visual", "query", "fast", "spatial", "temporal", "heads", "bank"]
+    assert suite.events == ["query", "visual", "fast", "spatial", "temporal", "heads", "bank"]
     assert output.visual.value == "adapted-main"
     assert output.runtime_state == "runtime-1"
     assert output.bank_states == ("bank-1",)
@@ -424,7 +424,7 @@ def test_soft_observation_recompute_boundary_cannot_duplicate_hard_commit(
 
     soft = model.observe_chunk_soft(request)
 
-    assert suite.events == ["visual", "query", "fast", "spatial", "temporal", "heads"]
+    assert suite.events == ["query", "visual", "fast", "spatial", "temporal", "heads"]
     assert "bank" not in suite.events
     assert lifecycle.audit().observation_count == 0
     output = model.commit_observation(request, soft, lifecycle)
@@ -650,7 +650,7 @@ def test_disabled_features_are_not_called_and_are_reported_as_absent(
     observation = run_observation(model, owner, lifecycle)
     answer = run_answer(model, make_answer_request(owner, observation), lifecycle)
 
-    assert suite.events == ["visual", "query", "composer", "qwen.prefill"]
+    assert suite.events == ["query", "visual", "composer", "qwen.prefill"]
     assert observation.visual.value == "main-visual"
     assert observation.spatial is None
     assert observation.observations is None

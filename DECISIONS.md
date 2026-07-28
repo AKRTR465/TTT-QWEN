@@ -22,8 +22,9 @@
 ## 训练
 
 - 正式流程直接 A2→A5。
-- A2 全量解冻 Qwen、状态路径和 W0，冻结 Predictor，禁止 Inner SGD。
-- A5 固定 `pred + 0.5 identity + 0.5 event`，K=8 截断二阶并重锚 W0。
+- A2 全量解冻 Qwen、状态路径和 W0，冻结 `P_C/P_V`，禁止 Inner SGD。
+- A5 使用 Bank-conditioned Associative LTTT 的 masked visual MSE，K=8 截断二阶并重锚 W0；
+  Query Answer/State loss 是唯一 Outer 目标。
 - A1/A3/A4 与 full-graph Meta-TTT 已从生产实现和配置中删除。
 - graph anchor 只服务真实多卡动态分支，单卡不启用。
 - Outer checkpoint 完整保存模型/optimizer/scheduler/RNG，排除所有临时 runtime state。

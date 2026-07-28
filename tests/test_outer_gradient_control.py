@@ -74,7 +74,7 @@ def test_zero_partition_groups_match_plain_reference(monkeypatch: pytest.MonkeyP
             ("state_router_time", 1.0e-4, parameters[3]),
             ("state_retrieval", 1.0e-4, parameters[4]),
             ("w0", 1.0e-4, parameters[5]),
-            ("predictor", 1.0e-4, parameters[6]),
+            ("associative", 1.0e-4, parameters[6]),
         )
     )
     controller = OuterGradientController(
@@ -86,7 +86,7 @@ def test_zero_partition_groups_match_plain_reference(monkeypatch: pytest.MonkeyP
             "state_router_time",
             "state_retrieval",
             "w0",
-            "predictor",
+            "associative",
         ),
     )
 
@@ -102,9 +102,9 @@ def test_zero_partition_groups_match_plain_reference(monkeypatch: pytest.MonkeyP
         "state_router_time",
         "state_retrieval",
         "w0",
-        "predictor",
+        "associative",
     )
-    assert dict(audit.metrics())["outer_grad/predictor/lr_x_post_norm"] == pytest.approx(1.0e-5)
+    assert dict(audit.metrics())["outer_grad/associative/lr_x_post_norm"] == pytest.approx(1.0e-5)
 
 
 def test_group_order_and_global_clip_contract_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:

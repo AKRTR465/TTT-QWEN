@@ -209,8 +209,8 @@ else:
     w0_lr = float(project.a5.optimizer.w0_learning_rate)
     independent_budgets = {"w0": w0_lr * float(caps.w0)}
     if adaptation_mode == "meta_ttt":
-        independent_budgets["predictor"] = (
-            float(project.a5.optimizer.predictor_learning_rate) * float(caps.predictor)
+        independent_budgets["associative"] = (
+            float(project.a5.optimizer.associative_learning_rate) * float(caps.associative)
         )
 state_names = ("state_shared", "state_task", "state_router_time", "state_retrieval")
 budget_audit = {
@@ -224,6 +224,9 @@ budget_audit = {
 }
 payload = {
     "stage": stage,
+    "project_spec_version": project.spec_version,
+    "config_schema_version": project.config_schema_version,
+    "associative_ttt_contract": project.associative_ttt.contract,
     "a5_adaptation_mode": adaptation_mode,
     "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
     "outer_update_norm_budget_audit": budget_audit,

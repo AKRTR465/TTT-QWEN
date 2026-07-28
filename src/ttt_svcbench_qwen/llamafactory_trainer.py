@@ -42,6 +42,7 @@ from ttt_svcbench_qwen.episode_data import (
     load_production_manifest_views,
     load_visual_cost_index,
 )
+from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter
 from ttt_svcbench_qwen.meta_trainer import (
     CounterfactualAuditRequest,
     MetaTTTEpisode,
@@ -590,8 +591,8 @@ class _SemanticProjectorStepAuditor:
 class _A5ParameterGroupStepAuditor:
     """Measure real post-Adam deltas for the groups implicated in A5 TTT drift."""
 
-    _GROUP_NAMES = ("predictor", "w0", "state_shared")
-    _DEFAULT_GROUP_NAMES = ("predictor", "w0", "state_shared")
+    _GROUP_NAMES = ("associative", "w0", "state_shared")
+    _DEFAULT_GROUP_NAMES = ("associative", "w0", "state_shared")
 
     def __init__(
         self,
@@ -630,8 +631,8 @@ class _A5ParameterGroupStepAuditor:
     @staticmethod
     def _classify_parameter(name: str) -> str:
         lowered = name.casefold()
-        if "predictor" in lowered:
-            return "predictor"
+        if _is_associative_parameter_name(lowered):
+            return "associative"
         if lowered.endswith(("w0_1", "w0_2")) or "meta_fast" in lowered:
             return "w0"
         if (
@@ -753,8 +754,8 @@ class OuterParameterAudit:
     qwen_trainable_count: int
     non_qwen_parameter_count: int
     non_qwen_trainable_count: int
-    predictor_parameter_count: int
-    predictor_trainable_count: int
+    associative_parameter_count: int
+    associative_trainable_count: int
     transient_parameter_names: tuple[str, ...]
     backbone_registered: bool
     a5_adaptation_mode: str = "meta_ttt"
@@ -764,8 +765,8 @@ class OuterParameterAudit:
             raise ValueError("outer parameter audit has an invalid A5 adaptation mode")
         if self.total_parameter_count <= 0 or self.trainable_parameter_count <= 0:
             raise ValueError("production outer model exposes no trainable parameters")
-        if self.predictor_parameter_count <= 0:
-            raise ValueError("production outer model must register Predictor parameters")
+        if self.associative_parameter_count <= 0:
+            raise ValueError("production outer model must register Associative parameters")
         if self.transient_parameter_names:
             raise ValueError("transient fast matrices entered registered outer parameters")
         if not self.backbone_registered:
@@ -780,27 +781,27 @@ class OuterParameterAudit:
         ):
             raise ValueError("Qwen/non-Qwen trainable audit does not cover the outer model")
         if self.stage is ProductionStage.A2:
-            if self.predictor_trainable_count:
-                raise ValueError("A2 Predictor must remain frozen")
-            expected = self.total_parameter_count - self.predictor_parameter_count
+            if self.associative_trainable_count:
+                raise ValueError("A2 Associative must remain frozen")
+            expected = self.total_parameter_count - self.associative_parameter_count
             if self.trainable_parameter_count != expected:
-                raise ValueError("A2 must train every registered non-Predictor parameter")
+                raise ValueError("A2 must train every registered non-Associative parameter")
         elif self.a5_adaptation_mode == "meta_ttt":
             if self.qwen_trainable_count <= 0:
                 raise ValueError("A5 must train at least one configured Qwen parameter")
             if self.non_qwen_trainable_count != self.non_qwen_parameter_count:
-                raise ValueError("A5 must train every state, W0, and Predictor parameter")
-            if self.predictor_trainable_count != self.predictor_parameter_count:
-                raise ValueError("A5 Predictor must be fully trainable")
+                raise ValueError("A5 must train every state, W0, and Associative parameter")
+            if self.associative_trainable_count != self.associative_parameter_count:
+                raise ValueError("A5 Associative must be fully trainable")
         else:
             if self.qwen_trainable_count <= 0:
                 raise ValueError("static-W0 A5 must train configured Qwen parameters")
-            if self.predictor_trainable_count:
-                raise ValueError("static-W0 A5 Predictor must remain frozen")
-            expected_non_qwen = self.non_qwen_parameter_count - self.predictor_parameter_count
+            if self.associative_trainable_count:
+                raise ValueError("static-W0 A5 Associative must remain frozen")
+            expected_non_qwen = self.non_qwen_parameter_count - self.associative_parameter_count
             if self.non_qwen_trainable_count != expected_non_qwen:
                 raise ValueError(
-                    "static-W0 A5 must train every non-Predictor state and W0 parameter"
+                    "static-W0 A5 must train every non-Associative state and W0 parameter"
                 )
 
 
@@ -1424,15 +1425,17 @@ class TTTQwenTrainerMixin:
                     "a5/outer_only_segment_count": float(meta_audit.outer_only_segment_count),
                     "a5/static_w0_segment_count": float(meta_audit.static_w0_segment_count),
                     "a5/ablation/ttt_enabled": float(meta_audit.ttt_enabled),
-                    "a5/ablation/ttt_valid": float(meta_audit.ttt_valid_count > 0),
-                    "a5/ablation/ttt_valid_count": float(meta_audit.ttt_valid_count),
-                    "a5/ablation/predictor_trainable": float(
+                    "a5/associative/valid": float(meta_audit.associative_valid_count > 0),
+                    "a5/associative/valid_count": float(
+                        meta_audit.associative_valid_count
+                    ),
+                    "a5/ablation/associative_trainable": float(
                         self.ttt_runtime.a5_adaptation_mode == "meta_ttt"
                     ),
-                    "a5/ablation/predictor_gradient_enabled": float(
+                    "a5/ablation/associative_gradient_enabled": float(
                         self.ttt_runtime.a5_adaptation_mode == "meta_ttt"
                     ),
-                    "a5/ablation/predictor_parameter_delta_enabled": float(
+                    "a5/ablation/associative_parameter_delta_enabled": float(
                         self.ttt_runtime.a5_adaptation_mode == "meta_ttt"
                     ),
                     "a5/ablation/w0_outer_trainable": 1.0,
@@ -1440,28 +1443,22 @@ class TTTQwenTrainerMixin:
                         meta_audit.insufficient_inter_query_gap
                     ),
                     "a5/loss/meta_query_sum": float(meta_output.query_loss.item()),
-                    "a5/loss/support_ttt_mean_x_0.1": float(
-                        meta_output.support_auxiliary_loss.item()
+                    "a5/associative/loss": meta_audit.associative_loss_mean,
+                    "a5/associative/key_rms": meta_audit.key_rms,
+                    "a5/associative/value_rms": meta_audit.value_rms,
+                    "a5/associative/prediction_rms": meta_audit.prediction_rms,
+                    "a5/associative/error_rms": meta_audit.error_rms,
+                    "a5/associative/key_max_abs": meta_audit.key_max_abs,
+                    "a5/associative/value_max_abs": meta_audit.value_max_abs,
+                    "a5/associative/prediction_max_abs": meta_audit.prediction_max_abs,
+                    "a5/associative/error_max_abs": meta_audit.error_max_abs,
+                    "a5/associative/element_count": float(
+                        meta_audit.associative_element_count
                     ),
-                    "a5/ttt/raw_mean": meta_audit.support_ttt_raw_mean,
-                    "a5/ttt/outer_effective_mean": (meta_audit.support_ttt_outer_mean),
-                    "a5/ttt/pred_mean": meta_audit.support_pred_mean,
-                    "a5/ttt/identity_weighted_mean": (meta_audit.support_identity_weighted_mean),
-                    "a5/ttt/event_weighted_mean": (meta_audit.support_event_weighted_mean),
-                    "a5/ttt/temporal_hidden_rms": meta_audit.temporal_hidden_rms,
-                    "a5/ttt/temporal_target_rms": meta_audit.temporal_target_rms,
-                    "a5/ttt/temporal_prediction_rms": (meta_audit.temporal_prediction_rms),
-                    "a5/ttt/temporal_error_rms": meta_audit.temporal_error_rms,
-                    "a5/ttt/temporal_hidden_max_abs": (meta_audit.temporal_hidden_max_abs),
-                    "a5/ttt/temporal_target_max_abs": (meta_audit.temporal_target_max_abs),
-                    "a5/ttt/temporal_prediction_max_abs": (meta_audit.temporal_prediction_max_abs),
-                    "a5/ttt/temporal_error_max_abs": (meta_audit.temporal_error_max_abs),
-                    "a5/ttt/temporal_hidden_element_count": float(
-                        meta_audit.temporal_hidden_element_count
+                    "a5/associative/bank_record_count": float(
+                        meta_audit.bank_record_count
                     ),
-                    "a5/ttt/temporal_pair_element_count": float(
-                        meta_audit.temporal_pair_element_count
-                    ),
+                    "a5/associative/empty_bank_count": float(meta_audit.empty_bank_count),
                 }
             )
             role_norms: dict[str, list[float]] = {}
@@ -1988,7 +1985,14 @@ def _run_main(argv: list[str] | None = None) -> int:
         checkpoint_audit = initialize_outer_model_from_a2(
             runtime_raw.model,
             checkpoint,
+            allowed_missing_fragments=(
+                ".p_context.",
+                ".p_value.",
+                "associative_contract_version",
+            ),
+            allowed_unexpected_prefixes=("predictor.",),
         )
+        _reset_a2_to_a5_associative(runtime_raw.model)
         _reset_a2_to_a5_balance(runtime_raw.model)
     expected_gradient_groups = (
         (
@@ -2007,7 +2011,7 @@ def _run_main(argv: list[str] | None = None) -> int:
             "state_router_time",
             "state_retrieval",
             "w0",
-            *(("predictor",) if backbone.ttt_config.a5_adaptation_mode == "meta_ttt" else ()),
+            *(("associative",) if backbone.ttt_config.a5_adaptation_mode == "meta_ttt" else ()),
         )
     )
     runtime_raw = replace(
@@ -2056,7 +2060,7 @@ def _run_main(argv: list[str] | None = None) -> int:
             float(training_args.learning_rate),
             float(project.a5.optimizer.state_learning_rate),
             float(project.a5.optimizer.w0_learning_rate),
-            float(project.a5.optimizer.predictor_learning_rate),
+            float(project.a5.optimizer.associative_learning_rate),
         )
     budget_audit = _outer_update_norm_budget_audit(
         project,
@@ -2064,7 +2068,7 @@ def _run_main(argv: list[str] | None = None) -> int:
         qwen_lr=budget_lrs[0],
         state_lr=budget_lrs[1],
         w0_lr=budget_lrs[2],
-        predictor_lr=budget_lrs[3],
+        associative_lr=budget_lrs[3],
         a5_adaptation_mode=runtime_raw.a5_adaptation_mode,
     )
     raw_smoke_steps = os.environ.get("TTT_SMOKE_MAX_STEPS")
@@ -2428,18 +2432,18 @@ def resolve_same_stage_resume(
     raw = cast(object, json.loads(run_config.read_text(encoding="utf-8")))
     if not isinstance(raw, dict) or raw.get("stage") != stage.value:
         raise ValueError("resume checkpoint stage does not match the configured production stage")
+    if raw.get("config_schema_version") != 10 or raw.get(
+        "associative_ttt_contract"
+    ) != "bank_conditioned_visual_v1":
+        raise ValueError(
+            "same-stage resume requires the schema-10 Bank-conditioned associative contract"
+        )
     if stage is ProductionStage.A5:
         checkpoint_mode = raw.get("a5_adaptation_mode", "meta_ttt")
         if checkpoint_mode != a5_adaptation_mode:
             raise ValueError(
                 "resume checkpoint A5 adaptation mode does not match the configured mode"
             )
-        checkpoint_step_mode = raw.get("a5_step_controller_mode")
-        if checkpoint_step_mode is not None and checkpoint_step_mode != "fixed":
-            raise ValueError("learned-step checkpoints are incompatible with fixed-step A5")
-        checkpoint_variant = raw.get("a5_fixed_variant")
-        if checkpoint_variant is not None and checkpoint_variant != "A":
-            raise ValueError("B-E effect-ablation checkpoints are incompatible with canonical A5")
     return root
 
 
@@ -2505,8 +2509,10 @@ def _audit_outer_parameters(
         raise ValueError(
             "production Outer model still registers removed step-controller parameters"
         )
-    predictor = tuple(
-        (name, parameter) for name, parameter in named if "predictor" in name.casefold()
+    associative = tuple(
+        (name, parameter)
+        for name, parameter in named
+        if _is_associative_parameter_name(name)
     )
     transient = tuple(
         name
@@ -2534,9 +2540,9 @@ def _audit_outer_parameters(
         non_qwen_trainable_count=sum(
             parameter.numel() for _, parameter in non_qwen if parameter.requires_grad
         ),
-        predictor_parameter_count=sum(parameter.numel() for _, parameter in predictor),
-        predictor_trainable_count=sum(
-            parameter.numel() for _, parameter in predictor if parameter.requires_grad
+        associative_parameter_count=sum(parameter.numel() for _, parameter in associative),
+        associative_trainable_count=sum(
+            parameter.numel() for _, parameter in associative if parameter.requires_grad
         ),
         transient_parameter_names=transient,
         backbone_registered=bool(backbone_ids) and backbone_ids <= runtime_ids,
@@ -2550,7 +2556,7 @@ def _outer_update_norm_budget_audit(
     qwen_lr: float,
     state_lr: float,
     w0_lr: float,
-    predictor_lr: float,
+    associative_lr: float,
     a5_adaptation_mode: str,
 ) -> dict[str, object]:
     caps = project.outer_gradient_control.max_grad_norm
@@ -2558,7 +2564,7 @@ def _outer_update_norm_budget_audit(
     independent_budgets = {
         "w0": w0_lr * float(caps.w0),
         **(
-            {"predictor": predictor_lr * float(caps.predictor)}
+            {"associative": associative_lr * float(caps.associative)}
             if stage is ProductionStage.A5 and a5_adaptation_mode == "meta_ttt"
             else {}
         ),
@@ -2572,7 +2578,7 @@ def _outer_update_norm_budget_audit(
         or not math.isclose(value, expected_budgets[name], rel_tol=1.0e-6)
         for name, value in independent_budgets.items()
     ):
-        raise ValueError("Qwen/W0/Predictor update-norm budgets must remain aligned")
+        raise ValueError("Qwen/W0/Associative update-norm budgets must remain aligned")
     state_names = (
         "state_shared",
         "state_task",
@@ -2609,13 +2615,13 @@ def make_production_outer_optimizer_factory(
         qwen_lr = backbone.project_config.a2.optimizer.qwen_learning_rate
         state_lr = backbone.project_config.a2.optimizer.state_learning_rate
         w0_lr = backbone.project_config.a2.optimizer.w0_learning_rate
-        predictor_lr = state_lr
+        associative_lr = state_lr
     else:
         qwen_lr = float(training_args.learning_rate)
         optimizer = backbone.project_config.a5.optimizer
         state_lr = optimizer.state_learning_rate
         w0_lr = optimizer.w0_learning_rate
-        predictor_lr = optimizer.predictor_learning_rate
+        associative_lr = optimizer.associative_learning_rate
 
     def factory(model: nn.Module) -> torch.optim.Optimizer:
         groups: dict[str, list[nn.Parameter]] = {
@@ -2625,7 +2631,7 @@ def make_production_outer_optimizer_factory(
             "state_router_time": [],
             "state_retrieval": [],
             "w0": [],
-            "predictor": [],
+            "associative": [],
         }
         ownership: dict[int, str] = {}
         for name, parameter in model.named_parameters(remove_duplicate=False):
@@ -2639,8 +2645,8 @@ def make_production_outer_optimizer_factory(
                 raise ValueError("step-controller parameters were removed from canonical A5")
             if parameter_id in qwen_ids:
                 group = "qwen"
-            elif "predictor" in lowered:
-                group = "predictor"
+            elif _is_associative_parameter_name(lowered):
+                group = "associative"
             elif lowered.endswith(("w0_1", "w0_2")) or "meta_fast" in lowered:
                 group = "w0"
             elif "component_modules.observation_heads" in lowered:
@@ -2671,13 +2677,13 @@ def make_production_outer_optimizer_factory(
         empty = tuple(name for name in required if not groups[name])
         if empty:
             raise ValueError(f"Outer AdamW requires non-empty formal groups: {empty}")
-        if stage is ProductionStage.A2 and groups["predictor"]:
-            raise ValueError("A2 Outer AdamW cannot own Predictor")
+        if stage is ProductionStage.A2 and groups["associative"]:
+            raise ValueError("A2 Outer AdamW cannot own Associative")
         if stage is ProductionStage.A5:
-            if a5_adaptation_mode == "meta_ttt" and not groups["predictor"]:
-                raise ValueError("Meta-TTT A5 Outer AdamW must own Predictor")
-            if a5_adaptation_mode == "static_w0" and groups["predictor"]:
-                raise ValueError("static-W0 A5 Outer AdamW cannot own Predictor")
+            if a5_adaptation_mode == "meta_ttt" and not groups["associative"]:
+                raise ValueError("Meta-TTT A5 Outer AdamW must own Associative")
+            if a5_adaptation_mode == "static_w0" and groups["associative"]:
+                raise ValueError("static-W0 A5 Outer AdamW cannot own Associative")
         semantic_projector_ids = {
             id(parameter)
             for name, parameter in model.named_parameters(remove_duplicate=False)
@@ -2701,7 +2707,7 @@ def make_production_outer_optimizer_factory(
             "state_router_time": state_lr,
             "state_retrieval": state_lr,
             "w0": w0_lr,
-            "predictor": predictor_lr,
+            "associative": associative_lr,
         }
         parameter_groups: list[dict[str, Any]] = [
             {
@@ -2718,7 +2724,7 @@ def make_production_outer_optimizer_factory(
             qwen_lr=qwen_lr,
             state_lr=state_lr,
             w0_lr=w0_lr,
-            predictor_lr=predictor_lr,
+            associative_lr=associative_lr,
             a5_adaptation_mode=a5_adaptation_mode,
         )
         trace_event("outer_optimizer_update_norm_budgets", **budget_audit)
@@ -2745,6 +2751,22 @@ def make_production_outer_optimizer_factory(
         return optimizer
 
     return factory
+
+
+def _is_associative_parameter_name(name: str) -> bool:
+    lowered = name.casefold()
+    return (
+        lowered.startswith(("p_context.", "p_value."))
+        or ".p_context." in lowered
+        or ".p_value." in lowered
+    )
+
+
+def _reset_a2_to_a5_associative(model: nn.Module) -> None:
+    adapters = tuple(module for module in model.modules() if isinstance(module, FastTTTAdapter))
+    if len(adapters) != 1:
+        raise RuntimeError("A2→A5 initialization requires exactly one FastTTTAdapter")
+    adapters[0].reset_associative_projections()
 
 
 def _reset_a2_to_a5_balance(model: nn.Module) -> None:

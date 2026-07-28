@@ -81,7 +81,7 @@ def test_semantic_projector_training_log_uses_pre_step_group_and_real_delta() ->
 
 def test_a5_parameter_group_audit_measures_real_post_optimizer_delta() -> None:
     model = nn.Module()
-    model.add_module("predictor", nn.Linear(3, 2))
+    model.add_module("p_context", nn.Linear(3, 2))
     meta_fast = nn.Module()
     meta_fast.register_parameter("w0_1", nn.Parameter(torch.ones(2, 2)))
     meta_fast.register_parameter("w0_2", nn.Parameter(torch.ones(2, 2)))
@@ -105,7 +105,7 @@ def test_a5_parameter_group_audit_measures_real_post_optimizer_delta() -> None:
             parameter.add_(0.25)
     auditor.after_step(snapshot, audit)
 
-    for group in ("predictor", "w0", "state_shared"):
+    for group in ("associative", "w0", "state_shared"):
         prefix = f"a5/parameter_delta/{group}"
         assert auditor.last_metrics[f"{prefix}/l2"] > 0.0
         assert auditor.last_metrics[f"{prefix}/rms"] == pytest.approx(0.25)
@@ -229,7 +229,7 @@ def test_actual_fast_bridge_observation_chain_has_exact_inner_update_boundary() 
         fast_state=state,
         optimizer_config=optimizer_config,
         optimizer_state=initialize_optimizer_state(optimizer_config),
-        valid_term_count=1,
+        valid_token_count=2,
     )
     assert result.did_update is True
 
@@ -258,7 +258,7 @@ def test_actual_fast_bridge_observation_chain_has_exact_inner_update_boundary() 
         )
     )
 
-    assert audits["adapter_checkpointed"].parameter_count == 7_480_064
+    assert audits["adapter_checkpointed"].parameter_count == 11_020_544
     assert audits["frozen_bridge"].parameter_count == 3_145_728
     assert audits["observation_o1"].parameter_count == 2_632_710
     assert audits["state_bank.semantic_projector"].parameter_count == 1_316_864

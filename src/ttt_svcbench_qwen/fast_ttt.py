@@ -17,6 +17,12 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from ttt_svcbench_qwen.associative_ttt import (
+    ASSOCIATIVE_CONTRACT_VERSION,
+    BANK_EMBEDDING_DIM,
+    AssociativeTTTIntermediates,
+    FastAssociativeContext,
+)
 from ttt_svcbench_qwen.config import FastTTTConfig, ProjectConfig
 
 
@@ -156,18 +162,24 @@ class FastTTTForwardAudit:
     update_counts: tuple[int, ...]
     valid_token_counts: tuple[int, ...]
     used_runtime_state: bool
+    used_associative_context: bool
+    bank_record_counts: tuple[int, ...]
     w_t_1_norms: tuple[float, ...]
     w_t_2_norms: tuple[float, ...]
     input_norms: tuple[float, ...]
     residual_norms: tuple[float, ...]
 
     def __post_init__(self) -> None:
-        if type(self.used_runtime_state) is not bool:
-            raise TypeError("used_runtime_state must be a bool")
+        if (
+            type(self.used_runtime_state) is not bool
+            or type(self.used_associative_context) is not bool
+        ):
+            raise TypeError("Fast TTT runtime/context audit flags must be bool")
         lengths = {
             len(self.fast_versions),
             len(self.update_counts),
             len(self.valid_token_counts),
+            len(self.bank_record_counts),
             len(self.w_t_1_norms),
             len(self.w_t_2_norms),
             len(self.input_norms),
@@ -175,7 +187,12 @@ class FastTTTForwardAudit:
         }
         if lengths != {len(self.fast_versions)} or not self.fast_versions:
             raise ValueError("Fast TTT audit fields must align to one non-empty batch")
-        counters = (*self.fast_versions, *self.update_counts, *self.valid_token_counts)
+        counters = (
+            *self.fast_versions,
+            *self.update_counts,
+            *self.valid_token_counts,
+            *self.bank_record_counts,
+        )
         if any(type(counter) is not int for counter in counters):
             raise TypeError("Fast TTT audit counters must be exact integers")
         if min(counters) < 0:
@@ -216,6 +233,16 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             config.bottleneck_dim,
             bias=config.slow_projection_bias,
         )
+        self.p_context = nn.Linear(
+            BANK_EMBEDDING_DIM,
+            config.bottleneck_dim,
+            bias=config.slow_projection_bias,
+        )
+        self.p_value = nn.Linear(
+            config.input_dim,
+            config.bottleneck_dim,
+            bias=config.slow_projection_bias,
+        )
         self.w0_1 = nn.Parameter(torch.empty(config.bottleneck_dim, config.bottleneck_dim))
         self.w0_2 = nn.Parameter(torch.empty(config.bottleneck_dim, config.bottleneck_dim))
         self.p_out = nn.Linear(
@@ -225,7 +252,15 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
         )
         nn.init.xavier_uniform_(self.w0_1)
         nn.init.xavier_uniform_(self.w0_2)
+        self.register_buffer(
+            "associative_contract_version",
+            torch.tensor(ASSOCIATIVE_CONTRACT_VERSION, dtype=torch.int64),
+            persistent=True,
+        )
+        self.reset_associative_projections()
         self._active_fast_states: tuple[FastWeightsState, ...] | None = None
+        self._active_associative_context: FastAssociativeContext | None = None
+        self._last_associative_intermediates: AssociativeTTTIntermediates | None = None
         self.last_audit: FastTTTForwardAudit | None = None
 
     def forward(
@@ -240,6 +275,7 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
 
         del metadata
         self.last_audit = None
+        self._last_associative_intermediates = None
         self._validate_input(visual_embeddings)
         mask = self._normalize_valid_mask(visual_embeddings, valid_mask)
         if fast_state is not None and self._active_fast_states is not None:
@@ -271,6 +307,10 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
         rms_weight = self._online_value(self.rms_norm.weight, detach_slow)
         p_in_weight = self._online_value(self.p_in.weight, detach_slow)
         p_in_bias = self._online_value(self.p_in.bias, detach_slow)
+        p_context_weight = self._online_value(self.p_context.weight, detach_slow)
+        p_context_bias = self._online_value(self.p_context.bias, detach_slow)
+        p_value_weight = self._online_value(self.p_value.weight, detach_slow)
+        p_value_bias = self._online_value(self.p_value.bias, detach_slow)
         p_out_weight = self._online_value(self.p_out.weight, detach_slow)
         p_out_bias = self._online_value(self.p_out.bias, detach_slow)
         normalized = F.rms_norm(
@@ -280,6 +320,42 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             self.config.rms_norm_eps,
         )
         projected = F.linear(normalized, p_in_weight, p_in_bias)
+        context = self._active_associative_context
+        if context is None:
+            combined_query = visual_embeddings.new_zeros(
+                (visual_embeddings.shape[0], BANK_EMBEDDING_DIM)
+            )
+            bank_record_counts = torch.zeros(
+                visual_embeddings.shape[0],
+                dtype=torch.int64,
+                device=visual_embeddings.device,
+            )
+            bank_versions = (0,) * visual_embeddings.shape[0]
+        else:
+            context = context.to(visual_embeddings)
+            if context.combined_query.shape[0] != visual_embeddings.shape[0]:
+                raise ValueError("associative context and visual batch must align")
+            combined_query = context.combined_query
+            bank_record_counts = context.bank_record_counts
+            bank_versions = context.bank_versions
+        normalized_context = F.layer_norm(
+            combined_query,
+            (BANK_EMBEDDING_DIM,),
+            None,
+            None,
+        )
+        projected = projected + F.linear(
+            normalized_context,
+            p_context_weight,
+            p_context_bias,
+        ).unsqueeze(1)
+        value_normalized = F.rms_norm(
+            visual_embeddings.detach(),
+            (self.input_dim,),
+            rms_weight,
+            self.config.rms_norm_eps,
+        )
+        values = F.linear(value_normalized, p_value_weight, p_value_bias)
         if runtime_states is None:
             hidden = F.linear(projected, w_t_1, None)
         else:
@@ -289,7 +365,16 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             hidden = F.linear(hidden, w_t_2, None)
         else:
             hidden = torch.bmm(hidden, w_t_2.transpose(1, 2))
-        residual = F.linear(hidden, p_out_weight, p_out_bias)
+        predictions = hidden
+        self._last_associative_intermediates = AssociativeTTTIntermediates(
+            keys=projected,
+            values=values,
+            predictions=predictions,
+            valid_mask=mask,
+            bank_record_counts=bank_record_counts,
+            bank_versions=bank_versions,
+        )
+        residual = F.linear(predictions, p_out_weight, p_out_bias)
         residual = residual.masked_fill(~mask.unsqueeze(-1), 0.0)
         scaled_residual = self.residual_scale * residual
         output = visual_embeddings + scaled_residual
@@ -306,6 +391,8 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             update_counts=update_counts,
             valid_token_counts=tuple(int(row.sum().item()) for row in mask),
             used_runtime_state=runtime_states is not None,
+            used_associative_context=context is not None,
+            bank_record_counts=tuple(int(value.item()) for value in bank_record_counts),
             w_t_1_norms=w_t_1_norms,
             w_t_2_norms=w_t_2_norms,
             input_norms=tuple(
@@ -403,6 +490,49 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
                 ):
                     parameter.requires_grad_(requires_grad)
 
+    @contextmanager
+    def use_associative_context(
+        self,
+        context: FastAssociativeContext,
+    ) -> Iterator[FastTTTAdapter]:
+        """Bind one immutable pre-write Bank context to the next visual call(s)."""
+
+        if not isinstance(context, FastAssociativeContext):
+            raise TypeError("associative context binding requires FastAssociativeContext")
+        if self._active_associative_context is not None:
+            raise RuntimeError("Fast associative context binding is not re-entrant")
+        self._active_associative_context = context
+        try:
+            yield self
+        except BaseException:
+            self._last_associative_intermediates = None
+            raise
+        finally:
+            self._active_associative_context = None
+
+    def consume_associative_intermediates(self) -> AssociativeTTTIntermediates:
+        """Take and clear the ephemeral tensors captured by the latest visual call."""
+
+        value = self._last_associative_intermediates
+        self._last_associative_intermediates = None
+        if value is None:
+            raise RuntimeError("no associative intermediates are available to consume")
+        return value
+
+    @torch.no_grad()  # type: ignore[untyped-decorator]
+    def reset_associative_projections(self) -> None:
+        """Apply the frozen A2→A5 initialization without changing the W0 forward."""
+
+        self.p_context.weight.zero_()
+        if self.p_context.bias is not None:
+            self.p_context.bias.zero_()
+        self.p_value.weight.copy_(self.p_in.weight)
+        if self.p_value.bias is not None:
+            if self.p_in.bias is None:
+                self.p_value.bias.zero_()
+            else:
+                self.p_value.bias.copy_(self.p_in.bias)
+
     def collect_meta_fast_parameters(self) -> tuple[nn.Parameter, nn.Parameter]:
         return (self.w0_1, self.w0_2)
 
@@ -417,6 +547,18 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             bias_in,
             self.p_out.weight,
             bias_out,
+        )
+
+    def collect_associative_parameters(self) -> tuple[nn.Parameter, ...]:
+        context_bias = self.p_context.bias
+        value_bias = self.p_value.bias
+        if context_bias is None or value_bias is None:
+            raise RuntimeError("associative projection biases disappeared")
+        return (
+            self.p_context.weight,
+            context_bias,
+            self.p_value.weight,
+            value_bias,
         )
 
     def parameter_groups(self, state: FastWeightsState) -> FastParameterGroups:

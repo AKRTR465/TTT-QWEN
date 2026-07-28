@@ -17,15 +17,14 @@ from enum import StrEnum
 import torch
 from torch import Tensor
 
+from ttt_svcbench_qwen.associative_ttt import AssociativeTTTLossOutput
 from ttt_svcbench_qwen.config import InnerSGDConfig
 from ttt_svcbench_qwen.fast_ttt import FastWeightsState, OptimizerRuntimeState
-from ttt_svcbench_qwen.losses import LossSkipReason, LossTerm, TTTLossOutput
 from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
 
 
 class UpdateSkipReason(StrEnum):
-    NO_VALID_TERM = "no_valid_term"
-    INSUFFICIENT_TIME = "insufficient_time"
+    NO_VALID_TOKEN = "no_valid_token"
     NONFINITE_LOSS = "nonfinite_loss"
     NONFINITE_GRADIENT = "nonfinite_gradient"
     ZERO_GRADIENT = "zero_gradient"
@@ -117,7 +116,7 @@ class FunctionalSGDResult:
     fast_state: FastWeightsState
     optimizer_state: OptimizerRuntimeState
     did_update: bool
-    valid_term_count: int
+    valid_token_count: int
     gradient_norm: float | None
     clipped_gradient_norm: float | None
     per_matrix_gradient_norms: tuple[float, float] | None
@@ -133,8 +132,8 @@ class FunctionalSGDResult:
             raise TypeError("functional SGD update flag must be bool")
         if not isinstance(self.gradient_mode, GradientMode):
             raise TypeError("functional SGD gradient_mode must be GradientMode")
-        if type(self.valid_term_count) is not int or self.valid_term_count < 0:
-            raise ValueError("valid_term_count must be a non-negative exact integer")
+        if type(self.valid_token_count) is not int or self.valid_token_count < 0:
+            raise ValueError("valid_token_count must be a non-negative exact integer")
         if not math.isfinite(self.update_norm) or self.update_norm < 0.0:
             raise ValueError("update_norm must be finite and non-negative")
         if not math.isfinite(self.step_size) or not 0.0 < self.step_size < 3.0e-4:
@@ -152,8 +151,8 @@ class FunctionalSGDResult:
         if self.did_update:
             if self.skip_reason is not None or self.skip_detail is not None:
                 raise ValueError("successful updates cannot carry skip metadata")
-            if self.valid_term_count == 0:
-                raise ValueError("successful updates require at least one valid term")
+            if self.valid_token_count == 0:
+                raise ValueError("successful updates require at least one valid token")
             if any(value is None for value in scalars + pairs) or self.update_norm <= 0.0:
                 raise ValueError("successful updates require complete positive finite audits")
             if self.optimizer_state.last_skip_reason is not None:
@@ -284,36 +283,33 @@ def audit_gradient_delta_group(
     )
 
 
-def functional_sgd_step_from_ttt_row(
+def functional_sgd_step_from_associative_row(
     *,
-    ttt_output: TTTLossOutput,
+    associative_output: AssociativeTTTLossOutput,
     row: int,
     fast_state: FastWeightsState,
     optimizer_config: InnerSGDConfig,
     optimizer_state: OptimizerRuntimeState,
     _retain_graph: bool = False,
 ) -> FunctionalSGDResult:
-    """Update exactly one video's state from its authoritative TTT row."""
+    """Update exactly one video's state from its associative-loss row."""
 
-    batch_size = _validate_ttt_output_for_sgd(ttt_output)
+    batch_size = _validate_associative_output_for_sgd(associative_output)
     if type(_retain_graph) is not bool:
-        raise TypeError("TTT row retain-graph control must be bool")
+        raise TypeError("associative row retain-graph control must be bool")
     if type(row) is not int or row < 0 or row >= batch_size:
-        raise IndexError("TTT row must be an exact in-range batch index")
-    valid_term_count = sum(
-        int(term.valid_counts[row].item())
-        for term in (ttt_output.pred, ttt_output.identity, ttt_output.event)
-    )
-    row_is_valid = bool(ttt_output.update_valid_mask[row].item())
-    if row_is_valid != (valid_term_count > 0):
-        raise ValueError("TTT row validity must agree with its valid support count")
+        raise IndexError("associative row must be an exact in-range batch index")
+    valid_token_count = int(associative_output.valid_token_counts[row].item())
+    row_is_valid = bool(associative_output.update_valid_mask[row].item())
+    if row_is_valid != (valid_token_count > 0):
+        raise ValueError("associative row validity must agree with its valid token count")
     if row_is_valid:
         return functional_sgd_step(
-            loss=ttt_output.per_row_total[row],
+            loss=associative_output.per_row_total[row],
             fast_state=fast_state,
             optimizer_config=optimizer_config,
             optimizer_state=optimizer_state,
-            valid_term_count=valid_term_count,
+            valid_token_count=valid_token_count,
             _retain_graph=_retain_graph,
         )
     return functional_sgd_step(
@@ -321,41 +317,45 @@ def functional_sgd_step_from_ttt_row(
         fast_state=fast_state,
         optimizer_config=optimizer_config,
         optimizer_state=optimizer_state,
-        valid_term_count=0,
-        invalid_reason=_invalid_ttt_row_reason(ttt_output, row),
+        valid_token_count=0,
+        invalid_reason=UpdateSkipReason.NO_VALID_TOKEN,
     )
 
 
-def functional_sgd_steps_from_ttt(
+def functional_sgd_steps_from_associative(
     *,
-    ttt_output: TTTLossOutput,
+    associative_output: AssociativeTTTLossOutput,
     fast_states: Sequence[FastWeightsState],
     optimizer_config: InnerSGDConfig,
     optimizer_states: Sequence[OptimizerRuntimeState],
 ) -> tuple[FunctionalSGDResult, ...]:
     """Apply independent row losses to a storage-isolated batch of video states."""
 
-    batch_size = _validate_ttt_output_for_sgd(ttt_output)
+    batch_size = _validate_associative_output_for_sgd(associative_output)
     states = tuple(fast_states)
     runtimes = tuple(optimizer_states)
     if len(states) != batch_size or len(runtimes) != batch_size:
-        raise ValueError("TTT batch, fast states, and optimizer states must have identical B")
+        raise ValueError(
+            "associative batch, fast states, and optimizer states must have identical B"
+        )
     if not all(isinstance(state, FastWeightsState) for state in states):
-        raise TypeError("TTT batch bridge requires only FastWeightsState values")
+        raise TypeError("associative batch bridge requires only FastWeightsState values")
     if not all(isinstance(state, OptimizerRuntimeState) for state in runtimes):
-        raise TypeError("TTT batch bridge requires only OptimizerRuntimeState values")
+        raise TypeError("associative batch bridge requires only OptimizerRuntimeState values")
     fast_values = tuple(value for state in states for value in state.fast_parameters)
     if len({tensor_storage_key(value) for value in fast_values}) != len(fast_values):
         raise ValueError("batched fast states must use storage-isolated W_t tensors")
     valid_rows = tuple(
-        row for row in range(batch_size) if bool(ttt_output.update_valid_mask[row].item())
+        row
+        for row in range(batch_size)
+        if bool(associative_output.update_valid_mask[row].item())
     )
     last_valid_row = valid_rows[-1] if valid_rows else None
     results: list[FunctionalSGDResult] = []
     for row in range(batch_size):
         results.append(
-            functional_sgd_step_from_ttt_row(
-                ttt_output=ttt_output,
+            functional_sgd_step_from_associative_row(
+                associative_output=associative_output,
                 row=row,
                 fast_state=states[row],
                 optimizer_config=optimizer_config,
@@ -372,7 +372,7 @@ def functional_sgd_step(
     fast_state: FastWeightsState,
     optimizer_config: InnerSGDConfig,
     optimizer_state: OptimizerRuntimeState,
-    valid_term_count: int,
+    valid_token_count: int,
     invalid_reason: UpdateSkipReason | None = None,
     _retain_graph: bool = False,
 ) -> FunctionalSGDResult:
@@ -390,29 +390,26 @@ def functional_sgd_step(
     _validate_optimizer_config(optimizer_config)
     _validate_optimizer_runtime(optimizer_config, optimizer_state, fast_state)
     audited_step_size = float(optimizer_config.learning_rate)
-    if type(valid_term_count) is not int or valid_term_count < 0:
-        raise ValueError("valid_term_count must be a non-negative exact integer")
+    if type(valid_token_count) is not int or valid_token_count < 0:
+        raise ValueError("valid_token_count must be a non-negative exact integer")
 
-    if valid_term_count == 0:
+    if valid_token_count == 0:
         if loss is not None:
             raise ValueError("invalid TTT terms must not provide a fabricated scalar loss")
-        if invalid_reason not in (
-            UpdateSkipReason.NO_VALID_TERM,
-            UpdateSkipReason.INSUFFICIENT_TIME,
-        ):
-            raise ValueError("invalid terms require no_valid_term or insufficient_time")
+        if invalid_reason is not UpdateSkipReason.NO_VALID_TOKEN:
+            raise ValueError("an empty associative mask requires no_valid_token")
         return _skip_result(
             fast_state,
             optimizer_state,
             reason=invalid_reason,
             detail=invalid_reason.value,
-            valid_term_count=0,
+            valid_token_count=0,
             step_size=audited_step_size,
         )
     if invalid_reason is not None:
-        raise ValueError("valid TTT terms cannot carry a caller-supplied skip reason")
+        raise ValueError("valid associative rows cannot carry a caller-supplied skip reason")
     if not isinstance(loss, Tensor):
-        raise TypeError("valid TTT terms require a scalar Tensor loss")
+        raise TypeError("valid associative rows require a scalar Tensor loss")
     _validate_loss(loss, fast_state)
     if not bool(torch.isfinite(loss.detach()).item()):
         return _skip_result(
@@ -420,7 +417,7 @@ def functional_sgd_step(
             optimizer_state,
             reason=UpdateSkipReason.NONFINITE_LOSS,
             detail="loss_is_not_finite",
-            valid_term_count=valid_term_count,
+            valid_token_count=valid_token_count,
             step_size=audited_step_size,
         )
 
@@ -446,7 +443,7 @@ def functional_sgd_step(
             optimizer_state,
             reason=UpdateSkipReason.NONFINITE_GRADIENT,
             detail="one_or_more_fast_gradients_are_not_finite",
-            valid_term_count=valid_term_count,
+            valid_token_count=valid_token_count,
             step_size=audited_step_size,
         )
 
@@ -457,7 +454,7 @@ def functional_sgd_step(
             optimizer_state,
             reason=UpdateSkipReason.NONFINITE_GRADIENT,
             detail="fp32_global_gradient_norm_is_not_finite",
-            valid_term_count=valid_term_count,
+            valid_token_count=valid_token_count,
             step_size=audited_step_size,
         )
     gradient_norm = _audit_float(gradient_norm_tensor)
@@ -473,7 +470,7 @@ def functional_sgd_step(
             optimizer_state,
             reason=UpdateSkipReason.INVALID_AFTER_CLIP,
             detail="clipped_gradient_is_not_finite",
-            valid_term_count=valid_term_count,
+            valid_token_count=valid_token_count,
             gradient_norm=gradient_norm,
             per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
             step_size=audited_step_size,
@@ -485,7 +482,7 @@ def functional_sgd_step(
             optimizer_state,
             reason=UpdateSkipReason.INVALID_AFTER_CLIP,
             detail="clipped_fp32_global_norm_is_not_finite",
-            valid_term_count=valid_term_count,
+            valid_token_count=valid_token_count,
             gradient_norm=gradient_norm,
             per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
             step_size=audited_step_size,
@@ -498,7 +495,7 @@ def functional_sgd_step(
             optimizer_state,
             reason=UpdateSkipReason.ZERO_GRADIENT,
             detail="clipped_gradient_has_zero_global_norm",
-            valid_term_count=valid_term_count,
+            valid_token_count=valid_token_count,
             gradient_norm=gradient_norm,
             clipped_gradient_norm=clipped_norm,
             per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
@@ -516,7 +513,7 @@ def functional_sgd_step(
             optimizer_state,
             reason=UpdateSkipReason.INVALID_AFTER_CLIP,
             detail="candidate_fast_weight_is_not_finite",
-            valid_term_count=valid_term_count,
+            valid_token_count=valid_token_count,
             gradient_norm=gradient_norm,
             clipped_gradient_norm=clipped_norm,
             per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
@@ -537,7 +534,7 @@ def functional_sgd_step(
             optimizer_state,
             reason=UpdateSkipReason.UNREPRESENTABLE_UPDATE,
             detail="update_not_representable_in_fast_dtype",
-            valid_term_count=valid_term_count,
+            valid_token_count=valid_token_count,
             gradient_norm=gradient_norm,
             clipped_gradient_norm=clipped_norm,
             per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
@@ -561,7 +558,7 @@ def functional_sgd_step(
         fast_state=next_state,
         optimizer_state=next_optimizer,
         did_update=True,
-        valid_term_count=valid_term_count,
+        valid_token_count=valid_token_count,
         gradient_norm=gradient_norm,
         clipped_gradient_norm=clipped_norm,
         per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
@@ -580,7 +577,7 @@ def _skip_result(
     *,
     reason: UpdateSkipReason,
     detail: str,
-    valid_term_count: int,
+    valid_token_count: int,
     gradient_norm: float | None = None,
     clipped_gradient_norm: float | None = None,
     per_matrix_gradient_norms: tuple[float, float] | None = None,
@@ -606,7 +603,7 @@ def _skip_result(
         fast_state=next_state,
         optimizer_state=next_optimizer,
         did_update=False,
-        valid_term_count=valid_term_count,
+        valid_token_count=valid_token_count,
         gradient_norm=gradient_norm,
         clipped_gradient_norm=clipped_gradient_norm,
         per_matrix_gradient_norms=per_matrix_gradient_norms,
@@ -682,62 +679,18 @@ def _next_optimizer_state(
     )
 
 
-def _validate_ttt_output_for_sgd(ttt_output: TTTLossOutput) -> int:
-    if not isinstance(ttt_output, TTTLossOutput):
-        raise TypeError("TTT SGD bridge requires TTTLossOutput")
-    batch_size = int(ttt_output.per_row_total.shape[0])
+def _validate_associative_output_for_sgd(
+    associative_output: AssociativeTTTLossOutput,
+) -> int:
+    if not isinstance(associative_output, AssociativeTTTLossOutput):
+        raise TypeError("associative SGD bridge requires AssociativeTTTLossOutput")
+    batch_size = int(associative_output.per_row_total.shape[0])
     if batch_size <= 0:
-        raise ValueError("TTT SGD bridge requires a non-empty batch")
-    terms: tuple[LossTerm, ...] = (
-        ttt_output.pred,
-        ttt_output.identity,
-        ttt_output.e1_event,
-        ttt_output.e2_event,
-        ttt_output.event,
-    )
-    if any(term.per_row.shape != (batch_size,) for term in terms):
-        raise ValueError("all TTT loss terms must share the output batch size")
-    if any(term.per_row.device != ttt_output.per_row_total.device for term in terms):
-        raise ValueError("all TTT loss rows must share one device")
-    expected_event_rows = ttt_output.e1_event.per_row + ttt_output.e2_event.per_row
-    expected_event_counts = ttt_output.e1_event.valid_counts + ttt_output.e2_event.valid_counts
-    if not torch.allclose(
-        ttt_output.event.per_row.detach(),
-        expected_event_rows.detach(),
-        atol=1.0e-6,
-        rtol=1.0e-6,
-    ) or not torch.equal(ttt_output.event.valid_counts, expected_event_counts):
-        raise ValueError("TTT event rows/counts must equal E1 plus E2")
-    expected_rows = (
-        ttt_output.pred_weight * ttt_output.pred.per_row
-        + ttt_output.identity_weight * ttt_output.identity.per_row
-        + ttt_output.event_weight * ttt_output.event.per_row
-    )
-    if not torch.allclose(
-        ttt_output.per_row_total.detach(),
-        expected_rows.detach(),
-        atol=1.0e-6,
-        rtol=1.0e-6,
-    ):
-        raise ValueError("TTT per-row total must equal its frozen weighted terms")
-    expected_valid = (
-        ttt_output.pred.row_valid_mask
-        | ttt_output.identity.row_valid_mask
-        | ttt_output.event.row_valid_mask
-    )
-    if not torch.equal(ttt_output.update_valid_mask, expected_valid):
-        raise ValueError("TTT update-valid mask must be the union of weighted terms")
+        raise ValueError("associative SGD bridge requires a non-empty batch")
+    expected_valid = associative_output.valid_token_counts > 0
+    if not torch.equal(associative_output.update_valid_mask, expected_valid):
+        raise ValueError("associative update-valid mask must match valid token counts")
     return batch_size
-
-
-def _invalid_ttt_row_reason(
-    ttt_output: TTTLossOutput,
-    row: int,
-) -> UpdateSkipReason:
-    pred_reason = ttt_output.pred.skip_reasons[row]
-    if pred_reason is LossSkipReason.INSUFFICIENT_TIME:
-        return UpdateSkipReason.INSUFFICIENT_TIME
-    return UpdateSkipReason.NO_VALID_TERM
 
 
 def _gradient_mode(
