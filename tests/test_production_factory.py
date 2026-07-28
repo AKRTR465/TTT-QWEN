@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
-import sys
 from collections.abc import Iterator
 from enum import StrEnum
 from fractions import Fraction
@@ -75,7 +73,6 @@ from ttt_svcbench_qwen.stage_a_targets import (
     OfficialWeakLossAudit,
     OperatorDiagnosticAudit,
 )
-from ttt_svcbench_qwen.step_controller import InnerStepController
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -386,6 +383,11 @@ def test_outer_checkpoint_loader_accepts_only_exact_safetensors(tmp_path: Path) 
     save_file(bad, tmp_path / "bad.safetensors")
     with pytest.raises(ValueError, match="exactly match"):
         load_outer_checkpoint(target, tmp_path / "bad.safetensors")
+    removed_controller = dict(source.state_dict())
+    removed_controller["step_controller.weight"] = torch.zeros((1, 7))
+    save_file(removed_controller, tmp_path / "learned-step.safetensors")
+    with pytest.raises(ValueError, match="exactly match"):
+        load_outer_checkpoint(target, tmp_path / "learned-step.safetensors")
 
 
 def test_production_outer_checkpoint_owns_ema_balance_state() -> None:
@@ -1600,45 +1602,6 @@ def test_production_runtime_defers_optimizer_and_sampler_to_central_bridge() -> 
     assert runtime.train_sampler_factory is None
 
 
-def test_a2_initialization_allows_only_new_learned_step_controller_keys(
-    tmp_path: Path,
-) -> None:
-    source = _OuterToy()
-    checkpoint = tmp_path / "a2-final-without-controller"
-    checkpoint.mkdir()
-    save_file(
-        {name: value.detach().clone() for name, value in source.state_dict().items()},
-        str(checkpoint / "model.safetensors"),
-    )
-    target = _OuterToy()
-    learned_config = load_config().fast_ttt.step_controller.model_copy(
-        update={"mode": "learned"}
-    )
-    target.step_controller = InnerStepController(learned_config)
-    initial_controller = {
-        name: value.detach().clone()
-        for name, value in target.step_controller.state_dict().items()
-    }
-
-    audit = initialize_outer_model_from_a2(
-        target,
-        checkpoint,
-        allowed_missing_prefixes=("step_controller.",),
-    )
-
-    assert audit.missing_keys == ()
-    assert all(
-        torch.equal(source.state_dict()[name], target.state_dict()[name])
-        for name in source.state_dict()
-    )
-    assert all(
-        torch.equal(initial_controller[name], target.step_controller.state_dict()[name])
-        for name in initial_controller
-    )
-    with pytest.raises(ValueError, match="exactly match"):
-        initialize_outer_model_from_a2(target, checkpoint)
-
-
 def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Path) -> None:
     run = tmp_path / "runs" / "0715_010203_a5"
     checkpoint = run / "checkpoints" / "checkpoint-20"
@@ -1691,7 +1654,7 @@ def test_same_stage_resume_accepts_only_matching_static_w0_mode(tmp_path: Path) 
         resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
 
 
-def test_same_stage_resume_rejects_step_controller_ablation_mismatch(
+def test_same_stage_resume_accepts_only_legacy_a_fixed(
     tmp_path: Path,
 ) -> None:
     run = tmp_path / "runs" / "learned-step"
@@ -1712,26 +1675,19 @@ def test_same_stage_resume_rejects_step_controller_ablation_mismatch(
         encoding="utf-8",
     )
 
-    assert (
-        resolve_same_stage_resume(
-            str(checkpoint),
-            ProductionStage.A5,
-            a5_step_controller_mode="learned",
-        )
-        == checkpoint
-    )
-    with pytest.raises(ValueError, match="step-controller mode"):
+    with pytest.raises(ValueError, match="learned-step checkpoints"):
         resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
 
     raw = json.loads((run / "run_config.json").read_text(encoding="utf-8"))
-    del raw["a5_step_controller_feature_contract"]
+    raw["a5_step_controller_mode"] = "fixed"
+    raw["a5_fixed_variant"] = "A"
     (run / "run_config.json").write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(ValueError, match="feature contract is incompatible"):
-        resolve_same_stage_resume(
-            str(checkpoint),
-            ProductionStage.A5,
-            a5_step_controller_mode="learned",
-        )
+    assert resolve_same_stage_resume(str(checkpoint), ProductionStage.A5) == checkpoint
+
+    raw["a5_fixed_variant"] = "C"
+    (run / "run_config.json").write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="B-E effect-ablation checkpoints"):
+        resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
 
 
 def test_a5_global_sample_sequence_hash_is_mode_independent(
@@ -2438,42 +2394,10 @@ def test_central_outer_optimizer_has_exact_stage_groups(
     assert owned == {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
 
 
-@pytest.mark.parametrize(
-    ("variant", "expected_w0_budget", "expected_predictor_budget"),
-    [
-        ("A", 5.0e-6, 5.0e-6),
-        ("B", 5.0e-6, 5.0e-6),
-        ("C", 5.0e-6, 1.0e-5),
-        ("D", 5.0e-6, 5.0e-6),
-        ("E", 7.5e-6, 5.0e-6),
-    ],
-)
-def test_each_generated_a5_variant_builds_the_production_optimizer(
+def test_canonical_a5_builds_equal_budget_production_optimizer(
     tmp_path: Path,
-    variant: str,
-    expected_w0_budget: float,
-    expected_predictor_budget: float,
 ) -> None:
-    output = tmp_path / "project.yaml"
-    subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "scripts" / "build_a5_ttt_effect_config.py"),
-            "--base",
-            str(ROOT / "configs" / "model_state_ttt_8b.yaml"),
-            "--output",
-            str(output),
-            "--fixed-variant",
-            variant,
-            "--step-controller",
-            "fixed",
-        ],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    project = load_config(output)
+    project = load_config()
     bundle, model = _grouped_bundle(tmp_path, project)
 
     optimizer = make_production_outer_optimizer_factory(
@@ -2483,48 +2407,35 @@ def test_each_generated_a5_variant_builds_the_production_optimizer(
 
     groups = {str(group["group_name"]): group for group in optimizer.param_groups}
     caps = project.outer_gradient_control.max_grad_norm
-    assert project.a5.effect_ablation.fixed_variant == variant
+    assert "step_controller" not in groups
     assert float(groups["w0"]["lr"]) * float(caps.w0) == pytest.approx(
-        expected_w0_budget
+        5.0e-6
     )
     assert float(groups["predictor"]["lr"]) * float(caps.predictor) == pytest.approx(
-        expected_predictor_budget
+        5.0e-6
     )
 
 
-def test_optimizer_rejects_unlicensed_c_budget_drift(tmp_path: Path) -> None:
+def test_optimizer_rejects_noncanonical_budget_drift(tmp_path: Path) -> None:
     base = load_config()
-    c_project = ProjectConfig.model_validate(
-        {
-            **base.model_dump(mode="python"),
-            "a5": {
-                **base.a5.model_dump(mode="python"),
-                "effect_ablation": {"fixed_variant": "C"},
-                "optimizer": {
-                    **base.a5.optimizer.model_dump(mode="python"),
-                    "predictor_learning_rate": 1.0e-4,
-                },
-            },
-            "outer_gradient_control": {
-                **base.outer_gradient_control.model_dump(mode="python"),
-                "mode": "per_group_l2_single_factor_ablation",
-            },
-        }
-    )
-    wrong_mode = c_project.model_copy(
+    wrong_project = base.model_copy(
         update={
-            "outer_gradient_control": c_project.outer_gradient_control.model_copy(
-                update={"mode": base.outer_gradient_control.mode}
+            "a5": base.a5.model_copy(
+                update={
+                    "optimizer": base.a5.optimizer.model_copy(
+                        update={"predictor_learning_rate": 1.0e-4}
+                    )
+                }
             )
         }
     )
-    bundle, model = _grouped_bundle(tmp_path, wrong_mode)
+    bundle, model = _grouped_bundle(tmp_path, wrong_project)
 
-    with pytest.raises(ValueError, match="configured policy"):
+    with pytest.raises(ValueError, match="must remain aligned"):
         make_production_outer_optimizer_factory(bundle, ProductionStage.A5)(model)
 
 
-def test_learned_step_controller_has_its_own_outer_optimizer_group(
+def test_outer_optimizer_rejects_removed_step_controller_parameters(
     tmp_path: Path,
 ) -> None:
     qwen = nn.Linear(4, 4)
@@ -2579,19 +2490,11 @@ def test_learned_step_controller_has_its_own_outer_optimizer_group(
         symbols=symbols,
     )
     model = _GroupedOuterToy(qwen, predictor_trainable=True)
-    model.step_controller = InnerStepController(project.fast_ttt.step_controller.model_copy(
-        update={"mode": "learned"}
-    ))
+    model.step_controller = nn.Linear(7, 1)
 
-    optimizer = make_production_outer_optimizer_factory(
-        bundle,
-        ProductionStage.A5,
-        a5_adaptation_mode="meta_ttt",
-        a5_step_controller_mode="learned",
-    )(model)
-
-    groups = {group["group_name"]: group for group in optimizer.param_groups}
-    assert groups["step_controller"]["lr"] == 1.0e-4
-    assert {id(parameter) for parameter in groups["step_controller"]["params"]} == {
-        id(parameter) for parameter in model.step_controller.parameters()
-    }
+    with pytest.raises(ValueError, match="step-controller parameters were removed"):
+        make_production_outer_optimizer_factory(
+            bundle,
+            ProductionStage.A5,
+            a5_adaptation_mode="meta_ttt",
+        )(model)

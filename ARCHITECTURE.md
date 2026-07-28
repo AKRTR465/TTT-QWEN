@@ -87,11 +87,11 @@ Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由�
 - Support 不设人工数值上限；
 - 每 8 个 Support 截断二阶图并重锚 W0；
 - 每个 segment backward，episode 末由 Outer optimizer 单次 step；
-- A–E 固定步实验由 `a5.effect_ablation.fixed_variant` 标识；正式预算保持等值，C 仅允许
-  Predictor `LR × cap` 为基准的 2 倍，E 仅允许 W0 为基准的 1.5 倍；
-- learned controller 仅可叠加 Variant A，其七维输入使用 `causal_k8_v2`：第一维为固定
-  K=8 因果窗口进度，第二维为仅计入含因果帧 chunk 的 episode 进度；
-- 不运行 static-W0 counterfactual。
+- Inner SGD 固定使用 `1e-4`，不注册可学习步长控制器；
+- Predictor Outer LR 固定为 `5e-5`，Support auxiliary outer weight 固定为 `0.1`，W0
+  gradient cap 固定为 `0.1`，各独立组更新预算严格对齐 Qwen；
+- `static_w0` 保留为 NoUpdate 对照；counterfactual 仅作为 Meta-TTT 的无梯度因果诊断，
+  不参与优化。
 
 ## 5. 在线推理主线
 
@@ -110,7 +110,7 @@ load checkpoint
 约束：
 
 - query_time 之后帧在进入模型前裁剪；
-- learned updater 的 Support 位置由请求预先计算并显式传入，纯未来 chunk 不计数；
+- updater 固定使用配置中的 Inner SGD LR；纯未来 chunk 不触发状态观察或更新；
 - updater 只允许修改 fast/optimizer/overlap memory；
 - 更新后的 Wt 不得回溯影响当前 chunk；
 - generation 不重跑视频状态路径、不修改 Bank/FSM/Fast；

@@ -57,11 +57,6 @@ from ttt_svcbench_qwen.model import (
 from ttt_svcbench_qwen.state_bank import StructuredStateBank, TensorizedRetrievalHistory
 from ttt_svcbench_qwen.state_encoder import TemporalCache
 from ttt_svcbench_qwen.state_reader import ReaderResult
-from ttt_svcbench_qwen.step_controller import (
-    CausalSupportPosition,
-    InnerStepController,
-    build_step_controller_features,
-)
 
 type AuditValue = str | int | float | bool | None
 
@@ -245,24 +240,6 @@ class InferenceRequest:
         return self.query_input.query_time
 
 
-def build_causal_support_positions(
-    chunks: tuple[CausalChunk, ...],
-    *,
-    query_time: float,
-    truncation_horizon: int,
-) -> dict[str, CausalSupportPosition]:
-    """Index only chunks that expose at least one frame at or before the Query time."""
-
-    causal_ids = tuple(
-        chunk.chunk_id for chunk in chunks if chunk.causal_prefix(query_time) is not None
-    )
-    support_count = len(causal_ids)
-    return {
-        chunk_id: CausalSupportPosition(index, support_count, truncation_horizon)
-        for index, chunk_id in enumerate(causal_ids)
-    }
-
-
 @dataclass(frozen=True, slots=True)
 class RuntimeBoundaryStamp:
     """CPU-copy-free lifecycle identity for the authoritative runtime."""
@@ -382,9 +359,7 @@ class TTTUpdateStage(Protocol):
         observation: ObservationChunkOutput,
         runtime_state: TrajectoryRuntimeState,
         *,
-        current_start_time: float,
         current_end_time: float,
-        causal_position: CausalSupportPosition | None,
     ) -> TTTUpdateOutcome: ...
 
 
@@ -395,7 +370,6 @@ class OnlineTTTUpdater:
         self,
         config: ProjectConfig,
         predictor: TemporalPredictor,
-        step_controller: InnerStepController | None = None,
     ) -> None:
         if not isinstance(config, ProjectConfig):
             raise TypeError("online updater requires validated ProjectConfig")
@@ -404,22 +378,13 @@ class OnlineTTTUpdater:
         self.config = config
         self.predictor = predictor
         self.input_builder = CausalOverlapTTTInputBuilder(config)
-        self.step_controller_mode = config.fast_ttt.step_controller.mode
-        if self.step_controller_mode == "learned":
-            if not isinstance(step_controller, InnerStepController):
-                raise ValueError("learned online TTT requires its checkpointed step controller")
-        elif step_controller is not None:
-            raise ValueError("fixed online TTT must not register a step controller")
-        self.step_controller = step_controller
 
     def __call__(
         self,
         observation: ObservationChunkOutput,
         runtime_state: TrajectoryRuntimeState,
         *,
-        current_start_time: float,
         current_end_time: float,
-        causal_position: CausalSupportPosition | None,
     ) -> TTTUpdateOutcome:
         if observation.owner != runtime_state.owner:
             raise InferenceProtocolError("online update owner does not match observation")
@@ -431,31 +396,11 @@ class OnlineTTTUpdater:
             enabled_terms=("pred", "identity", "event"),
         )
         output = compute_ttt_loss(self.predictor, built.inputs)
-        step_sizes: Tensor | None = None
-        if self.step_controller is not None:
-            if not isinstance(causal_position, CausalSupportPosition):
-                raise InferenceProtocolError(
-                    "learned online TTT requires a causal Support position"
-                )
-            with torch.no_grad():
-                step_sizes = self.step_controller(
-                    build_step_controller_features(
-                        ttt_output=output,
-                        start_time=current_start_time,
-                        end_time=current_end_time,
-                        previous_end_time=(
-                            current_start_time if previous is None else previous.end_time
-                        ),
-                        position=causal_position,
-                        controller=self.step_controller,
-                    )
-                )
         result = functional_sgd_steps_from_ttt(
             ttt_output=output,
             fast_states=(_require_fast_state(runtime_state),),
             optimizer_config=self.config.fast_ttt.optimizer,
             optimizer_states=(_require_optimizer_state(runtime_state),),
-            step_sizes=step_sizes,
         )[0]
         updated = replace(
             runtime_state,
@@ -706,7 +651,6 @@ class PerVideoRuntimeManager:
         query_input: RuntimeQueryInput,
         query_time: float,
         updater: TTTUpdateStage,
-        causal_position: CausalSupportPosition | None = None,
         prepared_query: PreparedQueryOutput | None = None,
     ) -> ChunkExecution:
         """Observe with W_t, write hard state, then create W_(t+1) for the next chunk."""
@@ -719,10 +663,6 @@ class PerVideoRuntimeManager:
             before_fast_stamp = _fast_state_stamp(fast)
             causal = chunk.causal_prefix(query_time)
             if causal is None:
-                if causal_position is not None:
-                    raise InferenceProtocolError(
-                        "future-only chunk cannot carry a causal Support position"
-                    )
                 audit = ChunkAudit(
                     chunk_id=chunk.chunk_id,
                     original_start_time=chunk.start_time,
@@ -803,9 +743,7 @@ class PerVideoRuntimeManager:
             outcome = updater(
                 observation,
                 observed,
-                current_start_time=causal.start_time,
                 current_end_time=causal.end_time,
-                causal_position=causal_position,
             )
             updated = _require_trajectory_runtime(outcome.runtime_state, owner)
             if _hard_state_stamp(updated) != hard_stamp:
@@ -872,26 +810,27 @@ class PerVideoRuntimeManager:
             lifecycle = self._query_lifecycle(owner)
             before_guard = _runtime_guard_stamp(runtime)
             before_snapshot = self._snapshot(runtime, content=True)
-            prepared = model.prepare_answer(
-                AnswerQueryRequest(
-                    owner=owner,
-                    observation=observation,
-                    base_input_ids=answer_inputs.base_input_ids,
-                    base_attention_mask=answer_inputs.base_attention_mask,
-                    pixel_values_videos=answer_inputs.pixel_values_videos,
-                    video_grid_thw=answer_inputs.video_grid_thw,
-                    tokenizer=answer_inputs.tokenizer,
-                    embedding_owner=answer_inputs.embedding_owner,
-                    rope_indexer=answer_inputs.rope_indexer,
-                    qwen_kwargs=answer_inputs.qwen_kwargs,
-                ),
-                lifecycle,
-            )
-            generated = model.generate_answer(
-                prepared,
-                lifecycle,
-                max_new_tokens=max_new_tokens,
-            )
+            with self.fast_adapter.use_fast_state(fast), torch.no_grad():
+                prepared = model.prepare_answer(
+                    AnswerQueryRequest(
+                        owner=owner,
+                        observation=observation,
+                        base_input_ids=answer_inputs.base_input_ids,
+                        base_attention_mask=answer_inputs.base_attention_mask,
+                        pixel_values_videos=answer_inputs.pixel_values_videos,
+                        video_grid_thw=answer_inputs.video_grid_thw,
+                        tokenizer=answer_inputs.tokenizer,
+                        embedding_owner=answer_inputs.embedding_owner,
+                        rope_indexer=answer_inputs.rope_indexer,
+                        qwen_kwargs=answer_inputs.qwen_kwargs,
+                    ),
+                    lifecycle,
+                )
+                generated = model.generate_answer(
+                    prepared,
+                    lifecycle,
+                    max_new_tokens=max_new_tokens,
+                )
             if len(generated.reader) != 1 or not isinstance(generated.reader[0], ReaderResult):
                 raise InferenceProtocolError("online inference requires one ReaderResult")
             reader_result = generated.reader[0]
@@ -1109,11 +1048,6 @@ def run_inference(
         raise TypeError("run_inference requires StateTTTModel")
     if not isinstance(request, InferenceRequest):
         raise TypeError("run_inference requires InferenceRequest")
-    causal_positions = build_causal_support_positions(
-        request.chunks,
-        query_time=request.query_time,
-        truncation_horizon=model.config.a5.truncation_horizon,
-    )
     manager.reset(request.video_id, request.trajectory_id, request.query_signature)
     latest_observation: ObservationChunkOutput | None = None
     try:
@@ -1124,7 +1058,6 @@ def run_inference(
                 query_input=request.query_input,
                 query_time=request.query_time,
                 updater=updater,
-                causal_position=causal_positions.get(chunk.chunk_id),
                 prepared_query=request.prepared_query,
             )
             if execution.observation is not None:

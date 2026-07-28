@@ -91,11 +91,6 @@ from ttt_svcbench_qwen.stage_a_targets import (
 )
 from ttt_svcbench_qwen.state_encoder import TemporalEncoderOutput
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
-from ttt_svcbench_qwen.step_controller import (
-    CausalSupportPosition,
-    InnerStepController,
-    build_step_controller_features,
-)
 from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
 from ttt_svcbench_qwen.trainer import (
     StageAEpisodeAnswerInputs,
@@ -840,7 +835,6 @@ class InnerUpdateAudit:
     skip_reasons: tuple[str | None, ...]
     gradient_norms: tuple[float | None, ...]
     update_norms: tuple[float, ...]
-    step_sizes: tuple[float, ...]
     pred_valid_counts: tuple[int, ...]
     identity_valid_counts: tuple[int, ...]
     e1_valid_counts: tuple[int, ...]
@@ -858,7 +852,6 @@ class InnerUpdateAudit:
             self.skip_reasons,
             self.gradient_norms,
             self.update_norms,
-            self.step_sizes,
             self.pred_valid_counts,
             self.identity_valid_counts,
             self.e1_valid_counts,
@@ -1337,7 +1330,6 @@ class MetaTTTEpisodeRunner:
         query_activation_offload: bool = False,
         outer_composer: OfficialWeakOuterLossComposer | None = None,
         adaptation_mode: str = "meta_ttt",
-        step_controller: InnerStepController | None = None,
     ) -> None:
         if not isinstance(config, ProjectConfig):
             raise TypeError("Meta-TTT runner requires validated ProjectConfig")
@@ -1370,15 +1362,6 @@ class MetaTTTEpisodeRunner:
             raise ValueError("A5 adaptation mode must be meta_ttt or static_w0")
         self.adaptation_mode = adaptation_mode
         self.ttt_enabled = adaptation_mode == "meta_ttt"
-        self.step_controller_mode = config.fast_ttt.step_controller.mode
-        if self.step_controller_mode == "learned":
-            if not self.ttt_enabled:
-                raise ValueError("learned InnerStepController is forbidden in static-W0")
-            if not isinstance(step_controller, InnerStepController):
-                raise TypeError("learned step mode requires InnerStepController")
-        elif step_controller is not None:
-            raise ValueError("fixed step mode must not register InnerStepController")
-        self.step_controller = step_controller
         if not self.ttt_enabled:
             self.predictor.requires_grad_(False)
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
@@ -1426,14 +1409,11 @@ class MetaTTTEpisodeRunner:
         backward_fn = backward or _plain_backward
         self.model.train()
         self.predictor.train(self.ttt_enabled)
-        if self.step_controller is not None:
-            self.step_controller.train()
         adapted = self._reset_trajectory(episode.owner, differentiable=True)
         tracked_parameters = _unique_parameters(
             (
                 *self.model.parameters(),
                 *self.predictor.parameters(),
-                *(() if self.step_controller is None else self.step_controller.parameters()),
             )
         )
         versions_before = tuple(parameter._version for parameter in tracked_parameters)
@@ -1591,30 +1571,11 @@ class MetaTTTEpisodeRunner:
                 _validate_variant_loss_terms(ttt_output, self.enabled_terms)
                 outer_ttt_loss = compute_ttt_outer_auxiliary_loss(ttt_output)
                 before_versions = tuple(state.fast_version for state in adapted.fast_states)
-                step_sizes = (
-                    None
-                    if self.step_controller is None
-                    else self.step_controller(
-                        build_step_controller_features(
-                            ttt_output=ttt_output,
-                            start_time=chunk.start_time,
-                            end_time=chunk.end_time,
-                            previous_end_time=previous_snapshot.end_time,
-                            position=CausalSupportPosition(
-                                support_index=support_index,
-                                support_count=support_count,
-                                truncation_horizon=self.config.a5.truncation_horizon,
-                            ),
-                            controller=self.step_controller,
-                        )
-                    )
-                )
                 results = functional_sgd_steps_from_ttt(
                     ttt_output=ttt_output,
                     fast_states=adapted.fast_states,
                     optimizer_config=self.config.fast_ttt.optimizer,
                     optimizer_states=adapted.optimizer_states,
-                    step_sizes=step_sizes,
                 )
                 adapted.fast_states = tuple(result.fast_state for result in results)
                 adapted.optimizer_states = tuple(result.optimizer_state for result in results)
@@ -1694,7 +1655,7 @@ class MetaTTTEpisodeRunner:
                 temporal_error_max_abs = torch.maximum(
                     temporal_error_max_abs, scale_audit.error_max_abs
                 )
-                del results, step_sizes, ttt_output, built, observation
+                del results, ttt_output, built, observation
 
             query_runtime_snapshot = adapted.runtime
             authoritative_fast_states = query_runtime_snapshot.fast_states
@@ -1731,6 +1692,7 @@ class MetaTTTEpisodeRunner:
                         query,
                         calibration_observation,
                         calibration_lifecycle,
+                        fast_states=adapted.fast_states,
                         with_grad=False,
                     )
                     self._balance_query_objectives(
@@ -1779,6 +1741,7 @@ class MetaTTTEpisodeRunner:
                         query,
                         observation,
                         query_lifecycle,
+                        fast_states=proxy_states,
                         with_grad=True,
                     )
                 immutable = observation_versions == _tensor_version_signature(observation)
@@ -2300,6 +2263,7 @@ class MetaTTTEpisodeRunner:
         observation: ObservationChunkOutput,
         lifecycle: PrefillLifecycle,
         *,
+        fast_states: Sequence[FastWeightsState],
         with_grad: bool,
     ) -> StateTTTModelOutput:
         answer = query.answer
@@ -2315,7 +2279,10 @@ class MetaTTTEpisodeRunner:
             rope_indexer=answer.rope_indexer,
             qwen_kwargs=answer.qwen_kwargs,
         )
-        with torch.set_grad_enabled(with_grad):
+        with (
+            torch.set_grad_enabled(with_grad),
+            self.fast_controller.use_fast_state(fast_states),
+        ):
             return self.model.prefill_answer(
                 self.model.prepare_answer(request, lifecycle),
                 lifecycle,
@@ -2357,7 +2324,13 @@ class MetaTTTEpisodeRunner:
                 with_grad=False,
                 prepared_query=prepared_query,
             )
-            output = self._answer(query, observation, lifecycle, with_grad=False)
+            output = self._answer(
+                query,
+                observation,
+                lifecycle,
+                fast_states=reference.fast_states,
+                with_grad=False,
+            )
             objective = self._query_objective(query, output, ())
             if balance_audit is not None:
                 outer = self.outer_composer.compose_one_from_audit(
@@ -2493,7 +2466,6 @@ def _make_inner_update_audit(
         ),
         gradient_norms=tuple(result.gradient_norm for result in results),
         update_norms=tuple(result.update_norm for result in results),
-        step_sizes=tuple(result.step_size for result in results),
         pred_valid_counts=tuple(int(value.item()) for value in ttt_output.pred.valid_counts),
         identity_valid_counts=tuple(
             int(value.item()) for value in ttt_output.identity.valid_counts

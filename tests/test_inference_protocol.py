@@ -24,7 +24,6 @@ from ttt_svcbench_qwen.inference import (
     QueryAttemptKind,
     TTTUpdateOutcome,
     assert_inference_runtime_payload,
-    build_causal_support_positions,
     run_inference,
     runtime_boundary_stamp,
 )
@@ -75,7 +74,6 @@ from ttt_svcbench_qwen.state_encoder import (
     TemporalEncoderOutput,
 )
 from ttt_svcbench_qwen.state_reader import ReaderResult, ReaderStatus
-from ttt_svcbench_qwen.step_controller import CausalSupportPosition, InnerStepController
 
 
 class _Dependencies(SimpleNamespace):
@@ -171,6 +169,7 @@ class _FakeSuite:
         self.fast_adapter: FastTTTAdapter | None = None
         self.fast_mode = "consume"
         self.fast_versions: list[int] = []
+        self.answer_fast_versions: list[tuple[int, ...]] = []
         self.seen_frames: list[tuple[object, ...]] = []
         self.prefill_calls = 0
         self.generate_calls = 0
@@ -339,6 +338,13 @@ class _FakeSuite:
 
     def generate(self, request: QwenGenerateRequest) -> QwenGenerateOutput:
         self.generate_calls += 1
+        if self.fast_adapter is None or self.fast_adapter._active_fast_states is None:
+            raise RuntimeError("tiny Answer generation requires one managed fast-state binding")
+        active = self.fast_adapter._active_fast_states
+        self.answer_fast_versions.append(tuple(state.fast_version for state in active))
+        dtype = self.fast_adapter.w0_1.dtype
+        device = self.fast_adapter.w0_1.device
+        self.fast_adapter(torch.zeros((len(active), 1, 4096), dtype=dtype, device=device))
         if self.mutate_manager is not None:
             state = self.mutate_manager.active_runtime
             assert state is not None and state.fast_weights is not None
@@ -628,20 +634,15 @@ class _Updater:
     def __init__(self, skip_calls: set[int] | None = None) -> None:
         self.calls = 0
         self.skip_calls = skip_calls or set()
-        self.positions: list[CausalSupportPosition | None] = []
 
     def __call__(
         self,
         _observation: ObservationChunkOutput,
         runtime: TrajectoryRuntimeState,
         *,
-        current_start_time: float,
         current_end_time: float,
-        causal_position: CausalSupportPosition | None,
     ) -> TTTUpdateOutcome:
-        assert 0.0 <= current_start_time <= current_end_time
         assert current_end_time >= 0.0
-        self.positions.append(causal_position)
         call = self.calls
         self.calls += 1
         fast = runtime.fast_weights
@@ -784,7 +785,7 @@ def test_causal_chunks_next_only_updates_and_generation_immutability(
     assert manager.active_runtime is None
 
 
-def test_causal_support_positions_exclude_future_only_chunks_without_gaps(
+def test_future_only_chunks_are_skipped_without_update_state(
     dependencies: _Dependencies,
 ) -> None:
     chunks = (
@@ -792,17 +793,6 @@ def test_causal_support_positions_exclude_future_only_chunks_without_gaps(
         CausalChunk("partial", ("c", "future"), (2.0, 4.0), (2, 3)),
         CausalChunk("future", ("d", "e"), (3.0, 5.0), (4, 5)),
     )
-    positions = build_causal_support_positions(
-        chunks,
-        query_time=2.0,
-        truncation_horizon=8,
-    )
-
-    assert positions == {
-        "full": CausalSupportPosition(0, 2, 8),
-        "partial": CausalSupportPosition(1, 2, 8),
-    }
-
     updater = _Updater()
     request = replace(_request(), chunks=chunks)
     manager = _manager(dependencies)
@@ -813,7 +803,7 @@ def test_causal_support_positions_exclude_future_only_chunks_without_gaps(
         updater=updater,
     )
 
-    assert updater.positions == [positions["full"], positions["partial"]]
+    assert updater.calls == 2
     assert tuple(audit.update_attempted for audit in result.chunk_audit) == (True, True, False)
     assert result.state_attention is not None
     assert result.runtime_state.released
@@ -952,6 +942,13 @@ def test_reader_statuses_and_explicit_retry_use_one_prefill_each(
     assert tuple(result.reader_result.status for result in results) == statuses
     assert results[1].generate_audit.query_kind is QueryAttemptKind.RETRY
     assert results[1].generate_audit.retry_of == "query-ok"
+    runtime = manager.active_runtime
+    assert runtime is not None and runtime.fast_weights is not None
+    assert suite.answer_fast_versions == [
+        (runtime.fast_weights.fast_version,),
+    ] * len(statuses)
+    assert suite.fast_adapter is not None
+    assert suite.fast_adapter._active_fast_states is None
     manager.release()
 
 
@@ -969,6 +966,8 @@ def test_generation_mutation_fails_closed_and_exception_releases_runtime(
             updater=_Updater(skip_calls={1}),
         )
     assert manager.active_runtime is None
+    assert suite.fast_adapter is not None
+    assert suite.fast_adapter._active_fast_states is None
 
 
 def test_fast_binding_is_fail_closed_and_not_reentrant(dependencies: _Dependencies) -> None:
@@ -1049,6 +1048,7 @@ def test_online_updater_publishes_overlap_and_next_only_fast_state(
     assert first.audit.fast_version_used == 0
     assert first.audit.did_update, first.audit.skip_reason
     assert first.audit.next_fast_version == 1
+    assert first.audit.step_size == pytest.approx(1.0e-4)
     assert first.runtime_state.online_overlap_memory is not None
     assert first.runtime_state.online_overlap_memory.end_time == 1.0
 
@@ -1061,88 +1061,10 @@ def test_online_updater_publishes_overlap_and_next_only_fast_state(
     )
     assert second.audit.fast_version_used == 1
     assert second.audit.next_fast_version == 2
+    assert second.audit.step_size == pytest.approx(1.0e-4)
     assert second.runtime_state.online_overlap_memory is not None
     assert second.runtime_state.online_overlap_memory.end_time == 3.0
     manager.release()
-
-
-def test_learned_online_updater_is_explicit_and_uses_checkpointed_step_size(
-    dependencies: _Dependencies,
-) -> None:
-    raw = dependencies.config.model_dump(mode="python")
-    raw["fast_ttt"]["step_controller"]["mode"] = "learned"
-    config = ProjectConfig.model_validate(raw)
-    controller = InnerStepController(config.fast_ttt.step_controller)
-    with torch.no_grad():
-        controller.output.bias.zero_()
-    updater = OnlineTTTUpdater(
-        config,
-        build_temporal_predictor(config.predictor),
-        controller,
-    )
-    manager = _manager(dependencies)
-    model = _stage_a_model(dependencies, _TypedStageSuite())
-    manager.reset("video-a", "trajectory-a", torch.zeros(512))
-
-    first = manager.observe_chunk(
-        model=model,
-        chunk=CausalChunk("chunk-0", ("a", "b"), (0.0, 1.0), (0, 1)),
-        query_input=_request().query_input,
-        query_time=3.0,
-        updater=updater,
-        causal_position=CausalSupportPosition(0, 2, 8),
-    )
-    second = manager.observe_chunk(
-        model=model,
-        chunk=CausalChunk("chunk-1", ("c", "d"), (2.0, 3.0), (2, 3)),
-        query_input=_request().query_input,
-        query_time=3.0,
-        updater=updater,
-        causal_position=CausalSupportPosition(1, 2, 8),
-    )
-
-    assert first.audit.step_size == pytest.approx(1.5e-4)
-    assert second.audit.step_size == pytest.approx(1.5e-4)
-    manager.release()
-
-
-def test_learned_online_updater_requires_explicit_position_without_query_state(
-    dependencies: _Dependencies,
-) -> None:
-    raw = dependencies.config.model_dump(mode="python")
-    raw["fast_ttt"]["step_controller"]["mode"] = "learned"
-    config = ProjectConfig.model_validate(raw)
-    controller = InnerStepController(config.fast_ttt.step_controller)
-    updater = OnlineTTTUpdater(config, build_temporal_predictor(config.predictor), controller)
-    manager = _manager(dependencies)
-    manager.reset("video-a", "trajectory-a", torch.zeros(512))
-
-    with pytest.raises(InferenceProtocolError, match="causal Support position"):
-        manager.observe_chunk(
-            model=_stage_a_model(dependencies, _TypedStageSuite()),
-            chunk=CausalChunk("chunk", ("a", "b"), (0.0, 1.0), (0, 1)),
-            query_input=_request().query_input,
-            query_time=2.0,
-            updater=updater,
-        )
-    assert not hasattr(updater, "_support_index")
-    assert not hasattr(updater, "_support_count")
-    manager.release()
-
-
-def test_online_updater_rejects_hidden_step_controller_ablation(
-    dependencies: _Dependencies,
-) -> None:
-    controller = InnerStepController(dependencies.config.fast_ttt.step_controller)
-    predictor = build_temporal_predictor(dependencies.config.predictor)
-    with pytest.raises(ValueError, match="fixed online TTT"):
-        OnlineTTTUpdater(dependencies.config, predictor, controller)
-
-    raw = dependencies.config.model_dump(mode="python")
-    raw["fast_ttt"]["step_controller"]["mode"] = "learned"
-    learned = ProjectConfig.model_validate(raw)
-    with pytest.raises(ValueError, match="learned online TTT"):
-        OnlineTTTUpdater(learned, predictor)
 
 
 def test_inference_payload_recursively_rejects_labels() -> None:

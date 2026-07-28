@@ -1,5 +1,5 @@
 spec_version: state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history
-config_schema_version: 8
+config_schema_version: 9
 
 paths:
   model_root_env: QWEN_MODEL_ROOT
@@ -74,13 +74,6 @@ fast_ttt:
     grad_clip_norm: 1.0
     reset_per_video: true
     meta_gradient_mode: full_second_order
-  step_controller:
-    mode: fixed
-    input_dim: 7
-    hidden_dim: 32
-    maximum_step_size: 3.0e-4
-    initial_step_size: 1.0e-4
-    feature_contract: causal_k8_v2
 
 spatial_encoder:
   input_dim: 4096
@@ -484,7 +477,6 @@ outer_gradient_control:
     state_retrieval: 0.05
     w0: 0.1
     predictor: 0.1
-    step_controller: 0.05
   nonfinite_policy: skip_update
   audit_steps: 32
 
@@ -497,13 +489,10 @@ a2:
 a5:
   truncation_horizon: 8
   seed: 42
-  effect_ablation:
-    fixed_variant: A
   optimizer:
     state_learning_rate: 5.0e-5
     w0_learning_rate: 5.0e-5
     predictor_learning_rate: 5.0e-5
-    step_controller_learning_rate: 1.0e-4
   counterfactual_audit:
     enabled: false
     interval_steps: 8

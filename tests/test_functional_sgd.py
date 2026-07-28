@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import replace
 
@@ -175,6 +176,7 @@ def test_exact_two_matrix_step_matches_manual_sgd_without_mutating_old_state(
     assert result.did_update is True
     assert result.gradient_mode is GradientMode.ONLINE_LEAF
     assert result.skip_reason is None
+    assert result.step_size == pytest.approx(optimizer_config.learning_rate)
     assert result.fast_state.fast_version == result.fast_state.update_count == 1
     assert result.fast_state.skip_count == 0
     assert result.optimizer_state.attempted_update_count == 1
@@ -244,6 +246,7 @@ def test_invalid_terms_skip_without_autograd_and_advance_audit_only(
     assert result.optimizer_state.last_skip_reason == reason.value
     assert result.gradient_norm is None
     assert result.update_norm == 0.0
+    assert result.step_size == pytest.approx(optimizer_config.learning_rate)
     assert all(
         torch.equal(new, old)
         for new, old in zip(result.fast_state.fast_parameters, state.fast_parameters, strict=True)
@@ -252,6 +255,12 @@ def test_invalid_terms_skip_without_autograd_and_advance_audit_only(
         storage_pointer(new) != pointer
         for new, pointer in zip(result.fast_state.fast_parameters, original_storage, strict=True)
     )
+
+
+def test_functional_sgd_public_signatures_have_no_step_override() -> None:
+    assert "step_size" not in inspect.signature(functional_sgd_step).parameters
+    assert "step_size" not in inspect.signature(functional_sgd_step_from_ttt_row).parameters
+    assert "step_sizes" not in inspect.signature(functional_sgd_steps_from_ttt).parameters
 
 
 def test_nonfinite_loss_skips_before_gradient_computation(
