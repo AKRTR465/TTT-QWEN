@@ -882,6 +882,40 @@ def test_state_and_answer_geometry_may_differ_and_answer_visual_receives_gradien
     )
 
 
+def test_answer_visual_logits_reach_both_bound_query_proxy_matrices() -> None:
+    project = make_tiny_project_config()
+    proxy_1 = torch.eye(8, requires_grad=True)
+    proxy_2 = torch.eye(8, requires_grad=True)
+
+    class ProxyAdapter(nn.Module):
+        def forward(
+            self,
+            visual_embeddings: Tensor,
+            _valid_mask: Tensor,
+            _metadata: object,
+        ) -> Tensor:
+            hidden = torch.matmul(visual_embeddings, proxy_1.transpose(0, 1))
+            residual = torch.matmul(hidden, proxy_2.transpose(0, 1))
+            return visual_embeddings + 0.1 * residual
+
+    wrapper = Qwen3VLAdapter(
+        make_tiny_hf_model(),
+        project,
+        ProxyAdapter(),
+        adapter_enabled=True,
+        freeze_base=True,
+    )
+
+    output = wrapper(**video_inputs())
+    gradients = torch.autograd.grad(
+        output.logits.float().square().mean(),
+        (proxy_1, proxy_2),
+    )
+
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert all(float(torch.linalg.vector_norm(gradient).item()) > 0.0 for gradient in gradients)
+
+
 def test_video_interception_scope_rejects_reentry_but_allows_multiple_native_calls() -> None:
     model = make_tiny_hf_model()
     owner = model.model

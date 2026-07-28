@@ -20,8 +20,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SPEC_VERSION = "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history"
-CONFIG_SCHEMA_VERSION = 8
-STEP_CONTROLLER_FEATURE_CONTRACT = "causal_k8_v2"
+CONFIG_SCHEMA_VERSION = 9
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -133,29 +132,6 @@ class InnerSGDConfig(FrozenModel):
     meta_gradient_mode: str
 
 
-class FastTTTStepControllerConfig(FrozenModel):
-    """Explicit ablation switch for a bounded learned Inner-SGD step size."""
-
-    mode: Literal["fixed", "learned"] = "fixed"
-    input_dim: PositiveInt = 7
-    hidden_dim: PositiveInt = 32
-    maximum_step_size: PositiveFloat = 3.0e-4
-    initial_step_size: PositiveFloat = 1.0e-4
-    feature_contract: Literal["causal_k8_v2"] = "causal_k8_v2"
-
-    @model_validator(mode="after")  # type: ignore[untyped-decorator]
-    def validate_controller_contract(self) -> Self:
-        if self.input_dim != 7 or self.hidden_dim != 32:
-            raise ValueError("InnerStepController topology must remain 7 -> 32 -> 1")
-        if self.maximum_step_size != 3.0e-4:
-            raise ValueError("InnerStepController maximum_step_size must remain 3e-4")
-        if self.initial_step_size != 1.0e-4:
-            raise ValueError("InnerStepController initial_step_size must remain 1e-4")
-        if self.initial_step_size >= self.maximum_step_size:
-            raise ValueError("InnerStepController initial step must be below its upper bound")
-        return self
-
-
 class FastTTTConfig(FrozenModel):
     input_dim: PositiveInt
     bottleneck_dim: PositiveInt
@@ -169,7 +145,6 @@ class FastTTTConfig(FrozenModel):
     online_parameter_count: PositiveInt
     update_order: str
     optimizer: InnerSGDConfig
-    step_controller: FastTTTStepControllerConfig = FastTTTStepControllerConfig()
 
 
 class SpatialEncoderConfig(FrozenModel):
@@ -599,7 +574,6 @@ class LossConfig(FrozenModel):
 
 class OuterGradientControlMode(StrEnum):
     PER_GROUP_L2_EQUAL_UPDATE_CAP = "per_group_l2_equal_update_cap"
-    PER_GROUP_L2_SINGLE_FACTOR_ABLATION = "per_group_l2_single_factor_ablation"
 
 
 class OuterNonfinitePolicy(StrEnum):
@@ -614,7 +588,6 @@ class OuterMaxGradNormConfig(FrozenModel):
     state_retrieval: PositiveFloat
     w0: PositiveFloat
     predictor: PositiveFloat
-    step_controller: PositiveFloat = 0.05
 
 
 class OuterGradientControlConfig(FrozenModel):
@@ -642,7 +615,6 @@ class A5OptimizerConfig(FrozenModel):
     state_learning_rate: PositiveFloat
     w0_learning_rate: PositiveFloat
     predictor_learning_rate: PositiveFloat
-    step_controller_learning_rate: PositiveFloat = 1.0e-4
 
 
 class A5CounterfactualAuditConfig(FrozenModel):
@@ -667,19 +639,12 @@ class A5CounterfactualAuditConfig(FrozenModel):
         return self
 
 
-class A5TTTEffectAblationConfig(FrozenModel):
-    """Identity of the one-factor A5 TTT-effect experiment."""
-
-    fixed_variant: Literal["A", "B", "C", "D", "E"]
-
-
 class A5TrainingConfig(FrozenModel):
     """Direct A5 contract with K-step truncation and one episode seed."""
 
     truncation_horizon: PositiveInt
     seed: NonNegativeInt
     optimizer: A5OptimizerConfig
-    effect_ablation: A5TTTEffectAblationConfig
     counterfactual_audit: A5CounterfactualAuditConfig = A5CounterfactualAuditConfig()
 
 
@@ -690,7 +655,7 @@ class InferenceRuntimeConfig(FrozenModel):
 
 
 class ProjectConfig(FrozenModel):
-    """Schema-8 production configuration with cross-component contract validation."""
+    """Schema-9 production configuration with cross-component contract validation."""
 
     spec_version: str
     config_schema_version: int
@@ -842,23 +807,7 @@ class ProjectConfig(FrozenModel):
                 self.fast_ttt.optimizer.meta_gradient_mode,
                 "full_second_order",
             ),
-            ("fast_ttt.step_controller.input_dim", self.fast_ttt.step_controller.input_dim, 7),
-            ("fast_ttt.step_controller.hidden_dim", self.fast_ttt.step_controller.hidden_dim, 32),
-            (
-                "fast_ttt.step_controller.maximum_step_size",
-                self.fast_ttt.step_controller.maximum_step_size,
-                3.0e-4,
-            ),
-            (
-                "fast_ttt.step_controller.initial_step_size",
-                self.fast_ttt.step_controller.initial_step_size,
-                1.0e-4,
-            ),
-            (
-                "fast_ttt.step_controller.feature_contract",
-                self.fast_ttt.step_controller.feature_contract,
-                STEP_CONTROLLER_FEATURE_CONTRACT,
-            ),
+            ("fast_ttt.optimizer.learning_rate", self.fast_ttt.optimizer.learning_rate, 1.0e-4),
             ("spatial_encoder.input_dim", self.spatial_encoder.input_dim, 4096),
             ("spatial_encoder.hidden_dim", self.spatial_encoder.hidden_dim, 768),
             ("spatial_encoder.stages", self.spatial_encoder.stages, 2),
@@ -1700,9 +1649,14 @@ class ProjectConfig(FrozenModel):
                 0.1,
             ),
             (
-                "outer_gradient_control.max_grad_norm.step_controller",
-                self.outer_gradient_control.max_grad_norm.step_controller,
-                0.05,
+                "outer_gradient_control.max_grad_norm.w0",
+                self.outer_gradient_control.max_grad_norm.w0,
+                0.1,
+            ),
+            (
+                "outer_gradient_control.mode",
+                self.outer_gradient_control.mode,
+                OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP,
             ),
             (
                 "outer_gradient_control.nonfinite_policy",
@@ -1738,75 +1692,16 @@ class ProjectConfig(FrozenModel):
                 5.0e-5,
             ),
             (
-                "a5.optimizer.step_controller_learning_rate",
-                self.a5.optimizer.step_controller_learning_rate,
-                1.0e-4,
+                "a5.optimizer.predictor_learning_rate",
+                self.a5.optimizer.predictor_learning_rate,
+                5.0e-5,
             ),
+            ("loss.auxiliary_outer_weight", self.loss.auxiliary_outer_weight, 0.1),
             ("inference.audit_level", self.inference.audit_level, AuditLevel.BOUNDARY),
         )
         for path, actual, expected in checks:
             if actual != expected:
                 raise ValueError(f"{path} must be {expected!r}; got {actual!r}")
-        experimental_choices = (
-            (
-                "fast_ttt.optimizer.learning_rate",
-                self.fast_ttt.optimizer.learning_rate,
-                (1.0e-4, 2.0e-4),
-            ),
-            (
-                "loss.auxiliary_outer_weight",
-                self.loss.auxiliary_outer_weight,
-                (0.1, 0.2),
-            ),
-            (
-                "outer_gradient_control.max_grad_norm.w0",
-                self.outer_gradient_control.max_grad_norm.w0,
-                (0.1, 0.15),
-            ),
-            (
-                "a5.optimizer.predictor_learning_rate",
-                self.a5.optimizer.predictor_learning_rate,
-                (5.0e-5, 1.0e-4),
-            ),
-        )
-        for path, actual, allowed in experimental_choices:
-            if actual not in allowed:
-                raise ValueError(f"{path} must be one of {allowed!r}; got {actual!r}")
-
-        variant = self.a5.effect_ablation.fixed_variant
-        actual_effect = (
-            float(self.fast_ttt.optimizer.learning_rate),
-            float(self.a5.optimizer.predictor_learning_rate),
-            float(self.loss.auxiliary_outer_weight),
-            float(self.outer_gradient_control.max_grad_norm.w0),
-        )
-        expected_effects = {
-            "A": (1.0e-4, 5.0e-5, 0.1, 0.1),
-            "B": (2.0e-4, 5.0e-5, 0.1, 0.1),
-            "C": (1.0e-4, 1.0e-4, 0.1, 0.1),
-            "D": (1.0e-4, 5.0e-5, 0.2, 0.1),
-            "E": (1.0e-4, 5.0e-5, 0.1, 0.15),
-        }
-        if actual_effect != expected_effects[variant]:
-            raise ValueError(
-                f"A5 fixed variant {variant} must change exactly its declared factor; "
-                f"got {actual_effect!r}"
-            )
-        expected_gradient_mode = (
-            OuterGradientControlMode.PER_GROUP_L2_SINGLE_FACTOR_ABLATION
-            if variant in {"C", "E"}
-            else OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP
-        )
-        if self.outer_gradient_control.mode is not expected_gradient_mode:
-            raise ValueError(
-                f"A5 fixed variant {variant} requires outer gradient mode "
-                f"{expected_gradient_mode.value!r}"
-            )
-        if self.fast_ttt.step_controller.mode == "learned" and variant != "A":
-            raise ValueError(
-                "learned InnerStepController may be combined only with fixed variant A"
-            )
-
         self._validate_attention_dimensions()
         self._validate_video_preprocessing_contract()
         self._validate_head_contracts()
@@ -2336,36 +2231,115 @@ def _require_schema6_block(raw: dict[str, object], name: str, expected: object) 
     return actual
 
 
+def _normalize_schema_eight(value: dict[str, object]) -> dict[str, object]:
+    """Upgrade only the canonical fixed-step A configuration from schema 8."""
+
+    raw = copy.deepcopy(value)
+    fast_ttt = raw.get("fast_ttt")
+    if not isinstance(fast_ttt, dict):
+        raise ValueError("schema 8 fast_ttt must be a mapping")
+    controller = fast_ttt.pop("step_controller", None)
+    if controller is None:
+        controller = {
+            "mode": "fixed",
+            "input_dim": 7,
+            "hidden_dim": 32,
+            "maximum_step_size": 3.0e-4,
+            "initial_step_size": 1.0e-4,
+            "feature_contract": "causal_k8_v2",
+        }
+    if not isinstance(controller, dict):
+        raise ValueError("schema 8 fast_ttt.step_controller must be a mapping")
+    expected_controller = {
+        "mode": "fixed",
+        "input_dim": 7,
+        "hidden_dim": 32,
+        "maximum_step_size": 3.0e-4,
+        "initial_step_size": 1.0e-4,
+        "feature_contract": "causal_k8_v2",
+    }
+    normalized_controller = {
+        key: controller.get(key, expected) for key, expected in expected_controller.items()
+    }
+    if set(controller) - set(expected_controller) or normalized_controller != expected_controller:
+        raise ValueError(
+            "schema 8 learned or non-canonical step-controller configuration is incompatible; "
+            "rebuild the config"
+        )
+
+    a5 = raw.get("a5")
+    if not isinstance(a5, dict):
+        raise ValueError("schema 8 a5 must be a mapping")
+    effect = a5.pop("effect_ablation", None)
+    if effect != {"fixed_variant": "A"}:
+        raise ValueError("schema 8 B-E effect ablations are incompatible; rebuild the config")
+    a5_optimizer = a5.get("optimizer")
+    if not isinstance(a5_optimizer, dict):
+        raise ValueError("schema 8 a5.optimizer must be a mapping")
+    controller_lr = a5_optimizer.pop("step_controller_learning_rate", 1.0e-4)
+    if controller_lr != 1.0e-4:
+        raise ValueError("schema 8 step-controller learning rate must remain canonical")
+
+    gradient_control = raw.get("outer_gradient_control")
+    if not isinstance(gradient_control, dict):
+        raise ValueError("schema 8 outer_gradient_control must be a mapping")
+    if gradient_control.get("mode") != "per_group_l2_equal_update_cap":
+        raise ValueError("schema 8 single-factor gradient mode is incompatible; rebuild the config")
+    caps = gradient_control.get("max_grad_norm")
+    if not isinstance(caps, dict):
+        raise ValueError("schema 8 outer_gradient_control.max_grad_norm must be a mapping")
+    controller_cap = caps.pop("step_controller", 0.05)
+    if controller_cap != 0.05:
+        raise ValueError("schema 8 step-controller gradient cap must remain canonical")
+
+    loss = raw.get("loss")
+    optimizer = fast_ttt.get("optimizer")
+    if not isinstance(loss, dict) or not isinstance(optimizer, dict):
+        raise ValueError("schema 8 loss and fast_ttt.optimizer must be mappings")
+    canonical_effect = (
+        optimizer.get("learning_rate"),
+        a5_optimizer.get("predictor_learning_rate"),
+        loss.get("auxiliary_outer_weight"),
+        caps.get("w0"),
+    )
+    if canonical_effect != (1.0e-4, 5.0e-5, 0.1, 0.1):
+        raise ValueError("schema 8 B-E effect values are incompatible; rebuild the config")
+
+    raw["config_schema_version"] = CONFIG_SCHEMA_VERSION
+    return raw
+
+
 def _normalize_schema_seven(value: dict[str, object]) -> dict[str, object]:
-    """Upgrade fixed-step schema 7; learned checkpoints/configs need an explicit retrain."""
+    """Upgrade only the original fixed-step schema 7 through schema 8."""
 
     raw = copy.deepcopy(value)
     fast_ttt = raw.get("fast_ttt")
     if not isinstance(fast_ttt, dict):
         raise ValueError("schema 7 fast_ttt must be a mapping")
-    controller = fast_ttt.get("step_controller")
-    if controller is None:
-        controller = {}
-        fast_ttt["step_controller"] = controller
-    if not isinstance(controller, dict):
-        raise ValueError("schema 7 fast_ttt.step_controller must be a mapping")
-    if controller.get("mode", "fixed") == "learned":
+    if "step_controller" in fast_ttt:
         raise ValueError(
-            "schema 7 learned step-controller feature contract is incompatible; "
-            "rebuild the config and retrain"
+            "schema 7 does not accept fast_ttt.step_controller; rebuild the config "
+            "with the canonical schema-9 fixed-step contract"
         )
-    controller.setdefault("mode", "fixed")
-    controller.setdefault("input_dim", 7)
-    controller.setdefault("hidden_dim", 32)
-    controller.setdefault("maximum_step_size", 3.0e-4)
-    controller.setdefault("initial_step_size", 1.0e-4)
-    controller["feature_contract"] = STEP_CONTROLLER_FEATURE_CONTRACT
+    fast_ttt["step_controller"] = {
+        "mode": "fixed",
+        "input_dim": 7,
+        "hidden_dim": 32,
+        "maximum_step_size": 3.0e-4,
+        "initial_step_size": 1.0e-4,
+        "feature_contract": "causal_k8_v2",
+    }
     a5 = raw.get("a5")
     if not isinstance(a5, dict):
         raise ValueError("schema 7 a5 must be a mapping")
+    if "effect_ablation" in a5:
+        raise ValueError(
+            "schema 7 does not accept a5.effect_ablation; rebuild the config "
+            "with the canonical schema-9 fixed-step contract"
+        )
     a5["effect_ablation"] = {"fixed_variant": "A"}
-    raw["config_schema_version"] = CONFIG_SCHEMA_VERSION
-    return raw
+    raw["config_schema_version"] = 8
+    return _normalize_schema_eight(raw)
 
 
 def _normalize_project_schema(value: object) -> object:
@@ -2374,11 +2348,14 @@ def _normalize_project_schema(value: object) -> object:
     schema = value.get("config_schema_version")
     if schema == CONFIG_SCHEMA_VERSION:
         return value
+    if schema == 8:
+        return _normalize_schema_eight(cast(dict[str, object], value))
     if schema == 7:
         return _normalize_schema_seven(cast(dict[str, object], value))
     if schema != 6:
         raise ValueError(
-            "config_schema_version must be 8, fixed-step schema 7, or the strict formal schema 6"
+            "config_schema_version must be 9, canonical schema 8, fixed-step schema 7, "
+            "or the strict formal schema 6"
         )
 
     raw = dict(value)
@@ -2451,7 +2428,7 @@ def environment_summary() -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Validate and print the schema-8 configuration")
+    parser = argparse.ArgumentParser(description="Validate and print the schema-9 configuration")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     args = parser.parse_args(argv)
     print(load_config(args.config).model_dump_json(indent=2))

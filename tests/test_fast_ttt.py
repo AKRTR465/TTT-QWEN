@@ -197,6 +197,18 @@ def test_differentiable_state_preserves_outer_gradients_to_w0_and_slow_parameter
         assert parameter.grad.abs().sum() > 0
 
 
+def test_initial_bound_fast_state_matches_static_w0_forward() -> None:
+    adapter = make_adapter()
+    visual = torch.randn(1, 3, 4096)
+
+    static_output = adapter(visual)
+    initial = adapter.initialize_fast_state(differentiable=True)
+    with adapter.use_fast_state(initial):
+        bound_output = adapter(visual)
+
+    torch.testing.assert_close(bound_output, static_output, rtol=1.0e-5, atol=1.0e-6)
+
+
 def test_reset_and_video_initialization_clone_current_w0_without_storage_sharing() -> None:
     adapter = make_adapter()
     first = adapter.initialize_fast_state()

@@ -33,11 +33,7 @@ import transformers
 from safetensors import safe_open
 from torch import Tensor, nn
 
-from ttt_svcbench_qwen.config import (
-    STEP_CONTROLLER_FEATURE_CONTRACT,
-    OuterGradientControlMode,
-    ProjectConfig,
-)
+from ttt_svcbench_qwen.config import OuterGradientControlMode, ProjectConfig
 from ttt_svcbench_qwen.episode_data import (
     A2QueryRecord,
     A5EpisodeRecord,
@@ -594,7 +590,7 @@ class _SemanticProjectorStepAuditor:
 class _A5ParameterGroupStepAuditor:
     """Measure real post-Adam deltas for the groups implicated in A5 TTT drift."""
 
-    _GROUP_NAMES = ("step_controller", "predictor", "w0", "state_shared")
+    _GROUP_NAMES = ("predictor", "w0", "state_shared")
     _DEFAULT_GROUP_NAMES = ("predictor", "w0", "state_shared")
 
     def __init__(
@@ -634,8 +630,6 @@ class _A5ParameterGroupStepAuditor:
     @staticmethod
     def _classify_parameter(name: str) -> str:
         lowered = name.casefold()
-        if "step_controller" in lowered:
-            return "step_controller"
         if "predictor" in lowered:
             return "predictor"
         if lowered.endswith(("w0_1", "w0_2")) or "meta_fast" in lowered:
@@ -763,16 +757,11 @@ class OuterParameterAudit:
     predictor_trainable_count: int
     transient_parameter_names: tuple[str, ...]
     backbone_registered: bool
-    step_controller_parameter_count: int = 0
-    step_controller_trainable_count: int = 0
     a5_adaptation_mode: str = "meta_ttt"
-    a5_step_controller_mode: str = "fixed"
 
     def __post_init__(self) -> None:
         if self.a5_adaptation_mode not in {"meta_ttt", "static_w0"}:
             raise ValueError("outer parameter audit has an invalid A5 adaptation mode")
-        if self.a5_step_controller_mode not in {"fixed", "learned"}:
-            raise ValueError("outer parameter audit has an invalid step-controller mode")
         if self.total_parameter_count <= 0 or self.trainable_parameter_count <= 0:
             raise ValueError("production outer model exposes no trainable parameters")
         if self.predictor_parameter_count <= 0:
@@ -791,8 +780,6 @@ class OuterParameterAudit:
         ):
             raise ValueError("Qwen/non-Qwen trainable audit does not cover the outer model")
         if self.stage is ProductionStage.A2:
-            if self.a5_step_controller_mode != "fixed" or self.step_controller_parameter_count:
-                raise ValueError("A2 cannot register InnerStepController")
             if self.predictor_trainable_count:
                 raise ValueError("A2 Predictor must remain frozen")
             expected = self.total_parameter_count - self.predictor_parameter_count
@@ -805,18 +792,7 @@ class OuterParameterAudit:
                 raise ValueError("A5 must train every state, W0, and Predictor parameter")
             if self.predictor_trainable_count != self.predictor_parameter_count:
                 raise ValueError("A5 Predictor must be fully trainable")
-            if self.a5_step_controller_mode == "learned":
-                if (
-                    self.step_controller_parameter_count <= 0
-                    or self.step_controller_trainable_count
-                    != self.step_controller_parameter_count
-                ):
-                    raise ValueError("learned-step A5 must fully train InnerStepController")
-            elif self.step_controller_parameter_count or self.step_controller_trainable_count:
-                raise ValueError("fixed-step A5 must not register InnerStepController")
         else:
-            if self.a5_step_controller_mode != "fixed" or self.step_controller_parameter_count:
-                raise ValueError("static-W0 must exclude InnerStepController")
             if self.qwen_trainable_count <= 0:
                 raise ValueError("static-W0 A5 must train configured Qwen parameters")
             if self.predictor_trainable_count:
@@ -838,7 +814,6 @@ class ProductionTrainerRuntime:
     eval_dataset: object | None
     data_collator: Callable[..., object]
     a5_adaptation_mode: str = "meta_ttt"
-    a5_step_controller_mode: str = "fixed"
     stage_a_loss_step: StageALossStep | None = None
     meta_runner: MetaTTTEpisodeRunner | None = None
     episode_adapter: EpisodeAdapter | None = None
@@ -857,14 +832,8 @@ class ProductionTrainerRuntime:
             raise TypeError("production runtime requires a data collator")
         if self.a5_adaptation_mode not in {"meta_ttt", "static_w0"}:
             raise ValueError("production runtime has an invalid A5 adaptation mode")
-        if self.a5_step_controller_mode not in {"fixed", "learned"}:
-            raise ValueError("production runtime has an invalid step-controller mode")
         if self.stage is ProductionStage.A2 and self.a5_adaptation_mode != "meta_ttt":
             raise ValueError("A2 cannot select an A5 adaptation mode")
-        if self.stage is ProductionStage.A2 and self.a5_step_controller_mode != "fixed":
-            raise ValueError("A2 cannot select learned InnerStepController")
-        if self.a5_adaptation_mode == "static_w0" and self.a5_step_controller_mode != "fixed":
-            raise ValueError("static-W0 must exclude learned InnerStepController")
         if (
             type(self.semantic_projector_delta_audit_steps) is not int
             or self.semantic_projector_delta_audit_steps < 0
@@ -1467,9 +1436,6 @@ class TTTQwenTrainerMixin:
                         self.ttt_runtime.a5_adaptation_mode == "meta_ttt"
                     ),
                     "a5/ablation/w0_outer_trainable": 1.0,
-                    "a5/ablation/step_controller_learned": float(
-                        self.ttt_runtime.a5_step_controller_mode == "learned"
-                    ),
                     "a5/insufficient_inter_query_gap": float(
                         meta_audit.insufficient_inter_query_gap
                     ),
@@ -1498,48 +1464,6 @@ class TTTQwenTrainerMixin:
                     ),
                 }
             )
-            step_values = tuple(
-                value for update in meta_audit.updates for value in update.step_sizes
-            )
-            if step_values:
-                ordered_steps = sorted(step_values)
-
-                def step_quantile(probability: float) -> float:
-                    index = round(probability * (len(ordered_steps) - 1))
-                    return ordered_steps[index]
-
-                maximum_step = 3.0e-4
-                enriched.update(
-                    {
-                        "a5/step_size/mean": sum(step_values) / len(step_values),
-                        "a5/step_size/p50": step_quantile(0.50),
-                        "a5/step_size/p95": step_quantile(0.95),
-                        "a5/step_size/min": ordered_steps[0],
-                        "a5/step_size/max": ordered_steps[-1],
-                        "a5/step_size/saturation_low_rate": sum(
-                            value <= 0.05 * maximum_step for value in step_values
-                        )
-                        / len(step_values),
-                        "a5/step_size/saturation_high_rate": sum(
-                            value >= 0.95 * maximum_step for value in step_values
-                        )
-                        / len(step_values),
-                    }
-                )
-                by_position: dict[int, list[float]] = {}
-                for segment in meta_audit.segments:
-                    for update in meta_audit.updates:
-                        if (
-                            segment.support_start_index
-                            <= update.support_index
-                            <= segment.support_end_index
-                        ):
-                            position = update.support_index - segment.support_start_index + 1
-                            by_position.setdefault(position, []).extend(update.step_sizes)
-                for position, values in by_position.items():
-                    enriched[f"a5/step_size/by_support_position/{position}"] = (
-                        sum(values) / len(values)
-                    )
             role_norms: dict[str, list[float]] = {}
             role_losses: dict[str, list[float]] = {}
             for query in meta_audit.queries:
@@ -1598,18 +1522,9 @@ class TTTQwenTrainerMixin:
                         count
                     )
         enriched.update(self.last_semantic_projector_metrics)
-        step_controller_delta_key = "a5/parameter_delta/step_controller/l2"
-        if step_controller_delta_key in enriched:
-            enriched["a5/step_controller/parameter_delta"] = enriched[
-                step_controller_delta_key
-            ]
         controller = self.ttt_runtime.gradient_controller
         if isinstance(controller, OuterGradientController) and controller.last_audit is not None:
             enriched.update(dict(controller.last_audit.metrics()))
-            if "step_controller" in controller.expected_groups:
-                enriched["a5/step_controller/gradient_norm"] = controller.last_audit.group(
-                    "step_controller"
-                ).pre_clip_norm
         super().log(enriched, *args, **kwargs)  # type: ignore[misc]
 
     def compute_loss(
@@ -1999,10 +1914,6 @@ def _run_main(argv: list[str] | None = None) -> int:
         os.environ.get("TTT_RESUME_CHECKPOINT"),
         configured_stage,
         a5_adaptation_mode=backbone.ttt_config.a5_adaptation_mode,
-        a5_step_controller_mode=backbone.project_config.fast_ttt.step_controller.mode,
-        a5_step_controller_feature_contract=(
-            backbone.project_config.fast_ttt.step_controller.feature_contract
-        ),
     )
     if same_stage_resume is not None:
         _validate_resume_balance_schema(same_stage_resume)
@@ -2077,11 +1988,6 @@ def _run_main(argv: list[str] | None = None) -> int:
         checkpoint_audit = initialize_outer_model_from_a2(
             runtime_raw.model,
             checkpoint,
-            allowed_missing_prefixes=(
-                ("step_controller.",)
-                if backbone.project_config.fast_ttt.step_controller.mode == "learned"
-                else ()
-            ),
         )
         _reset_a2_to_a5_balance(runtime_raw.model)
     expected_gradient_groups = (
@@ -2102,11 +2008,6 @@ def _run_main(argv: list[str] | None = None) -> int:
             "state_retrieval",
             "w0",
             *(("predictor",) if backbone.ttt_config.a5_adaptation_mode == "meta_ttt" else ()),
-            *(
-                ("step_controller",)
-                if backbone.project_config.fast_ttt.step_controller.mode == "learned"
-                else ()
-            ),
         )
     )
     runtime_raw = replace(
@@ -2115,7 +2016,6 @@ def _run_main(argv: list[str] | None = None) -> int:
             backbone,
             configured_stage,
             a5_adaptation_mode=backbone.ttt_config.a5_adaptation_mode,
-            a5_step_controller_mode=backbone.project_config.fast_ttt.step_controller.mode,
         ),
         gradient_controller=OuterGradientController(
             backbone.project_config.outer_gradient_control,
@@ -2150,7 +2050,6 @@ def _run_main(argv: list[str] | None = None) -> int:
             float(project.a2.optimizer.state_learning_rate),
             float(project.a2.optimizer.w0_learning_rate),
             float(project.a2.optimizer.state_learning_rate),
-            float(project.a2.optimizer.state_learning_rate),
         )
     else:
         budget_lrs = (
@@ -2158,7 +2057,6 @@ def _run_main(argv: list[str] | None = None) -> int:
             float(project.a5.optimizer.state_learning_rate),
             float(project.a5.optimizer.w0_learning_rate),
             float(project.a5.optimizer.predictor_learning_rate),
-            float(project.a5.optimizer.step_controller_learning_rate),
         )
     budget_audit = _outer_update_norm_budget_audit(
         project,
@@ -2167,9 +2065,7 @@ def _run_main(argv: list[str] | None = None) -> int:
         state_lr=budget_lrs[1],
         w0_lr=budget_lrs[2],
         predictor_lr=budget_lrs[3],
-        step_controller_lr=budget_lrs[4],
         a5_adaptation_mode=runtime_raw.a5_adaptation_mode,
-        a5_step_controller_mode=runtime_raw.a5_step_controller_mode,
     )
     raw_smoke_steps = os.environ.get("TTT_SMOKE_MAX_STEPS")
     smoke_max_steps: int | None = None
@@ -2219,9 +2115,8 @@ def _run_main(argv: list[str] | None = None) -> int:
         if full_unfreeze_audit is not None:
             environment["full_unfreeze_audit"] = asdict(full_unfreeze_audit)
         environment["outer_parameter_audit"] = asdict(parameter_audit)
-        environment["a5_fixed_variant"] = project.a5.effect_ablation.fixed_variant
-        environment["a5_step_controller_feature_contract"] = (
-            project.fast_ttt.step_controller.feature_contract
+        environment["inner_sgd_learning_rate"] = float(
+            project.fast_ttt.optimizer.learning_rate
         )
         environment["outer_update_norm_budget_audit"] = budget_audit
         checkpoint_environment = None
@@ -2249,10 +2144,8 @@ def _run_main(argv: list[str] | None = None) -> int:
                     "status": "smoke_completed",
                     "stage": runtime_raw.stage.value,
                     "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
-                    "a5_step_controller_mode": runtime_raw.a5_step_controller_mode,
-                    "a5_fixed_variant": project.a5.effect_ablation.fixed_variant,
-                    "a5_step_controller_feature_contract": (
-                        project.fast_ttt.step_controller.feature_contract
+                    "inner_sgd_learning_rate": float(
+                        project.fast_ttt.optimizer.learning_rate
                     ),
                     "outer_update_norm_budget_audit": budget_audit,
                     "global_step": int(trainer.state.global_step),
@@ -2283,10 +2176,8 @@ def _run_main(argv: list[str] | None = None) -> int:
                     "status": "completed",
                     "stage": runtime_raw.stage.value,
                     "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
-                    "a5_step_controller_mode": runtime_raw.a5_step_controller_mode,
-                    "a5_fixed_variant": project.a5.effect_ablation.fixed_variant,
-                    "a5_step_controller_feature_contract": (
-                        project.fast_ttt.step_controller.feature_contract
+                    "inner_sgd_learning_rate": float(
+                        project.fast_ttt.optimizer.learning_rate
                     ),
                     "outer_update_norm_budget_audit": budget_audit,
                     "global_step": int(trainer.state.global_step),
@@ -2332,11 +2223,7 @@ def _run_main(argv: list[str] | None = None) -> int:
                 "status": "completed",
                 "stage": runtime_raw.stage.value,
                 "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
-                "a5_step_controller_mode": runtime_raw.a5_step_controller_mode,
-                "a5_fixed_variant": project.a5.effect_ablation.fixed_variant,
-                "a5_step_controller_feature_contract": (
-                    project.fast_ttt.step_controller.feature_contract
-                ),
+                "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
                 "outer_update_norm_budget_audit": budget_audit,
                 "global_step": int(trainer.state.global_step),
                 "elapsed_seconds": time.monotonic() - started,
@@ -2511,8 +2398,6 @@ def resolve_same_stage_resume(
     stage: ProductionStage,
     *,
     a5_adaptation_mode: str = "meta_ttt",
-    a5_step_controller_mode: str = "fixed",
-    a5_step_controller_feature_contract: str = STEP_CONTROLLER_FEATURE_CONTRACT,
 ) -> Path | None:
     """Validate a standard Trainer checkpoint without conflating it with A2→A5 init."""
 
@@ -2549,17 +2434,12 @@ def resolve_same_stage_resume(
             raise ValueError(
                 "resume checkpoint A5 adaptation mode does not match the configured mode"
             )
-        checkpoint_step_mode = raw.get("a5_step_controller_mode", "fixed")
-        if checkpoint_step_mode != a5_step_controller_mode:
-            raise ValueError(
-                "resume checkpoint step-controller mode does not match the configured mode"
-            )
-        if a5_step_controller_mode == "learned":
-            checkpoint_feature_contract = raw.get("a5_step_controller_feature_contract")
-            if checkpoint_feature_contract != a5_step_controller_feature_contract:
-                raise ValueError(
-                    "resume checkpoint learned step-controller feature contract is incompatible"
-                )
+        checkpoint_step_mode = raw.get("a5_step_controller_mode")
+        if checkpoint_step_mode is not None and checkpoint_step_mode != "fixed":
+            raise ValueError("learned-step checkpoints are incompatible with fixed-step A5")
+        checkpoint_variant = raw.get("a5_fixed_variant")
+        if checkpoint_variant is not None and checkpoint_variant != "A":
+            raise ValueError("B-E effect-ablation checkpoints are incompatible with canonical A5")
     return root
 
 
@@ -2620,11 +2500,13 @@ def _audit_outer_parameters(
     runtime: ProductionTrainerRuntime,
 ) -> OuterParameterAudit:
     named = tuple(runtime.model.named_parameters())
+    removed = tuple(name for name, _ in named if "step_controller" in name.casefold())
+    if removed:
+        raise ValueError(
+            "production Outer model still registers removed step-controller parameters"
+        )
     predictor = tuple(
         (name, parameter) for name, parameter in named if "predictor" in name.casefold()
-    )
-    step_controller = tuple(
-        (name, parameter) for name, parameter in named if "step_controller" in name.casefold()
     )
     transient = tuple(
         name
@@ -2640,7 +2522,6 @@ def _audit_outer_parameters(
     return OuterParameterAudit(
         stage=runtime.stage,
         a5_adaptation_mode=runtime.a5_adaptation_mode,
-        a5_step_controller_mode=runtime.a5_step_controller_mode,
         total_parameter_count=sum(parameter.numel() for _, parameter in named),
         trainable_parameter_count=sum(
             parameter.numel() for _, parameter in named if parameter.requires_grad
@@ -2657,14 +2538,6 @@ def _audit_outer_parameters(
         predictor_trainable_count=sum(
             parameter.numel() for _, parameter in predictor if parameter.requires_grad
         ),
-        step_controller_parameter_count=sum(
-            parameter.numel() for _, parameter in step_controller
-        ),
-        step_controller_trainable_count=sum(
-            parameter.numel()
-            for _, parameter in step_controller
-            if parameter.requires_grad
-        ),
         transient_parameter_names=transient,
         backbone_registered=bool(backbone_ids) and backbone_ids <= runtime_ids,
     )
@@ -2678,9 +2551,7 @@ def _outer_update_norm_budget_audit(
     state_lr: float,
     w0_lr: float,
     predictor_lr: float,
-    step_controller_lr: float,
     a5_adaptation_mode: str,
-    a5_step_controller_mode: str,
 ) -> dict[str, object]:
     caps = project.outer_gradient_control.max_grad_norm
     reference_budget = qwen_lr * float(caps.qwen)
@@ -2691,42 +2562,17 @@ def _outer_update_norm_budget_audit(
             if stage is ProductionStage.A5 and a5_adaptation_mode == "meta_ttt"
             else {}
         ),
-        **(
-            {"step_controller": step_controller_lr * float(caps.step_controller)}
-            if stage is ProductionStage.A5 and a5_step_controller_mode == "learned"
-            else {}
-        ),
     }
-    variant = project.a5.effect_ablation.fixed_variant
     mode = project.outer_gradient_control.mode
-    if stage is ProductionStage.A2:
-        if variant != "A" or mode is not OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP:
-            raise ValueError("A2 requires the canonical equal-budget variant A configuration")
-        expected_budgets = {name: reference_budget for name in independent_budgets}
-    elif mode is OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP:
-        expected_budgets = {name: reference_budget for name in independent_budgets}
-    else:
-        if (
-            a5_adaptation_mode != "meta_ttt"
-            or a5_step_controller_mode != "fixed"
-            or variant not in {"C", "E"}
-        ):
-            raise ValueError(
-                "single-factor budget mode requires fixed-step Meta-TTT variant C or E"
-            )
-        expected_budgets = {name: reference_budget for name in independent_budgets}
-        if variant == "C":
-            expected_budgets["predictor"] = 2.0 * reference_budget
-        else:
-            expected_budgets["w0"] = 1.5 * reference_budget
+    if mode is not OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP:
+        raise ValueError("production training requires the canonical equal-update budget policy")
+    expected_budgets = {name: reference_budget for name in independent_budgets}
     if any(
         name not in expected_budgets
         or not math.isclose(value, expected_budgets[name], rel_tol=1.0e-6)
         for name, value in independent_budgets.items()
     ):
-        raise ValueError(
-            "Qwen/W0/Predictor/StepController update-norm budgets violate the configured policy"
-        )
+        raise ValueError("Qwen/W0/Predictor update-norm budgets must remain aligned")
     state_names = (
         "state_shared",
         "state_task",
@@ -2739,8 +2585,8 @@ def _outer_update_norm_budget_audit(
     if not math.isclose(state_rss_budget, reference_budget, rel_tol=1.0e-6):
         raise ValueError("state subgroup RSS update-norm budget drifted from the formal cap")
     return {
-        "fixed_variant": variant,
-        "mode": mode.value,
+        "policy": mode.value,
+        "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
         "reference": reference_budget,
         "independent": independent_budgets,
         "state_rss": state_rss_budget,
@@ -2752,18 +2598,11 @@ def make_production_outer_optimizer_factory(
     stage: ProductionStage,
     *,
     a5_adaptation_mode: str = "meta_ttt",
-    a5_step_controller_mode: str = "fixed",
 ) -> Callable[[nn.Module], torch.optim.Optimizer]:
     if a5_adaptation_mode not in {"meta_ttt", "static_w0"}:
         raise ValueError("A5 adaptation mode must be meta_ttt or static_w0")
     if stage is ProductionStage.A2 and a5_adaptation_mode != "meta_ttt":
         raise ValueError("A2 cannot select an A5 adaptation mode")
-    if a5_step_controller_mode not in {"fixed", "learned"}:
-        raise ValueError("A5 step-controller mode must be fixed or learned")
-    if stage is ProductionStage.A2 and a5_step_controller_mode != "fixed":
-        raise ValueError("A2 cannot select learned InnerStepController")
-    if a5_adaptation_mode == "static_w0" and a5_step_controller_mode != "fixed":
-        raise ValueError("static-W0 cannot select learned InnerStepController")
     qwen_ids = {id(parameter) for parameter in backbone.model.parameters()}
     training_args = cast(Any, backbone.training_args)
     if stage is ProductionStage.A2:
@@ -2771,14 +2610,12 @@ def make_production_outer_optimizer_factory(
         state_lr = backbone.project_config.a2.optimizer.state_learning_rate
         w0_lr = backbone.project_config.a2.optimizer.w0_learning_rate
         predictor_lr = state_lr
-        step_controller_lr = state_lr
     else:
         qwen_lr = float(training_args.learning_rate)
         optimizer = backbone.project_config.a5.optimizer
         state_lr = optimizer.state_learning_rate
         w0_lr = optimizer.w0_learning_rate
         predictor_lr = optimizer.predictor_learning_rate
-        step_controller_lr = optimizer.step_controller_learning_rate
 
     def factory(model: nn.Module) -> torch.optim.Optimizer:
         groups: dict[str, list[nn.Parameter]] = {
@@ -2789,7 +2626,6 @@ def make_production_outer_optimizer_factory(
             "state_retrieval": [],
             "w0": [],
             "predictor": [],
-            "step_controller": [],
         }
         ownership: dict[int, str] = {}
         for name, parameter in model.named_parameters(remove_duplicate=False):
@@ -2799,10 +2635,10 @@ def make_production_outer_optimizer_factory(
             lowered = name.casefold()
             if "transient_w_t" in lowered or lowered.endswith(("w_t_1", "w_t_2")):
                 raise ValueError("transient W_t cannot enter the Outer optimizer")
+            if "step_controller" in lowered:
+                raise ValueError("step-controller parameters were removed from canonical A5")
             if parameter_id in qwen_ids:
                 group = "qwen"
-            elif "step_controller" in lowered:
-                group = "step_controller"
             elif "predictor" in lowered:
                 group = "predictor"
             elif lowered.endswith(("w0_1", "w0_2")) or "meta_fast" in lowered:
@@ -2842,10 +2678,6 @@ def make_production_outer_optimizer_factory(
                 raise ValueError("Meta-TTT A5 Outer AdamW must own Predictor")
             if a5_adaptation_mode == "static_w0" and groups["predictor"]:
                 raise ValueError("static-W0 A5 Outer AdamW cannot own Predictor")
-            if a5_step_controller_mode == "learned" and not groups["step_controller"]:
-                raise ValueError("learned-step A5 Outer AdamW must own InnerStepController")
-            if a5_step_controller_mode == "fixed" and groups["step_controller"]:
-                raise ValueError("fixed-step A5 Outer AdamW cannot own InnerStepController")
         semantic_projector_ids = {
             id(parameter)
             for name, parameter in model.named_parameters(remove_duplicate=False)
@@ -2870,7 +2702,6 @@ def make_production_outer_optimizer_factory(
             "state_retrieval": state_lr,
             "w0": w0_lr,
             "predictor": predictor_lr,
-            "step_controller": step_controller_lr,
         }
         parameter_groups: list[dict[str, Any]] = [
             {
@@ -2888,9 +2719,7 @@ def make_production_outer_optimizer_factory(
             state_lr=state_lr,
             w0_lr=w0_lr,
             predictor_lr=predictor_lr,
-            step_controller_lr=step_controller_lr,
             a5_adaptation_mode=a5_adaptation_mode,
-            a5_step_controller_mode=a5_step_controller_mode,
         )
         trace_event("outer_optimizer_update_norm_budgets", **budget_audit)
         optimizer = torch.optim.AdamW(

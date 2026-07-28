@@ -49,24 +49,41 @@ def load_schema6_raw() -> dict[str, Any]:
     return raw
 
 
-def test_schema8_yaml_passes_strong_validation_and_serializes_completely() -> None:
+def load_schema8_raw() -> dict[str, Any]:
+    raw = load_raw_config()
+    raw["config_schema_version"] = 8
+    raw["fast_ttt"]["step_controller"] = {
+        "mode": "fixed",
+        "input_dim": 7,
+        "hidden_dim": 32,
+        "maximum_step_size": 3.0e-4,
+        "initial_step_size": 1.0e-4,
+        "feature_contract": "causal_k8_v2",
+    }
+    raw["outer_gradient_control"]["max_grad_norm"]["step_controller"] = 0.05
+    raw["a5"]["effect_ablation"] = {"fixed_variant": "A"}
+    raw["a5"]["optimizer"]["step_controller_learning_rate"] = 1.0e-4
+    return raw
+
+
+def test_schema9_yaml_passes_strong_validation_and_serializes_completely() -> None:
     config = load_config(CONFIG_PATH)
     serialized = json.loads(config.model_dump_json())
 
     assert serialized["spec_version"] == (
         "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history"
     )
-    assert serialized["config_schema_version"] == 8
+    assert serialized["config_schema_version"] == 9
     assert serialized["model"]["revision"] == "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
     assert set(serialized) == set(ProjectConfig.model_fields)
 
 
-def test_formal_schema6_normalizes_once_to_schema8() -> None:
+def test_formal_schema6_normalizes_once_to_schema9() -> None:
     raw = load_schema6_raw()
     config = ProjectConfig.model_validate(raw)
     serialized = config.model_dump(mode="json")
 
-    assert serialized["config_schema_version"] == 8
+    assert serialized["config_schema_version"] == 9
     assert "stage_a" not in serialized and "stage_b" not in serialized
     assert "stage_c" not in serialized and "evaluation" not in serialized
     assert "parameter_budget" not in serialized
@@ -83,44 +100,104 @@ def test_formal_schema6_normalizes_once_to_schema8() -> None:
     }
 
 
-def test_schema7_fixed_normalizes_but_learned_requires_retraining() -> None:
+def test_schema7_fixed_normalizes_without_schema8_only_fields() -> None:
     fixed = load_raw_config()
     fixed["config_schema_version"] = 7
-    del fixed["fast_ttt"]["step_controller"]["feature_contract"]
-    del fixed["a5"]["effect_ablation"]
 
     normalized = ProjectConfig.model_validate(fixed)
 
-    assert normalized.config_schema_version == 8
-    assert normalized.a5.effect_ablation.fixed_variant == "A"
-    assert normalized.fast_ttt.step_controller.feature_contract == "causal_k8_v2"
+    assert normalized.config_schema_version == 9
+    assert "step_controller" not in normalized.fast_ttt.model_dump()
+    assert "effect_ablation" not in normalized.a5.model_dump()
 
-    learned = copy.deepcopy(fixed)
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("fast_ttt", "step_controller", None),
+        ("fast_ttt", "step_controller", {"mode": "learned"}),
+        (
+            "fast_ttt",
+            "step_controller",
+            {"mode": "fixed", "initial_step_size": 2.0e-4},
+        ),
+        ("a5", "effect_ablation", None),
+        ("a5", "effect_ablation", {"fixed_variant": "A"}),
+        ("a5", "effect_ablation", {"fixed_variant": "E"}),
+    ],
+)
+def test_schema7_rejects_fields_introduced_by_schema8(
+    section: str,
+    key: str,
+    value: object,
+) -> None:
+    raw = load_raw_config()
+    raw["config_schema_version"] = 7
+    raw[section][key] = value
+
+    with pytest.raises(ValidationError, match="schema 7 does not accept"):
+        ProjectConfig.model_validate(raw)
+
+
+def test_schema8_only_upgrades_canonical_a_fixed() -> None:
+    normalized = ProjectConfig.model_validate(load_schema8_raw())
+    assert normalized.config_schema_version == 9
+    assert "step_controller" not in normalized.fast_ttt.model_dump()
+    assert "effect_ablation" not in normalized.a5.model_dump()
+
+    learned = load_schema8_raw()
     learned["fast_ttt"]["step_controller"]["mode"] = "learned"
-    with pytest.raises(ValidationError, match="feature contract is incompatible"):
+    with pytest.raises(ValidationError, match="step-controller configuration is incompatible"):
         ProjectConfig.model_validate(learned)
 
-
-def test_a5_fixed_variant_contract_rejects_wrong_mode_and_multiple_changes() -> None:
-    wrong_mode = load_raw_config()
+    wrong_mode = load_schema8_raw()
     wrong_mode["a5"]["effect_ablation"]["fixed_variant"] = "C"
     wrong_mode["a5"]["optimizer"]["predictor_learning_rate"] = 1.0e-4
-    with pytest.raises(ValidationError, match="requires outer gradient mode"):
+    wrong_mode["outer_gradient_control"]["mode"] = "per_group_l2_single_factor_ablation"
+    with pytest.raises(ValidationError, match="B-E effect ablations"):
         ProjectConfig.model_validate(wrong_mode)
 
-    multiple = load_raw_config()
+    multiple = load_schema8_raw()
     multiple["a5"]["effect_ablation"]["fixed_variant"] = "B"
     multiple["fast_ttt"]["optimizer"]["learning_rate"] = 2.0e-4
     multiple["loss"]["auxiliary_outer_weight"] = 0.2
-    with pytest.raises(ValidationError, match="change exactly its declared factor"):
+    with pytest.raises(ValidationError, match="B-E effect ablations"):
         ProjectConfig.model_validate(multiple)
 
-    learned_b = load_raw_config()
-    learned_b["a5"]["effect_ablation"]["fixed_variant"] = "B"
-    learned_b["fast_ttt"]["optimizer"]["learning_rate"] = 2.0e-4
-    learned_b["fast_ttt"]["step_controller"]["mode"] = "learned"
-    with pytest.raises(ValidationError, match="only with fixed variant A"):
-        ProjectConfig.model_validate(learned_b)
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("fast_ttt", "step_controller", {"mode": "fixed"}),
+        ("a5", "effect_ablation", {"fixed_variant": "A"}),
+    ],
+)
+def test_schema9_rejects_removed_ablation_fields(
+    section: str, key: str, value: object
+) -> None:
+    raw = load_raw_config()
+    raw[section][key] = value
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ProjectConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("fast_ttt", "optimizer", "learning_rate"), 2.0e-4),
+        (("a5", "optimizer", "predictor_learning_rate"), 1.0e-4),
+        (("loss", "auxiliary_outer_weight"), 0.2),
+        (("outer_gradient_control", "max_grad_norm", "w0"), 0.15),
+    ],
+)
+def test_schema9_rejects_removed_effect_values(path: tuple[str, ...], value: object) -> None:
+    raw = load_raw_config()
+    target = raw
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValidationError, match="must be"):
+        ProjectConfig.model_validate(raw)
 
 
 @pytest.mark.parametrize("mode", ["instant_equal", "legacy_sum"])
@@ -705,7 +782,6 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
             "state_retrieval": 0.05,
             "w0": 0.1,
             "predictor": 0.1,
-            "step_controller": 0.05,
         },
         "nonfinite_policy": "skip_update",
         "audit_steps": 32,
@@ -720,12 +796,10 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
     assert config.a5.model_dump() == {
         "truncation_horizon": 8,
         "seed": 42,
-        "effect_ablation": {"fixed_variant": "A"},
         "optimizer": {
             "state_learning_rate": 5.0e-5,
             "w0_learning_rate": 5.0e-5,
             "predictor_learning_rate": 5.0e-5,
-            "step_controller_learning_rate": 1.0e-4,
         },
         "counterfactual_audit": {
             "enabled": False,
@@ -737,7 +811,7 @@ def test_v5_query_retrieval_resampler_and_loss_contracts() -> None:
     assert config.inference.model_dump() == {"audit_level": AuditLevel.BOUNDARY}
 
 
-def test_schema8_exposes_only_direct_a2_a5_training_contracts() -> None:
+def test_schema9_exposes_only_direct_a2_a5_training_contracts() -> None:
     config = load_config()
 
     assert config.a2.optimizer.qwen_learning_rate == pytest.approx(1.0e-5)

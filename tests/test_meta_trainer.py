@@ -11,6 +11,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+import ttt_svcbench_qwen.meta_trainer as meta_trainer_module
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.data import RuntimeQueryInput, assert_runtime_payload_safe
 from ttt_svcbench_qwen.fast_ttt import FastTTTForwardAudit, FastWeightsState
@@ -77,7 +78,6 @@ from ttt_svcbench_qwen.state_bank import (
     build_state_bank,
 )
 from ttt_svcbench_qwen.state_encoder import TemporalCache, TemporalEncoderOutput
-from ttt_svcbench_qwen.step_controller import InnerStepController
 from ttt_svcbench_qwen.trainer import StageAEpisodeAnswerInputs, StageASupervisionBatch
 
 
@@ -512,15 +512,25 @@ class _Composer:
 
 
 class _Qwen(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, fast_controller: _TinyFastController) -> None:
         super().__init__()
+        object.__setattr__(self, "_fast_controller", fast_controller)
         self.answer_features: list[Tensor] = []
+        self.answer_fast_versions: list[tuple[int, ...]] = []
 
     def forward(self, request: QwenPrefillRequest) -> object:
         if not isinstance(request.input_ids, Tensor):
             raise TypeError("tiny Qwen inputs must be tensors")
+        fast_controller = self._fast_controller
+        active = fast_controller._active
+        if active is None:
+            raise RuntimeError("tiny Answer prefill requires one managed fast-state binding")
         self.answer_features.append(request.pixel_values_videos.detach().clone())
-        score = request.pixel_values_videos.float().mean().reshape(1)
+        self.answer_fast_versions.append(tuple(state.fast_version for state in active))
+        gains = torch.stack(
+            tuple(state.w_t_1[0, 0] * state.w_t_2[0, 0] for state in active)
+        )
+        score = request.pixel_values_videos.float().mean().reshape(1) + gains - gains.detach()
         zeros = torch.zeros_like(score)
         row = torch.stack((score, -score, zeros), dim=-1)
         logits = row[:, None, :].expand(-1, request.input_ids.shape[1], -1)
@@ -541,6 +551,10 @@ class _TinyPredictor(TemporalPredictor):
 
 
 class _TinyQueryLossBuilder:
+    def __init__(self, *, answer_connected: bool = True, state_connected: bool = True) -> None:
+        self.answer_connected = answer_connected
+        self.state_connected = state_connected
+
     def __call__(
         self,
         output: StateTTTModelOutput,
@@ -558,15 +572,19 @@ class _TinyQueryLossBuilder:
             raise ValueError("tiny Query labels must align to Qwen logits")
         number_mask = torch.zeros_like(labels, dtype=torch.bool)
         o1 = output.observations.o1
+        answer_logits = (
+            output.answer_logits if self.answer_connected else output.answer_logits.detach()
+        )
+        state_mask = o1.valid_mask if self.state_connected else torch.zeros_like(o1.valid_mask)
         return MetaQueryLossInput(
-            answer=AnswerLossInput(output.answer_logits, labels, number_mask),
+            answer=AnswerLossInput(answer_logits, labels, number_mask),
             state=StateLossInput(
                 batch_size=output.answer_logits.shape[0],
                 o1=O1StateTarget(
                     row_indices=torch.arange(output.answer_logits.shape[0]),
                     logits=o1.logits,
                     targets=torch.zeros_like(o1.logits),
-                    slot_mask=o1.valid_mask,
+                    slot_mask=state_mask,
                 ),
             ),
         )
@@ -628,13 +646,12 @@ def _system(
     raw_support_visual_batcher: object | None = None,
     support_visual_batch_size: int = 1,
     adaptation_mode: str = "meta_ttt",
-    step_controller: InnerStepController | None = None,
 ) -> tuple[MetaTTTEpisodeRunner, _TinyFastController, _TinyPredictor, _RuntimeResetter]:
     fast = _TinyFastController()
     predictor = _TinyPredictor()
     resetter = _RuntimeResetter()
     reader = _Reader()
-    qwen = _Qwen()
+    qwen = _Qwen(fast)
     model = StateTTTModel(
         config,
         ModelComponents(
@@ -670,7 +687,6 @@ def _system(
         raw_support_visual_batcher=raw_support_visual_batcher,  # type: ignore[arg-type]
         support_visual_batch_size=support_visual_batch_size,
         adaptation_mode=adaptation_mode,
-        step_controller=step_controller,
     )
     return runner, fast, predictor, resetter
 
@@ -1067,6 +1083,50 @@ def test_truncated_a5_query_bundle_sums_proxy_gradients_then_closes_once(
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
 
 
+def test_query_proxy_gradient_equals_answer_plus_state_components(
+    config: ProjectConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_capture = meta_trainer_module._capture_query_proxy_gradients
+    captured: list[tuple[Tensor, ...]] = []
+
+    def capture(
+        states: Sequence[FastWeightsState],
+        *,
+        backward_gradient_scale: float,
+    ) -> tuple[tuple[Tensor, ...], tuple[float, ...]]:
+        gradients, norms = original_capture(
+            states,
+            backward_gradient_scale=backward_gradient_scale,
+        )
+        captured.append(tuple(gradient.detach().clone() for gradient in gradients))
+        return gradients, norms
+
+    monkeypatch.setattr(meta_trainer_module, "_capture_query_proxy_gradients", capture)
+
+    def run(builder: _TinyQueryLossBuilder) -> tuple[Tensor, ...]:
+        captured.clear()
+        torch.manual_seed(101)
+        runner, _, _, _ = _system(config, query_loss_builder=builder)
+        runner.run_truncated(_truncated_episode(config, support_count=4))
+        assert len(captured) == 1
+        return tuple(gradient.clone() for gradient in captured[0])
+
+    answer = run(_TinyQueryLossBuilder(state_connected=False))
+    state = run(_TinyQueryLossBuilder(answer_connected=False))
+    total = run(_TinyQueryLossBuilder())
+
+    assert all(float(torch.linalg.vector_norm(gradient).item()) > 0.0 for gradient in answer)
+    assert all(float(torch.linalg.vector_norm(gradient).item()) > 0.0 for gradient in state)
+    for combined, answer_gradient, state_gradient in zip(total, answer, state, strict=True):
+        torch.testing.assert_close(
+            combined,
+            answer_gradient + state_gradient,
+            rtol=1.0e-5,
+            atol=1.0e-7,
+        )
+
+
 def test_static_w0_keeps_dense_queries_and_outer_trains_w0_without_ttt(
     config: ProjectConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -1258,6 +1318,9 @@ def test_truncated_a5_ema_balance_composes_all_queries_once(
         "loss/aux_to_answer_ratio" not in dict(query.metrics.metrics)
         for query in output.audit.queries
     )
+    qwen = runner.model.components.qwen_prefill
+    assert isinstance(qwen, _Qwen)
+    assert qwen.answer_fast_versions == [(8,), (8,), (9,), (9,)]
 
 
 def test_truncated_a5_reuses_one_query_graph_per_segment_and_final_key(
@@ -1465,6 +1528,9 @@ def test_diagnostic_counterfactual_is_no_grad_and_does_not_change_training(
         "episode_w0",
         "segment_start",
     )
+    audited_qwen = audited_runner.model.components.qwen_prefill
+    assert isinstance(audited_qwen, _Qwen)
+    assert audited_qwen.answer_fast_versions == [(4,), (4,), (0,), (0,)]
     assert all(torch.equal(left.w_t_1, right.w_t_1) for left, right in zip(
         baseline.final_fast_states,
         audited.final_fast_states,
@@ -1472,26 +1538,27 @@ def test_diagnostic_counterfactual_is_no_grad_and_does_not_change_training(
     ))
 
 
-def test_learned_step_controller_is_explicit_and_receives_query_gradient(
+def test_answer_only_proxy_gradient_trains_predictor(
     config: ProjectConfig,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    raw = config.model_dump(mode="python")
-    raw["fast_ttt"]["step_controller"]["mode"] = "learned"
-    learned_config = ProjectConfig.model_validate(raw)
-    controller = InnerStepController(learned_config.fast_ttt.step_controller)
-    runner, _, _, _ = _system(learned_config, step_controller=controller)
-
-    output = runner.run_truncated(_truncated_episode(learned_config, support_count=4))
-
-    step_sizes = tuple(value for update in output.audit.updates for value in update.step_sizes)
-    assert step_sizes == pytest.approx((1.0e-4,) * len(step_sizes), rel=1.0e-6)
-    gradients = tuple(parameter.grad for parameter in controller.parameters())
-    assert all(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients)
-    assert any(
-        float(torch.linalg.vector_norm(gradient).item()) > 0.0
-        for gradient in gradients
-        if gradient is not None
+    runner, _, predictor, _ = _system(
+        config,
+        query_loss_builder=_TinyQueryLossBuilder(state_connected=False),
     )
+    monkeypatch.setattr(
+        meta_trainer_module,
+        "compute_ttt_outer_auxiliary_loss",
+        lambda output: output.total * 0.0,
+    )
+
+    output = runner.run_truncated(_truncated_episode(config, support_count=4))
+
+    query = output.audit.queries[0]
+    assert all(value > 0.0 for value in query.proxy_gradient_norms)
+    assert output.audit.segments[0].deferred_vjp_norm > 0.0
+    assert predictor.scale.grad is not None
+    assert float(torch.linalg.vector_norm(predictor.scale.grad).item()) > 0.0
 
 
 @pytest.mark.parametrize("denied", ["answer", "count", "occurrence_times"])
