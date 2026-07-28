@@ -5,16 +5,19 @@
 - A2 全量状态模型训练，再初始化 A5 Meta-TTT；
 - 按视频隔离、按 chunk 因果更新的在线推理。
 
-当前架构规范为 `state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history`，正式配置 schema 为 9；历史阶段 gate 与 synthetic 报告不再随源码分发。
+当前架构规范为 `state_ttt_qwen3vl8b_bank_associative_v1`，正式配置 schema 为 10；历史阶段 gate 与 synthetic 报告不再随源码分发。
 
 ## 架构摘要
 
 - Fast Adapter 位于 Qwen Main Visual Merger 与 video `masked_scatter` 之间；DeepStack 保持原始路径。
+- A5 的 key 由 Query 和写入前 Bank 的有效语义记录共同构造，value 来自原始 Main Merger 视觉 token；
+  `P_C` 与 `P_V` 是唯一新增的 Associative 投影。
 - 在线状态仅更新两块 768x768 fast matrix，更新顺序固定为“当前 chunk 使用 Wt，更新后的 Wt+1 从下一 chunk 生效”。
 - 状态路包含 Spatial Slot Encoder、Temporal Encoder、O1/O2/E1/E2 heads、Structured State Bank、Identity Bank、Retriever 和 Deterministic Reader。
 - State Bank 同时维护写后 aggregate/Confirmed 状态和 append-only retrieval history；Query 从写前 history 重投影 768D source，Reader 直接读取写后状态。
 - Reader 负责精确计数及证据，Qwen 负责自然语言答案。
-- A5 使用 `L_pred + 0.5 L_id + 0.5 L_event`，K=8 截断二阶梯度并重锚 W0。
+- A5 使用单一无标签 `masked_fp32_mse(K_t, V_t, W_t)` 关联损失；它只驱动 Support 内层
+  functional SGD 产生 `W_{t+1}`，K=8 截断二阶梯度并重锚 W0。
 - A2/A5 正式训练唯一使用 `ema_answer_ref`：loss EMA 对齐 Answer 尺度，再按
   `q_target/q_operator/q_time` 激活面的梯度 RMS EMA 平衡四项 official-weak loss；辅助组仍限制为
   Answer 的至多 30%。
@@ -49,8 +52,8 @@ bash scripts/h200/train_fullprefix256.sh a5 /absolute/path/a2/checkpoints/final-
   `W_t`，不以 auxiliary 权重加入 Outer loss，Answer/State Query loss 通过 deferred VJP 学习更新方向；
 - Support 保持 8/16 帧动态块；每个 Query 独立读取 `[0, query_time]` 因果前缀，2 FPS、最多
   256 帧，动态视觉 Token 数不变；
-- A5 多 Query 逐个 forward/backward，释放各自激活；所有 Query 共用同一 `W_after` 和只读
-  Bank/FSM snapshot；
+- A5 多 Query 逐个 forward/backward，释放各自激活；所有 Query 使用同一段末 fast state，
+  Bank/FSM 仍是只读权威状态；Support 内层损失不进入 Outer backward，关联中间量不跨调用保存。
 - 四卡 sampler 保持任务/segment parity，padding 样本 loss 权重为零；
 - checkpoint 保存模型、optimizer、scheduler、RNG，但排除 Wt、Bank、cache 和 FSM runtime。
 

@@ -1,7 +1,7 @@
-# Qwen3-VL-8B State-TTT v6 架构
+# Qwen3-VL-8B Bank-conditioned Associative State-TTT 架构
 
-> 规范版本：state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history
-> 配置 schema：8（schema 6/固定步 schema 7 可一次性内存归一化；schema 7 learned 拒绝）
+> 规范版本：state_ttt_qwen3vl8b_bank_associative_v1
+> 配置 schema：10（旧 schema 9 及更早配置不自动升级）
 > 修订日期：2026-07-28
 > 状态：A2/A5 TRAINING MAINLINE IMPLEMENTED；ONLINE INFERENCE WIRED
 
@@ -12,23 +12,26 @@
 核心不变量：
 
 - base model：`Qwen/Qwen3-VL-8B-Instruct`；
-- Fast Adapter：4096→768→4096，两块在线矩阵共 1,179,648 参数；
+- Fast Adapter：4096→768→4096，两块在线矩阵共 1,179,648 参数；另有 `P_C:512→768`
+  和 `P_V:4096→768` 两个 Associative 投影；
 - 插入点：Main Visual Merger 输出之后、video `masked_scatter` 之前；
 - DeepStack indexes：8、16、24，保持 Qwen 原路径；
-- 更新顺序：observe with Wt → hard-state commit → label-free update → next chunk uses Wt+1；
+- 更新顺序：Query/写入前 Bank context → observe with Wt → hard-state commit →
+  `L_assoc` functional update → next chunk uses Wt+1；
 - hard state 不参与反向传播，Reader 算术不进入 optimizer。
 
 ## 2. 数据流
 
 ```text
 video chunk
+  -> Query Encoder + write-before Bank semantic context
   -> Qwen ViT + Main Merger
-  -> Fast Adapter(Wt)
+  -> Fast Adapter(Wt, K_t)
   -> Spatial Slot Encoder
   -> Temporal Causal Encoder
   -> O1/O2/E1/E2
-  -> State Bank + Identity Bank
-  -> label-free TTT loss
+  -> State Bank + Identity Bank hard write
+  -> masked FP32 visual association loss L_assoc
   -> functional SGD -> Wt+1
 
 question + query_time
@@ -39,13 +42,26 @@ question + query_time
   -> Qwen answer prefill/generation
 ```
 
-每个 `TrajectoryRuntimeState` 是单视频唯一状态源，持有 fast weights、optimizer state、slot/cache、E1/E2、State/Identity Bank、Reader audit 和 detached overlap memory。
+每个 `TrajectoryRuntimeState` 是单视频唯一状态源，持有 fast weights、optimizer state、slot/cache、
+E1/E2、State/Identity Bank 和 Reader audit；不持有关联 context 或其他关联临时中间量。
 
 ## 3. 状态模型
 
 ### 3.1 Fast Adapter
 
-输入输出维度为 4096，bottleneck 为 768。W0 属于 checkpoint 和 Outer optimizer；Wt 是 per-video 临时状态，不注册为 parameter/buffer，不进入 checkpoint。在线更新必须有限、版本单调且 storage 隔离。
+输入输出维度为 4096，bottleneck 为 768。对每个 Main Merger token：
+
+```text
+b_{t-1} = attention_pool(Query, present & valid Bank semantics)
+K_t = P_in(RMSNorm(X_t)) + P_C(LayerNorm(Query + b_{t-1}))
+V_t = P_V(RMSNorm(stopgrad(X_t)))
+L_assoc = masked_fp32_mse(f_Wt(K_t), V_t)
+```
+
+空 Bank 的 `b` 固定为零；硬 payload、count、phase、timestamp 不进入池化。`P_C` 零初始化，
+`P_V` 在 A2→A5 初始化时复制 `P_in`，使新 A5 初始前向保持 W0 数值兼容。W0 属于 checkpoint
+和 Outer optimizer；Wt 是 per-video 临时状态，不注册为 parameter/buffer，不进入 checkpoint。
+在线更新必须有限、版本单调且 storage 隔离。
 
 ### 3.2 Spatial 与 Temporal
 
@@ -69,8 +85,9 @@ Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由�
 ### A2
 
 - 全量解冻 Qwen、状态模块与 W0；
-- v5 及更早训练因 aggregate 单记录拓扑而视为 legacy retrieval-off 消融；v6 新训练不恢复旧 optimizer、scheduler、RNG 或 runtime state；
-- Predictor 冻结、Inner SGD 不可达；
+- schema-10 是当前唯一正式训练契约；旧 schema checkpoint 不自动迁移，A5 只能从显式允许的旧 A2
+  权重初始化，并重新创建 Associative 投影、optimizer、scheduler、RNG 与 runtime state；
+- `P_C/P_V` 冻结、Inner SGD 不可达；
 - Query outer loss 正式使用 `ema_answer_ref`：先用一步滞后的 loss EMA 对齐 Answer，
   再用 `q_target/q_operator/q_time` 激活梯度 RMS EMA 平衡 Task、Operator、Retrieval、Time；
   四槽固定且辅助组限制为 Answer 的至多 30%；
@@ -83,13 +100,16 @@ Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由�
 ### A5
 
 - 从完整 A2 safetensors checkpoint 初始化；
-- loss 固定为 `L_pred + 0.5 L_id + 0.5 L_event`；
+- Support 只使用 Bank-conditioned visual association loss：Bank 语义影响当前 key，Fast
+  Adapter 输出随后影响 soft object selection 和唯一一次 hard Bank/FSM write；
+- `L_assoc` 是 masked FP32 MSE，只对原始视觉输入停止梯度，不使用 Answer/State 标签，也不
+  读取硬 payload；它只用于 functional SGD，不以 auxiliary 权重加入 Outer loss；
 - Support 不设人工数值上限；
 - 每 8 个 Support 截断二阶图并重锚 W0；
-- 每个 segment backward，episode 末由 Outer optimizer 单次 step；
-- Inner SGD 固定使用 `1e-4`，不注册可学习步长控制器；
-- Predictor Outer LR 固定为 `5e-5`，Support auxiliary outer weight 固定为 `0.1`，W0
-  gradient cap 固定为 `0.1`，各独立组更新预算严格对齐 Qwen；
+- 每个 segment 只对 Query Answer/State Outer loss 执行 backward，deferred VJP 将 Query 梯度
+  传回 `W_t`、W0、`P_C/P_V` 和慢模块；episode 末由 Outer optimizer 单次 step；
+- Inner SGD 使用配置中的 fast update LR（当前 `1e-4`）；Associative projection 的 Outer LR
+  当前为 `5e-5`，不注册可学习步长控制器；Associative 组更新预算与 Qwen/W0 严格对齐；
 - `static_w0` 保留为 NoUpdate 对照；counterfactual 仅作为 Meta-TTT 的无梯度因果诊断，
   不参与优化。
 
@@ -111,7 +131,8 @@ load checkpoint
 
 - query_time 之后帧在进入模型前裁剪；
 - updater 固定使用配置中的 Inner SGD LR；纯未来 chunk 不触发状态观察或更新；
-- updater 只允许修改 fast/optimizer/overlap memory；
+- updater 只允许修改当前视频的 fast/optimizer state；Associative context 是本次调用的
+  短生命周期临时对象，不跨请求、重试或异常路径残留；
 - 更新后的 Wt 不得回溯影响当前 chunk；
 - generation 不重跑视频状态路径、不修改 Bank/FSM/Fast；
 - 正常、异常和中断均 release。
@@ -124,7 +145,9 @@ load checkpoint
 
 ## 6. Checkpoint 与分布式
 
-正式 checkpoint 必须完整匹配模型 key，支持单文件和 sharded safetensors。禁止保存或加载 Wt、optimizer runtime、Bank、cache、FSM 和 overlap memory。
+正式 checkpoint 必须完整匹配 schema-10 模型 key，支持单文件和 sharded safetensors，并包含
+`associative_contract_version`。禁止保存或加载 Wt、optimizer runtime、Bank、cache、FSM 和
+Associative 临时 context；旧 A5 checkpoint 缺少该版本 buffer 时直接拒绝。
 
 A2/A5 sampler 必须保持四卡任务或 segment parity。非有限 loss/gradient 必须 warning/skip，不能产生部分参数更新。ZeRO、BF16、显存和性能是否可接受只由真实 H200 记录决定。
 
