@@ -8,7 +8,6 @@ Forbidden: model forward logic, training logic, secret values, or platform absol
 from __future__ import annotations
 
 import argparse
-import copy
 import platform
 from enum import StrEnum
 from pathlib import Path
@@ -19,8 +18,8 @@ import transformers
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION = "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history"
-CONFIG_SCHEMA_VERSION = 9
+SPEC_VERSION = "state_ttt_qwen3vl8b_bank_associative_v1"
+CONFIG_SCHEMA_VERSION = 10
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -526,14 +525,16 @@ class InputComposerConfig(FrozenModel):
     generation_num_beams: PositiveInt
 
 
-class PredictorConfig(FrozenModel):
-    input_dim: PositiveInt
-    hidden_dim: PositiveInt
-    output_dim: PositiveInt
-    layer_norm_eps: PositiveFloat
-    activation: str
-    linear_bias: bool
-    parameter_count: PositiveInt
+class AssociativeTTTConfig(FrozenModel):
+    """Frozen Bank-conditioned visual association contract."""
+
+    contract: Literal["bank_conditioned_visual_v1"]
+    bank_embedding_dim: PositiveInt
+    key_dim: PositiveInt
+    value_dim: PositiveInt
+    bank_empty_policy: Literal["zero"]
+    value_source: Literal["raw_main_merger_stopgrad"]
+    loss: Literal["masked_fp32_mse"]
 
 
 class OfficialWeakBalanceConfig(FrozenModel):
@@ -559,14 +560,9 @@ class OfficialWeakBalanceConfig(FrozenModel):
 
 
 class LossConfig(FrozenModel):
-    pred_weight: NonNegativeFloat
-    identity_weight: NonNegativeFloat
-    event_weight: NonNegativeFloat
-    o1_unlabeled_weight: NonNegativeFloat
     operator_weight: NonNegativeFloat
     retrieval_weight: NonNegativeFloat
     time_weight: NonNegativeFloat
-    auxiliary_outer_weight: NonNegativeFloat
     answer_causal_shift: bool
     answer_ignore_index: int
     official_weak_balance: OfficialWeakBalanceConfig
@@ -587,7 +583,7 @@ class OuterMaxGradNormConfig(FrozenModel):
     state_router_time: PositiveFloat
     state_retrieval: PositiveFloat
     w0: PositiveFloat
-    predictor: PositiveFloat
+    associative: PositiveFloat
 
 
 class OuterGradientControlConfig(FrozenModel):
@@ -614,7 +610,7 @@ class A5OptimizerConfig(FrozenModel):
 
     state_learning_rate: PositiveFloat
     w0_learning_rate: PositiveFloat
-    predictor_learning_rate: PositiveFloat
+    associative_learning_rate: PositiveFloat
 
 
 class A5CounterfactualAuditConfig(FrozenModel):
@@ -655,7 +651,7 @@ class InferenceRuntimeConfig(FrozenModel):
 
 
 class ProjectConfig(FrozenModel):
-    """Schema-9 production configuration with cross-component contract validation."""
+    """Schema-10 production configuration with cross-component contract validation."""
 
     spec_version: str
     config_schema_version: int
@@ -675,7 +671,7 @@ class ProjectConfig(FrozenModel):
     state_resampler: StateResamplerConfig
     state_reader: StateReaderConfig
     input_composer: InputComposerConfig
-    predictor: PredictorConfig
+    associative_ttt: AssociativeTTTConfig
     loss: LossConfig
     outer_gradient_control: OuterGradientControlConfig
     a2: A2TrainingConfig
@@ -1557,17 +1553,21 @@ class ProjectConfig(FrozenModel):
                 self.input_composer.generation_num_beams,
                 1,
             ),
-            ("predictor.input_dim", self.predictor.input_dim, 768),
-            ("predictor.hidden_dim", self.predictor.hidden_dim, 1536),
-            ("predictor.output_dim", self.predictor.output_dim, 768),
-            ("predictor.layer_norm_eps", self.predictor.layer_norm_eps, 1.0e-5),
-            ("predictor.activation", self.predictor.activation, "silu"),
-            ("predictor.linear_bias", self.predictor.linear_bias, True),
-            ("predictor.parameter_count", self.predictor.parameter_count, 2_363_136),
-            ("loss.pred_weight", self.loss.pred_weight, 1.0),
-            ("loss.identity_weight", self.loss.identity_weight, 0.5),
-            ("loss.event_weight", self.loss.event_weight, 0.5),
-            ("loss.o1_unlabeled_weight", self.loss.o1_unlabeled_weight, 0.0),
+            (
+                "associative_ttt.contract",
+                self.associative_ttt.contract,
+                "bank_conditioned_visual_v1",
+            ),
+            ("associative_ttt.bank_embedding_dim", self.associative_ttt.bank_embedding_dim, 512),
+            ("associative_ttt.key_dim", self.associative_ttt.key_dim, 768),
+            ("associative_ttt.value_dim", self.associative_ttt.value_dim, 768),
+            ("associative_ttt.bank_empty_policy", self.associative_ttt.bank_empty_policy, "zero"),
+            (
+                "associative_ttt.value_source",
+                self.associative_ttt.value_source,
+                "raw_main_merger_stopgrad",
+            ),
+            ("associative_ttt.loss", self.associative_ttt.loss, "masked_fp32_mse"),
             ("loss.operator_weight", self.loss.operator_weight, 1.0),
             ("loss.retrieval_weight", self.loss.retrieval_weight, 1.0),
             ("loss.time_weight", self.loss.time_weight, 1.0),
@@ -1644,8 +1644,8 @@ class ProjectConfig(FrozenModel):
                 0.05,
             ),
             (
-                "outer_gradient_control.max_grad_norm.predictor",
-                self.outer_gradient_control.max_grad_norm.predictor,
+                "outer_gradient_control.max_grad_norm.associative",
+                self.outer_gradient_control.max_grad_norm.associative,
                 0.1,
             ),
             (
@@ -1692,11 +1692,10 @@ class ProjectConfig(FrozenModel):
                 5.0e-5,
             ),
             (
-                "a5.optimizer.predictor_learning_rate",
-                self.a5.optimizer.predictor_learning_rate,
+                "a5.optimizer.associative_learning_rate",
+                self.a5.optimizer.associative_learning_rate,
                 5.0e-5,
             ),
-            ("loss.auxiliary_outer_weight", self.loss.auxiliary_outer_weight, 0.1),
             ("inference.audit_level", self.inference.audit_level, AuditLevel.BOUNDARY),
         )
         for path, actual, expected in checks:
@@ -2070,338 +2069,23 @@ class ProjectConfig(FrozenModel):
             raise ValueError("spatial_encoder.active_slots cannot exceed max_active_slots")
 
 
-_SCHEMA6_A2 = {
-    "variant": "a2",
-    "inner_sgd_enabled": False,
-    "fast_adapter_mode": "static_w0_no_inner_sgd",
-    "qwen_strategy": "full_unfreeze_qwen3_vl_8b",
-    "qwen_parameter_allowlist": [],
-    "trainable_components": [
-        "qwen_vit",
-        "qwen_main_merger",
-        "qwen_deepstack_mergers",
-        "qwen_decoder_36",
-        "fast_adapter_w0",
-        "query_encoder",
-        "spatial_encoder",
-        "temporal_encoder",
-        "observation_heads",
-        "state_bank",
-        "resampler",
-    ],
-    "predictor_trainable": False,
-    "epochs": 8,
-    "per_device_train_batch_size": 1,
-    "gradient_accumulation_steps": 4,
-    "world_size": 4,
-    "global_batch_size": 16,
-    "loss_terms": ["state", "answer"],
-    "supervision_provenance": "official_weak",
-    "load_best_model_at_end": False,
-    "balanced_task_sampling": True,
-    "synthetic_engineering_gate_only": False,
-    "seed": 42,
-    "optimizer": {
-        "name": "adamw",
-        "qwen_learning_rate": 1.0e-5,
-        "state_learning_rate": 1.0e-4,
-        "w0_learning_rate": 1.0e-4,
-        "weight_decay": 0.01,
-        "betas": [0.9, 0.999],
-        "epsilon": 1.0e-8,
-    },
-    "checkpoint": {
-        "format": "full_model_optimizer_scheduler_rng_v1",
-        "trainable_only": False,
-        "include_optimizer": True,
-        "include_scheduler": True,
-        "include_rng": True,
-        "save_full_model": True,
-        "save_runtime_state": False,
-        "save_every_epochs": 2,
-        "selection_policy": "final_epoch",
-    },
-}
-_SCHEMA6_STAGE_B = {
-    "variant": "a3",
-    "support_chunks": 1,
-    "minimum_query_points": 1,
-    "enabled_ttt_terms": ["pred"],
-    "inner_sgd_enabled": True,
-    "update_effect": "next_chunk_only",
-    "auxiliary_outer_weight": 0.1,
-    "reset_per_episode": True,
-    "compare_before_after": True,
-    "meta_gradient_mode": "meta_full_second_order",
-    "reuse_strategy": "causal_replay_isolated_prefill",
-    "synthetic_engineering_gate_only": True,
-    "seed": 42,
-}
-_SCHEMA6_A5 = {
-    "active_variant": "a5",
-    "variants": ["a4", "a5"],
-    "a4_enabled_ttt_terms": ["pred", "identity"],
-    "a5_enabled_ttt_terms": ["pred", "identity", "event"],
-    "support_chunk_schedule": [],
-    "maximum_support_chunks": None,
-    "minimum_query_points": 2,
-    "multi_query_enabled": True,
-    "detach_overlap_snapshots": True,
-    "detach_runtime_between_chunks": True,
-    "update_effect": "next_chunk_only",
-    "reuse_strategy": "causal_replay_isolated_prefill",
-    "direct_from_stage_a": True,
-    "meta_gradient_mode": "truncated_second_order",
-    "truncation_horizon": 8,
-    "reanchor_to_w0": True,
-    "segment_auxiliary_backward": True,
-    "training_counterfactual_enabled": False,
-    "prewarm_support_chunks": 1,
-    "outer_step_scope": "episode",
-    "synthetic_engineering_gate_only": False,
-    "seed": 42,
-    "optimizer": {
-        "state_learning_rate": 5.0e-5,
-        "w0_learning_rate": 5.0e-5,
-        "predictor_learning_rate": 5.0e-5,
-    },
-}
-_SCHEMA6_INFERENCE = {
-    "reset_per_video": True,
-    "update_effect": "next_chunk_only",
-    "prefill_once": True,
-    "decode_state_immutable": True,
-    "release_on_exception": True,
-    "audit_level": "boundary",
-    "repeat_query_policy": "explicit_new_or_retry",
-    "record_skip_reasons": True,
-    "synthetic_engineering_gate_only": True,
-}
-_SCHEMA6_EVALUATION = {
-    "formal_evaluation_enabled": False,
-    "official_clean_tuning_forbidden": True,
-}
-_SCHEMA6_PARAMETER_BUDGET = {
-    "fast_ttt_adapter_millions": 7.48,
-    "online_fast_matrices_millions": 1.179648,
-    "spatial_encoder_millions": 24.81536,
-    "temporal_encoder_millions": 48.438272,
-    "query_encoder_millions": 36.03,
-    "o1_millions": 2.63271,
-    "o2_millions": 2.499843,
-    "e1_millions": 9.717252,
-    "e2_millions": 7.293449,
-    "semantic_projector_millions": 1.316864,
-    "predictor_millions": 2.36,
-    "state_resampler_millions": 14.72,
-    "router_resolver_empty_millions": 0.14,
-    "new_modules_total_millions": 157.44375,
-    "rounding_tolerance_millions": 0.02,
-}
-_SCHEMA6_BALANCE = {
-    "mode": "ema_answer_ref",
-    "experimental": False,
-    "group_weight": 0.3,
-    "scale_min": 0.001,
-    "scale_max": 20.0,
-    "epsilon": 1.0e-8,
-    "ema_beta": 0.99,
-    "grad_ema_beta": 0.99,
-    "grad_scale_min": 0.1,
-    "grad_scale_max": 10.0,
-}
-
-
-def _plain_schema_value(value: object) -> object:
-    if isinstance(value, StrEnum):
-        return value.value
-    if isinstance(value, dict):
-        return {key: _plain_schema_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_plain_schema_value(item) for item in value]
-    return value
-
-
-def _require_schema6_block(raw: dict[str, object], name: str, expected: object) -> object:
-    if name not in raw:
-        raise ValueError(f"schema 6 requires the current formal {name} block")
-    actual = _plain_schema_value(raw[name])
-    if actual != expected:
-        raise ValueError(f"schema 6 {name} is not the current formal production value")
-    return actual
-
-
-def _normalize_schema_eight(value: dict[str, object]) -> dict[str, object]:
-    """Upgrade only the canonical fixed-step A configuration from schema 8."""
-
-    raw = copy.deepcopy(value)
-    fast_ttt = raw.get("fast_ttt")
-    if not isinstance(fast_ttt, dict):
-        raise ValueError("schema 8 fast_ttt must be a mapping")
-    controller = fast_ttt.pop("step_controller", None)
-    if controller is None:
-        controller = {
-            "mode": "fixed",
-            "input_dim": 7,
-            "hidden_dim": 32,
-            "maximum_step_size": 3.0e-4,
-            "initial_step_size": 1.0e-4,
-            "feature_contract": "causal_k8_v2",
-        }
-    if not isinstance(controller, dict):
-        raise ValueError("schema 8 fast_ttt.step_controller must be a mapping")
-    expected_controller = {
-        "mode": "fixed",
-        "input_dim": 7,
-        "hidden_dim": 32,
-        "maximum_step_size": 3.0e-4,
-        "initial_step_size": 1.0e-4,
-        "feature_contract": "causal_k8_v2",
-    }
-    normalized_controller = {
-        key: controller.get(key, expected) for key, expected in expected_controller.items()
-    }
-    if set(controller) - set(expected_controller) or normalized_controller != expected_controller:
-        raise ValueError(
-            "schema 8 learned or non-canonical step-controller configuration is incompatible; "
-            "rebuild the config"
-        )
-
-    a5 = raw.get("a5")
-    if not isinstance(a5, dict):
-        raise ValueError("schema 8 a5 must be a mapping")
-    effect = a5.pop("effect_ablation", None)
-    if effect != {"fixed_variant": "A"}:
-        raise ValueError("schema 8 B-E effect ablations are incompatible; rebuild the config")
-    a5_optimizer = a5.get("optimizer")
-    if not isinstance(a5_optimizer, dict):
-        raise ValueError("schema 8 a5.optimizer must be a mapping")
-    controller_lr = a5_optimizer.pop("step_controller_learning_rate", 1.0e-4)
-    if controller_lr != 1.0e-4:
-        raise ValueError("schema 8 step-controller learning rate must remain canonical")
-
-    gradient_control = raw.get("outer_gradient_control")
-    if not isinstance(gradient_control, dict):
-        raise ValueError("schema 8 outer_gradient_control must be a mapping")
-    if gradient_control.get("mode") != "per_group_l2_equal_update_cap":
-        raise ValueError("schema 8 single-factor gradient mode is incompatible; rebuild the config")
-    caps = gradient_control.get("max_grad_norm")
-    if not isinstance(caps, dict):
-        raise ValueError("schema 8 outer_gradient_control.max_grad_norm must be a mapping")
-    controller_cap = caps.pop("step_controller", 0.05)
-    if controller_cap != 0.05:
-        raise ValueError("schema 8 step-controller gradient cap must remain canonical")
-
-    loss = raw.get("loss")
-    optimizer = fast_ttt.get("optimizer")
-    if not isinstance(loss, dict) or not isinstance(optimizer, dict):
-        raise ValueError("schema 8 loss and fast_ttt.optimizer must be mappings")
-    canonical_effect = (
-        optimizer.get("learning_rate"),
-        a5_optimizer.get("predictor_learning_rate"),
-        loss.get("auxiliary_outer_weight"),
-        caps.get("w0"),
-    )
-    if canonical_effect != (1.0e-4, 5.0e-5, 0.1, 0.1):
-        raise ValueError("schema 8 B-E effect values are incompatible; rebuild the config")
-
-    raw["config_schema_version"] = CONFIG_SCHEMA_VERSION
-    return raw
-
-
-def _normalize_schema_seven(value: dict[str, object]) -> dict[str, object]:
-    """Upgrade only the original fixed-step schema 7 through schema 8."""
-
-    raw = copy.deepcopy(value)
-    fast_ttt = raw.get("fast_ttt")
-    if not isinstance(fast_ttt, dict):
-        raise ValueError("schema 7 fast_ttt must be a mapping")
-    if "step_controller" in fast_ttt:
-        raise ValueError(
-            "schema 7 does not accept fast_ttt.step_controller; rebuild the config "
-            "with the canonical schema-9 fixed-step contract"
-        )
-    fast_ttt["step_controller"] = {
-        "mode": "fixed",
-        "input_dim": 7,
-        "hidden_dim": 32,
-        "maximum_step_size": 3.0e-4,
-        "initial_step_size": 1.0e-4,
-        "feature_contract": "causal_k8_v2",
-    }
-    a5 = raw.get("a5")
-    if not isinstance(a5, dict):
-        raise ValueError("schema 7 a5 must be a mapping")
-    if "effect_ablation" in a5:
-        raise ValueError(
-            "schema 7 does not accept a5.effect_ablation; rebuild the config "
-            "with the canonical schema-9 fixed-step contract"
-        )
-    a5["effect_ablation"] = {"fixed_variant": "A"}
-    raw["config_schema_version"] = 8
-    return _normalize_schema_eight(raw)
-
-
 def _normalize_project_schema(value: object) -> object:
+    """Reject every legacy loss contract at the associative boundary."""
+
     if not isinstance(value, dict):
         return value
     schema = value.get("config_schema_version")
     if schema == CONFIG_SCHEMA_VERSION:
         return value
-    if schema == 8:
-        return _normalize_schema_eight(cast(dict[str, object], value))
-    if schema == 7:
-        return _normalize_schema_seven(cast(dict[str, object], value))
-    if schema != 6:
+    if schema == 9:
         raise ValueError(
-            "config_schema_version must be 9, canonical schema 8, fixed-step schema 7, "
-            "or the strict formal schema 6"
+            "schema 9 uses the removed Predictor/identity/event LTTT contract; "
+            "rebuild a schema-10 Bank-conditioned associative configuration"
         )
-
-    raw = dict(value)
-    stage_a = cast(dict[str, object], _require_schema6_block(raw, "stage_a", _SCHEMA6_A2))
-    _require_schema6_block(raw, "stage_b", _SCHEMA6_STAGE_B)
-    stage_c = cast(dict[str, object], _require_schema6_block(raw, "stage_c", _SCHEMA6_A5))
-    inference = cast(
-        dict[str, object],
-        _require_schema6_block(raw, "inference", _SCHEMA6_INFERENCE),
+    raise ValueError(
+        "config_schema_version must be 10; legacy schema 6-9 configurations "
+        "cannot be migrated across the associative LTTT boundary"
     )
-    _require_schema6_block(raw, "evaluation", _SCHEMA6_EVALUATION)
-    _require_schema6_block(raw, "parameter_budget", _SCHEMA6_PARAMETER_BUDGET)
-    loss = raw.get("loss")
-    if not isinstance(loss, dict):
-        raise ValueError("schema 6 loss must be a mapping")
-    balance = _plain_schema_value(loss.get("official_weak_balance"))
-    if balance != _SCHEMA6_BALANCE:
-        raise ValueError(
-            "schema 6 official_weak_balance must be formal ema_answer_ref with experimental=false"
-        )
-
-    normalized_loss = dict(loss)
-    normalized_loss["official_weak_balance"] = {
-        key: item for key, item in _SCHEMA6_BALANCE.items() if key not in {"mode", "experimental"}
-    }
-    normalized_loss["official_weak_balance"]["group_weight"] = 0.4
-    optimizer_a2 = cast(dict[str, object], stage_a["optimizer"])
-    optimizer_a5 = cast(dict[str, object], stage_c["optimizer"])
-    for name in ("stage_a", "stage_b", "stage_c", "evaluation", "parameter_budget"):
-        raw.pop(name)
-    raw["config_schema_version"] = 7
-    raw["loss"] = normalized_loss
-    raw["a2"] = {
-        "optimizer": {
-            key: optimizer_a2[key]
-            for key in ("qwen_learning_rate", "state_learning_rate", "w0_learning_rate")
-        }
-    }
-    raw["a5"] = {
-        "truncation_horizon": stage_c["truncation_horizon"],
-        "seed": stage_c["seed"],
-        "optimizer": optimizer_a5,
-    }
-    raw["inference"] = {"audit_level": inference["audit_level"]}
-    return _normalize_project_schema(raw)
-
 
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:
     """Read one UTF-8 YAML file and reject missing, unknown, or invalid values."""

@@ -5,8 +5,8 @@ from ttt_svcbench_qwen.inference import main as inference_main
 from ttt_svcbench_qwen.llamafactory_trainer import main as training_main
 from ttt_svcbench_qwen.production_runtime import build_runtime
 
-V6_ARCHITECTURE_SNAPSHOT = {
-    "spec_version": "state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history",
+V10_ARCHITECTURE_SNAPSHOT = {
+    "spec_version": "state_ttt_qwen3vl8b_bank_associative_v1",
     "base_model": "Qwen/Qwen3-VL-8B-Instruct",
     "vision": {
         "output_size": 4096,
@@ -34,17 +34,24 @@ V6_ARCHITECTURE_SNAPSHOT = {
         "state_token_output_dim": 4096,
         "signed_exact_count": True,
     },
-    "loss": {
-        "pred_weight": 1.0,
-        "identity_weight": 0.5,
-        "event_weight": 0.5,
-        "o1_unlabeled_weight": 0.0,
-        "auxiliary_outer_weight": 0.1,
+    "associative_ttt": {
+        "contract": "bank_conditioned_visual_v1",
+        "bank_embedding_dim": 512,
+        "key_dim": 768,
+        "value_dim": 768,
+        "bank_empty_policy": "zero",
+        "value_source": "raw_main_merger_stopgrad",
+        "loss": "masked_fp32_mse",
+    },
+    "query_loss": {
+        "operator_weight": 1.0,
+        "retrieval_weight": 1.0,
+        "time_weight": 1.0,
     },
 }
 
 
-def test_v6_architecture_snapshot_is_unchanged() -> None:
+def test_v10_architecture_snapshot_is_unchanged() -> None:
     config = load_config()
     actual = {
         "spec_version": config.spec_version,
@@ -90,15 +97,22 @@ def test_v6_architecture_snapshot_is_unchanged() -> None:
             "state_token_output_dim": config.state_resampler.output_dim,
             "signed_exact_count": config.state_reader.signed_exact_count,
         },
-        "loss": {
-            "pred_weight": config.loss.pred_weight,
-            "identity_weight": config.loss.identity_weight,
-            "event_weight": config.loss.event_weight,
-            "o1_unlabeled_weight": config.loss.o1_unlabeled_weight,
-            "auxiliary_outer_weight": config.loss.auxiliary_outer_weight,
+        "associative_ttt": {
+            "contract": config.associative_ttt.contract,
+            "bank_embedding_dim": config.associative_ttt.bank_embedding_dim,
+            "key_dim": config.associative_ttt.key_dim,
+            "value_dim": config.associative_ttt.value_dim,
+            "bank_empty_policy": config.associative_ttt.bank_empty_policy,
+            "value_source": config.associative_ttt.value_source,
+            "loss": config.associative_ttt.loss,
+        },
+        "query_loss": {
+            "operator_weight": config.loss.operator_weight,
+            "retrieval_weight": config.loss.retrieval_weight,
+            "time_weight": config.loss.time_weight,
         },
     }
-    assert actual == V6_ARCHITECTURE_SNAPSHOT
+    assert actual == V10_ARCHITECTURE_SNAPSHOT
 
 
 def test_production_entrypoints_remain_importable() -> None:

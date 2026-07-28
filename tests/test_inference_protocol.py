@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import AbstractContextManager
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
@@ -10,6 +11,10 @@ import torch
 from torch import Tensor
 
 from tests.support import make_test_model as build_model
+from ttt_svcbench_qwen.associative_ttt import (
+    AssociativeTTTIntermediates,
+    FastAssociativeContext,
+)
 from ttt_svcbench_qwen.config import AuditLevel, ProjectConfig, load_config
 from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter, FastWeightsState, build_fast_ttt_adapter
 from ttt_svcbench_qwen.identity_bank import IdentityBank, build_identity_bank
@@ -27,7 +32,6 @@ from ttt_svcbench_qwen.inference import (
     run_inference,
     runtime_boundary_stamp,
 )
-from ttt_svcbench_qwen.losses import build_temporal_predictor
 from ttt_svcbench_qwen.model import (
     BankWriteOutput,
     BatchRuntimeState,
@@ -582,6 +586,36 @@ class _TypedStageSuite(_FakeSuite):
         )
 
 
+class _FakeFastStage:
+    """Expose the real adapter's associative protocol around the synthetic stage."""
+
+    def __init__(self, suite: _FakeSuite) -> None:
+        self.suite = suite
+
+    def _adapter(self) -> FastTTTAdapter:
+        adapter = self.suite.fast_adapter
+        if adapter is None:
+            raise RuntimeError("test suite Fast Adapter was not installed")
+        return adapter
+
+    def use_associative_context(
+        self,
+        context: FastAssociativeContext,
+    ) -> AbstractContextManager[FastTTTAdapter]:
+        return self._adapter().use_associative_context(context)
+
+    def consume_associative_intermediates(self) -> AssociativeTTTIntermediates:
+        return self._adapter().consume_associative_intermediates()
+
+    def __call__(
+        self,
+        visual: VisualStageOutput,
+        query: object,
+        request: ObservationChunkRequest,
+    ) -> VisualStageOutput:
+        return self.suite.fast(visual, query, request)
+
+
 def _model(dependencies: _Dependencies, suite: _FakeSuite) -> StateTTTModel:
     suite.fast_adapter = dependencies.fast_adapter
     return build_model(
@@ -592,7 +626,7 @@ def _model(dependencies: _Dependencies, suite: _FakeSuite) -> StateTTTModel:
             composer=suite.compose,
             qwen_prefill=suite.prefill,
             qwen_generate=suite.generate,
-            fast_adapter=suite.fast,
+            fast_adapter=_FakeFastStage(suite),
             spatial_encoder=suite.spatial,
             temporal_encoder=suite.temporal,
             observation_heads=suite.heads,
@@ -616,7 +650,7 @@ def _stage_a_model(dependencies: _Dependencies, suite: _TypedStageSuite) -> Stat
             composer=suite.compose,
             qwen_prefill=suite.prefill,
             qwen_generate=suite.generate,
-            fast_adapter=suite.fast,
+            fast_adapter=_FakeFastStage(suite),
             spatial_encoder=suite.spatial,
             temporal_encoder=suite.temporal,
             observation_heads=suite.heads,
@@ -649,7 +683,7 @@ class _Updater:
         optimizer = runtime.optimizer
         assert fast is not None and optimizer is not None
         if call in self.skip_calls:
-            reason = "no_valid_term"
+            reason = "no_valid_token"
             return TTTUpdateOutcome(
                 runtime_state=replace(
                     runtime,
@@ -662,7 +696,7 @@ class _Updater:
                 ),
                 did_update=False,
                 skip_reason=reason,
-                valid_term_count=0,
+                valid_token_count=0,
             )
         with torch.no_grad():
             next_w1 = (fast.w_t_1 - 1.0e-4).detach().clone().requires_grad_(True)
@@ -688,7 +722,7 @@ class _Updater:
             ),
             did_update=True,
             skip_reason=None,
-            valid_term_count=1,
+            valid_token_count=1,
             loss_value=0.25,
         )
 
@@ -773,7 +807,7 @@ def test_causal_chunks_next_only_updates_and_generation_immutability(
     assert tuple(audit.fast_version_used for audit in result.chunk_audit) == (0, 1)
     assert tuple(audit.next_fast_version for audit in result.chunk_audit) == (1, 1)
     assert result.chunk_audit[1].future_frame_count == 1
-    assert result.chunk_audit[1].skip_reason == "no_valid_term"
+    assert result.chunk_audit[1].skip_reason == "no_valid_token"
     assert result.generate_audit.prefill_count == 1
     assert result.generate_audit.decode_count == 0
     assert result.generate_audit.state_before == result.generate_audit.state_after
@@ -972,7 +1006,7 @@ def test_generation_mutation_fails_closed_and_exception_releases_runtime(
 
 def test_fast_binding_is_fail_closed_and_not_reentrant(dependencies: _Dependencies) -> None:
     for mode, error, message in (
-        ("skip", InferenceProtocolError, "manager-bound FastWeightsState"),
+        ("skip", RuntimeError, "no associative intermediates"),
         ("reenter", RuntimeError, "not re-entrant"),
     ):
         suite = _FakeSuite()
@@ -1025,17 +1059,14 @@ def test_unified_runtime_commits_real_hard_state(dependencies: _Dependencies) ->
     manager.release()
 
 
-def test_online_updater_publishes_overlap_and_next_only_fast_state(
+def test_online_updater_uses_association_and_publishes_next_only_fast_state(
     dependencies: _Dependencies,
 ) -> None:
     torch.manual_seed(15)
     suite = _TypedStageSuite()
     manager = _manager(dependencies)
     model = _stage_a_model(dependencies, suite)
-    updater = OnlineTTTUpdater(
-        dependencies.config,
-        build_temporal_predictor(dependencies.config.predictor),
-    )
+    updater = OnlineTTTUpdater(dependencies.config)
     manager.reset("video-a", "trajectory-a", torch.zeros(512))
 
     first = manager.observe_chunk(
@@ -1049,8 +1080,7 @@ def test_online_updater_publishes_overlap_and_next_only_fast_state(
     assert first.audit.did_update, first.audit.skip_reason
     assert first.audit.next_fast_version == 1
     assert first.audit.step_size == pytest.approx(1.0e-4)
-    assert first.runtime_state.online_overlap_memory is not None
-    assert first.runtime_state.online_overlap_memory.end_time == 1.0
+    assert first.audit.valid_token_count > 0
 
     second = manager.observe_chunk(
         model=model,
@@ -1062,8 +1092,7 @@ def test_online_updater_publishes_overlap_and_next_only_fast_state(
     assert second.audit.fast_version_used == 1
     assert second.audit.next_fast_version == 2
     assert second.audit.step_size == pytest.approx(1.0e-4)
-    assert second.runtime_state.online_overlap_memory is not None
-    assert second.runtime_state.online_overlap_memory.end_time == 3.0
+    assert second.audit.valid_token_count > 0
     manager.release()
 
 

@@ -81,7 +81,7 @@ class _OuterToy(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.backbone = nn.Linear(3, 4)
-        self.predictor = nn.Linear(4, 4)
+        self.p_context = nn.Linear(4, 4)
 
 
 def test_trainer_main_destroys_initialized_process_group_on_success(
@@ -147,8 +147,8 @@ def test_a5_outer_parameter_audit_allows_partial_qwen_with_full_state_training()
         qwen_trainable_count=30,
         non_qwen_parameter_count=40,
         non_qwen_trainable_count=40,
-        predictor_parameter_count=10,
-        predictor_trainable_count=10,
+        associative_parameter_count=10,
+        associative_trainable_count=10,
         transient_parameter_names=(),
         backbone_registered=True,
     )
@@ -157,7 +157,7 @@ def test_a5_outer_parameter_audit_allows_partial_qwen_with_full_state_training()
 
 
 def test_a5_outer_parameter_audit_rejects_frozen_state_parameter() -> None:
-    with pytest.raises(ValueError, match="every state, W0, and Predictor"):
+    with pytest.raises(ValueError, match="every state, W0, and Associative"):
         OuterParameterAudit(
             stage=ProductionStage.A5,
             total_parameter_count=100,
@@ -166,14 +166,14 @@ def test_a5_outer_parameter_audit_rejects_frozen_state_parameter() -> None:
             qwen_trainable_count=30,
             non_qwen_parameter_count=40,
             non_qwen_trainable_count=39,
-            predictor_parameter_count=10,
-            predictor_trainable_count=10,
+            associative_parameter_count=10,
+            associative_trainable_count=10,
             transient_parameter_names=(),
             backbone_registered=True,
         )
 
 
-def test_static_w0_outer_parameter_audit_requires_frozen_predictor() -> None:
+def test_static_w0_outer_parameter_audit_requires_frozen_associative() -> None:
     audit = OuterParameterAudit(
         stage=ProductionStage.A5,
         a5_adaptation_mode="static_w0",
@@ -183,14 +183,14 @@ def test_static_w0_outer_parameter_audit_requires_frozen_predictor() -> None:
         qwen_trainable_count=30,
         non_qwen_parameter_count=40,
         non_qwen_trainable_count=30,
-        predictor_parameter_count=10,
-        predictor_trainable_count=0,
+        associative_parameter_count=10,
+        associative_trainable_count=0,
         transient_parameter_names=(),
         backbone_registered=True,
     )
 
-    assert audit.predictor_trainable_count == 0
-    with pytest.raises(ValueError, match="Predictor must remain frozen"):
+    assert audit.associative_trainable_count == 0
+    with pytest.raises(ValueError, match="Associative must remain frozen"):
         OuterParameterAudit(
             stage=ProductionStage.A5,
             a5_adaptation_mode="static_w0",
@@ -200,8 +200,8 @@ def test_static_w0_outer_parameter_audit_requires_frozen_predictor() -> None:
             qwen_trainable_count=30,
             non_qwen_parameter_count=40,
             non_qwen_trainable_count=31,
-            predictor_parameter_count=10,
-            predictor_trainable_count=1,
+            associative_parameter_count=10,
+            associative_trainable_count=1,
             transient_parameter_names=(),
             backbone_registered=True,
         )
@@ -238,7 +238,7 @@ def test_runtime_preprocess_cache_honors_explicit_namespace(
 
 
 class _GroupedOuterToy(nn.Module):
-    def __init__(self, qwen: nn.Module, *, predictor_trainable: bool) -> None:
+    def __init__(self, qwen: nn.Module, *, associative_trainable: bool) -> None:
         super().__init__()
         self.qwen = qwen
         self.state_model = nn.Module()
@@ -252,8 +252,8 @@ class _GroupedOuterToy(nn.Module):
         )
         self.w0_1 = nn.Parameter(torch.ones(4, 4))
         self.w0_2 = nn.Parameter(torch.ones(4, 4))
-        self.predictor = nn.Linear(4, 4)
-        self.predictor.requires_grad_(predictor_trainable)
+        self.p_context = nn.Linear(4, 4)
+        self.p_context.requires_grad_(associative_trainable)
 
 
 class _GroupedQueryToy(nn.Module):
@@ -326,7 +326,7 @@ def _grouped_bundle(
         ),
         symbols=symbols,
     )
-    return bundle, _GroupedOuterToy(qwen, predictor_trainable=adaptation_mode == "meta_ttt")
+    return bundle, _GroupedOuterToy(qwen, associative_trainable=adaptation_mode == "meta_ttt")
 
 
 class _QwenOwnerToy(nn.Module):
@@ -394,7 +394,7 @@ def test_production_outer_checkpoint_owns_ema_balance_state() -> None:
     config = load_config()
     qwen = nn.Linear(2, 2)
     balancer = OfficialWeakOuterLossComposer(config.loss.official_weak_balance)
-    outer = ProductionOuterModel(nn.Linear(2, 2), nn.Linear(2, 2), qwen, balancer)
+    outer = ProductionOuterModel(nn.Linear(2, 2), qwen, balancer)
 
     keys = set(audit_outer_checkpoint_boundary(outer))
 
@@ -416,7 +416,7 @@ def test_a2_to_a5_resets_loss_and_gradient_ema() -> None:
     balancer.gradient_ema_values.fill_(5.0)
     balancer.gradient_ema_valid.fill_(True)
     balancer.gradient_ema_update_counts.fill_(6)
-    outer = ProductionOuterModel(nn.Linear(2, 2), nn.Linear(2, 2), nn.Linear(2, 2), balancer)
+    outer = ProductionOuterModel(nn.Linear(2, 2), nn.Linear(2, 2), balancer)
 
     _reset_a2_to_a5_balance(outer)
 
@@ -1320,7 +1320,7 @@ def test_outer_model_forces_non_reentrant_gradient_checkpointing() -> None:
             pass
 
     qwen = _CheckpointingQwen()
-    outer = ProductionOuterModel(nn.Linear(1, 1), nn.Linear(1, 1), qwen)
+    outer = ProductionOuterModel(nn.Linear(1, 1), qwen)
     outer.gradient_checkpointing_enable({"use_reentrant": True, "preserve_rng_state": False})
 
     assert qwen.calls == [{"use_reentrant": False, "preserve_rng_state": False}]
@@ -1588,7 +1588,7 @@ def test_a2_weight_initialization_is_strict_and_excludes_runtime_state(tmp_path:
 
 def test_production_runtime_defers_optimizer_and_sampler_to_central_bridge() -> None:
     model = _OuterToy()
-    model.predictor.requires_grad_(False)
+    model.p_context.requires_grad_(False)
     runtime = ProductionTrainerRuntime(
         stage=ProductionStage.A2,
         model=model,
@@ -1609,7 +1609,16 @@ def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Pa
     (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
     (checkpoint / "scheduler.pt").write_bytes(b"scheduler")
     (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
-    (run / "run_config.json").write_text('{"stage": "a5"}', encoding="utf-8")
+    (run / "run_config.json").write_text(
+        json.dumps(
+            {
+                "stage": "a5",
+                "config_schema_version": 10,
+                "associative_ttt_contract": "bank_conditioned_visual_v1",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     assert resolve_same_stage_resume(str(checkpoint), ProductionStage.A5) == checkpoint
     with pytest.raises(ValueError, match="stage does not match"):
@@ -1638,7 +1647,14 @@ def test_same_stage_resume_accepts_only_matching_static_w0_mode(tmp_path: Path) 
     (checkpoint / "scheduler.pt").write_bytes(b"scheduler")
     (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
     (run / "run_config.json").write_text(
-        '{"stage": "a5", "a5_adaptation_mode": "static_w0"}',
+        json.dumps(
+            {
+                "stage": "a5",
+                "a5_adaptation_mode": "static_w0",
+                "config_schema_version": 10,
+                "associative_ttt_contract": "bank_conditioned_visual_v1",
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -1654,7 +1670,7 @@ def test_same_stage_resume_accepts_only_matching_static_w0_mode(tmp_path: Path) 
         resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
 
 
-def test_same_stage_resume_accepts_only_legacy_a_fixed(
+def test_same_stage_resume_rejects_legacy_associative_contract(
     tmp_path: Path,
 ) -> None:
     run = tmp_path / "runs" / "learned-step"
@@ -1668,25 +1684,13 @@ def test_same_stage_resume_accepts_only_legacy_a_fixed(
             {
                 "stage": "a5",
                 "a5_adaptation_mode": "meta_ttt",
-                "a5_step_controller_mode": "learned",
-                "a5_step_controller_feature_contract": "causal_k8_v2",
+                "config_schema_version": 9,
             }
         ),
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="learned-step checkpoints"):
-        resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
-
-    raw = json.loads((run / "run_config.json").read_text(encoding="utf-8"))
-    raw["a5_step_controller_mode"] = "fixed"
-    raw["a5_fixed_variant"] = "A"
-    (run / "run_config.json").write_text(json.dumps(raw), encoding="utf-8")
-    assert resolve_same_stage_resume(str(checkpoint), ProductionStage.A5) == checkpoint
-
-    raw["a5_fixed_variant"] = "C"
-    (run / "run_config.json").write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(ValueError, match="B-E effect-ablation checkpoints"):
+    with pytest.raises(ValueError, match="schema-10 Bank-conditioned associative"):
         resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
 
 
@@ -1828,12 +1832,12 @@ def test_a5_rank_stable_optimizer_anchor_excludes_always_used_qwen_group() -> No
             super().__init__()
             self.qwen = nn.Linear(1, 1, bias=False)
             self.state = nn.Linear(1, 1, bias=False)
-            self.predictor = nn.Linear(1, 1, bias=False)
+            self.p_context = nn.Linear(1, 1, bias=False)
 
     model = _Model()
     gradient_controller = OuterGradientController(
         load_config().outer_gradient_control,
-        expected_groups=("qwen", "state_shared", "predictor"),
+        expected_groups=("qwen", "state_shared", "associative"),
     )
 
     class _Engine:
@@ -1864,7 +1868,7 @@ def test_a5_rank_stable_optimizer_anchor_excludes_always_used_qwen_group() -> No
 
     assert controller._rank_stable_parameters == (
         model.state.weight,
-        model.predictor.weight,
+        model.p_context.weight,
     )
 
 
@@ -1878,12 +1882,12 @@ def test_a5_rank_stable_hook_order_audit_is_fail_closed(
             super().__init__()
             self.qwen = nn.Linear(1, 1, bias=False)
             self.state = nn.Linear(1, 1, bias=False)
-            self.predictor = nn.Linear(1, 1, bias=False)
+            self.p_context = nn.Linear(1, 1, bias=False)
 
     model = _Model()
     gradient_controller = OuterGradientController(
         load_config().outer_gradient_control,
-        expected_groups=("qwen", "state_shared", "predictor"),
+        expected_groups=("qwen", "state_shared", "associative"),
     )
     step_calls = 0
 
@@ -1940,12 +1944,12 @@ def test_a5_zero1_rank_audit_allows_order_drift_with_identical_coverage(
             super().__init__()
             self.qwen = nn.Linear(1, 1, bias=False)
             self.state = nn.Linear(1, 1, bias=False)
-            self.predictor = nn.Linear(1, 1, bias=False)
+            self.p_context = nn.Linear(1, 1, bias=False)
 
     model = _Model()
     gradient_controller = OuterGradientController(
         load_config().outer_gradient_control,
-        expected_groups=("qwen", "state_shared", "predictor"),
+        expected_groups=("qwen", "state_shared", "associative"),
     )
 
     class _Engine:
@@ -2120,7 +2124,9 @@ def test_a5_nonfinite_segment_preserves_backward_parity_and_skips_episode_update
     monkeypatch.setattr("ttt_svcbench_qwen.outer_gradient_control.version", lambda _name: "0.18.8")
     parameter = nn.Parameter(torch.tensor(1.0))
     parameter.grad = torch.zeros_like(parameter)
-    optimizer = torch.optim.SGD([{"params": [parameter], "lr": 1.0e-4, "group_name": "predictor"}])
+    optimizer = torch.optim.SGD(
+        [{"params": [parameter], "lr": 1.0e-4, "group_name": "associative"}]
+    )
 
     class _Zero:
         def __init__(self) -> None:
@@ -2170,7 +2176,7 @@ def test_a5_nonfinite_segment_preserves_backward_parity_and_skips_episode_update
     engine = _Engine()
     gradient_controller = OuterGradientController(
         load_config().outer_gradient_control,
-        expected_groups=("predictor",),
+        expected_groups=("associative",),
     )
     controller = SegmentBackwardController(
         SimpleNamespace(
@@ -2279,7 +2285,7 @@ def test_explicit_smoke_disables_all_periodic_checkpoints() -> None:
 
 
 @pytest.mark.parametrize(
-    ("stage", "adaptation_mode", "predictor_trainable", "expected_lrs"),
+    ("stage", "adaptation_mode", "associative_trainable", "expected_lrs"),
     [
         (
             ProductionStage.A2,
@@ -2305,7 +2311,7 @@ def test_explicit_smoke_disables_all_periodic_checkpoints() -> None:
                 "state_router_time": 5.0e-5,
                 "state_retrieval": 5.0e-5,
                 "w0": 5.0e-5,
-                "predictor": 5.0e-5,
+                "associative": 5.0e-5,
             },
         ),
         (
@@ -2327,7 +2333,7 @@ def test_central_outer_optimizer_has_exact_stage_groups(
     tmp_path: Path,
     stage: ProductionStage,
     adaptation_mode: str,
-    predictor_trainable: bool,
+    associative_trainable: bool,
     expected_lrs: dict[str, float],
 ) -> None:
     qwen = nn.Linear(4, 4)
@@ -2380,7 +2386,7 @@ def test_central_outer_optimizer_has_exact_stage_groups(
         ),
         symbols=symbols,
     )
-    model = _GroupedOuterToy(qwen, predictor_trainable=predictor_trainable)
+    model = _GroupedOuterToy(qwen, associative_trainable=associative_trainable)
 
     optimizer = make_production_outer_optimizer_factory(
         bundle,
@@ -2411,7 +2417,7 @@ def test_canonical_a5_builds_equal_budget_production_optimizer(
     assert float(groups["w0"]["lr"]) * float(caps.w0) == pytest.approx(
         5.0e-6
     )
-    assert float(groups["predictor"]["lr"]) * float(caps.predictor) == pytest.approx(
+    assert float(groups["associative"]["lr"]) * float(caps.associative) == pytest.approx(
         5.0e-6
     )
 
@@ -2423,7 +2429,7 @@ def test_optimizer_rejects_noncanonical_budget_drift(tmp_path: Path) -> None:
             "a5": base.a5.model_copy(
                 update={
                     "optimizer": base.a5.optimizer.model_copy(
-                        update={"predictor_learning_rate": 1.0e-4}
+                        update={"associative_learning_rate": 1.0e-4}
                     )
                 }
             )
@@ -2489,7 +2495,7 @@ def test_outer_optimizer_rejects_removed_step_controller_parameters(
         ),
         symbols=symbols,
     )
-    model = _GroupedOuterToy(qwen, predictor_trainable=True)
+    model = _GroupedOuterToy(qwen, associative_trainable=True)
     model.step_controller = nn.Linear(7, 1)
 
     with pytest.raises(ValueError, match="step-controller parameters were removed"):

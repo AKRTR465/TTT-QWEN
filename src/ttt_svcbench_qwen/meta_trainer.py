@@ -1,9 +1,9 @@
-"""P16/P17 causal Meta-TTT episode orchestration and engineering audits.
+"""Causal Meta-TTT episode orchestration and associative inner-update audits.
 
 Inputs: resettable model/runtime factories, causal Support/Query chunks, typed query labels,
 and the frozen P14 loss/functional-SGD contracts.
-Outputs: an after-update outer objective, per-video next-only fast generations, detached overlap
-snapshots, before/after query metrics, and bounded graph/lifecycle audits.
+Outputs: a Query-only after-update objective, per-video next-only fast generations, before/after
+Query metrics, and bounded graph/lifecycle audits.
 Forbidden: Support labels, batch-scalar inner updates, in-place fast mutation, first-order training,
 cross-video runtime reuse, observe-after-prefill, or carrying differentiable runtime snapshots.
 """
@@ -20,6 +20,11 @@ from typing import Protocol, cast
 import torch
 from torch import Tensor, nn
 
+from ttt_svcbench_qwen.associative_ttt import (
+    ASSOCIATIVE_CONTRACT,
+    AssociativeTTTLossOutput,
+    compute_associative_ttt_loss,
+)
 from ttt_svcbench_qwen.config import ProjectConfig
 from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.fast_ttt import (
@@ -33,39 +38,27 @@ from ttt_svcbench_qwen.fast_ttt import (
 )
 from ttt_svcbench_qwen.functional_sgd import (
     FunctionalSGDResult,
-    functional_sgd_steps_from_ttt,
+    functional_sgd_steps_from_associative,
     reset_optimizer_state,
 )
 from ttt_svcbench_qwen.input_composer import ComposedInput, map_teacher_forced_targets
 from ttt_svcbench_qwen.losses import (
     AnswerLossInput,
     AnswerLossOutput,
-    E1ConsistencyInput,
-    E2ConsistencyInput,
-    EventConsistencyInput,
-    IdentityConsistencyInput,
-    IdentityPairStatus,
     OuterLossInput,
     OuterLossOutput,
     ReaderCountMetricInput,
     StateLossInput,
     StateLossOutput,
-    TemporalPredictionInput,
-    TemporalPredictor,
-    TTTLossInput,
-    TTTLossOutput,
     compute_answer_loss,
     compute_outer_loss,
     compute_state_loss,
-    compute_ttt_loss,
-    compute_ttt_outer_auxiliary_loss,
 )
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
     BatchRuntimeState,
     ObservationChunkOutput,
     ObservationChunkRequest,
-    OnlineOverlapSnapshot,
     PrefillLifecycle,
     PreparedQueryOutput,
     RuntimeOwner,
@@ -82,14 +75,12 @@ from ttt_svcbench_qwen.outer_loss_balance import (
 )
 from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput
 from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase, trace_event
-from ttt_svcbench_qwen.stage_a_runtime import StageAWriteAudit
 from ttt_svcbench_qwen.stage_a_targets import (
     OfficialWeakStateLossOutput,
     OfficialWeakTargetBuilder,
     StageATargetBuilder,
     TargetProvenance,
 )
-from ttt_svcbench_qwen.state_encoder import TemporalEncoderOutput
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
 from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
 from ttt_svcbench_qwen.trainer import (
@@ -102,7 +93,6 @@ from ttt_svcbench_qwen.training_context import (
     query_activation_context,
 )
 
-_SUPPORTED_TERMS = ("pred", "identity", "event")
 _CI_Z_95 = 1.959963984540054
 
 
@@ -124,6 +114,8 @@ class FastStateController(Protocol):
     ) -> AbstractContextManager[object]: ...
 
     def collect_meta_fast_parameters(self) -> tuple[nn.Parameter, nn.Parameter]: ...
+
+    def collect_associative_parameters(self) -> tuple[nn.Parameter, ...]: ...
 
 
 class EpisodeRuntimeResetter(Protocol):
@@ -271,440 +263,6 @@ class MetaTTTEpisode:
 
 
 @dataclass(frozen=True, slots=True)
-class CrossChunkMatchAudit:
-    previous_available: bool
-    snapshot_detached: bool
-    snapshot_storage_isolated: bool
-    position_causal: bool
-    authoritative_identity_update_evidence: bool
-    identity_decision_storage_free: bool
-    authoritative_identity_decision_counts: tuple[int, ...]
-    identity_matched_counts: tuple[int, ...]
-    identity_duplicate_counts: tuple[int, ...]
-    identity_low_confidence_counts: tuple[int, ...]
-    e1_overlap_counts: tuple[int, ...]
-    e2_overlap_counts: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        flags = (
-            self.previous_available,
-            self.snapshot_detached,
-            self.snapshot_storage_isolated,
-            self.position_causal,
-            self.authoritative_identity_update_evidence,
-            self.identity_decision_storage_free,
-        )
-        if any(type(value) is not bool for value in flags):
-            raise TypeError("cross-chunk match flags must be bool")
-        lengths = {
-            len(self.identity_matched_counts),
-            len(self.authoritative_identity_decision_counts),
-            len(self.identity_duplicate_counts),
-            len(self.identity_low_confidence_counts),
-            len(self.e1_overlap_counts),
-            len(self.e2_overlap_counts),
-        }
-        if len(lengths) != 1 or 0 in lengths:
-            raise ValueError("cross-chunk match counts must align to one non-empty batch")
-        counts = (
-            *self.identity_matched_counts,
-            *self.authoritative_identity_decision_counts,
-            *self.identity_duplicate_counts,
-            *self.identity_low_confidence_counts,
-            *self.e1_overlap_counts,
-            *self.e2_overlap_counts,
-        )
-        if any(type(value) is not int or value < 0 for value in counts):
-            raise ValueError("cross-chunk match counts must be non-negative integers")
-
-
-@dataclass(frozen=True, slots=True)
-class TTTInputBuildResult:
-    inputs: TTTLossInput
-    snapshot: OnlineOverlapSnapshot
-    audit: CrossChunkMatchAudit
-
-
-class CausalOverlapTTTInputBuilder:
-    """Build P14 inputs from real adjacent outputs and detached exact-position snapshots."""
-
-    def __init__(self, config: ProjectConfig) -> None:
-        self.match_threshold = float(config.observation_heads.o2.match_threshold)
-        self.ambiguity_margin = float(config.observation_heads.o2.match_ambiguity_margin)
-
-    def __call__(
-        self,
-        output: ObservationChunkOutput,
-        *,
-        previous: OnlineOverlapSnapshot | None,
-        current_end_time: float,
-        enabled_terms: tuple[str, ...],
-    ) -> TTTInputBuildResult:
-        observations = _typed_observations(output)
-        temporal = output.temporal
-        if not isinstance(temporal, TemporalEncoderOutput):
-            raise TypeError("Meta-TTT requires typed TemporalEncoderOutput")
-        if tuple(dict.fromkeys(enabled_terms)) != enabled_terms or any(
-            term not in _SUPPORTED_TERMS for term in enabled_terms
-        ):
-            raise ValueError("Meta-TTT enabled terms must be unique pred/identity/event names")
-        snapshot = OnlineOverlapSnapshot.capture(output, end_time=current_end_time)
-        if previous is not None:
-            if previous.owner != output.owner:
-                raise ValueError("overlap snapshot owner changed across chunks")
-            if previous.end_time >= current_end_time:
-                raise ValueError("overlap snapshot must precede the current chunk end")
-
-        identity, identity_counts = self._identity_input(
-            observations,
-            previous if "identity" in enabled_terms else None,
-        )
-        event, event_counts = self._event_input(
-            observations,
-            previous if "event" in enabled_terms else None,
-        )
-        previous_available = previous is not None
-        snapshot_tensors = () if previous is None else previous.tensors
-        snapshot_detached = all(
-            not value.requires_grad and value.grad_fn is None for value in snapshot_tensors
-        )
-        snapshot_isolated = len({tensor_storage_key(value) for value in snapshot_tensors}) == len(
-            snapshot_tensors
-        )
-        hard_audit = output.state_audit
-        if isinstance(hard_audit, StageAWriteAudit):
-            authoritative_identity = True
-            identity_decisions = hard_audit.identity_decisions
-        else:
-            authoritative_identity = False
-            identity_decisions = ()
-        decision_counts = (
-            tuple(len(values) for values in identity_decisions)
-            if authoritative_identity
-            else (0,) * observations.o2.identity.shape[0]
-        )
-        decision_storage_free = not _contains_tensor(identity_decisions)
-        if "identity" in enabled_terms and not authoritative_identity:
-            raise ValueError(
-                "identity consistency requires authoritative IdentityUpdateResult decision audit"
-            )
-        return TTTInputBuildResult(
-            inputs=TTTLossInput(
-                temporal=TemporalPredictionInput(
-                    hidden=temporal.hidden,
-                    valid_mask=temporal.valid_mask,
-                    position_ids=temporal.position_ids,
-                ),
-                identity=identity,
-                event=event,
-            ),
-            snapshot=snapshot,
-            audit=CrossChunkMatchAudit(
-                previous_available=previous_available,
-                snapshot_detached=snapshot_detached,
-                snapshot_storage_isolated=snapshot_isolated,
-                position_causal=previous is None or previous.end_time < current_end_time,
-                authoritative_identity_update_evidence=authoritative_identity,
-                identity_decision_storage_free=decision_storage_free,
-                authoritative_identity_decision_counts=decision_counts,
-                identity_matched_counts=identity_counts[0],
-                identity_duplicate_counts=identity_counts[1],
-                identity_low_confidence_counts=identity_counts[2],
-                e1_overlap_counts=event_counts,
-                e2_overlap_counts=event_counts,
-            ),
-        )
-
-    def _identity_input(
-        self,
-        current: ObservationOutputs,
-        previous: OnlineOverlapSnapshot | None,
-    ) -> tuple[IdentityConsistencyInput, tuple[tuple[int, ...], ...]]:
-        batch_size, current_width = current.o2.valid_mask.shape
-        if previous is None:
-            statuses = torch.full(
-                (batch_size, max(current_width, 1)),
-                int(IdentityPairStatus.PADDING),
-                dtype=torch.int64,
-                device=current.o2.identity.device,
-            )
-            indices = torch.full_like(statuses, -1)
-            positions = torch.full_like(statuses, -1)
-            timestamps = torch.full(
-                statuses.shape,
-                -1.0,
-                dtype=current.o2.timestamps.dtype,
-                device=current.o2.identity.device,
-            )
-            result = IdentityConsistencyInput(
-                current_predictions=current.o2.identity,
-                previous_targets=current.o2.identity.detach().clone(),
-                current_valid_mask=current.o2.valid_mask,
-                previous_valid_mask=current.o2.valid_mask.detach().clone(),
-                current_indices=indices,
-                previous_indices=indices.clone(),
-                statuses=statuses,
-                current_position_ids=positions,
-                previous_position_ids=positions.clone(),
-                current_timestamps=timestamps,
-                previous_timestamps=timestamps.clone(),
-            )
-            zeros = (0,) * batch_size
-            return result, (zeros, zeros, zeros)
-
-        if previous.identity.device != current.o2.identity.device:
-            raise ValueError("identity overlap snapshots must share the current device")
-        pair_width = max(current_width, 1)
-        current_indices = torch.full(
-            (batch_size, pair_width),
-            -1,
-            dtype=torch.int64,
-            device=current.o2.identity.device,
-        )
-        previous_indices = current_indices.clone()
-        statuses = torch.full_like(current_indices, int(IdentityPairStatus.PADDING))
-        current_positions = current_indices.clone()
-        previous_positions = current_indices.clone()
-        current_times = torch.full(
-            current_indices.shape,
-            -1.0,
-            dtype=current.o2.timestamps.dtype,
-            device=current.o2.identity.device,
-        )
-        previous_times = current_times.clone()
-        matched_counts: list[int] = []
-        duplicate_counts: list[int] = []
-        low_counts: list[int] = []
-        for row in range(batch_size):
-            decisions = self._match_identity_row(current, previous, row)
-            matched = duplicates = low = 0
-            for pair, (current_index, previous_index, status) in enumerate(decisions):
-                current_indices[row, pair] = current_index
-                previous_indices[row, pair] = previous_index
-                statuses[row, pair] = int(status)
-                if status not in (IdentityPairStatus.PADDING, IdentityPairStatus.INVALID_SOURCE):
-                    current_positions[row, pair] = current.o2.position_ids[row, current_index]
-                    previous_positions[row, pair] = previous.identity_position_ids[
-                        row, previous_index
-                    ]
-                    current_times[row, pair] = current.o2.timestamps[row, current_index]
-                    previous_times[row, pair] = previous.identity_timestamps[row, previous_index]
-                matched += status is IdentityPairStatus.MATCHED
-                duplicates += status is IdentityPairStatus.DUPLICATE
-                low += status is IdentityPairStatus.LOW_CONFIDENCE
-            matched_counts.append(matched)
-            duplicate_counts.append(duplicates)
-            low_counts.append(low)
-        result = IdentityConsistencyInput(
-            current_predictions=current.o2.identity,
-            previous_targets=previous.identity,
-            current_valid_mask=current.o2.valid_mask,
-            previous_valid_mask=previous.identity_valid_mask,
-            current_indices=current_indices,
-            previous_indices=previous_indices,
-            statuses=statuses,
-            current_position_ids=current_positions,
-            previous_position_ids=previous_positions,
-            current_timestamps=current_times,
-            previous_timestamps=previous_times,
-        )
-        return result, (
-            tuple(matched_counts),
-            tuple(duplicate_counts),
-            tuple(low_counts),
-        )
-
-    def _match_identity_row(
-        self,
-        current: ObservationOutputs,
-        previous: OnlineOverlapSnapshot,
-        row: int,
-    ) -> tuple[tuple[int, int, IdentityPairStatus], ...]:
-        current_valid = torch.nonzero(current.o2.valid_mask[row], as_tuple=False).flatten().tolist()
-        previous_valid = (
-            torch.nonzero(previous.identity_valid_mask[row], as_tuple=False).flatten().tolist()
-        )
-        decisions: list[tuple[int, int, IdentityPairStatus]] = []
-        claims: dict[int, list[tuple[int, float, float]]] = {}
-        for current_index in current_valid:
-            temporal_candidates = [
-                previous_index
-                for previous_index in previous_valid
-                if int(current.o2.position_ids[row, current_index].item())
-                == int(previous.identity_position_ids[row, previous_index].item())
-                and abs(
-                    float(current.o2.timestamps[row, current_index].item())
-                    - float(previous.identity_timestamps[row, previous_index].item())
-                )
-                <= 1.0e-6
-            ]
-            if not temporal_candidates:
-                decisions.append((-1, -1, IdentityPairStatus.INVALID_SOURCE))
-                continue
-            current_value = current.o2.identity[row, current_index].detach().float()
-            scores = [
-                float(
-                    torch.dot(current_value, previous.identity[row, previous_index].float()).item()
-                )
-                for previous_index in temporal_candidates
-            ]
-            order = sorted(range(len(scores)), key=lambda index: (-scores[index], index))
-            best_offset = order[0]
-            best_index = temporal_candidates[best_offset]
-            best_score = scores[best_offset]
-            second_score = scores[order[1]] if len(order) > 1 else -1.0
-            if best_score < self.match_threshold or (
-                len(order) > 1 and best_score - second_score <= self.ambiguity_margin
-            ):
-                decisions.append((current_index, best_index, IdentityPairStatus.LOW_CONFIDENCE))
-                continue
-            claims.setdefault(best_index, []).append((current_index, best_score, second_score))
-
-        claimed_current = {value[0] for values in claims.values() for value in values}
-        for previous_index, values in claims.items():
-            ordered = sorted(values, key=lambda item: (-item[1], item[0]))
-            winner = ordered[0]
-            decisions.append((winner[0], previous_index, IdentityPairStatus.MATCHED))
-            decisions.extend(
-                (loser[0], previous_index, IdentityPairStatus.DUPLICATE) for loser in ordered[1:]
-            )
-        decisions.sort(key=lambda item: (item[0] < 0, item[0], item[1]))
-        if len(decisions) > max(len(current_valid), 1):  # pragma: no cover - defensive
-            raise RuntimeError("identity matcher emitted more pairs than current slots")
-        if any(
-            current_index >= 0
-            and current_index not in claimed_current
-            and status is IdentityPairStatus.MATCHED
-            for current_index, _, status in decisions
-        ):
-            raise RuntimeError("identity matcher lost its one-to-one claim bookkeeping")
-        return tuple(decisions)
-
-    def _event_input(
-        self,
-        current: ObservationOutputs,
-        previous: OnlineOverlapSnapshot | None,
-    ) -> tuple[EventConsistencyInput, tuple[int, ...]]:
-        if previous is None:
-            batch_size = current.e1.valid_mask.shape[0]
-            width = max(int(current.e1.valid_mask.shape[1]), 1)
-            pair_mask = torch.zeros(
-                (batch_size, width), dtype=torch.bool, device=current.e1.valid_mask.device
-            )
-            positions = torch.full(pair_mask.shape, -1, dtype=torch.int64, device=pair_mask.device)
-            timestamps = torch.full(
-                pair_mask.shape,
-                -1.0,
-                dtype=current.e1.timestamps.dtype,
-                device=pair_mask.device,
-            )
-            e1_current = _pad_probability_width(current.e1.probabilities, width)
-            e2_event_current = _pad_probability_width(current.e2.event_probabilities, width)
-            e2_phase_current = _pad_probability_width(current.e2.phase_probabilities, width)
-            event = EventConsistencyInput(
-                e1=E1ConsistencyInput(
-                    current_probabilities=e1_current,
-                    previous_target_probabilities=e1_current.detach().clone(),
-                    pair_mask=pair_mask,
-                    alignment_mask=pair_mask.clone(),
-                    current_position_ids=positions,
-                    previous_position_ids=positions.clone(),
-                    current_timestamps=timestamps,
-                    previous_timestamps=timestamps.clone(),
-                ),
-                e2=E2ConsistencyInput(
-                    current_event_probabilities=e2_event_current,
-                    previous_event_target_probabilities=e2_event_current.detach().clone(),
-                    current_phase_probabilities=e2_phase_current,
-                    previous_phase_target_probabilities=e2_phase_current.detach().clone(),
-                    pair_mask=pair_mask.clone(),
-                    alignment_mask=pair_mask.clone(),
-                    current_position_ids=positions.clone(),
-                    previous_position_ids=positions.clone(),
-                    current_timestamps=timestamps.clone(),
-                    previous_timestamps=timestamps.clone(),
-                ),
-            )
-            return event, (0,) * batch_size
-
-        if previous.e1_probabilities.device != current.e1.probabilities.device:
-            raise ValueError("event overlap snapshots must share the current device")
-        pairs = _match_event_positions(current, previous)
-        pair_width = max(max((len(row) for row in pairs), default=0), 1)
-        batch_size = current.e1.valid_mask.shape[0]
-        pair_mask = torch.zeros(
-            (batch_size, pair_width), dtype=torch.bool, device=current.e1.valid_mask.device
-        )
-        alignment = pair_mask.clone()
-        current_positions = torch.full(
-            pair_mask.shape, -1, dtype=torch.int64, device=pair_mask.device
-        )
-        previous_positions = current_positions.clone()
-        current_times = torch.full(
-            pair_mask.shape,
-            -1.0,
-            dtype=current.e1.timestamps.dtype,
-            device=pair_mask.device,
-        )
-        previous_times = current_times.clone()
-        e1_current = torch.zeros(
-            (batch_size, pair_width, 3),
-            dtype=current.e1.probabilities.dtype,
-            device=pair_mask.device,
-        )
-        e1_previous = torch.zeros_like(e1_current)
-        e2_event_current = torch.zeros(
-            (batch_size, pair_width, 4),
-            dtype=current.e2.event_probabilities.dtype,
-            device=pair_mask.device,
-        )
-        e2_event_previous = torch.zeros_like(e2_event_current)
-        e2_phase_current = torch.zeros_like(e2_event_current)
-        e2_phase_previous = torch.zeros_like(e2_event_current)
-        counts: list[int] = []
-        for row, row_pairs in enumerate(pairs):
-            counts.append(len(row_pairs))
-            for pair, (current_index, previous_index, time_aligned) in enumerate(row_pairs):
-                pair_mask[row, pair] = True
-                alignment[row, pair] = time_aligned
-                current_positions[row, pair] = current.e1.position_ids[row, current_index]
-                previous_positions[row, pair] = previous.event_position_ids[row, previous_index]
-                current_times[row, pair] = current.e1.timestamps[row, current_index]
-                previous_times[row, pair] = previous.event_timestamps[row, previous_index]
-                e1_current[row, pair] = current.e1.probabilities[row, current_index]
-                e1_previous[row, pair] = previous.e1_probabilities[row, previous_index]
-                e2_event_current[row, pair] = current.e2.event_probabilities[row, current_index]
-                e2_event_previous[row, pair] = previous.e2_event_probabilities[row, previous_index]
-                e2_phase_current[row, pair] = current.e2.phase_probabilities[row, current_index]
-                e2_phase_previous[row, pair] = previous.e2_phase_probabilities[row, previous_index]
-        event = EventConsistencyInput(
-            e1=E1ConsistencyInput(
-                current_probabilities=e1_current,
-                previous_target_probabilities=e1_previous,
-                pair_mask=pair_mask,
-                alignment_mask=alignment,
-                current_position_ids=current_positions,
-                previous_position_ids=previous_positions,
-                current_timestamps=current_times,
-                previous_timestamps=previous_times,
-            ),
-            e2=E2ConsistencyInput(
-                current_event_probabilities=e2_event_current,
-                previous_event_target_probabilities=e2_event_previous,
-                current_phase_probabilities=e2_phase_current,
-                previous_phase_target_probabilities=e2_phase_previous,
-                pair_mask=pair_mask.clone(),
-                alignment_mask=alignment.clone(),
-                current_position_ids=current_positions.clone(),
-                previous_position_ids=previous_positions.clone(),
-                current_timestamps=current_times.clone(),
-                previous_timestamps=previous_times.clone(),
-            ),
-        )
-        return event, tuple(counts)
-
-
-@dataclass(frozen=True, slots=True)
 class MetaQueryLossInput:
     answer: AnswerLossInput
     state: StateLossInput | OfficialWeakStateLossOutput
@@ -835,11 +393,8 @@ class InnerUpdateAudit:
     skip_reasons: tuple[str | None, ...]
     gradient_norms: tuple[float | None, ...]
     update_norms: tuple[float, ...]
-    pred_valid_counts: tuple[int, ...]
-    identity_valid_counts: tuple[int, ...]
-    e1_valid_counts: tuple[int, ...]
-    e2_valid_counts: tuple[int, ...]
-    match: CrossChunkMatchAudit
+    valid_token_counts: tuple[int, ...]
+    bank_record_counts: tuple[int, ...]
     runtime_detached: bool
     next_only_verified: bool
 
@@ -852,10 +407,8 @@ class InnerUpdateAudit:
             self.skip_reasons,
             self.gradient_norms,
             self.update_norms,
-            self.pred_valid_counts,
-            self.identity_valid_counts,
-            self.e1_valid_counts,
-            self.e2_valid_counts,
+            self.valid_token_counts,
+            self.bank_record_counts,
         )
         if batch_size <= 0 or any(len(values) != batch_size for values in aligned):
             raise ValueError("Inner update audit fields must align to the owner batch")
@@ -875,7 +428,7 @@ class TruncatedSegmentAudit:
     support_end_index: int
     support_count: int
     query_count: int
-    auxiliary_loss: float
+    associative_loss: float
     deferred_vjp_norm: float
     query_roles: tuple[str, ...]
     query_weights: tuple[float, ...]
@@ -911,8 +464,8 @@ class TruncatedSegmentAudit:
             raise ValueError("a truncated segment must contain at least one Meta Query")
         if self.support_end_index - self.support_start_index + 1 != self.support_count:
             raise ValueError("truncated segment Support range does not match its count")
-        if not math.isfinite(self.auxiliary_loss) or self.auxiliary_loss < 0.0:
-            raise ValueError("truncated segment auxiliary loss must be finite and non-negative")
+        if not math.isfinite(self.associative_loss) or self.associative_loss < 0.0:
+            raise ValueError("truncated segment associative loss must be finite and non-negative")
         if not math.isfinite(self.deferred_vjp_norm) or self.deferred_vjp_norm < 0.0:
             raise ValueError("truncated segment deferred VJP norm must be finite and non-negative")
         if (
@@ -929,8 +482,8 @@ class TruncatedSegmentAudit:
         if self.training_mode == "static_w0":
             if self.update_attempt_count or self.update_count or self.skip_count:
                 raise ValueError("static-W0 segments cannot attempt fast-weight updates")
-            if self.auxiliary_loss != 0.0:
-                raise ValueError("static-W0 segments cannot include Support TTT loss")
+            if self.associative_loss != 0.0:
+                raise ValueError("static-W0 segments cannot include associative updates")
         else:
             expected_mode = "meta_ttt" if self.update_count > 0 else "outer_only"
             if self.training_mode != expected_mode:
@@ -1078,10 +631,10 @@ class TruncatedQueryPointAudit:
 class TruncatedMetaTTTEpisodeAudit:
     """Bounded-memory evidence for an otherwise unbounded numeric fast trajectory."""
 
-    active_terms: tuple[str, ...]
+    associative_contract: str
     adaptation_mode: str
     ttt_enabled: bool
-    ttt_valid_count: int
+    associative_valid_count: int
     loss_weight: float
     support_count: int
     query_count: int
@@ -1100,23 +653,20 @@ class TruncatedMetaTTTEpisodeAudit:
     update_attempt_count: int
     update_count: int
     skip_count: int
-    support_ttt_raw_mean: float
-    support_ttt_outer_mean: float
-    support_pred_mean: float
-    support_identity_weighted_mean: float
-    support_event_weighted_mean: float
-    temporal_hidden_rms: float
-    temporal_target_rms: float
-    temporal_prediction_rms: float
-    temporal_error_rms: float
-    temporal_hidden_max_abs: float
-    temporal_target_max_abs: float
-    temporal_prediction_max_abs: float
-    temporal_error_max_abs: float
-    temporal_hidden_element_count: int
-    temporal_pair_element_count: int
+    associative_loss_mean: float
+    key_rms: float
+    value_rms: float
+    prediction_rms: float
+    error_rms: float
+    key_max_abs: float
+    value_max_abs: float
+    prediction_max_abs: float
+    error_max_abs: float
+    associative_element_count: int
+    bank_record_count: int
+    empty_bank_count: int
     parameter_versions_unchanged_before_outer_step: bool
-    overlap_graph_detached: bool
+    bank_context_detached: bool
     support_supervision_reachable: bool
     training_counterfactual_executed: bool
     diagnostic_counterfactual_executed: bool
@@ -1130,8 +680,10 @@ class TruncatedMetaTTTEpisodeAudit:
             raise ValueError("A5 adaptation mode is invalid")
         if type(self.ttt_enabled) is not bool:
             raise TypeError("A5 TTT enabled audit must be bool")
-        if type(self.ttt_valid_count) is not int or self.ttt_valid_count < 0:
-            raise ValueError("A5 TTT valid count must be a non-negative integer")
+        if self.associative_contract != ASSOCIATIVE_CONTRACT:
+            raise ValueError("A5 associative contract is invalid")
+        if type(self.associative_valid_count) is not int or self.associative_valid_count < 0:
+            raise ValueError("A5 associative valid count must be a non-negative integer")
         if self.ttt_enabled != (self.adaptation_mode == "meta_ttt"):
             raise ValueError("A5 TTT enabled audit disagrees with adaptation mode")
         if self.training_counterfactual_executed:
@@ -1174,41 +726,29 @@ class TruncatedMetaTTTEpisodeAudit:
         if self.update_attempt_count != self.update_count + self.skip_count:
             raise ValueError("A5 update attempts must equal accepted plus skipped")
         nonnegative_finite = (
-            self.support_ttt_raw_mean,
-            self.support_ttt_outer_mean,
-            self.support_pred_mean,
-            self.support_identity_weighted_mean,
-            self.support_event_weighted_mean,
-            self.temporal_hidden_rms,
-            self.temporal_target_rms,
-            self.temporal_prediction_rms,
-            self.temporal_error_rms,
-            self.temporal_hidden_max_abs,
-            self.temporal_target_max_abs,
-            self.temporal_prediction_max_abs,
-            self.temporal_error_max_abs,
+            self.associative_loss_mean,
+            self.key_rms,
+            self.value_rms,
+            self.prediction_rms,
+            self.error_rms,
+            self.key_max_abs,
+            self.value_max_abs,
+            self.prediction_max_abs,
+            self.error_max_abs,
         )
         if any(not math.isfinite(value) or value < 0.0 for value in nonnegative_finite):
             raise ValueError("A5 TTT scale audit values must be finite and non-negative")
         if (
-            type(self.temporal_hidden_element_count) is not int
-            or type(self.temporal_pair_element_count) is not int
-            or self.temporal_hidden_element_count < 0
-            or self.temporal_pair_element_count < 0
+            type(self.associative_element_count) is not int
+            or type(self.bank_record_count) is not int
+            or type(self.empty_bank_count) is not int
+            or min(
+                self.associative_element_count,
+                self.bank_record_count,
+                self.empty_bank_count,
+            ) < 0
         ):
-            raise ValueError("A5 TTT scale audit counts must be non-negative integers")
-        component_total = (
-            self.support_pred_mean
-            + self.support_identity_weighted_mean
-            + self.support_event_weighted_mean
-        )
-        if not math.isclose(
-            self.support_ttt_raw_mean,
-            component_total,
-            rel_tol=1.0e-5,
-            abs_tol=1.0e-6,
-        ):
-            raise ValueError("A5 TTT component means do not reconstruct the raw mean")
+            raise ValueError("A5 associative audit counts must be non-negative integers")
         if len(self.segments) != self.segment_count:
             raise ValueError("A5 segment audit count drifted")
         expected_update_audits = self.support_count if self.ttt_enabled else 0
@@ -1218,16 +758,12 @@ class TruncatedMetaTTTEpisodeAudit:
             self.update_attempt_count
             or self.update_count
             or self.skip_count
-            or self.ttt_valid_count
+            or self.associative_valid_count
             or self.maximum_retained_support_graphs
             or any(
                 value != 0.0
                 for value in (
-                    self.support_ttt_raw_mean,
-                    self.support_ttt_outer_mean,
-                    self.support_pred_mean,
-                    self.support_identity_weighted_mean,
-                    self.support_event_weighted_mean,
+                    self.associative_loss_mean,
                 )
             )
             or any(segment.training_mode != "static_w0" for segment in self.segments)
@@ -1245,8 +781,8 @@ class TruncatedMetaTTTEpisodeAudit:
             raise ValueError("A5 segment Query bundle counts drifted")
         if not self.parameter_versions_unchanged_before_outer_step:
             raise ValueError("outer parameters changed before the episode-level optimizer step")
-        if not self.overlap_graph_detached:
-            raise ValueError("A5 overlap snapshots retained an autograd graph")
+        if not self.bank_context_detached:
+            raise ValueError("A5 Bank context retained an authoritative hard-state graph")
         if self.support_supervision_reachable:
             raise ValueError("Support labels became reachable from the A5 inner path")
         if self.training_counterfactual_executed:
@@ -1271,23 +807,21 @@ class TruncatedMetaTTTEpisodeOutput:
 
     total: Tensor
     query_loss: Tensor
-    support_auxiliary_loss: Tensor
     final_fast_states: tuple[FastWeightsState, ...]
     final_optimizer_states: tuple[OptimizerRuntimeState, ...]
     final_runtime: BatchRuntimeState
     audit: TruncatedMetaTTTEpisodeAudit
 
     def __post_init__(self) -> None:
-        values = (self.total, self.query_loss, self.support_auxiliary_loss)
+        values = (self.total, self.query_loss)
         if any(value.ndim != 0 or value.dtype != torch.float32 for value in values):
             raise ValueError("truncated A5 logging losses must be detached FP32 scalars")
         if any(value.requires_grad or value.grad_fn is not None for value in values):
             raise ValueError("truncated A5 output must not retain completed autograd graphs")
         if any(not bool(torch.isfinite(value).item()) for value in values):
             raise ValueError("truncated A5 logging losses must be finite")
-        expected = self.query_loss + self.support_auxiliary_loss
-        if not torch.allclose(self.total, expected, atol=1.0e-7, rtol=1.0e-7):
-            raise ValueError("truncated A5 total must equal Query plus normalized Support loss")
+        if not torch.equal(self.total, self.query_loss):
+            raise ValueError("truncated A5 total must equal Query outer loss exactly")
 
 
 @dataclass(slots=True)
@@ -1320,9 +854,7 @@ class MetaTTTEpisodeRunner:
         config: ProjectConfig,
         model: StateTTTModel,
         fast_controller: FastStateController,
-        predictor: TemporalPredictor,
         runtime_resetter: EpisodeRuntimeResetter,
-        ttt_input_builder: CausalOverlapTTTInputBuilder | None = None,
         query_loss_builder: MetaQueryLossBuilder | None = None,
         query_encoder_reuse: bool = False,
         raw_support_visual_batcher: RawSupportVisualBatcher | None = None,
@@ -1338,10 +870,7 @@ class MetaTTTEpisodeRunner:
         self.config = config
         self.model = model
         self.fast_controller = fast_controller
-        self.predictor = predictor
         self.runtime_resetter = runtime_resetter
-        self.enabled_terms = _SUPPORTED_TERMS
-        self.ttt_input_builder = ttt_input_builder or CausalOverlapTTTInputBuilder(config)
         self.query_loss_builder = query_loss_builder or StageAQueryLossBuilder()
         if type(query_encoder_reuse) is not bool:
             raise TypeError("query_encoder_reuse must be bool")
@@ -1363,7 +892,8 @@ class MetaTTTEpisodeRunner:
         self.adaptation_mode = adaptation_mode
         self.ttt_enabled = adaptation_mode == "meta_ttt"
         if not self.ttt_enabled:
-            self.predictor.requires_grad_(False)
+            for parameter in self.fast_controller.collect_associative_parameters():
+                parameter.requires_grad_(False)
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
         if config.fast_ttt.optimizer.meta_gradient_mode != "full_second_order":
             raise ValueError("the training runner only permits full_second_order inner updates")
@@ -1408,22 +938,11 @@ class MetaTTTEpisodeRunner:
         )
         backward_fn = backward or _plain_backward
         self.model.train()
-        self.predictor.train(self.ttt_enabled)
         adapted = self._reset_trajectory(episode.owner, differentiable=True)
-        tracked_parameters = _unique_parameters(
-            (
-                *self.model.parameters(),
-                *self.predictor.parameters(),
-            )
-        )
+        tracked_parameters = _unique_parameters(tuple(self.model.parameters()))
         versions_before = tuple(parameter._version for parameter in tracked_parameters)
         horizon = self.config.a5.truncation_horizon
         support_count = len(episode.support_chunks)
-        auxiliary_scale = (
-            float(self.config.loss.auxiliary_outer_weight) / support_count
-            if self.ttt_enabled
-            else 0.0
-        )
         update_audits: list[InnerUpdateAudit] = []
         segment_audits: list[TruncatedSegmentAudit] = []
         query_audits: list[TruncatedQueryPointAudit] = []
@@ -1432,20 +951,17 @@ class MetaTTTEpisodeRunner:
         device = adapted.fast_states[0].w_t_1.device
         query_loss_detached = torch.zeros((), dtype=torch.float32, device=device)
         support_total_detached = torch.zeros((), dtype=torch.float32, device=device)
-        support_outer_total_detached = torch.zeros((), dtype=torch.float32, device=device)
-        support_pred_total_detached = torch.zeros((), dtype=torch.float32, device=device)
-        support_identity_total_detached = torch.zeros((), dtype=torch.float32, device=device)
-        support_event_total_detached = torch.zeros((), dtype=torch.float32, device=device)
-        temporal_hidden_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
-        temporal_target_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
-        temporal_prediction_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
-        temporal_error_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
-        temporal_hidden_element_count = torch.zeros((), dtype=torch.int64, device=device)
-        temporal_pair_element_count = torch.zeros((), dtype=torch.int64, device=device)
-        temporal_hidden_max_abs = torch.zeros((), dtype=torch.float32, device=device)
-        temporal_target_max_abs = torch.zeros((), dtype=torch.float32, device=device)
-        temporal_prediction_max_abs = torch.zeros((), dtype=torch.float32, device=device)
-        temporal_error_max_abs = torch.zeros((), dtype=torch.float32, device=device)
+        associative_key_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
+        associative_value_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
+        associative_prediction_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
+        associative_error_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
+        associative_element_count = torch.zeros((), dtype=torch.int64, device=device)
+        associative_key_max_abs = torch.zeros((), dtype=torch.float32, device=device)
+        associative_value_max_abs = torch.zeros((), dtype=torch.float32, device=device)
+        associative_prediction_max_abs = torch.zeros((), dtype=torch.float32, device=device)
+        associative_error_max_abs = torch.zeros((), dtype=torch.float32, device=device)
+        bank_record_count = 0
+        empty_bank_count = 0
         support_lifecycle = PrefillLifecycle(episode.owner)
         query_offload_budget = (
             QueryActivationOffloadBudget.from_environment()
@@ -1488,14 +1004,6 @@ class MetaTTTEpisodeRunner:
             if counterfactual_audit is not None and episode_weight == 1.0
             else None
         )
-        previous_snapshot = (
-            OnlineOverlapSnapshot.capture(
-                prewarm_observation,
-                end_time=prewarm.end_time,
-            )
-            if self.ttt_enabled
-            else None
-        )
         del prewarm_observation
 
         query_offset = 0
@@ -1530,8 +1038,7 @@ class MetaTTTEpisodeRunner:
                     )
                 self._validate_prepared_segment(raw_segment, prepared_segment)
                 active_segment = prepared_segment
-            segment_outputs: list[TTTLossOutput] = []
-            segment_outer_losses: list[Tensor] = []
+            segment_outputs: list[AssociativeTTTLossOutput] = []
             segment_query = first_segment_query if segment_index == 0 else None
             for segment_offset, chunk in enumerate(active_segment):
                 support_index = support_offset + segment_offset
@@ -1559,20 +1066,13 @@ class MetaTTTEpisodeRunner:
                         raise RuntimeError("static-W0 Support changed fast-weight versions")
                     del observation
                     continue
-                if previous_snapshot is None:
-                    raise RuntimeError("Meta-TTT Support lost its overlap snapshot")
-                built = self.ttt_input_builder(
-                    observation,
-                    previous=previous_snapshot,
-                    current_end_time=chunk.end_time,
-                    enabled_terms=self.enabled_terms,
-                )
-                ttt_output = compute_ttt_loss(self.predictor, built.inputs)
-                _validate_variant_loss_terms(ttt_output, self.enabled_terms)
-                outer_ttt_loss = compute_ttt_outer_auxiliary_loss(ttt_output)
+                intermediates = observation.soft_intermediates.fast_associative
+                if intermediates is None:
+                    raise RuntimeError("Meta-TTT Support did not capture associative tensors")
+                associative_output = compute_associative_ttt_loss(intermediates)
                 before_versions = tuple(state.fast_version for state in adapted.fast_states)
-                results = functional_sgd_steps_from_ttt(
-                    ttt_output=ttt_output,
+                results = functional_sgd_steps_from_associative(
+                    associative_output=associative_output,
                     fast_states=adapted.fast_states,
                     optimizer_config=self.config.fast_ttt.optimizer,
                     optimizer_states=adapted.optimizer_states,
@@ -1587,75 +1087,42 @@ class MetaTTTEpisodeRunner:
                         before_versions=before_versions,
                         observed_fast_audit=fast_audit,
                         results=results,
-                        ttt_output=ttt_output,
-                        match=built.audit,
+                        associative_output=associative_output,
+                        bank_record_counts=tuple(
+                            int(value.item()) for value in intermediates.bank_record_counts
+                        ),
                         runtime=adapted.runtime,
                         after_versions=after_versions,
                     )
                 )
-                previous_snapshot = built.snapshot
-                segment_outputs.append(ttt_output)
-                segment_outer_losses.append(outer_ttt_loss)
+                segment_outputs.append(associative_output)
                 maximum_retained = max(maximum_retained, len(segment_outputs))
-                support_total_detached = support_total_detached + ttt_output.total.detach().to(
-                    torch.float32
+                support_total_detached = (
+                    support_total_detached
+                    + associative_output.total.detach().to(torch.float32)
                 )
-                support_outer_total_detached = (
-                    support_outer_total_detached + outer_ttt_loss.detach()
+                scale_audit = associative_output.scale_audit
+                associative_key_sum_squares += scale_audit.key_sum_squares
+                associative_value_sum_squares += scale_audit.value_sum_squares
+                associative_prediction_sum_squares += scale_audit.prediction_sum_squares
+                associative_error_sum_squares += scale_audit.error_sum_squares
+                associative_element_count += scale_audit.element_count
+                associative_key_max_abs = torch.maximum(
+                    associative_key_max_abs, scale_audit.key_max_abs
                 )
-                valid_rows = ttt_output.update_valid_mask
-                valid_denominator = valid_rows.sum().clamp_min(1)
-                support_pred_total_detached = (
-                    support_pred_total_detached
-                    + (ttt_output.pred.per_row * valid_rows.to(dtype=torch.float32)).sum().detach()
-                    / valid_denominator
+                associative_value_max_abs = torch.maximum(
+                    associative_value_max_abs, scale_audit.value_max_abs
                 )
-                support_identity_total_detached = (
-                    support_identity_total_detached
-                    + 0.5
-                    * (ttt_output.identity.per_row * valid_rows.to(dtype=torch.float32))
-                    .sum()
-                    .detach()
-                    / valid_denominator
+                associative_prediction_max_abs = torch.maximum(
+                    associative_prediction_max_abs, scale_audit.prediction_max_abs
                 )
-                support_event_total_detached = (
-                    support_event_total_detached
-                    + 0.5
-                    * (ttt_output.event.per_row * valid_rows.to(dtype=torch.float32)).sum().detach()
-                    / valid_denominator
+                associative_error_max_abs = torch.maximum(
+                    associative_error_max_abs, scale_audit.error_max_abs
                 )
-                scale_audit = ttt_output.temporal_scale_audit
-                temporal_hidden_sum_squares = (
-                    temporal_hidden_sum_squares + scale_audit.hidden_sum_squares
-                )
-                temporal_target_sum_squares = (
-                    temporal_target_sum_squares + scale_audit.target_sum_squares
-                )
-                temporal_prediction_sum_squares = (
-                    temporal_prediction_sum_squares + scale_audit.prediction_sum_squares
-                )
-                temporal_error_sum_squares = (
-                    temporal_error_sum_squares + scale_audit.error_sum_squares
-                )
-                temporal_hidden_element_count = (
-                    temporal_hidden_element_count + scale_audit.hidden_element_count
-                )
-                temporal_pair_element_count = (
-                    temporal_pair_element_count + scale_audit.pair_element_count
-                )
-                temporal_hidden_max_abs = torch.maximum(
-                    temporal_hidden_max_abs, scale_audit.hidden_max_abs
-                )
-                temporal_target_max_abs = torch.maximum(
-                    temporal_target_max_abs, scale_audit.target_max_abs
-                )
-                temporal_prediction_max_abs = torch.maximum(
-                    temporal_prediction_max_abs, scale_audit.prediction_max_abs
-                )
-                temporal_error_max_abs = torch.maximum(
-                    temporal_error_max_abs, scale_audit.error_max_abs
-                )
-                del results, ttt_output, built, observation
+                counts = tuple(int(value.item()) for value in intermediates.bank_record_counts)
+                bank_record_count += sum(counts)
+                empty_bank_count += sum(count == 0 for count in counts)
+                del results, associative_output, intermediates, observation
 
             query_runtime_snapshot = adapted.runtime
             authoritative_fast_states = query_runtime_snapshot.fast_states
@@ -1696,7 +1163,7 @@ class MetaTTTEpisodeRunner:
                         with_grad=False,
                     )
                     self._balance_query_objectives(
-                        (self._query_objective(query, calibration_output, ()),),
+                        (self._query_objective(query, calibration_output),),
                         calibration=True,
                         statistical_weight=episode_weight,
                     )
@@ -1745,7 +1212,7 @@ class MetaTTTEpisodeRunner:
                         with_grad=True,
                     )
                 immutable = observation_versions == _tensor_version_signature(observation)
-                objective = self._query_objective(query, output, ())
+                objective = self._query_objective(query, output)
                 balanced_outer: OuterLossOutput | None = None
                 gradient_statistics: Tensor | None = None
                 if balance_audit is not None:
@@ -1920,12 +1387,18 @@ class MetaTTTEpisodeRunner:
                 authoritative_fast_states,
                 accumulated_gradients,
             )
-            segment_loss = (
-                episode_weight * auxiliary_scale * torch.stack(tuple(segment_outer_losses)).sum()
-                if self.ttt_enabled
-                else deferred_vjp.new_zeros(())
+            segment_associative_loss = (
+                float(
+                    torch.stack(
+                        tuple(output.total.detach() for output in segment_outputs)
+                    )
+                    .mean()
+                    .item()
+                )
+                if segment_outputs
+                else 0.0
             )
-            backward_fn(segment_loss + deferred_vjp, False)
+            backward_fn(deferred_vjp, False)
             reanchor_audits = self._reanchor_trajectory(adapted)
             segment_updates = update_audits[segment_update_start:]
             segment_update_attempts = sum(len(audit.did_update) for audit in segment_updates)
@@ -1953,7 +1426,7 @@ class MetaTTTEpisodeRunner:
                     support_end_index=segment_start + segment_length - 1,
                     support_count=segment_length,
                     query_count=segment_query_count,
-                    auxiliary_loss=float(segment_loss.detach().item()),
+                    associative_loss=segment_associative_loss,
                     deferred_vjp_norm=deferred_vjp_norm,
                     query_roles=query_roles,
                     query_weights=query_weights,
@@ -2003,9 +1476,7 @@ class MetaTTTEpisodeRunner:
             del (
                 accumulated_gradients,
                 deferred_vjp,
-                segment_loss,
                 segment_outputs,
-                segment_outer_losses,
                 segment_query,
                 segment_updates,
             )
@@ -2018,19 +1489,9 @@ class MetaTTTEpisodeRunner:
         attempted = sum(len(audit.did_update) for audit in update_audits)
         updated = sum(sum(audit.did_update) for audit in update_audits)
         detached_query = query_loss_detached.detach().clone()
-        detached_auxiliary = (
-            (episode_weight * auxiliary_scale * support_outer_total_detached).detach().clone()
-        )
-        detached_total = (detached_query + detached_auxiliary).detach().clone()
-        support_ttt_raw_mean = float((support_total_detached / support_count).item())
-        support_ttt_outer_mean = float((support_outer_total_detached / support_count).item())
-        support_pred_mean = float((support_pred_total_detached / support_count).item())
-        support_identity_weighted_mean = float(
-            (support_identity_total_detached / support_count).item()
-        )
-        support_event_weighted_mean = float((support_event_total_detached / support_count).item())
-        hidden_elements = int(temporal_hidden_element_count.item())
-        pair_elements = int(temporal_pair_element_count.item())
+        detached_total = detached_query.detach().clone()
+        associative_loss_mean = float((support_total_detached / support_count).item())
+        associative_elements = int(associative_element_count.item())
 
         def rms(sum_squares: Tensor, count: int) -> float:
             return math.sqrt(float(sum_squares.item()) / count) if count else 0.0
@@ -2044,26 +1505,26 @@ class MetaTTTEpisodeRunner:
             query_count=query_count,
             adaptation_mode=self.adaptation_mode,
             ttt_enabled=self.ttt_enabled,
-            ttt_valid_count=updated,
-            support_ttt_raw_mean=support_ttt_raw_mean,
-            support_ttt_outer_mean=support_ttt_outer_mean,
-            support_pred_mean=support_pred_mean,
-            support_identity_weighted_mean=support_identity_weighted_mean,
-            support_event_weighted_mean=support_event_weighted_mean,
-            temporal_hidden_rms=rms(temporal_hidden_sum_squares, hidden_elements),
-            temporal_target_rms=rms(temporal_target_sum_squares, pair_elements),
-            temporal_prediction_rms=rms(temporal_prediction_sum_squares, pair_elements),
-            temporal_error_rms=rms(temporal_error_sum_squares, pair_elements),
-            temporal_hidden_max_abs=float(temporal_hidden_max_abs.item()),
-            temporal_target_max_abs=float(temporal_target_max_abs.item()),
-            temporal_prediction_max_abs=float(temporal_prediction_max_abs.item()),
-            temporal_error_max_abs=float(temporal_error_max_abs.item()),
+            associative_contract=ASSOCIATIVE_CONTRACT,
+            associative_valid_count=updated,
+            associative_loss_mean=associative_loss_mean,
+            key_rms=rms(associative_key_sum_squares, associative_elements),
+            value_rms=rms(associative_value_sum_squares, associative_elements),
+            prediction_rms=rms(associative_prediction_sum_squares, associative_elements),
+            error_rms=rms(associative_error_sum_squares, associative_elements),
+            key_max_abs=float(associative_key_max_abs.item()),
+            value_max_abs=float(associative_value_max_abs.item()),
+            prediction_max_abs=float(associative_prediction_max_abs.item()),
+            error_max_abs=float(associative_error_max_abs.item()),
+            associative_element_count=associative_elements,
+            bank_record_count=bank_record_count,
+            empty_bank_count=empty_bank_count,
         )
         episode_audit = TruncatedMetaTTTEpisodeAudit(
-            active_terms=self.enabled_terms if self.ttt_enabled else (),
+            associative_contract=ASSOCIATIVE_CONTRACT,
             adaptation_mode=self.adaptation_mode,
             ttt_enabled=self.ttt_enabled,
-            ttt_valid_count=updated,
+            associative_valid_count=updated,
             loss_weight=episode_weight,
             support_count=support_count,
             query_count=query_count,
@@ -2082,23 +1543,20 @@ class MetaTTTEpisodeRunner:
             update_attempt_count=attempted,
             update_count=updated,
             skip_count=attempted - updated,
-            support_ttt_raw_mean=support_ttt_raw_mean,
-            support_ttt_outer_mean=support_ttt_outer_mean,
-            support_pred_mean=support_pred_mean,
-            support_identity_weighted_mean=support_identity_weighted_mean,
-            support_event_weighted_mean=support_event_weighted_mean,
-            temporal_hidden_rms=rms(temporal_hidden_sum_squares, hidden_elements),
-            temporal_target_rms=rms(temporal_target_sum_squares, pair_elements),
-            temporal_prediction_rms=rms(temporal_prediction_sum_squares, pair_elements),
-            temporal_error_rms=rms(temporal_error_sum_squares, pair_elements),
-            temporal_hidden_max_abs=float(temporal_hidden_max_abs.item()),
-            temporal_target_max_abs=float(temporal_target_max_abs.item()),
-            temporal_prediction_max_abs=float(temporal_prediction_max_abs.item()),
-            temporal_error_max_abs=float(temporal_error_max_abs.item()),
-            temporal_hidden_element_count=hidden_elements,
-            temporal_pair_element_count=pair_elements,
+            associative_loss_mean=associative_loss_mean,
+            key_rms=rms(associative_key_sum_squares, associative_elements),
+            value_rms=rms(associative_value_sum_squares, associative_elements),
+            prediction_rms=rms(associative_prediction_sum_squares, associative_elements),
+            error_rms=rms(associative_error_sum_squares, associative_elements),
+            key_max_abs=float(associative_key_max_abs.item()),
+            value_max_abs=float(associative_value_max_abs.item()),
+            prediction_max_abs=float(associative_prediction_max_abs.item()),
+            error_max_abs=float(associative_error_max_abs.item()),
+            associative_element_count=associative_elements,
+            bank_record_count=bank_record_count,
+            empty_bank_count=empty_bank_count,
             parameter_versions_unchanged_before_outer_step=versions_before == versions_after,
-            overlap_graph_detached=all(item.match.snapshot_detached for item in update_audits),
+            bank_context_detached=True,
             support_supervision_reachable=False,
             training_counterfactual_executed=False,
             diagnostic_counterfactual_executed=any(
@@ -2114,7 +1572,6 @@ class MetaTTTEpisodeRunner:
         return TruncatedMetaTTTEpisodeOutput(
             total=detached_total,
             query_loss=detached_query,
-            support_auxiliary_loss=detached_auxiliary,
             final_fast_states=adapted.fast_states,
             final_optimizer_states=adapted.optimizer_states,
             final_runtime=adapted.runtime,
@@ -2331,7 +1788,7 @@ class MetaTTTEpisodeRunner:
                 fast_states=reference.fast_states,
                 with_grad=False,
             )
-            objective = self._query_objective(query, output, ())
+            objective = self._query_objective(query, output)
             if balance_audit is not None:
                 outer = self.outer_composer.compose_one_from_audit(
                     objective.answer,
@@ -2352,7 +1809,6 @@ class MetaTTTEpisodeRunner:
         self,
         query: MetaTTTQueryPoint,
         output: StateTTTModelOutput,
-        support: tuple[TTTLossOutput, ...],
     ) -> MetaQueryObjective:
         with trace_cuda_phase("outer_loss", stage="a5_query"):
             inputs = self.query_loss_builder(
@@ -2370,7 +1826,6 @@ class MetaTTTEpisodeRunner:
                 OuterLossInput(
                     answer_after=answer,
                     state_after=cast(StateLossOutput, state),
-                    support_ttt=support,
                 )
             )
         return MetaQueryObjective(
@@ -2422,13 +1877,10 @@ class MetaTTTEpisodeRunner:
             return objectives
         outputs: list[MetaQueryObjective] = []
         for objective, outer in zip(objectives, balanced.objectives, strict=True):
-            auxiliary = objective.outer.auxiliary_ttt
-            total = outer.outer + objective.outer.auxiliary_weight * auxiliary.value
-            balanced_outer = replace(outer, auxiliary_ttt=auxiliary, total=total)
             outputs.append(
                 replace(
                     objective,
-                    outer=balanced_outer,
+                    outer=outer,
                 )
             )
         return tuple(outputs)
@@ -2441,8 +1893,8 @@ def _make_inner_update_audit(
     before_versions: tuple[int, ...],
     observed_fast_audit: FastTTTForwardAudit,
     results: tuple[FunctionalSGDResult, ...],
-    ttt_output: TTTLossOutput,
-    match: CrossChunkMatchAudit,
+    associative_output: AssociativeTTTLossOutput,
+    bank_record_counts: tuple[int, ...],
     runtime: object,
     after_versions: tuple[int, ...],
 ) -> InnerUpdateAudit:
@@ -2466,88 +1918,13 @@ def _make_inner_update_audit(
         ),
         gradient_norms=tuple(result.gradient_norm for result in results),
         update_norms=tuple(result.update_norm for result in results),
-        pred_valid_counts=tuple(int(value.item()) for value in ttt_output.pred.valid_counts),
-        identity_valid_counts=tuple(
-            int(value.item()) for value in ttt_output.identity.valid_counts
+        valid_token_counts=tuple(
+            int(value.item()) for value in associative_output.valid_token_counts
         ),
-        e1_valid_counts=tuple(int(value.item()) for value in ttt_output.e1_event.valid_counts),
-        e2_valid_counts=tuple(int(value.item()) for value in ttt_output.e2_event.valid_counts),
-        match=match,
+        bank_record_counts=bank_record_counts,
         runtime_detached=not _contains_grad_tensor(runtime),
         next_only_verified=next_only,
     )
-
-
-def _validate_variant_loss_terms(
-    output: TTTLossOutput,
-    enabled_terms: tuple[str, ...],
-) -> None:
-    if "identity" not in enabled_terms and bool(output.identity.valid_counts.any().item()):
-        raise ValueError("disabled identity loss produced valid inner terms")
-    if "event" not in enabled_terms and bool(output.event.valid_counts.any().item()):
-        raise ValueError("disabled event loss produced valid inner terms")
-    expected = output.pred.per_row
-    if "identity" in enabled_terms:
-        expected = expected + 0.5 * output.identity.per_row
-    if "event" in enabled_terms:
-        expected = expected + 0.5 * output.event.per_row
-    if not torch.allclose(output.per_row_total, expected, atol=1.0e-6, rtol=1.0e-6):
-        raise ValueError("active Meta-TTT terms do not equal the audited variant objective")
-
-
-def _typed_observations(output: ObservationChunkOutput) -> ObservationOutputs:
-    if not isinstance(output.observations, ObservationOutputs):
-        raise TypeError("Meta-TTT overlap builder requires ObservationOutputs")
-    return output.observations
-
-
-def _match_event_positions(
-    current: ObservationOutputs,
-    previous: OnlineOverlapSnapshot,
-) -> tuple[tuple[tuple[int, int, bool], ...], ...]:
-    rows: list[tuple[tuple[int, int, bool], ...]] = []
-    for row in range(current.e1.valid_mask.shape[0]):
-        previous_by_position = {
-            int(previous.event_position_ids[row, index].item()): index
-            for index in torch.nonzero(previous.event_valid_mask[row], as_tuple=False)
-            .flatten()
-            .tolist()
-        }
-        pairs: list[tuple[int, int, bool]] = []
-        seen: set[int] = set()
-        for current_index in (
-            torch.nonzero(current.e1.valid_mask[row], as_tuple=False).flatten().tolist()
-        ):
-            position = int(current.e1.position_ids[row, current_index].item())
-            previous_index = previous_by_position.get(position)
-            if previous_index is None:
-                continue
-            if position in seen:
-                raise ValueError("event overlap position must be unique per current row")
-            seen.add(position)
-            time_aligned = (
-                abs(
-                    float(current.e1.timestamps[row, current_index].item())
-                    - float(previous.event_timestamps[row, previous_index].item())
-                )
-                <= 1.0e-6
-            )
-            pairs.append((current_index, previous_index, time_aligned))
-        rows.append(tuple(pairs))
-    return tuple(rows)
-
-
-def _pad_probability_width(values: Tensor, width: int) -> Tensor:
-    if values.shape[1] == width:
-        return values
-    if values.shape[1] > width:
-        return values[:, :width]
-    padding = torch.zeros(
-        (values.shape[0], width - values.shape[1], values.shape[2]),
-        dtype=values.dtype,
-        device=values.device,
-    )
-    return torch.cat((values, padding), dim=1)
 
 
 def _query_metrics(

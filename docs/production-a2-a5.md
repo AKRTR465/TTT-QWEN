@@ -6,15 +6,15 @@ synthetic ablation harness 已从主线删除。
 ## 已实现的边界
 
 - A2 全量解冻 Qwen ViT、Main Merger、DeepStack merger、36 层 Decoder，并训练状态模块和
-  `W0`；Predictor 冻结，不运行 Inner SGD，目标严格为 `L_state + L_answer`。
+  `W0`；Associative 投影冻结，不运行 Inner SGD，目标严格为 `L_state + L_answer`。
 - A5 对 Support 数不设上限，按处理过的 Support 每 `K=8` 步截断。段内
   `create_graph=True`，截断点使用
   `stopgrad(W_t) + W0 - stopgrad(W0)`，保留数值状态并重新建立到 `W0` 的梯度路径。
-- 非末段立即 backward `0.1/T * sum(L_TTT)`；多 Query 顺序 backward，最后一个 Query
-  同时 backward 最后一段 Support 辅助损失。
-  一个 episode 只由外层 Trainer 裁剪和执行一次 AdamW step。
+- 每个 Support 先用写入前 Bank 语义构造 key、用 stop-gradient 原始视觉构造 value，执行一次
+  masked FP32 association MSE 的 functional SGD；该损失只更新 transient `w_t_1/w_t_2`，
+  不执行 Support auxiliary backward。一个 episode 只由外层 Trainer 裁剪和执行一次 AdamW step。
 - Inner SGD 的唯一参数是 transient `w_t_1/w_t_2`，momentum 固定为 0。Qwen、状态模块、
-  `W0` 和 Predictor 只能进入 Outer AdamW。
+  `W0` 和 `P_C/P_V` 只能进入 Outer AdamW；Query Answer/State loss 是唯一 Outer objective。
 - hard Bank/FSM commit 与 soft observation forward 分离；activation checkpoint 重算只能经过
   soft 路径。
 - Support 每一步只物化一个 8/16 帧动态 chunk，处理后不保留历史视觉 Token；Query 单独从
@@ -60,9 +60,9 @@ factory。中央 bridge 会覆盖 runtime 的 dataset 字段，强制使用 mani
 
 运行时边界为：
 
-- 返回模型注册加载得到的同一个 `backbone.model`，并注册状态模块、`W0` 和 Predictor；
-- A2 返回 `stage_a_loss_step`，且 Predictor 全冻结；A5 返回 `MetaTTTEpisodeRunner` 与
-  `episode_adapter`，且 Predictor 可训练；
+- 返回模型注册加载得到的同一个 `backbone.model`，并注册状态模块、`W0` 和 Associative 投影；
+- A2 返回 `stage_a_loss_step`，且 `P_C/P_V` 全冻结；A5 返回 `MetaTTTEpisodeRunner` 与
+  `episode_adapter`，且 `P_C/P_V` 可训练；
 - collator 接收 `A2QueryRecord` 或 `A5EpisodeRecord`，Support 先保持轻量时间区间，执行到该步
   才解码并处理当前 chunk；
 - Query/weak/answer sidecar 的 join 发生在 forward 后；

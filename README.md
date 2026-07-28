@@ -43,8 +43,10 @@ bash scripts/h200/train_fullprefix256.sh a5 /absolute/path/a2/checkpoints/final-
 
 固定训练语义：
 
-- A2：Qwen、状态模块和 W0 全量解冻，Predictor 冻结，禁用 Inner SGD；
-- A5：从完整 A2 checkpoint 初始化，Predictor 启用，Support 不设人工上限，K=8 截断二阶；
+- A2：Qwen、状态模块和 W0 全量解冻，Associative 投影冻结，禁用 Inner SGD；
+- A5：从完整 A2 checkpoint 初始化，启用 Bank-conditioned Associative LTTT，Support 不设人工上限，K=8 截断二阶；
+- A5 的唯一 Support 内层目标是无标签 masked FP32 visual association MSE；它只产生下一步
+  `W_t`，不以 auxiliary 权重加入 Outer loss，Answer/State Query loss 通过 deferred VJP 学习更新方向；
 - Support 保持 8/16 帧动态块；每个 Query 独立读取 `[0, query_time]` 因果前缀，2 FPS、最多
   256 帧，动态视觉 Token 数不变；
 - A5 多 Query 逐个 forward/backward，释放各自激活；所有 Query 共用同一 `W_after` 和只读

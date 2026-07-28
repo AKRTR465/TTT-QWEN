@@ -23,6 +23,7 @@ from typing import Protocol, cast
 import torch
 from torch import Tensor
 
+from ttt_svcbench_qwen.associative_ttt import compute_associative_ttt_loss
 from ttt_svcbench_qwen.config import AuditLevel, InnerSGDConfig, ProjectConfig
 from ttt_svcbench_qwen.data import (
     RUNTIME_DENYLIST,
@@ -36,12 +37,10 @@ from ttt_svcbench_qwen.fast_ttt import (
     OptimizerRuntimeState,
 )
 from ttt_svcbench_qwen.functional_sgd import (
-    functional_sgd_steps_from_ttt,
+    functional_sgd_steps_from_associative,
     reset_optimizer_state,
 )
 from ttt_svcbench_qwen.identity_bank import IdentityBank
-from ttt_svcbench_qwen.losses import TemporalPredictor, compute_ttt_loss
-from ttt_svcbench_qwen.meta_trainer import CausalOverlapTTTInputBuilder
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
     BatchRuntimeState,
@@ -331,18 +330,18 @@ class TTTUpdateOutcome:
     runtime_state: TrajectoryRuntimeState
     did_update: bool
     skip_reason: str | None
-    valid_term_count: int
+    valid_token_count: int
     loss_value: float | None = None
     step_size: float | None = None
 
     def __post_init__(self) -> None:
         if type(self.did_update) is not bool:
             raise TypeError("TTT update did_update must be bool")
-        if type(self.valid_term_count) is not int or self.valid_term_count < 0:
-            raise ValueError("TTT update valid_term_count must be non-negative")
+        if type(self.valid_token_count) is not int or self.valid_token_count < 0:
+            raise ValueError("TTT update valid_token_count must be non-negative")
         if self.did_update:
-            if self.skip_reason is not None or self.valid_term_count == 0:
-                raise ValueError("successful TTT update requires valid terms and no skip reason")
+            if self.skip_reason is not None or self.valid_token_count == 0:
+                raise ValueError("successful TTT update requires valid tokens and no skip reason")
         elif not self.skip_reason:
             raise ValueError("skipped TTT update requires a skip reason")
         if self.loss_value is not None and not math.isfinite(self.loss_value):
@@ -364,20 +363,15 @@ class TTTUpdateStage(Protocol):
 
 
 class OnlineTTTUpdater:
-    """Apply label-free adjacent-chunk State-TTT and publish W_(t+1)."""
+    """Apply label-free visual association and publish W_(t+1)."""
 
     def __init__(
         self,
         config: ProjectConfig,
-        predictor: TemporalPredictor,
     ) -> None:
         if not isinstance(config, ProjectConfig):
             raise TypeError("online updater requires validated ProjectConfig")
-        if not isinstance(predictor, TemporalPredictor):
-            raise TypeError("online updater requires TemporalPredictor")
         self.config = config
-        self.predictor = predictor
-        self.input_builder = CausalOverlapTTTInputBuilder(config)
 
     def __call__(
         self,
@@ -388,16 +382,13 @@ class OnlineTTTUpdater:
     ) -> TTTUpdateOutcome:
         if observation.owner != runtime_state.owner:
             raise InferenceProtocolError("online update owner does not match observation")
-        previous = runtime_state.online_overlap_memory
-        built = self.input_builder(
-            observation,
-            previous=previous,
-            current_end_time=current_end_time,
-            enabled_terms=("pred", "identity", "event"),
-        )
-        output = compute_ttt_loss(self.predictor, built.inputs)
-        result = functional_sgd_steps_from_ttt(
-            ttt_output=output,
+        del current_end_time
+        intermediates = observation.soft_intermediates.fast_associative
+        if intermediates is None:
+            raise InferenceProtocolError("online observation did not capture associative tensors")
+        output = compute_associative_ttt_loss(intermediates)
+        result = functional_sgd_steps_from_associative(
+            associative_output=output,
             fast_states=(_require_fast_state(runtime_state),),
             optimizer_config=self.config.fast_ttt.optimizer,
             optimizer_states=(_require_optimizer_state(runtime_state),),
@@ -406,13 +397,12 @@ class OnlineTTTUpdater:
             runtime_state,
             fast_weights=result.fast_state,
             optimizer=result.optimizer_state,
-            online_overlap_memory=built.snapshot,
         )
         return TTTUpdateOutcome(
             runtime_state=updated,
             did_update=result.did_update,
             skip_reason=None if result.skip_reason is None else result.skip_reason.value,
-            valid_term_count=result.valid_term_count,
+            valid_token_count=result.valid_token_count,
             loss_value=float(output.total.detach().item()),
             step_size=result.step_size,
         )
@@ -433,7 +423,7 @@ class ChunkAudit:
     update_attempted: bool
     did_update: bool
     skip_reason: str | None
-    valid_term_count: int
+    valid_token_count: int
     state_before: RuntimeAuditSnapshot
     state_after_observe: RuntimeAuditSnapshot
     state_after_update: RuntimeAuditSnapshot
@@ -446,7 +436,7 @@ class ChunkAudit:
             self.future_frame_count,
             self.fast_version_used,
             self.next_fast_version,
-            self.valid_term_count,
+            self.valid_token_count,
         )
         if any(type(value) is not int or value < 0 for value in counts):
             raise ValueError("chunk audit counts/versions must be non-negative integers")
@@ -677,7 +667,7 @@ class PerVideoRuntimeManager:
                     update_attempted=False,
                     did_update=False,
                     skip_reason="no_causal_frames",
-                    valid_term_count=0,
+                    valid_token_count=0,
                     state_before=before_snapshot,
                     state_after_observe=before_snapshot,
                     state_after_update=before_snapshot,
@@ -771,7 +761,7 @@ class PerVideoRuntimeManager:
                 update_attempted=True,
                 did_update=outcome.did_update,
                 skip_reason=outcome.skip_reason,
-                valid_term_count=outcome.valid_term_count,
+                valid_token_count=outcome.valid_token_count,
                 state_before=before_snapshot,
                 state_after_observe=after_observe_snapshot,
                 state_after_update=after_update_snapshot,
@@ -1123,7 +1113,6 @@ def runtime_boundary_stamp(state: TrajectoryRuntimeState) -> RuntimeBoundaryStam
         state.state_bank,
         state.identity_bank,
         state.retrieval_history,
-        state.online_overlap_memory,
     )
     return RuntimeBoundaryStamp(
         video_id=state.video_id,

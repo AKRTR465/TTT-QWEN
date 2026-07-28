@@ -40,7 +40,6 @@ _FORBIDDEN_CHECKPOINT_TOKENS = (
     "temporal_cache",
     "visual_cache",
     "soft_overlap_snapshot",
-    "online_overlap_memory",
     "optimizer_runtime",
     "reader_audit",
 )
@@ -699,6 +698,8 @@ def initialize_outer_model_from_a2(
     checkpoint: str | Path,
     *,
     allowed_missing_prefixes: tuple[str, ...] = (),
+    allowed_missing_fragments: tuple[str, ...] = (),
+    allowed_unexpected_prefixes: tuple[str, ...] = (),
 ) -> OuterCheckpointAudit:
     """Load A2 weights only, leaving A5 optimizer/scheduler/RNG freshly initialized."""
 
@@ -706,14 +707,28 @@ def initialize_outer_model_from_a2(
     if not root.is_dir():
         raise FileNotFoundError(f"A2 checkpoint directory does not exist: {root}")
     expected_all = set(audit_outer_checkpoint_boundary(model))
-    if any(not prefix for prefix in allowed_missing_prefixes):
+    if any(
+        not value
+        for value in (
+            *allowed_missing_prefixes,
+            *allowed_missing_fragments,
+            *allowed_unexpected_prefixes,
+        )
+    ):
         raise ValueError("allowed A2 initialization prefixes must be non-empty")
+
+    def allowed_prefix(key: str, prefixes: tuple[str, ...]) -> bool:
+        return any(
+            key.startswith(prefix) or f".{prefix}" in key for prefix in prefixes
+        )
+
     allowed_missing = {
         key
         for key in expected_all
         if any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
+        or any(fragment in key for fragment in allowed_missing_fragments)
     }
-    if allowed_missing_prefixes and not allowed_missing:
+    if (allowed_missing_prefixes or allowed_missing_fragments) and not allowed_missing:
         raise ValueError("allowed A2 initialization prefix matched no model parameters")
     expected_keys = expected_all - allowed_missing
     safe_index = root / "model.safetensors.index.json"
@@ -725,7 +740,11 @@ def initialize_outer_model_from_a2(
     if safe_index.is_file() or torch_index.is_file():
         result = load_sharded_checkpoint(model, str(root), strict=False, prefer_safe=True)
         missing = tuple(key for key in result.missing_keys if key not in allowed_missing)
-        unexpected = tuple(result.unexpected_keys)
+        unexpected = tuple(
+            key
+            for key in result.unexpected_keys
+            if not allowed_prefix(key, allowed_unexpected_prefixes)
+        )
         index_path = safe_index if safe_index.is_file() else torch_index
         index = json.loads(index_path.read_text(encoding="utf-8"))
         weight_map = index.get("weight_map")
@@ -737,7 +756,11 @@ def initialize_outer_model_from_a2(
         state = load_file(str(safe_weights), device="cpu")
         result = model.load_state_dict(state, strict=False)
         missing = tuple(key for key in result.missing_keys if key not in allowed_missing)
-        unexpected = tuple(result.unexpected_keys)
+        unexpected = tuple(
+            key
+            for key in result.unexpected_keys
+            if not allowed_prefix(key, allowed_unexpected_prefixes)
+        )
         loaded_keys = set(state)
         checkpoint_format = "safetensors"
     elif torch_weights.is_file():
@@ -747,7 +770,11 @@ def initialize_outer_model_from_a2(
         state = cast(dict[str, torch.Tensor], raw)
         result = model.load_state_dict(state, strict=False)
         missing = tuple(key for key in result.missing_keys if key not in allowed_missing)
-        unexpected = tuple(result.unexpected_keys)
+        unexpected = tuple(
+            key
+            for key in result.unexpected_keys
+            if not any(key.startswith(prefix) for prefix in allowed_unexpected_prefixes)
+        )
         loaded_keys = set(state)
         checkpoint_format = "torch"
     else:
@@ -761,7 +788,13 @@ def initialize_outer_model_from_a2(
     )
     if loaded_keys != expected_keys:
         missing = tuple(sorted(expected_keys - loaded_keys))
-        unexpected = tuple(sorted(loaded_keys - expected_keys))
+        unexpected = tuple(
+            sorted(
+                key
+                for key in loaded_keys - expected_keys
+                if not allowed_prefix(key, allowed_unexpected_prefixes)
+            )
+        )
     return OuterCheckpointAudit(
         checkpoint=root,
         format=checkpoint_format,
@@ -779,6 +812,9 @@ def environment_manifest(bundle: LlamaFactoryBackboneBundle) -> dict[str, object
         "llamafactory_dirty": bundle.symbols.checkout.dirty,
         "qwen_model_path": str(getattr(bundle.model_args, "model_name_or_path", "")),
         "project_spec_version": bundle.project_config.spec_version,
+        "config_schema_version": bundle.project_config.config_schema_version,
+        "associative_ttt_contract": bundle.project_config.associative_ttt.contract,
+        "associative_ttt_contract_version": 1,
         "ttt_config": json.loads(bundle.ttt_config.model_dump_json()),
     }
 

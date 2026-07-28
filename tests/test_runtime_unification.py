@@ -50,7 +50,6 @@ def test_runtime_state_has_one_trajectory_and_one_batch_representation() -> None
         "fast_weights",
         "optimizer",
         "reader_audit",
-        "online_overlap_memory",
         "released",
     )
 

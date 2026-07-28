@@ -8,7 +8,7 @@ usage:
 
 Runs the four-GPU A5 static-W0 ablation with the same dense-Query v4 data order,
 partial Qwen trainability, seed 42, FP16 Support+State-Query cache, and four epochs
-as the Meta-TTT experiment. Predictor, Support TTT, Inner SGD, fast-weight updates,
+as the Meta-TTT experiment. Associative projections, Support TTT, Inner SGD, fast-weight updates,
 and second-order Support-to-Query gradients are disabled. Only final-checkpoint is
 published after all four epochs.
 

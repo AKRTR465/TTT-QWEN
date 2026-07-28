@@ -41,12 +41,23 @@ def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> N
     assert adapter.p_in.out_features == 768
     assert adapter.p_out.in_features == 768
     assert adapter.p_out.out_features == 4096
+    assert adapter.p_context.in_features == 512
+    assert adapter.p_context.out_features == 768
+    assert adapter.p_value.in_features == 4096
+    assert adapter.p_value.out_features == 768
     assert adapter.p_in.bias is not None
     assert adapter.p_out.bias is not None
     assert adapter.w0_1.shape == adapter.w0_2.shape == (768, 768)
-    assert set(adapter._modules) == {"rms_norm", "p_in", "p_out"}
-    assert parameter_count(adapter) == 7_480_064
+    assert set(adapter._modules) == {
+        "rms_norm",
+        "p_in",
+        "p_context",
+        "p_value",
+        "p_out",
+    }
+    assert parameter_count(adapter) == 11_020_544
     assert tensor_count(adapter.collect_slow_parameters()) == 6_300_416
+    assert tensor_count(adapter.collect_associative_parameters()) == 3_540_480
     assert (
         sum(parameter.numel() for parameter in adapter.collect_meta_fast_parameters()) == 1_179_648
     )
@@ -54,10 +65,15 @@ def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> N
         "rms_norm.weight",
         "p_in.weight",
         "p_in.bias",
+        "p_context.weight",
+        "p_context.bias",
+        "p_value.weight",
+        "p_value.bias",
         "w0_1",
         "w0_2",
         "p_out.weight",
         "p_out.bias",
+        "associative_contract_version",
     }
 
 
@@ -83,6 +99,8 @@ def test_demo_forward_preserves_shape_dtype_device_and_reports_true_residual_nor
     assert audit.fast_versions == audit.update_counts == (0,)
     assert audit.valid_token_counts == (392,)
     assert audit.used_runtime_state is False
+    assert audit.used_associative_context is False
+    assert audit.bank_record_counts == (0,)
     actual_residual_norm = torch.linalg.vector_norm(output - visual).item()
     assert audit.residual_norms[0] == pytest.approx(actual_residual_norm, rel=1.0e-5)
     assert actual_residual_norm / torch.linalg.vector_norm(visual).item() < 0.25
@@ -191,10 +209,15 @@ def test_differentiable_state_preserves_outer_gradients_to_w0_and_slow_parameter
 
     assert state.w_t_1.is_leaf is False
     assert state.w_t_2.is_leaf is False
-    for parameter in adapter.parameters():
+    for parameter in (
+        *adapter.collect_slow_parameters(),
+        *adapter.collect_meta_fast_parameters(),
+    ):
         assert parameter.grad is not None
         assert torch.isfinite(parameter.grad).all()
         assert parameter.grad.abs().sum() > 0
+    assert all(parameter.grad is not None for parameter in adapter.p_context.parameters())
+    assert all(parameter.grad is None for parameter in adapter.p_value.parameters())
 
 
 def test_initial_bound_fast_state_matches_static_w0_forward() -> None:
@@ -254,6 +277,7 @@ def test_parameter_collection_is_stable_exact_and_rejects_boundary_drift() -> No
     assert groups.slow == adapter.collect_slow_parameters()
     assert tensor_count(collect_fast_parameters(state)) == 2 * 768 * 768 == 1_179_648
     assert tensor_count(adapter.collect_slow_parameters()) == 6_300_416
+    assert tensor_count(adapter.collect_associative_parameters()) == 3_540_480
     assert not ({id(parameter) for parameter in groups.online_fast} & {id(p) for p in groups.slow})
     adapter.assert_online_parameter_boundary(groups.online_fast, state)
 
@@ -356,7 +380,15 @@ def test_online_binding_rejects_stale_slow_grad_and_differentiable_binding_stays
         assert all(parameter.requires_grad for parameter in adapter.parameters())
         output = adapter(torch.randn(1, 1, 4096))
     output.square().mean().backward()
-    assert all(parameter.grad is not None for parameter in adapter.parameters())
+    assert all(
+        parameter.grad is not None
+        for parameter in (
+            *adapter.collect_slow_parameters(),
+            *adapter.collect_meta_fast_parameters(),
+        )
+    )
+    assert all(parameter.grad is not None for parameter in adapter.p_context.parameters())
+    assert all(parameter.grad is None for parameter in adapter.p_value.parameters())
 
 
 def test_float64_is_preserved_and_stale_state_after_module_move_fails() -> None:
@@ -463,25 +495,29 @@ def test_fast_state_rejects_alias_nonfinite_nonleaf_and_invalid_metadata() -> No
 
     with pytest.raises(TypeError, match="exact integers"):
         FastTTTForwardAudit(
-            (True,),
-            (0,),
-            (1,),
-            False,
-            (0.0,),
-            (0.0,),
-            (0.0,),
-            (0.0,),
+            fast_versions=(True,),
+            update_counts=(0,),
+            valid_token_counts=(1,),
+            used_runtime_state=False,
+            used_associative_context=False,
+            bank_record_counts=(0,),
+            w_t_1_norms=(0.0,),
+            w_t_2_norms=(0.0,),
+            input_norms=(0.0,),
+            residual_norms=(0.0,),
         )
-    with pytest.raises(TypeError, match="used_runtime_state"):
+    with pytest.raises(TypeError, match="runtime/context audit flags"):
         FastTTTForwardAudit(
-            (0,),
-            (0,),
-            (1,),
-            1,  # type: ignore[arg-type]
-            (0.0,),
-            (0.0,),
-            (0.0,),
-            (0.0,),
+            fast_versions=(0,),
+            update_counts=(0,),
+            valid_token_counts=(1,),
+            used_runtime_state=1,  # type: ignore[arg-type]
+            used_associative_context=False,
+            bank_record_counts=(0,),
+            w_t_1_norms=(0.0,),
+            w_t_2_norms=(0.0,),
+            input_norms=(0.0,),
+            residual_norms=(0.0,),
         )
 
 

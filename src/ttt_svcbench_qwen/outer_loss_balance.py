@@ -16,7 +16,6 @@ from ttt_svcbench_qwen.config import OfficialWeakBalanceConfig
 from ttt_svcbench_qwen.losses import (
     AnswerLossOutput,
     OuterLossOutput,
-    TTTLossOutput,
     compose_outer_loss_terms,
 )
 from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase, trace_event
@@ -448,7 +447,6 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         answers: Sequence[AnswerLossOutput],
         states: Sequence[OfficialWeakStateLossOutput],
         *,
-        support_ttt: Sequence[tuple[TTTLossOutput, ...]] | None = None,
         gradient_anchors: Sequence[OfficialWeakGradientAnchors] | None = None,
         measure_gradients: bool = True,
         statistical_weights: Sequence[float] | None = None,
@@ -458,9 +456,6 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         state_items = tuple(states)
         if not answer_items or len(answer_items) != len(state_items):
             raise ValueError("official-weak Answer and State batches must be non-empty and aligned")
-        supports = tuple(() for _ in answer_items) if support_ttt is None else tuple(support_ttt)
-        if len(supports) != len(answer_items):
-            raise ValueError("official-weak support-TTT batches must align to Query objectives")
         anchors = () if gradient_anchors is None else tuple(gradient_anchors)
         if anchors and len(anchors) != len(answer_items):
             raise ValueError("official-weak gradient anchors must align to Query objectives")
@@ -605,7 +600,7 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         )
         query_count = len(answer_items)
         objectives: list[OuterLossOutput] = []
-        for item_index, (_answer, support) in enumerate(zip(answer_items, supports, strict=True)):
+        for item_index, _answer in enumerate(answer_items):
             answer_contribution = (
                 float(query_count * world_size)
                 * answer_sums[item_index]
@@ -631,7 +626,6 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
                 compose_outer_loss_terms(
                     answer_after=answer_contribution,
                     state_after=state_contribution,
-                    support_ttt=support,
                 )
             )
 
@@ -925,7 +919,6 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         *,
         query_count: int,
         audit: OfficialWeakBalanceAudit,
-        support_ttt: tuple[TTTLossOutput, ...] = (),
     ) -> OuterLossOutput:
         """Apply detached batch/global balance coefficients to one streamed Query graph."""
 
@@ -965,7 +958,6 @@ class OfficialWeakOuterLossComposer(nn.Module):  # type: ignore[misc]
         return compose_outer_loss_terms(
             answer_after=answer_contribution,
             state_after=state_contribution,
-            support_ttt=support_ttt,
         )
 
     def _global_sum(self, values: Tensor) -> tuple[Tensor, int]:

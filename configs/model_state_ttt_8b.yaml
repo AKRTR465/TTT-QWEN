@@ -1,5 +1,5 @@
-spec_version: state_ttt_qwen3vl8b_high_capacity_sgd_v6_retrieval_history
-config_schema_version: 9
+spec_version: state_ttt_qwen3vl8b_bank_associative_v1
+config_schema_version: 10
 
 paths:
   model_root_env: QWEN_MODEL_ROOT
@@ -436,24 +436,19 @@ input_composer:
   prefill_once: true
   generation_num_beams: 1
 
-predictor:
-  input_dim: 768
-  hidden_dim: 1536
-  output_dim: 768
-  layer_norm_eps: 1.0e-5
-  activation: silu
-  linear_bias: true
-  parameter_count: 2363136
+associative_ttt:
+  contract: bank_conditioned_visual_v1
+  bank_embedding_dim: 512
+  key_dim: 768
+  value_dim: 768
+  bank_empty_policy: zero
+  value_source: raw_main_merger_stopgrad
+  loss: masked_fp32_mse
 
 loss:
-  pred_weight: 1.0
-  identity_weight: 0.5
-  event_weight: 0.5
-  o1_unlabeled_weight: 0.0
   operator_weight: 1.0
   retrieval_weight: 1.0
   time_weight: 1.0
-  auxiliary_outer_weight: 0.1
   answer_causal_shift: true
   answer_ignore_index: -100
   official_weak_balance:
@@ -476,7 +471,7 @@ outer_gradient_control:
     state_router_time: 0.05
     state_retrieval: 0.05
     w0: 0.1
-    predictor: 0.1
+    associative: 0.1
   nonfinite_policy: skip_update
   audit_steps: 32
 
@@ -492,7 +487,7 @@ a5:
   optimizer:
     state_learning_rate: 5.0e-5
     w0_learning_rate: 5.0e-5
-    predictor_learning_rate: 5.0e-5
+    associative_learning_rate: 5.0e-5
   counterfactual_audit:
     enabled: false
     interval_steps: 8

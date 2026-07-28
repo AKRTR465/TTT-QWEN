@@ -1,42 +1,31 @@
-"""Implement the typed P14 TTT, State, Answer, and Outer loss contracts.
+"""Implement the typed State, Answer, and Query Outer loss contracts.
 
-Inputs: differentiable soft predictions, explicit dense labels/masks, and detached snapshots.
-Outputs: FP32 per-row loss terms, validity/skip audits, metrics, and composed objectives.
-Forbidden: hard Bank/FSM inputs, fabricated count labels, parameter updates, or O1 inner loss.
+Inputs: differentiable soft predictions and explicit dense labels/masks.
+Outputs: FP32 per-row loss terms, validity audits, metrics, and Query-only Outer objectives.
+The label-free Bank-conditioned visual association objective lives in ``associative_ttt`` and
+is deliberately not part of the Query Outer loss.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum, StrEnum
+from enum import StrEnum
 
 import torch
-from torch import Tensor, nn
+from torch import Tensor
 from torch.nn import functional as F
-
-from ttt_svcbench_qwen.config import PredictorConfig
 
 _FP32_EPS = 1.0e-8
 _NORM_ATOL = 5.0e-4
-_TTT_OUTER_TARGET_RMS_FLOOR = 1.0
-_PRED_WEIGHT = 1.0
-_IDENTITY_WEIGHT = 0.5
-_EVENT_WEIGHT = 0.5
-_O1_UNLABELED_WEIGHT = 0.0
 _TASK_WEIGHT = 1.0
 _OPERATOR_WEIGHT = 1.0
 _RETRIEVAL_WEIGHT = 1.0
 _TIME_WEIGHT = 1.0
-_AUXILIARY_OUTER_WEIGHT = 0.1
 
 
 class LossSkipReason(StrEnum):
     """Auditable row-level reason for excluding a value from a reduction."""
 
-    INSUFFICIENT_TIME = "insufficient_time"
-    NO_CONTIGUOUS_PAIR = "no_contiguous_pair"
-    NO_RELIABLE_MATCH = "no_reliable_match"
-    NO_ALIGNED_EVENT = "no_aligned_event"
     NOT_APPLICABLE = "not_applicable"
     NO_TASK_LABEL = "no_task_label"
     NO_VALID_LABEL = "no_valid_label"
@@ -47,18 +36,6 @@ class LossSkipReason(StrEnum):
     NO_ANSWER_TOKEN = "no_answer_token"
     NO_NUMBER_TOKEN = "no_number_token"
     NO_READER_COUNT = "no_reader_count"
-    NO_VALID_SUPPORT = "no_valid_support"
-
-
-class IdentityPairStatus(IntEnum):
-    """Fixed non-learned disposition for one proposed overlap identity pair."""
-
-    MATCHED = 0
-    MISMATCH = 1
-    DUPLICATE = 2
-    LOW_CONFIDENCE = 3
-    INVALID_SOURCE = 4
-    PADDING = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,747 +83,6 @@ class LossTerm:
             raise ValueError("valid_counts cannot exceed mask_counts")
         if not torch.equal(self.row_valid_mask, self.valid_counts > 0):
             raise ValueError("row validity must exactly match positive valid_counts")
-
-
-@dataclass(frozen=True, slots=True)
-class TemporalPredictionInput:
-    hidden: Tensor
-    valid_mask: Tensor
-    position_ids: Tensor
-
-    def __post_init__(self) -> None:
-        if (
-            self.hidden.ndim != 3
-            or not torch.is_floating_point(self.hidden)
-            or self.hidden.shape[0] <= 0
-        ):
-            raise ValueError("temporal hidden must be floating [B, T, D] with B > 0")
-        shape = self.hidden.shape[:2]
-        if self.valid_mask.shape != shape or self.valid_mask.dtype != torch.bool:
-            raise ValueError("temporal valid_mask must be bool [B, T]")
-        if self.position_ids.shape != shape or self.position_ids.dtype != torch.int64:
-            raise ValueError("temporal position_ids must be int64 [B, T]")
-        _require_same_device(
-            (self.hidden, self.valid_mask, self.position_ids), "temporal prediction input"
-        )
-        if self.hidden.device.type != "meta":
-            if bool(torch.any(self.hidden[~self.valid_mask] != 0.0)):
-                raise ValueError("invalid temporal hidden positions must be zero")
-            if bool(torch.any(self.position_ids[~self.valid_mask] != -1)):
-                raise ValueError("invalid temporal positions must use -1")
-
-
-@dataclass(frozen=True, slots=True)
-class TemporalPredictionScaleAudit:
-    """Detached sufficient statistics for diagnosing temporal-target scale drift."""
-
-    hidden_sum_squares: Tensor
-    hidden_element_count: Tensor
-    hidden_max_abs: Tensor
-    target_sum_squares: Tensor
-    prediction_sum_squares: Tensor
-    error_sum_squares: Tensor
-    pair_element_count: Tensor
-    target_max_abs: Tensor
-    prediction_max_abs: Tensor
-    error_max_abs: Tensor
-
-    def __post_init__(self) -> None:
-        floating = (
-            self.hidden_sum_squares,
-            self.hidden_max_abs,
-            self.target_sum_squares,
-            self.prediction_sum_squares,
-            self.error_sum_squares,
-            self.target_max_abs,
-            self.prediction_max_abs,
-            self.error_max_abs,
-        )
-        counts = (self.hidden_element_count, self.pair_element_count)
-        if any(value.ndim != 0 or value.dtype != torch.float32 for value in floating):
-            raise ValueError("temporal scale audit values must be FP32 scalars")
-        if any(value.ndim != 0 or value.dtype != torch.int64 for value in counts):
-            raise ValueError("temporal scale audit counts must be int64 scalars")
-        tensors = (*floating, *counts)
-        if any(value.requires_grad or value.grad_fn is not None for value in tensors):
-            raise ValueError("temporal scale audit must be detached")
-        if len({value.device for value in tensors}) != 1:
-            raise ValueError("temporal scale audit values must share one device")
-
-
-class TemporalPredictor(nn.Module):  # type: ignore[misc]
-    """LayerNorm -> Linear -> SiLU -> Linear next-tubelet predictor."""
-
-    def __init__(self, config: PredictorConfig) -> None:
-        super().__init__()
-        if float(config.layer_norm_eps) != 1.0e-5:
-            raise ValueError("Predictor layer_norm_eps is frozen at 1e-5")
-        if config.activation != "silu":
-            raise ValueError("Predictor activation is frozen at silu")
-        if not config.linear_bias:
-            raise ValueError("Predictor Linear layers require bias")
-        self.input_dim = int(config.input_dim)
-        self.output_dim = int(config.output_dim)
-        self.network = nn.Sequential(
-            nn.LayerNorm(
-                self.input_dim,
-                eps=float(config.layer_norm_eps),
-                elementwise_affine=True,
-                bias=config.linear_bias,
-            ),
-            nn.Linear(self.input_dim, int(config.hidden_dim), bias=config.linear_bias),
-            nn.SiLU(),
-            nn.Linear(int(config.hidden_dim), self.output_dim, bias=config.linear_bias),
-        )
-        actual_parameter_count = sum(parameter.numel() for parameter in self.parameters())
-        if int(config.parameter_count) != actual_parameter_count:
-            raise ValueError("Predictor parameter_count does not match its configured topology")
-        if actual_parameter_count != 2_363_136:
-            raise ValueError("P14 Predictor must contain exactly 2,363,136 parameters")
-
-    def forward(self, hidden: Tensor) -> Tensor:
-        if (
-            hidden.ndim != 3
-            or hidden.shape[-1] != self.input_dim
-            or not torch.is_floating_point(hidden)
-        ):
-            raise ValueError(f"predictor input must be floating [B, T, {self.input_dim}]")
-        output = self.network(hidden)
-        return output
-
-
-def build_temporal_predictor(config: PredictorConfig) -> TemporalPredictor:
-    """Build from only the three configured dimensions; eps and biases are frozen by P14."""
-
-    return TemporalPredictor(config)
-
-
-@dataclass(frozen=True, slots=True)
-class IdentityConsistencyInput:
-    """O2 identity banks plus explicit proposed-pair dispositions."""
-
-    current_predictions: Tensor
-    previous_targets: Tensor
-    current_valid_mask: Tensor
-    previous_valid_mask: Tensor
-    current_indices: Tensor
-    previous_indices: Tensor
-    statuses: Tensor
-    current_position_ids: Tensor
-    previous_position_ids: Tensor
-    current_timestamps: Tensor
-    previous_timestamps: Tensor
-
-    def __post_init__(self) -> None:
-        for tensor, name in (
-            (self.current_predictions, "current_predictions"),
-            (self.previous_targets, "previous_targets"),
-        ):
-            if (
-                tensor.ndim != 3
-                or tensor.shape[1] <= 0
-                or tensor.shape[-1] != 256
-                or not torch.is_floating_point(tensor)
-            ):
-                raise ValueError(f"identity {name} must be floating [B, N, 256]")
-        batch_size = self.current_predictions.shape[0]
-        if self.previous_targets.shape[0] != batch_size:
-            raise ValueError("current and previous identity banks must share B")
-        if self.current_valid_mask.shape != self.current_predictions.shape[:2]:
-            raise ValueError("current identity valid mask has the wrong shape")
-        if self.previous_valid_mask.shape != self.previous_targets.shape[:2]:
-            raise ValueError("previous identity valid mask has the wrong shape")
-        if (
-            self.current_valid_mask.dtype != torch.bool
-            or self.previous_valid_mask.dtype != torch.bool
-        ):
-            raise TypeError("identity valid masks must use bool dtype")
-        pair_shape = self.current_indices.shape
-        if (
-            len(pair_shape) != 2
-            or pair_shape[0] != batch_size
-            or self.previous_indices.shape != pair_shape
-            or self.statuses.shape != pair_shape
-        ):
-            raise ValueError("identity pair indices/statuses must share [B, M]")
-        if any(
-            tensor.dtype != torch.int64
-            for tensor in (self.current_indices, self.previous_indices, self.statuses)
-        ):
-            raise TypeError("identity pair indices/statuses must use int64 dtype")
-        if (
-            self.current_position_ids.shape != pair_shape
-            or self.previous_position_ids.shape != pair_shape
-            or self.current_position_ids.dtype != torch.int64
-            or self.previous_position_ids.dtype != torch.int64
-        ):
-            raise ValueError("identity pair positions must be int64 [B, M]")
-        if (
-            self.current_timestamps.shape != pair_shape
-            or self.previous_timestamps.shape != pair_shape
-            or not torch.is_floating_point(self.current_timestamps)
-            or not torch.is_floating_point(self.previous_timestamps)
-        ):
-            raise ValueError("identity pair timestamps must be floating [B, M]")
-        _require_same_device(
-            (
-                self.current_predictions,
-                self.previous_targets,
-                self.current_valid_mask,
-                self.previous_valid_mask,
-                self.current_indices,
-                self.previous_indices,
-                self.statuses,
-                self.current_position_ids,
-                self.previous_position_ids,
-                self.current_timestamps,
-                self.previous_timestamps,
-            ),
-            "identity consistency input",
-        )
-        if self.current_predictions.device.type == "meta":
-            return
-        allowed = torch.tensor(
-            [int(status) for status in IdentityPairStatus], device=self.statuses.device
-        )
-        if bool(torch.any(~torch.isin(self.statuses, allowed))):
-            raise ValueError("identity pair statuses contain an unknown value")
-        padding = self.statuses == int(IdentityPairStatus.PADDING)
-        invalid_source = self.statuses == int(IdentityPairStatus.INVALID_SOURCE)
-        if bool(
-            torch.any(
-                padding
-                & (
-                    (self.current_indices != -1)
-                    | (self.previous_indices != -1)
-                    | (self.current_position_ids != -1)
-                    | (self.previous_position_ids != -1)
-                    | (self.current_timestamps != -1.0)
-                    | (self.previous_timestamps != -1.0)
-                )
-            )
-        ):
-            raise ValueError("padding identity pairs must use -1 sentinels")
-        if bool(
-            torch.any(
-                invalid_source
-                & (
-                    (self.current_indices != -1)
-                    | (self.previous_indices != -1)
-                    | (self.current_position_ids != -1)
-                    | (self.previous_position_ids != -1)
-                    | (self.current_timestamps != -1.0)
-                    | (self.previous_timestamps != -1.0)
-                )
-            )
-        ):
-            raise ValueError("invalid-source identity pairs must use -1 sentinels")
-        source_required = ~(padding | invalid_source)
-        current_width = self.current_predictions.shape[1]
-        previous_width = self.previous_targets.shape[1]
-        if bool(
-            torch.any(
-                source_required
-                & (
-                    (self.current_indices < 0)
-                    | (self.current_indices >= current_width)
-                    | (self.previous_indices < 0)
-                    | (self.previous_indices >= previous_width)
-                )
-            )
-        ):
-            raise ValueError("non-padding identity pair indices are out of range")
-        safe_current = self.current_indices.clamp_min(0)
-        safe_previous = self.previous_indices.clamp_min(0)
-        current_refs = torch.gather(self.current_valid_mask, 1, safe_current)
-        previous_refs = torch.gather(self.previous_valid_mask, 1, safe_previous)
-        if bool(torch.any(source_required & (~current_refs | ~previous_refs))):
-            raise ValueError("identity pairs may reference only valid O2 slots")
-        if bool(
-            torch.any(
-                source_required
-                & (
-                    (self.current_position_ids < 0)
-                    | (self.previous_position_ids < 0)
-                    | (self.current_timestamps < 0.0)
-                    | (self.previous_timestamps < 0.0)
-                )
-            )
-        ):
-            raise ValueError("valid identity sources require non-negative time metadata")
-        _require_unit_norm(self.current_predictions, self.current_valid_mask, "current O2 identity")
-        _require_unit_norm(self.previous_targets, self.previous_valid_mask, "previous O2 identity")
-        matched = self.statuses == int(IdentityPairStatus.MATCHED)
-        if bool(torch.any(matched & (self.current_position_ids != self.previous_position_ids))):
-            raise ValueError("matched identity positions must be equal")
-        if bool(
-            torch.any(
-                matched & ((self.current_timestamps - self.previous_timestamps).abs() > 1.0e-6)
-            )
-        ):
-            raise ValueError("matched identity timestamps must agree within 1e-6")
-        for row in range(batch_size):
-            current = self.current_indices[row, matched[row]].tolist()
-            previous = self.previous_indices[row, matched[row]].tolist()
-            if len(set(current)) != len(current) or len(set(previous)) != len(previous):
-                raise ValueError("MATCHED identity pairs must be one-to-one")
-            current_positions = self.current_position_ids[row, matched[row]].tolist()
-            previous_positions = self.previous_position_ids[row, matched[row]].tolist()
-            if len(set(current_positions)) != len(current_positions) or len(
-                set(previous_positions)
-            ) != len(previous_positions):
-                raise ValueError("MATCHED identity positions must be unique per row")
-
-
-@dataclass(frozen=True, slots=True)
-class IdentityConsistencyAudit:
-    matched_counts: Tensor
-    mismatch_counts: Tensor
-    duplicate_counts: Tensor
-    low_confidence_counts: Tensor
-    invalid_source_counts: Tensor
-    padding_counts: Tensor
-
-    def __post_init__(self) -> None:
-        fields = (
-            self.matched_counts,
-            self.mismatch_counts,
-            self.duplicate_counts,
-            self.low_confidence_counts,
-            self.invalid_source_counts,
-            self.padding_counts,
-        )
-        shape = fields[0].shape
-        if len(shape) != 1 or any(
-            field.shape != shape or field.dtype != torch.int64 for field in fields
-        ):
-            raise ValueError("identity audit counts must be aligned int64 [B]")
-        _require_same_device(fields, "identity consistency audit")
-        if any(bool(torch.any(field < 0)) for field in fields):
-            raise ValueError("identity audit counts must be non-negative")
-
-
-@dataclass(frozen=True, slots=True)
-class IdentityLossOutput:
-    term: LossTerm
-    audit: IdentityConsistencyAudit
-
-
-@dataclass(frozen=True, slots=True)
-class E1ConsistencyInput:
-    current_probabilities: Tensor
-    previous_target_probabilities: Tensor
-    pair_mask: Tensor
-    alignment_mask: Tensor
-    current_position_ids: Tensor
-    previous_position_ids: Tensor
-    current_timestamps: Tensor
-    previous_timestamps: Tensor
-
-    def __post_init__(self) -> None:
-        _validate_overlap_probabilities(
-            self.current_probabilities,
-            self.previous_target_probabilities,
-            self.pair_mask,
-            self.alignment_mask,
-            self.current_position_ids,
-            self.previous_position_ids,
-            self.current_timestamps,
-            self.previous_timestamps,
-            width=3,
-            name="E1",
-            phase=False,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class E2ConsistencyInput:
-    current_event_probabilities: Tensor
-    previous_event_target_probabilities: Tensor
-    current_phase_probabilities: Tensor
-    previous_phase_target_probabilities: Tensor
-    pair_mask: Tensor
-    alignment_mask: Tensor
-    current_position_ids: Tensor
-    previous_position_ids: Tensor
-    current_timestamps: Tensor
-    previous_timestamps: Tensor
-
-    def __post_init__(self) -> None:
-        args = (
-            self.pair_mask,
-            self.alignment_mask,
-            self.current_position_ids,
-            self.previous_position_ids,
-            self.current_timestamps,
-            self.previous_timestamps,
-        )
-        _validate_overlap_probabilities(
-            self.current_event_probabilities,
-            self.previous_event_target_probabilities,
-            *args,
-            width=4,
-            name="E2 event",
-            phase=False,
-        )
-        _validate_overlap_probabilities(
-            self.current_phase_probabilities,
-            self.previous_phase_target_probabilities,
-            *args,
-            width=4,
-            name="E2 phase",
-            phase=True,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class EventConsistencyInput:
-    e1: E1ConsistencyInput
-    e2: E2ConsistencyInput
-
-    def __post_init__(self) -> None:
-        if self.e1.current_probabilities.shape[0] != self.e2.current_event_probabilities.shape[0]:
-            raise ValueError("E1 and E2 consistency batches must share B")
-        if self.e1.current_probabilities.device != self.e2.current_event_probabilities.device:
-            raise ValueError("E1 and E2 consistency inputs must share one device")
-
-
-@dataclass(frozen=True, slots=True)
-class EventLossOutput:
-    e1: LossTerm
-    e2: LossTerm
-    total: LossTerm
-
-    def __post_init__(self) -> None:
-        expected_per_row = self.e1.per_row + self.e2.per_row
-        if not torch.allclose(self.total.per_row, expected_per_row, atol=1.0e-6, rtol=1.0e-6):
-            raise ValueError("event total per_row must equal E1 + E2")
-
-
-@dataclass(frozen=True, slots=True)
-class TTTLossInput:
-    temporal: TemporalPredictionInput
-    identity: IdentityConsistencyInput
-    event: EventConsistencyInput
-
-    def __post_init__(self) -> None:
-        batch_size = self.temporal.hidden.shape[0]
-        if self.identity.current_predictions.shape[0] != batch_size:
-            raise ValueError("temporal and identity TTT inputs must share B")
-        if self.event.e1.current_probabilities.shape[0] != batch_size:
-            raise ValueError("temporal and event TTT inputs must share B")
-        if self.temporal.hidden.device != self.identity.current_predictions.device:
-            raise ValueError("all TTT inputs must share one device")
-        if self.temporal.hidden.device != self.event.e1.current_probabilities.device:
-            raise ValueError("all TTT inputs must share one device")
-
-
-@dataclass(frozen=True, slots=True)
-class TTTLossOutput:
-    pred: LossTerm
-    identity: LossTerm
-    e1_event: LossTerm
-    e2_event: LossTerm
-    event: LossTerm
-    total: Tensor
-    per_row_total: Tensor
-    update_valid_mask: Tensor
-    identity_audit: IdentityConsistencyAudit
-    temporal_scale_audit: TemporalPredictionScaleAudit
-    pred_weight: float = _PRED_WEIGHT
-    identity_weight: float = _IDENTITY_WEIGHT
-    event_weight: float = _EVENT_WEIGHT
-    o1_unlabeled_weight: float = _O1_UNLABELED_WEIGHT
-
-    def __post_init__(self) -> None:
-        _require_fp32_scalar(self.total, "TTT total")
-        batch_size = self.pred.per_row.shape[0]
-        if self.per_row_total.shape != (batch_size,) or self.per_row_total.dtype != torch.float32:
-            raise ValueError("TTT per_row_total must be FP32 [B]")
-        if (
-            self.update_valid_mask.shape != (batch_size,)
-            or self.update_valid_mask.dtype != torch.bool
-        ):
-            raise ValueError("TTT update_valid_mask must be bool [B]")
-        if (
-            self.per_row_total.device != self.total.device
-            or self.update_valid_mask.device != self.total.device
-        ):
-            raise ValueError("TTT outputs must share one device")
-        if (self.pred_weight, self.identity_weight, self.event_weight) != (1.0, 0.5, 0.5):
-            raise ValueError("P14 TTT weights are frozen at 1/0.5/0.5")
-        if self.o1_unlabeled_weight != 0.0:
-            raise ValueError("O1 unlabeled loss is forbidden")
-
-
-def compute_ttt_outer_auxiliary_loss(output: TTTLossOutput) -> Tensor:
-    """Scale only outer temporal supervision; keep the Inner-SGD TTT loss unchanged.
-
-    The target mean-square is detached by the temporal audit. Dividing the
-    prediction component by ``max(target_rms, 1)^2`` turns the outer auxiliary
-    into a relative MSE when raw hidden-state scale grows, while never
-    amplifying small targets. Identity and event consistency keep their exact
-    frozen weights.
-    """
-
-    audit = output.temporal_scale_audit
-    pair_count = audit.pair_element_count.to(dtype=torch.float32)
-    target_mean_square = audit.target_sum_squares / pair_count.clamp_min(1.0)
-    prediction_scale = torch.where(
-        audit.pair_element_count > 0,
-        target_mean_square.clamp_min(_TTT_OUTER_TARGET_RMS_FLOOR**2).reciprocal(),
-        torch.ones_like(target_mean_square),
-    ).detach()
-    outer_per_row = (
-        prediction_scale * output.pred.per_row
-        + output.identity_weight * output.identity.per_row
-        + output.event_weight * output.event.per_row
-    )
-    valid_weights = output.update_valid_mask.to(dtype=torch.float32)
-    outer = (
-        (outer_per_row * valid_weights).sum()
-        / valid_weights.sum().clamp_min(1.0)
-    )
-    _require_fp32_scalar(outer, "TTT outer auxiliary")
-    return outer
-
-
-def _temporal_prediction_scale_audit(
-    inputs: TemporalPredictionInput,
-    *,
-    predictions: Tensor | None,
-    targets: Tensor | None,
-    contiguous_mask: Tensor | None,
-) -> TemporalPredictionScaleAudit:
-    hidden = inputs.hidden.detach().float()
-    hidden_mask = inputs.valid_mask.unsqueeze(-1)
-    hidden_values = hidden * hidden_mask
-    hidden_sum_squares = hidden_values.square().sum().detach()
-    hidden_element_count = (
-        inputs.valid_mask.sum(dtype=torch.int64) * inputs.hidden.shape[-1]
-    ).detach()
-    hidden_max_abs = (
-        hidden_values.abs().amax().detach()
-        if hidden_values.numel()
-        else hidden_sum_squares.new_zeros(())
-    )
-    zero = hidden_sum_squares.new_zeros(())
-    zero_count = hidden_element_count.new_zeros(())
-    if predictions is None or targets is None or contiguous_mask is None:
-        return TemporalPredictionScaleAudit(
-            hidden_sum_squares=hidden_sum_squares,
-            hidden_element_count=hidden_element_count,
-            hidden_max_abs=hidden_max_abs,
-            target_sum_squares=zero.clone(),
-            prediction_sum_squares=zero.clone(),
-            error_sum_squares=zero.clone(),
-            pair_element_count=zero_count,
-            target_max_abs=zero.clone(),
-            prediction_max_abs=zero.clone(),
-            error_max_abs=zero.clone(),
-        )
-    pair_mask = contiguous_mask.unsqueeze(-1)
-    target_values = targets.detach().float() * pair_mask
-    prediction_values = predictions.detach().float() * pair_mask
-    error_values = (predictions.detach().float() - targets.detach().float()) * pair_mask
-    pair_element_count = (
-        contiguous_mask.sum(dtype=torch.int64) * inputs.hidden.shape[-1]
-    ).detach()
-    return TemporalPredictionScaleAudit(
-        hidden_sum_squares=hidden_sum_squares,
-        hidden_element_count=hidden_element_count,
-        hidden_max_abs=hidden_max_abs,
-        target_sum_squares=target_values.square().sum().detach(),
-        prediction_sum_squares=prediction_values.square().sum().detach(),
-        error_sum_squares=error_values.square().sum().detach(),
-        pair_element_count=pair_element_count,
-        target_max_abs=target_values.abs().amax().detach(),
-        prediction_max_abs=prediction_values.abs().amax().detach(),
-        error_max_abs=error_values.abs().amax().detach(),
-    )
-
-
-def _compute_temporal_prediction_loss_with_audit(
-    predictor: TemporalPredictor, inputs: TemporalPredictionInput
-) -> tuple[LossTerm, TemporalPredictionScaleAudit]:
-    """Predict the next contiguous valid tubelet and detach only its target."""
-
-    if inputs.hidden.shape[-1] != predictor.input_dim:
-        raise ValueError("temporal hidden size does not match PredictorConfig.input_dim")
-    if predictor.output_dim != inputs.hidden.shape[-1]:
-        raise ValueError("PredictorConfig.output_dim must match temporal hidden size")
-    batch_size, length, _ = inputs.hidden.shape
-    if length < 2:
-        zero = _differentiable_zero(inputs.hidden)
-        zeros = torch.zeros(batch_size, dtype=torch.int64, device=inputs.hidden.device)
-        term = _make_term_from_rows(
-            torch.zeros(batch_size, dtype=torch.float32, device=inputs.hidden.device) + zero,
-            zeros,
-            zeros,
-            tuple(LossSkipReason.INSUFFICIENT_TIME for _ in range(batch_size)),
-        )
-        return term, _temporal_prediction_scale_audit(
-            inputs,
-            predictions=None,
-            targets=None,
-            contiguous_mask=None,
-        )
-    predictions = predictor(inputs.hidden[:, :-1])
-    targets = inputs.hidden[:, 1:].detach()
-    candidate_mask = inputs.valid_mask[:, :-1] & inputs.valid_mask[:, 1:]
-    contiguous_mask = candidate_mask & (
-        inputs.position_ids[:, 1:] == inputs.position_ids[:, :-1] + 1
-    )
-    item_losses = (predictions.float() - targets.float()).square().mean(dim=-1)
-    valid_counts = contiguous_mask.sum(dim=1, dtype=torch.int64)
-    mask_counts = candidate_mask.sum(dim=1, dtype=torch.int64)
-    reasons = tuple(
-        None
-        if int(valid_counts[row].item()) > 0
-        else (
-            LossSkipReason.INSUFFICIENT_TIME
-            if int(mask_counts[row].item()) == 0
-            else LossSkipReason.NO_CONTIGUOUS_PAIR
-        )
-        for row in range(batch_size)
-    )
-    term = _reduce_items(item_losses, contiguous_mask, mask_counts, reasons)
-    return term, _temporal_prediction_scale_audit(
-        inputs,
-        predictions=predictions,
-        targets=targets,
-        contiguous_mask=contiguous_mask,
-    )
-
-
-def compute_temporal_prediction_loss(
-    predictor: TemporalPredictor, inputs: TemporalPredictionInput
-) -> LossTerm:
-    """Preserve the public loss-only API while the formal TTT path records scale audit."""
-
-    term, _ = _compute_temporal_prediction_loss_with_audit(predictor, inputs)
-    return term
-
-
-def compute_identity_consistency_loss(inputs: IdentityConsistencyInput) -> IdentityLossOutput:
-    """Train current O2 identities toward detached previous snapshots for reliable pairs."""
-
-    matched = inputs.statuses == int(IdentityPairStatus.MATCHED)
-    safe_current = inputs.current_indices.clamp_min(0)
-    safe_previous = inputs.previous_indices.clamp_min(0)
-    feature_dim = inputs.current_predictions.shape[-1]
-    current = torch.gather(
-        inputs.current_predictions,
-        1,
-        safe_current.unsqueeze(-1).expand(-1, -1, feature_dim),
-    )
-    previous = torch.gather(
-        inputs.previous_targets,
-        1,
-        safe_previous.unsqueeze(-1).expand(-1, -1, feature_dim),
-    ).detach()
-    item_losses = (
-        1.0 - (current.float() * previous.float()).sum(dim=-1)
-    ).clamp_min(0.0)
-    valid_counts = matched.sum(dim=1, dtype=torch.int64)
-    mask_counts = (inputs.statuses != int(IdentityPairStatus.PADDING)).sum(dim=1, dtype=torch.int64)
-    reasons = tuple(
-        None if int(count.item()) > 0 else LossSkipReason.NO_RELIABLE_MATCH
-        for count in valid_counts
-    )
-    term = _reduce_items(item_losses, matched, mask_counts, reasons)
-    audit = IdentityConsistencyAudit(
-        matched_counts=valid_counts,
-        mismatch_counts=(inputs.statuses == int(IdentityPairStatus.MISMATCH)).sum(
-            dim=1, dtype=torch.int64
-        ),
-        duplicate_counts=(inputs.statuses == int(IdentityPairStatus.DUPLICATE)).sum(
-            dim=1, dtype=torch.int64
-        ),
-        low_confidence_counts=(inputs.statuses == int(IdentityPairStatus.LOW_CONFIDENCE)).sum(
-            dim=1, dtype=torch.int64
-        ),
-        invalid_source_counts=(inputs.statuses == int(IdentityPairStatus.INVALID_SOURCE)).sum(
-            dim=1, dtype=torch.int64
-        ),
-        padding_counts=(inputs.statuses == int(IdentityPairStatus.PADDING)).sum(
-            dim=1, dtype=torch.int64
-        ),
-    )
-    return IdentityLossOutput(term=term, audit=audit)
-
-
-def compute_event_consistency_loss(inputs: EventConsistencyInput) -> EventLossOutput:
-    """Compare aligned E1/E2 soft outputs against detached previous snapshots."""
-
-    e1_items = (
-        (
-            inputs.e1.current_probabilities.float()
-            - inputs.e1.previous_target_probabilities.detach().float()
-        )
-        .square()
-        .mean(dim=-1)
-    )
-    e1 = _reduce_overlap_items(e1_items, inputs.e1.pair_mask, inputs.e1.alignment_mask)
-
-    event_mse = (
-        (
-            inputs.e2.current_event_probabilities.float()
-            - inputs.e2.previous_event_target_probabilities.detach().float()
-        )
-        .square()
-        .mean(dim=-1)
-    )
-    target_phase = inputs.e2.previous_phase_target_probabilities.detach().float()
-    target_phase = target_phase.clamp_min(_FP32_EPS)
-    target_phase = target_phase / target_phase.sum(dim=-1, keepdim=True)
-    current_phase = inputs.e2.current_phase_probabilities.float().clamp_min(_FP32_EPS)
-    current_phase = current_phase / current_phase.sum(dim=-1, keepdim=True)
-    phase_kl = (target_phase * (target_phase.log() - current_phase.log())).sum(dim=-1)
-    e2_items = event_mse + phase_kl
-    e2 = _reduce_overlap_items(e2_items, inputs.e2.pair_mask, inputs.e2.alignment_mask)
-
-    per_row = e1.per_row + e2.per_row
-    valid_counts = e1.valid_counts + e2.valid_counts
-    mask_counts = e1.mask_counts + e2.mask_counts
-    row_valid = valid_counts > 0
-    reasons = tuple(
-        None if bool(row_valid[row].item()) else LossSkipReason.NO_ALIGNED_EVENT
-        for row in range(per_row.shape[0])
-    )
-    total = _make_term_from_rows(per_row, valid_counts, mask_counts, reasons)
-    return EventLossOutput(e1=e1, e2=e2, total=total)
-
-
-def compute_ttt_loss(predictor: TemporalPredictor, inputs: TTTLossInput) -> TTTLossOutput:
-    pred, temporal_scale_audit = _compute_temporal_prediction_loss_with_audit(
-        predictor, inputs.temporal
-    )
-    identity_output = compute_identity_consistency_loss(inputs.identity)
-    event_output = compute_event_consistency_loss(inputs.event)
-    per_row = (
-        _PRED_WEIGHT * pred.per_row
-        + _IDENTITY_WEIGHT * identity_output.term.per_row
-        + _EVENT_WEIGHT * event_output.total.per_row
-    )
-    update_valid = (
-        pred.row_valid_mask
-        | identity_output.term.row_valid_mask
-        | event_output.total.row_valid_mask
-    )
-    total = per_row[update_valid].mean() if bool(update_valid.any().item()) else per_row.sum() * 0.0
-    return TTTLossOutput(
-        pred=pred,
-        identity=identity_output.term,
-        e1_event=event_output.e1,
-        e2_event=event_output.e2,
-        event=event_output.total,
-        total=total,
-        per_row_total=per_row,
-        update_valid_mask=update_valid,
-        identity_audit=identity_output.audit,
-        temporal_scale_audit=temporal_scale_audit,
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1433,24 +669,18 @@ def compute_answer_loss(inputs: AnswerLossInput) -> AnswerLossOutput:
 class OuterLossInput:
     answer_after: AnswerLossOutput
     state_after: StateLossOutput
-    support_ttt: tuple[TTTLossOutput, ...]
 
     def __post_init__(self) -> None:
         if self.answer_after.loss.value.device != self.state_after.total.device:
             raise ValueError("after-update Answer and State losses must share one device")
-        for support in self.support_ttt:
-            if support.total.device != self.state_after.total.device:
-                raise ValueError("support TTT losses must share the after-update device")
 
 
 @dataclass(frozen=True, slots=True)
 class OuterLossOutput:
     answer_after: Tensor
     state_after: Tensor
-    auxiliary_ttt: LossTerm
     outer: Tensor
     total: Tensor
-    auxiliary_weight: float = _AUXILIARY_OUTER_WEIGHT
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -1460,15 +690,14 @@ class OuterLossOutput:
             (self.total, "total loss"),
         ):
             _require_fp32_scalar(value, name)
-        if self.auxiliary_weight != 0.1:
-            raise ValueError("P14 auxiliary outer weight is frozen at 0.1")
+        if not torch.equal(self.outer, self.total):
+            raise ValueError("Outer total must contain only Answer and State Query losses")
 
 
 def compute_outer_loss(inputs: OuterLossInput) -> OuterLossOutput:
     return compose_outer_loss_terms(
         answer_after=inputs.answer_after.loss.value,
         state_after=inputs.state_after.total,
-        support_ttt=inputs.support_ttt,
     )
 
 
@@ -1476,72 +705,18 @@ def compose_outer_loss_terms(
     *,
     answer_after: Tensor,
     state_after: Tensor,
-    support_ttt: tuple[TTTLossOutput, ...],
 ) -> OuterLossOutput:
-    """Compose already-reduced Answer/State terms without changing support-TTT semantics."""
+    """Compose the complete Query objective from Answer and State only."""
 
     if answer_after.device != state_after.device:
         raise ValueError("composed outer Answer and State losses must share one device")
-    auxiliary = _support_ttt_term(support_ttt, answer_after + state_after)
     outer = answer_after + state_after
-    total = outer + _AUXILIARY_OUTER_WEIGHT * auxiliary.value
     return OuterLossOutput(
         answer_after=answer_after,
         state_after=state_after,
-        auxiliary_ttt=auxiliary,
         outer=outer,
-        total=total,
+        total=outer,
     )
-
-
-@dataclass(frozen=True, slots=True)
-class TrainingLossInput:
-    """One current TTT batch plus optional earlier/additional support TTT outputs."""
-
-    ttt: TTTLossInput
-    state_after: StateLossInput
-    answer_after: AnswerLossInput
-    support_ttt: tuple[TTTLossOutput, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class TrainingLossOutput:
-    ttt: TTTLossOutput
-    state: StateLossOutput
-    answer: AnswerLossOutput
-    outer: OuterLossOutput
-    total: Tensor
-
-    def __post_init__(self) -> None:
-        _require_fp32_scalar(self.total, "training total")
-
-
-def compute_losses(
-    inputs: TrainingLossInput | None = None,
-    *,
-    predictor: TemporalPredictor | None = None,
-) -> TrainingLossOutput:
-    """Compute the complete P14 objective from explicit typed inputs.
-
-    The no-argument guard preserves the staged-entrypoint audit: callers must supply typed inputs
-    and the registered Predictor rather than receive fabricated labels.
-    """
-
-    if inputs is None:
-        raise ValueError("compute_losses requires explicit TrainingLossInput")
-    if predictor is None:
-        raise ValueError("compute_losses requires the registered TemporalPredictor")
-    ttt = compute_ttt_loss(predictor, inputs.ttt)
-    state = compute_state_loss(inputs.state_after)
-    answer = compute_answer_loss(inputs.answer_after)
-    outer = compute_outer_loss(
-        OuterLossInput(
-            answer_after=answer,
-            state_after=state,
-            support_ttt=(ttt, *inputs.support_ttt),
-        )
-    )
-    return TrainingLossOutput(ttt=ttt, state=state, answer=answer, outer=outer, total=outer.total)
 
 
 def _compute_o1_state_term(target: O1StateTarget) -> LossTerm:
@@ -1703,19 +878,6 @@ def _scatter_term(local: LossTerm, row_indices: Tensor, batch_size: int) -> Loss
     )
 
 
-def _support_ttt_term(support: tuple[TTTLossOutput, ...], reference: Tensor) -> LossTerm:
-    if not support:
-        return _invalid_term(0, reference, LossSkipReason.NO_VALID_SUPPORT)
-    per_row = torch.cat(tuple(item.per_row_total for item in support), dim=0)
-    valid = torch.cat(tuple(item.update_valid_mask for item in support), dim=0)
-    per_row = torch.where(valid, per_row, torch.zeros_like(per_row))
-    counts = valid.to(torch.int64)
-    reasons = tuple(
-        None if bool(value.item()) else LossSkipReason.NO_VALID_SUPPORT for value in valid
-    )
-    return _make_term_from_rows(per_row, counts, torch.ones_like(counts), reasons)
-
-
 def _metric_from_items(
     correct: Tensor,
     valid_mask: Tensor,
@@ -1727,15 +889,6 @@ def _metric_from_items(
     per_row = torch.where(counts > 0, per_row, torch.zeros_like(per_row))
     reasons = tuple(None if int(count.item()) > 0 else invalid_reason for count in counts)
     return _make_term_from_rows(per_row, counts, mask_counts, reasons)
-
-
-def _reduce_overlap_items(losses: Tensor, pair_mask: Tensor, valid_mask: Tensor) -> LossTerm:
-    mask_counts = pair_mask.sum(dim=1, dtype=torch.int64)
-    reasons = tuple(
-        None if bool(valid_mask[row].any().item()) else LossSkipReason.NO_ALIGNED_EVENT
-        for row in range(valid_mask.shape[0])
-    )
-    return _reduce_items(losses, valid_mask, mask_counts, reasons)
 
 
 def _reduce_items(

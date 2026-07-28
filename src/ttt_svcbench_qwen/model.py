@@ -15,15 +15,20 @@ state rule.
 from __future__ import annotations
 
 import hashlib
-import math
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from threading import RLock
-from typing import Protocol
+from typing import Protocol, cast
 
 from torch import Tensor, nn
 
+from ttt_svcbench_qwen.associative_ttt import (
+    AssociativeTTTIntermediates,
+    FastAssociativeContext,
+    build_fast_associative_context,
+)
 from ttt_svcbench_qwen.config import ProjectConfig
 from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.fast_ttt import FastWeightsState, OptimizerRuntimeState
@@ -86,77 +91,6 @@ class RuntimeOwner:
 
 
 @dataclass(frozen=True, slots=True)
-class OnlineOverlapSnapshot:
-    """The sole detached adjacent-chunk memory used by training and inference."""
-
-    owner: RuntimeOwner
-    end_time: float
-    identity: Tensor
-    identity_valid_mask: Tensor
-    identity_position_ids: Tensor
-    identity_timestamps: Tensor
-    e1_probabilities: Tensor
-    e2_event_probabilities: Tensor
-    e2_phase_probabilities: Tensor
-    event_valid_mask: Tensor
-    event_position_ids: Tensor
-    event_timestamps: Tensor
-
-    def __post_init__(self) -> None:
-        if not math.isfinite(self.end_time) or self.end_time < 0.0:
-            raise ValueError("overlap snapshot end_time must be finite and non-negative")
-        tensors = self.tensors
-        if any(value.requires_grad or value.grad_fn is not None for value in tensors):
-            raise ValueError("overlap snapshots must be detached from autograd")
-        materialized = tuple(value for value in tensors if value.device.type != "meta")
-        storage = tuple(
-            (str(value.device), value.untyped_storage().data_ptr()) for value in materialized
-        )
-        if len(set(storage)) != len(storage):
-            raise ValueError("overlap snapshot tensors must use isolated storage")
-
-    @property
-    def tensors(self) -> tuple[Tensor, ...]:
-        return (
-            self.identity,
-            self.identity_valid_mask,
-            self.identity_position_ids,
-            self.identity_timestamps,
-            self.e1_probabilities,
-            self.e2_event_probabilities,
-            self.e2_phase_probabilities,
-            self.event_valid_mask,
-            self.event_position_ids,
-            self.event_timestamps,
-        )
-
-    @classmethod
-    def capture(
-        cls,
-        output: ObservationChunkOutput,
-        *,
-        end_time: float,
-    ) -> OnlineOverlapSnapshot:
-        observations = output.observations
-        if not isinstance(observations, ObservationOutputs):
-            raise TypeError("overlap snapshots require typed ObservationOutputs")
-        return cls(
-            owner=output.owner,
-            end_time=end_time,
-            identity=observations.o2.identity.detach().clone(),
-            identity_valid_mask=observations.o2.valid_mask.detach().clone(),
-            identity_position_ids=observations.o2.position_ids.detach().clone(),
-            identity_timestamps=observations.o2.timestamps.detach().clone(),
-            e1_probabilities=observations.e1.probabilities.detach().clone(),
-            e2_event_probabilities=observations.e2.event_probabilities.detach().clone(),
-            e2_phase_probabilities=observations.e2.phase_probabilities.detach().clone(),
-            event_valid_mask=observations.e1.valid_mask.detach().clone(),
-            event_position_ids=observations.e1.position_ids.detach().clone(),
-            event_timestamps=observations.e1.timestamps.detach().clone(),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class TrajectoryRuntimeState:
     """One authoritative trajectory across training and online inference."""
 
@@ -172,7 +106,6 @@ class TrajectoryRuntimeState:
     fast_weights: FastWeightsState | None = None
     optimizer: OptimizerRuntimeState | None = None
     reader_audit: tuple[ReaderResult, ...] = ()
-    online_overlap_memory: OnlineOverlapSnapshot | None = None
     released: bool = False
 
     def __post_init__(self) -> None:
@@ -559,6 +492,7 @@ class SoftIntermediates:
     temporal: TemporalEncoderOutput | None
     observations: ObservationOutputs | None
     state_write: object | None = None
+    fast_associative: AssociativeTTTIntermediates | None = None
 
 
 @dataclass(slots=True)
@@ -589,6 +523,7 @@ class SoftObservationChunkOutput:
     spatial: SpatialEncoderOutput | None
     temporal: TemporalEncoderOutput | None
     observations: ObservationOutputs | None
+    fast_associative: AssociativeTTTIntermediates | None
     commit_guard: ObservationCommitGuard
 
 
@@ -1004,20 +939,29 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
     ) -> SoftObservationChunkOutput:
         """Run only differentiable observation stages; safe to recompute for checkpointing."""
 
-        visual = self.components.visual_stage(request)
-        if not isinstance(visual, VisualStageOutput):
-            raise TypeError("visual_stage must return VisualStageOutput")
         query = (
             request.prepared_query.value
             if request.prepared_query is not None
             else self.components.query_encoder(request.query_input, inference=request.inference)
         )
-        adapted = visual
-        if self.feature_flags.fast_enabled:
-            fast_adapter = self.components.require_fast_adapter()
-            adapted = fast_adapter(visual, query, request)
-            if not isinstance(adapted, VisualStageOutput):
-                raise TypeError("fast_adapter must return VisualStageOutput")
+        fast_adapter = self.components.fast_adapter
+        associative_context = self._build_associative_context(query, request.bank_states)
+        binding = nullcontext()
+        if fast_adapter is not None and associative_context is not None:
+            binder = getattr(fast_adapter, "use_associative_context", None)
+            if binder is not None:
+                binding = binder(associative_context)
+        with binding:
+            visual = self.components.visual_stage(request)
+            if not isinstance(visual, VisualStageOutput):
+                raise TypeError("visual_stage must return VisualStageOutput")
+            adapted = visual
+            if self.feature_flags.fast_enabled:
+                fast_adapter = self.components.require_fast_adapter()
+                adapted = fast_adapter(visual, query, request)
+                if not isinstance(adapted, VisualStageOutput):
+                    raise TypeError("fast_adapter must return VisualStageOutput")
+        fast_associative = self._consume_associative_intermediates(fast_adapter, required=True)
 
         spatial: SpatialEncoderOutput | None = None
         temporal: TemporalEncoderOutput | None = None
@@ -1037,6 +981,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             spatial=spatial,
             temporal=temporal,
             observations=observations,
+            fast_associative=fast_associative,
             commit_guard=ObservationCommitGuard(request.owner),
         )
 
@@ -1120,6 +1065,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
                     temporal=soft.temporal,
                     observations=soft.observations,
                     state_write=soft_write,
+                    fast_associative=soft.fast_associative,
                 ),
                 lifecycle=lifecycle.audit(),
             )
@@ -1234,7 +1180,19 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
         request = prepared.request
         lifecycle._begin("prefill", request.owner)
         try:
-            qwen_output = self.components.qwen_prefill(prepared.qwen_request)
+            context = self._build_associative_context(
+                request.observation.query,
+                request.observation.bank_states,
+            )
+            fast_adapter = self.components.fast_adapter
+            binding = nullcontext()
+            if fast_adapter is not None and context is not None:
+                binder = getattr(fast_adapter, "use_associative_context", None)
+                if binder is not None:
+                    binding = binder(context)
+            with binding:
+                qwen_output = self.components.qwen_prefill(prepared.qwen_request)
+            self._consume_associative_intermediates(fast_adapter, required=False)
             lifecycle._succeed("prefill", request.observation.runtime_state)
             observation = request.observation
             return StateTTTModelOutput(
@@ -1271,9 +1229,21 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
         request = prepared.request
         lifecycle._begin("prefill", request.owner)
         try:
-            generated = self.components.qwen_generate(
-                QwenGenerateRequest(prepared.qwen_request, max_new_tokens=max_new_tokens)
+            context = self._build_associative_context(
+                request.observation.query,
+                request.observation.bank_states,
             )
+            fast_adapter = self.components.fast_adapter
+            binding = nullcontext()
+            if fast_adapter is not None and context is not None:
+                binder = getattr(fast_adapter, "use_associative_context", None)
+                if binder is not None:
+                    binding = binder(context)
+            with binding:
+                generated = self.components.qwen_generate(
+                    QwenGenerateRequest(prepared.qwen_request, max_new_tokens=max_new_tokens)
+                )
+            self._consume_associative_intermediates(fast_adapter, required=False)
             lifecycle._succeed("prefill", request.observation.runtime_state)
             return StateTTTGenerationOutput(
                 answer_text=generated.answer_text,
@@ -1287,6 +1257,36 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
         except Exception:
             lifecycle._fail("prefill")
             raise
+
+    def _build_associative_context(
+        self,
+        query: QueryEncoderOutput,
+        bank_states: Sequence[StateBankRuntimeState],
+    ) -> FastAssociativeContext | None:
+        if not self.feature_flags.fast_enabled or not self.feature_flags.bank_enabled:
+            return None
+        state_bank = self.components.state_bank
+        if not isinstance(state_bank, StructuredStateBank):
+            return None
+        return build_fast_associative_context(query.q_target, state_bank.view(bank_states))
+
+    @staticmethod
+    def _consume_associative_intermediates(
+        fast_adapter: FastStage | None,
+        *,
+        required: bool,
+    ) -> AssociativeTTTIntermediates | None:
+        if fast_adapter is None:
+            return None
+        consumer = getattr(fast_adapter, "consume_associative_intermediates", None)
+        if consumer is None:
+            return None
+        try:
+            return cast(AssociativeTTTIntermediates, consumer())
+        except RuntimeError:
+            if required:
+                raise
+            return None
 
 
 def assert_training_number_agreement(
