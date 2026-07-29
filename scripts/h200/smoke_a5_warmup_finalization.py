@@ -42,6 +42,7 @@ def _worker(
         init_method=f"file://{init_path}",
         rank=rank,
         world_size=world_size,
+        device_id=device,
     )
     try:
         torch.manual_seed(41)
@@ -58,13 +59,13 @@ def _worker(
         )
         if final_qwen_sha256 != initial_qwen_sha256:
             raise RuntimeError("Qwen digest changed in the finalization smoke")
-        torch.distributed.barrier()
+        torch.distributed.barrier(device_ids=[rank])
         if rank == 0:
             allowlist, tensors = prepared
             if tuple(sorted(tensors)) != allowlist:
                 raise RuntimeError("prepared bundle allowlist drifted")
             save_file(tensors, output_path)
-        torch.distributed.barrier()
+        torch.distributed.barrier(device_ids=[rank])
     finally:
         torch.distributed.destroy_process_group()
 

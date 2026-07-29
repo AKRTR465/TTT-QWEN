@@ -34,6 +34,7 @@ def _warmup_finalization_worker(
         init_method=f"file://{init_path}",
         rank=rank,
         world_size=world_size,
+        device_id=device,
     )
     try:
         torch.manual_seed(41)
@@ -51,12 +52,12 @@ def _warmup_finalization_worker(
             )
         )
         assert final_qwen_sha256 == initial_qwen_sha256
-        torch.distributed.barrier()
+        torch.distributed.barrier(device_ids=[rank])
         if rank == 0:
             allowlist, tensors = prepared
             assert tuple(sorted(tensors)) == allowlist
             save_file(tensors, output_path)
-        torch.distributed.barrier()
+        torch.distributed.barrier(device_ids=[rank])
     finally:
         torch.distributed.destroy_process_group()
 
