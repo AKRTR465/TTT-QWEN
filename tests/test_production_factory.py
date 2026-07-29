@@ -1398,6 +1398,7 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
     launcher = (root / "scripts/h200/train_a5_vithalf_decoder8.sh").read_text(encoding="utf-8")
     assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
     assert 'TTT_DATALOADER_TRACE="${TTT_DATALOADER_TRACE:-1}"' in launcher
+    assert 'TTT_SKIP_ENV_SETUP="${TTT_SKIP_ENV_SETUP:-1}"' in launcher
     assert "[[ $# -eq 3 ]] || usage" in launcher
     assert "<a5_warmup_bundle>" in launcher
     assert "<dataset_manifest.json>" in launcher
@@ -1435,6 +1436,7 @@ def test_a5_associative_lttt_finalonly_launcher_contract(
     assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
     assert "a5_dense_querybundle_train_support_statequery_fp16_v4" in launcher
     assert 'TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"' in launcher
+    assert 'TTT_SKIP_ENV_SETUP="${TTT_SKIP_ENV_SETUP:-1}"' in launcher
     assert "[[ $# -eq 3 ]] || usage" in launcher
     assert 'train_a2_a5.sh" a5 "$1" "$3"' in launcher
 
@@ -1470,6 +1472,7 @@ def test_a5_fast_state_warmup_yaml_and_launcher_are_restart_only(
     assert extension.qwen_outer_trainability.mode == "frozen"
     assert "[[ $# -eq 2 ]] || usage" in launcher
     assert "a5_warmup_bundle only" in launcher
+    assert 'TTT_SKIP_ENV_SETUP="${TTT_SKIP_ENV_SETUP:-1}"' in launcher
 
 
 def test_a5_static_w0_yaml_and_launcher_match_meta_ttt_data_contract(
