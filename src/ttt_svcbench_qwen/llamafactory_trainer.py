@@ -12,6 +12,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
 import time
 import warnings
@@ -31,6 +32,7 @@ if __name__ == "__main__":
 import torch
 import transformers
 from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
 
 from ttt_svcbench_qwen.config import OuterGradientControlMode, ProjectConfig
@@ -89,6 +91,20 @@ class ProductionStage(StrEnum):
 class CheckpointPolicy(StrEnum):
     ATOMIC_FINAL_ONLY = "atomic_final_only"
     EPOCH_2_AND_EPOCH_4 = "epoch_2_and_epoch_4"
+
+
+_WARMUP_BUNDLE_SCHEMA_VERSION = 1
+_WARMUP_BUNDLE_EXCLUDED_TOKENS = (
+    "official_weak_balancer",
+    "transient_w_t",
+    "state_bank_runtime",
+    "identity_bank_runtime",
+    "fsm_runtime",
+    "optimizer",
+    "scheduler",
+    "runtime",
+    "cache",
+)
 
 
 class StageALossStep(Protocol):
@@ -591,7 +607,7 @@ class _SemanticProjectorStepAuditor:
 class _A5ParameterGroupStepAuditor:
     """Measure real post-Adam deltas for the groups implicated in A5 TTT drift."""
 
-    _GROUP_NAMES = ("associative", "w0", "state_shared")
+    _GROUP_NAMES = ("associative", "fast_slow", "w0", "state_shared")
     _DEFAULT_GROUP_NAMES = ("associative", "w0", "state_shared")
 
     def __init__(
@@ -612,12 +628,22 @@ class _A5ParameterGroupStepAuditor:
             raise ValueError("A5 parameter delta audit groups are invalid")
         self.group_names = selected
         grouped: dict[str, list[nn.Parameter]] = {name: [] for name in self.group_names}
+        fast_slow_ids = {
+            id(parameter)
+            for module in model.modules()
+            if isinstance(module, FastTTTAdapter)
+            for parameter in module.collect_slow_parameters()
+        }
         seen: set[int] = set()
         for name, parameter in model.named_parameters(remove_duplicate=False):
             parameter_id = id(parameter)
             if not parameter.requires_grad or parameter_id in seen:
                 continue
-            group = self._classify_parameter(name)
+            group = (
+                "fast_slow"
+                if parameter_id in fast_slow_ids
+                else self._classify_parameter(name)
+            )
             if group in grouped:
                 grouped[group].append(parameter)
             seen.add(parameter_id)
@@ -759,10 +785,13 @@ class OuterParameterAudit:
     transient_parameter_names: tuple[str, ...]
     backbone_registered: bool
     a5_adaptation_mode: str = "meta_ttt"
+    a5_phase: str = "main"
 
     def __post_init__(self) -> None:
         if self.a5_adaptation_mode not in {"meta_ttt", "static_w0"}:
             raise ValueError("outer parameter audit has an invalid A5 adaptation mode")
+        if self.a5_phase not in {"fast_state_warmup", "main"}:
+            raise ValueError("outer parameter audit has an invalid A5 phase")
         if self.total_parameter_count <= 0 or self.trainable_parameter_count <= 0:
             raise ValueError("production outer model exposes no trainable parameters")
         if self.associative_parameter_count <= 0:
@@ -787,8 +816,11 @@ class OuterParameterAudit:
             if self.trainable_parameter_count != expected:
                 raise ValueError("A2 must train every registered non-Associative parameter")
         elif self.a5_adaptation_mode == "meta_ttt":
-            if self.qwen_trainable_count <= 0:
-                raise ValueError("A5 must train at least one configured Qwen parameter")
+            if self.a5_phase == "fast_state_warmup":
+                if self.qwen_trainable_count:
+                    raise ValueError("Fast/State warmup must freeze every Qwen parameter")
+            elif self.qwen_trainable_count <= 0:
+                raise ValueError("A5 main must train configured Qwen parameters")
             if self.non_qwen_trainable_count != self.non_qwen_parameter_count:
                 raise ValueError("A5 must train every state, W0, and Associative parameter")
             if self.associative_trainable_count != self.associative_parameter_count:
@@ -1500,8 +1532,24 @@ class TTTQwenTrainerMixin:
                         meta_audit.bank_record_count
                     ),
                     "a5/associative/empty_bank_count": float(meta_audit.empty_bank_count),
+                    "a5/associative/state_write/valid_target_count": float(
+                        sum(count for _, count in meta_audit.valid_target_counts)
+                    ),
+                    "a5/associative/state_write/unsupported_target_count": float(
+                        meta_audit.unsupported_target_count
+                    ),
+                    "a5/associative/state_write/empty_target_skip_count": float(
+                        meta_audit.empty_target_skip_count
+                    ),
+                    "a5/associative/state_write/prediction_target_cosine": (
+                        meta_audit.prediction_target_cosine_mean
+                    ),
                 }
             )
+            for head, count in meta_audit.active_head_counts:
+                enriched[f"a5/associative/state_write/active_head/{head}"] = float(count)
+            for head, count in meta_audit.valid_target_counts:
+                enriched[f"a5/associative/state_write/valid_target/{head}"] = float(count)
             role_norms: dict[str, list[float]] = {}
             role_clipped_norms: dict[str, list[float]] = {}
             role_losses: dict[str, list[float]] = {}
@@ -2088,6 +2136,11 @@ def _run_main(argv: list[str] | None = None) -> int:
         configured_stage,
         a5_adaptation_mode=backbone.ttt_config.a5_adaptation_mode,
     )
+    if (
+        backbone.ttt_config.a5_phase == "fast_state_warmup"
+        and same_stage_resume is not None
+    ):
+        raise ValueError("Fast/State warmup is restart-only and cannot resume")
     if same_stage_resume is not None:
         _validate_resume_balance_schema(same_stage_resume)
     from ttt_svcbench_qwen.production_runtime import _video_pixel_bounds, build_runtime
@@ -2153,6 +2206,7 @@ def _run_main(argv: list[str] | None = None) -> int:
             ),
         )
     checkpoint_audit: OuterCheckpointAudit | None = None
+    warmup_bundle_audit: dict[str, object] | None = None
     if configured_stage is ProductionStage.A5 and same_stage_resume is None:
         checkpoint = backbone.ttt_config.initialize_from_a2_checkpoint
         if checkpoint is None:
@@ -2163,12 +2217,17 @@ def _run_main(argv: list[str] | None = None) -> int:
             checkpoint,
             allowed_missing_fragments=(
                 ".p_context.",
-                ".p_value.",
                 "associative_contract_version",
             ),
-            allowed_unexpected_prefixes=("predictor.",),
+            allowed_unexpected_prefixes=("predictor.", "p_value."),
         )
         _reset_a2_to_a5_associative(runtime_raw.model)
+        if backbone.ttt_config.a5_phase == "main":
+            warmup_bundle_audit = _load_warmup_bundle(
+                model=runtime_raw.model,
+                qwen_model=backbone.model,
+                backbone=backbone,
+            )
         _reset_a2_to_a5_balance(runtime_raw.model)
     expected_gradient_groups = (
         (
@@ -2181,7 +2240,12 @@ def _run_main(argv: list[str] | None = None) -> int:
         )
         if configured_stage is ProductionStage.A2
         else (
-            "qwen",
+            *(
+                ("qwen",)
+                if backbone.ttt_config.a5_phase == "main"
+                else ()
+            ),
+            "fast_slow",
             "state_shared",
             "state_task",
             "state_router_time",
@@ -2196,6 +2260,7 @@ def _run_main(argv: list[str] | None = None) -> int:
             backbone,
             configured_stage,
             a5_adaptation_mode=backbone.ttt_config.a5_adaptation_mode,
+            a5_phase=backbone.ttt_config.a5_phase,
         ),
         gradient_controller=OuterGradientController(
             backbone.project_config.outer_gradient_control,
@@ -2220,7 +2285,11 @@ def _run_main(argv: list[str] | None = None) -> int:
             )
         ),
     )
-    parameter_audit = _audit_outer_parameters(backbone, runtime_raw)
+    parameter_audit = _audit_outer_parameters(
+        backbone,
+        runtime_raw,
+        a5_phase=backbone.ttt_config.a5_phase,
+    )
     audit_outer_checkpoint_boundary(runtime_raw.model)
     training_args = cast(Any, backbone.training_args)
     project = backbone.project_config
@@ -2228,24 +2297,33 @@ def _run_main(argv: list[str] | None = None) -> int:
         budget_lrs = (
             float(project.a2.optimizer.qwen_learning_rate),
             float(project.a2.optimizer.state_learning_rate),
+            float(project.a2.optimizer.state_learning_rate),
             float(project.a2.optimizer.w0_learning_rate),
             float(project.a2.optimizer.state_learning_rate),
         )
     else:
+        phase_optimizer = (
+            project.a5.warmup
+            if backbone.ttt_config.a5_phase == "fast_state_warmup"
+            else project.a5.optimizer
+        )
         budget_lrs = (
             float(training_args.learning_rate),
-            float(project.a5.optimizer.state_learning_rate),
-            float(project.a5.optimizer.w0_learning_rate),
-            float(project.a5.optimizer.associative_learning_rate),
+            float(phase_optimizer.fast_slow_learning_rate),
+            float(phase_optimizer.state_learning_rate),
+            float(phase_optimizer.w0_learning_rate),
+            float(phase_optimizer.associative_learning_rate),
         )
     budget_audit = _outer_update_norm_budget_audit(
         project,
         configured_stage,
         qwen_lr=budget_lrs[0],
-        state_lr=budget_lrs[1],
-        w0_lr=budget_lrs[2],
-        associative_lr=budget_lrs[3],
+        fast_slow_lr=budget_lrs[1],
+        state_lr=budget_lrs[2],
+        w0_lr=budget_lrs[3],
+        associative_lr=budget_lrs[4],
         a5_adaptation_mode=runtime_raw.a5_adaptation_mode,
+        a5_phase=backbone.ttt_config.a5_phase,
     )
     raw_smoke_steps = os.environ.get("TTT_SMOKE_MAX_STEPS")
     smoke_max_steps: int | None = None
@@ -2270,10 +2348,21 @@ def _run_main(argv: list[str] | None = None) -> int:
         _disable_smoke_checkpoints(training_args)
     if checkpoint_policy is CheckpointPolicy.EPOCH_2_AND_EPOCH_4:
         _validate_epoch_two_four_training_arguments(training_args)
+    if (
+        backbone.ttt_config.a5_phase == "fast_state_warmup"
+        and smoke_max_steps is None
+    ):
+        _validate_fast_state_warmup_training_arguments(training_args, project)
     trainer = cast(Any, build_production_trainer(backbone, runtime_raw))
     output_dir = Path(str(training_args.output_dir))
     artifact_root = Path(os.environ.get("RUN_ROOT", str(output_dir)))
     sequence_audit: tuple[str, int] | None = None
+    initial_qwen_sha256: str | None = None
+    if (
+        backbone.ttt_config.a5_phase == "fast_state_warmup"
+        and trainer.is_world_process_zero()
+    ):
+        initial_qwen_sha256 = _module_bitwise_sha256(backbone.model)
     if configured_stage is ProductionStage.A5:
         # The sampler synchronizes its runtime-cost EMA when advancing epochs. Every rank
         # must therefore execute this preflight in the same collective order; running it
@@ -2292,6 +2381,7 @@ def _run_main(argv: list[str] | None = None) -> int:
             environment["a5_global_sample_sequence_sha256"] = sequence_sha256
             environment["a5_global_sample_sequence_count"] = sequence_count
         environment["qwen_trainability_audit"] = asdict(trainability_audit)
+        environment["a5_phase"] = backbone.ttt_config.a5_phase
         if full_unfreeze_audit is not None:
             environment["full_unfreeze_audit"] = asdict(full_unfreeze_audit)
         environment["outer_parameter_audit"] = asdict(parameter_audit)
@@ -2304,6 +2394,8 @@ def _run_main(argv: list[str] | None = None) -> int:
             checkpoint_environment = asdict(checkpoint_audit)
             checkpoint_environment["checkpoint"] = str(checkpoint_audit.checkpoint)
         environment["a2_initialization_audit"] = checkpoint_environment
+        environment["warmup_bundle_audit"] = warmup_bundle_audit
+        environment["warmup_qwen_initial_sha256"] = initial_qwen_sha256
         _write_json(artifact_root / "environment.json", environment)
     if configured_stage is ProductionStage.A5:
         trainer.accelerator.wait_for_everyone()
@@ -2337,6 +2429,45 @@ def _run_main(argv: list[str] | None = None) -> int:
                     "resumed_from": None,
                 },
             )
+        return 0
+    if backbone.ttt_config.a5_phase == "fast_state_warmup":
+        trainer.accelerator.wait_for_everyone()
+        trainer.log_metrics("train", result.metrics)
+        trainer.save_metrics("train", result.metrics)
+        if trainer.is_world_process_zero():
+            if initial_qwen_sha256 is None:
+                raise RuntimeError("warmup lost the initial Qwen bitwise digest")
+            final_qwen_sha256 = _module_bitwise_sha256(backbone.model)
+            if final_qwen_sha256 != initial_qwen_sha256:
+                raise RuntimeError("Qwen parameters/buffers changed during Fast/State warmup")
+            bundle_path, bundle_manifest = _publish_warmup_bundle(
+                model=runtime_raw.model,
+                qwen_model=backbone.model,
+                backbone=backbone,
+                artifact_root=artifact_root,
+                global_step=int(trainer.state.global_step),
+                qwen_sha256=final_qwen_sha256,
+            )
+            _write_json(
+                artifact_root / "run_summary.json",
+                {
+                    "status": "completed",
+                    "stage": runtime_raw.stage.value,
+                    "a5_phase": "fast_state_warmup",
+                    "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
+                    "global_step": int(trainer.state.global_step),
+                    "elapsed_seconds": time.monotonic() - started,
+                    "metrics": result.metrics,
+                    "checkpoint_policy": "warmup_bundle_only",
+                    "warmup_bundle": str(bundle_path),
+                    "warmup_bundle_manifest": bundle_manifest,
+                    "qwen_bitwise_unchanged": True,
+                    "final_checkpoint": None,
+                    "resume_state": None,
+                    "resumed_from": None,
+                },
+            )
+        trainer.accelerator.wait_for_everyone()
         return 0
     if checkpoint_policy is CheckpointPolicy.EPOCH_2_AND_EPOCH_4:
         trainer.accelerator.wait_for_everyone()
@@ -2451,6 +2582,25 @@ def _validate_epoch_two_four_training_arguments(training_args: object) -> None:
         )
     if save_total_limit < 2:
         raise ValueError("epoch_2_and_epoch_4 checkpoint policy requires save_total_limit>=2")
+
+
+def _validate_fast_state_warmup_training_arguments(
+    training_args: object,
+    project: ProjectConfig,
+) -> None:
+    """Fail closed unless the independent warmup scheduler is exactly reproducible."""
+
+    arguments = cast(Any, training_args)
+    scheduler_raw = arguments.lr_scheduler_type
+    scheduler = getattr(scheduler_raw, "value", str(scheduler_raw))
+    if int(arguments.max_steps) != project.a5.warmup.max_steps:
+        raise ValueError("Fast/State warmup requires exactly 128 optimizer steps")
+    if int(arguments.warmup_steps) != project.a5.warmup.linear_warmup_steps:
+        raise ValueError("Fast/State warmup requires exactly four linear warmup steps")
+    if scheduler != "cosine":
+        raise ValueError("Fast/State warmup requires the cosine scheduler")
+    if int(arguments.gradient_accumulation_steps) != 1:
+        raise ValueError("Fast/State warmup requires one optimizer step per episode batch")
 
 
 def _standard_checkpoint_progress(checkpoint: Path) -> tuple[int, int, float]:
@@ -2608,11 +2758,11 @@ def resolve_same_stage_resume(
     raw = cast(object, json.loads(run_config.read_text(encoding="utf-8")))
     if not isinstance(raw, dict) or raw.get("stage") != stage.value:
         raise ValueError("resume checkpoint stage does not match the configured production stage")
-    if raw.get("config_schema_version") != 11 or raw.get(
+    if raw.get("config_schema_version") != 12 or raw.get(
         "associative_ttt_contract"
-    ) != "bank_conditioned_visual_v1":
+    ) != "bank_conditioned_state_write_v2":
         raise ValueError(
-            "same-stage resume requires the schema-11 Bank-conditioned associative contract"
+            "same-stage resume requires the schema-12 state-write associative contract"
         )
     if stage is ProductionStage.A5:
         checkpoint_mode = raw.get("a5_adaptation_mode", "meta_ttt")
@@ -2678,6 +2828,8 @@ def _validate_resume_balance_schema(checkpoint: Path) -> None:
 def _audit_outer_parameters(
     backbone: LlamaFactoryBackboneBundle,
     runtime: ProductionTrainerRuntime,
+    *,
+    a5_phase: str = "main",
 ) -> OuterParameterAudit:
     named = tuple(runtime.model.named_parameters())
     removed = tuple(name for name, _ in named if "step_controller" in name.casefold())
@@ -2722,6 +2874,7 @@ def _audit_outer_parameters(
         ),
         transient_parameter_names=transient,
         backbone_registered=bool(backbone_ids) and backbone_ids <= runtime_ids,
+        a5_phase=a5_phase,
     )
 
 
@@ -2730,15 +2883,25 @@ def _outer_update_norm_budget_audit(
     stage: ProductionStage,
     *,
     qwen_lr: float,
+    fast_slow_lr: float,
     state_lr: float,
     w0_lr: float,
     associative_lr: float,
     a5_adaptation_mode: str,
+    a5_phase: str = "main",
 ) -> dict[str, object]:
     caps = project.outer_gradient_control.max_grad_norm
-    reference_budget = qwen_lr * float(caps.qwen)
+    if stage is ProductionStage.A5:
+        reference_budget = fast_slow_lr * float(caps.fast_slow)
+    else:
+        reference_budget = qwen_lr * float(caps.qwen)
     independent_budgets = {
         "w0": w0_lr * float(caps.w0),
+        **(
+            {"fast_slow": fast_slow_lr * float(caps.fast_slow)}
+            if stage is ProductionStage.A5
+            else {}
+        ),
         **(
             {"associative": associative_lr * float(caps.associative)}
             if stage is ProductionStage.A5 and a5_adaptation_mode == "meta_ttt"
@@ -2764,14 +2927,25 @@ def _outer_update_norm_budget_audit(
     state_rss_budget = math.sqrt(
         sum((state_lr * float(getattr(caps, name))) ** 2 for name in state_names)
     )
-    if not math.isclose(state_rss_budget, reference_budget, rel_tol=1.0e-6):
+    if a5_phase != "fast_state_warmup" and not math.isclose(
+        state_rss_budget, reference_budget, rel_tol=1.0e-6
+    ):
         raise ValueError("state subgroup RSS update-norm budget drifted from the formal cap")
+    qwen_budget = qwen_lr * float(caps.qwen)
+    if (
+        stage is ProductionStage.A5
+        and a5_phase == "main"
+        and not math.isclose(qwen_budget, reference_budget, rel_tol=1.0e-6)
+    ):
+        raise ValueError("A5 main Qwen update-norm budget drifted from Fast/State reference")
     return {
         "policy": mode.value,
         "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
         "reference": reference_budget,
         "independent": independent_budgets,
         "state_rss": state_rss_budget,
+        "qwen": qwen_budget,
+        "a5_phase": a5_phase,
     }
 
 
@@ -2780,11 +2954,16 @@ def make_production_outer_optimizer_factory(
     stage: ProductionStage,
     *,
     a5_adaptation_mode: str = "meta_ttt",
+    a5_phase: str = "main",
 ) -> Callable[[nn.Module], torch.optim.Optimizer]:
     if a5_adaptation_mode not in {"meta_ttt", "static_w0"}:
         raise ValueError("A5 adaptation mode must be meta_ttt or static_w0")
     if stage is ProductionStage.A2 and a5_adaptation_mode != "meta_ttt":
         raise ValueError("A2 cannot select an A5 adaptation mode")
+    if a5_phase not in {"fast_state_warmup", "main"}:
+        raise ValueError("A5 phase must be fast_state_warmup or main")
+    if stage is ProductionStage.A2 and a5_phase != "main":
+        raise ValueError("A2 cannot select an A5 phase")
     qwen_ids = {id(parameter) for parameter in backbone.model.parameters()}
     training_args = cast(Any, backbone.training_args)
     if stage is ProductionStage.A2:
@@ -2792,9 +2971,14 @@ def make_production_outer_optimizer_factory(
         state_lr = backbone.project_config.a2.optimizer.state_learning_rate
         w0_lr = backbone.project_config.a2.optimizer.w0_learning_rate
         associative_lr = state_lr
+        fast_slow_lr = state_lr
     else:
         qwen_lr = float(training_args.learning_rate)
-        optimizer = backbone.project_config.a5.optimizer
+        if a5_phase == "fast_state_warmup":
+            optimizer = backbone.project_config.a5.warmup
+        else:
+            optimizer = backbone.project_config.a5.optimizer
+        fast_slow_lr = optimizer.fast_slow_learning_rate
         state_lr = optimizer.state_learning_rate
         w0_lr = optimizer.w0_learning_rate
         associative_lr = optimizer.associative_learning_rate
@@ -2802,6 +2986,7 @@ def make_production_outer_optimizer_factory(
     def factory(model: nn.Module) -> torch.optim.Optimizer:
         groups: dict[str, list[nn.Parameter]] = {
             "qwen": [],
+            "fast_slow": [],
             "state_shared": [],
             "state_task": [],
             "state_router_time": [],
@@ -2809,6 +2994,10 @@ def make_production_outer_optimizer_factory(
             "w0": [],
             "associative": [],
         }
+        adapters = tuple(module for module in model.modules() if isinstance(module, FastTTTAdapter))
+        if len(adapters) != 1:
+            raise RuntimeError("Outer optimizer requires exactly one FastTTTAdapter")
+        fast_slow_ids = {id(parameter) for parameter in adapters[0].collect_slow_parameters()}
         ownership: dict[int, str] = {}
         for name, parameter in model.named_parameters(remove_duplicate=False):
             if not parameter.requires_grad:
@@ -2821,6 +3010,8 @@ def make_production_outer_optimizer_factory(
                 raise ValueError("step-controller parameters were removed from canonical A5")
             if parameter_id in qwen_ids:
                 group = "qwen"
+            elif stage is ProductionStage.A5 and parameter_id in fast_slow_ids:
+                group = "fast_slow"
             elif _is_associative_parameter_name(lowered):
                 group = "associative"
             elif lowered.endswith(("w0_1", "w0_2")) or "meta_fast" in lowered:
@@ -2843,7 +3034,8 @@ def make_production_outer_optimizer_factory(
             ownership[parameter_id] = group
             groups[group].append(parameter)
         required = (
-            "qwen",
+            *(("qwen",) if stage is ProductionStage.A2 or a5_phase == "main" else ()),
+            *(("fast_slow",) if stage is ProductionStage.A5 else ()),
             "state_shared",
             "state_task",
             "state_router_time",
@@ -2856,6 +3048,8 @@ def make_production_outer_optimizer_factory(
         if stage is ProductionStage.A2 and groups["associative"]:
             raise ValueError("A2 Outer AdamW cannot own Associative")
         if stage is ProductionStage.A5:
+            if a5_phase == "fast_state_warmup" and groups["qwen"]:
+                raise ValueError("Fast/State warmup cannot own a Qwen optimizer group")
             if a5_adaptation_mode == "meta_ttt" and not groups["associative"]:
                 raise ValueError("Meta-TTT A5 Outer AdamW must own Associative")
             if a5_adaptation_mode == "static_w0" and groups["associative"]:
@@ -2878,6 +3072,7 @@ def make_production_outer_optimizer_factory(
             raise ValueError("every trainable Outer parameter must belong to exactly one group")
         learning_rates = {
             "qwen": qwen_lr,
+            "fast_slow": fast_slow_lr,
             "state_shared": state_lr,
             "state_task": state_lr,
             "state_router_time": state_lr,
@@ -2898,10 +3093,12 @@ def make_production_outer_optimizer_factory(
             backbone.project_config,
             stage,
             qwen_lr=qwen_lr,
+            fast_slow_lr=float(fast_slow_lr),
             state_lr=state_lr,
             w0_lr=w0_lr,
             associative_lr=associative_lr,
             a5_adaptation_mode=a5_adaptation_mode,
+            a5_phase=a5_phase,
         )
         trace_event("outer_optimizer_update_norm_budgets", **budget_audit)
         optimizer = torch.optim.AdamW(
@@ -2931,11 +3128,7 @@ def make_production_outer_optimizer_factory(
 
 def _is_associative_parameter_name(name: str) -> bool:
     lowered = name.casefold()
-    return (
-        lowered.startswith(("p_context.", "p_value."))
-        or ".p_context." in lowered
-        or ".p_value." in lowered
-    )
+    return lowered.startswith("p_context.") or ".p_context." in lowered
 
 
 def _reset_a2_to_a5_associative(model: nn.Module) -> None:
@@ -2981,6 +3174,284 @@ def _a5_global_sample_sequence_sha256(
     if count <= 0:
         raise RuntimeError("A5 sample-sequence audit produced no records")
     return digest.hexdigest(), count
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(8 * 1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _a2_checkpoint_sha256(checkpoint: Path) -> str:
+    """Hash the complete loadable A2 model payload in stable filename order."""
+
+    root = checkpoint.expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"A2 checkpoint directory does not exist: {root}")
+    single_candidates = (root / "model.safetensors", root / "pytorch_model.bin")
+    present_single = tuple(path for path in single_candidates if path.is_file())
+    index_candidates = (
+        root / "model.safetensors.index.json",
+        root / "pytorch_model.bin.index.json",
+    )
+    present_index = tuple(path for path in index_candidates if path.is_file())
+    if len(present_single) + len(present_index) != 1:
+        raise RuntimeError("A2 checkpoint must expose exactly one model weight entrypoint")
+    if present_single:
+        files = present_single
+    else:
+        index_path = present_index[0]
+        raw = cast(object, json.loads(index_path.read_text(encoding="utf-8")))
+        weight_map = raw.get("weight_map") if isinstance(raw, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise RuntimeError("A2 checkpoint shard index has no weight_map")
+        shard_names = tuple(
+            sorted({value for value in weight_map.values() if isinstance(value, str)})
+        )
+        if not shard_names or len(shard_names) != len(set(weight_map.values())):
+            raise RuntimeError("A2 checkpoint shard index contains invalid shard names")
+        files = (index_path, *(root / name for name in shard_names))
+    digest = hashlib.sha256()
+    for path in files:
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise FileNotFoundError(f"A2 checkpoint weight file is missing or empty: {path}")
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_sha256_file(path).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _effective_project_config_sha256(project: ProjectConfig) -> str:
+    payload = json.dumps(
+        project.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _current_git_commit(root: Path) -> tuple[str, bool]:
+    commit = subprocess.run(
+        ("git", "-C", str(root), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    dirty = bool(
+        subprocess.run(
+            ("git", "-C", str(root), "status", "--porcelain"),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    if not commit:
+        raise RuntimeError("Git did not return a code commit")
+    return commit, dirty
+
+
+def _warmup_bundle_allowlist(
+    model: nn.Module,
+    qwen_model: nn.Module,
+) -> tuple[str, ...]:
+    """Return every persistent non-Qwen tensor trained/carried by warmup."""
+
+    qwen_ids = {
+        id(value)
+        for value in (
+            *qwen_model.parameters(),
+            *qwen_model.buffers(),
+        )
+    }
+    names: set[str] = set()
+    for name, value in (
+        *model.named_parameters(remove_duplicate=False),
+        *model.named_buffers(remove_duplicate=False),
+    ):
+        lowered = name.casefold()
+        if id(value) in qwen_ids:
+            continue
+        if any(token in lowered for token in _WARMUP_BUNDLE_EXCLUDED_TOKENS):
+            continue
+        names.add(name)
+    if not names:
+        raise RuntimeError("warmup bundle allowlist contains no non-Qwen tensors")
+    state_keys = set(model.state_dict())
+    if not names <= state_keys:
+        raise RuntimeError("warmup bundle allowlist contains non-persistent tensors")
+    if any(name.casefold().endswith(("w_t_1", "w_t_2")) for name in names):
+        raise RuntimeError("transient W_t entered the warmup bundle allowlist")
+    return tuple(sorted(names))
+
+
+def _module_bitwise_sha256(module: nn.Module) -> str:
+    """Stream a deterministic bitwise digest without retaining a second model copy."""
+
+    digest = hashlib.sha256()
+    for name, tensor in sorted(module.state_dict().items()):
+        value = tensor.detach().contiguous().cpu()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _warmup_source_manifest(
+    *,
+    backbone: LlamaFactoryBackboneBundle,
+    code_root: Path,
+) -> dict[str, object]:
+    checkpoint_raw = backbone.ttt_config.initialize_from_a2_checkpoint
+    if checkpoint_raw is None:
+        raise RuntimeError("warmup source manifest lost the A2 checkpoint")
+    commit, dirty = _current_git_commit(code_root)
+    if dirty:
+        raise RuntimeError("warmup bundle requires a clean Git working tree")
+    dataset_manifest = Path(backbone.ttt_config.dataset_manifest).expanduser().resolve()
+    if not dataset_manifest.is_file():
+        raise FileNotFoundError(f"dataset manifest does not exist: {dataset_manifest}")
+    training_args = cast(Any, backbone.training_args)
+    seed = int(training_args.seed)
+    data_seed = int(training_args.data_seed)
+    if seed != backbone.project_config.a5.seed or data_seed != seed:
+        raise ValueError("warmup handoff requires matching seed/data_seed 42")
+    return {
+        "a2_checkpoint_sha256": _a2_checkpoint_sha256(Path(checkpoint_raw)),
+        "code_commit": commit,
+        "code_dirty": False,
+        "project_config_sha256": _effective_project_config_sha256(
+            backbone.project_config
+        ),
+        "dataset_manifest_sha256": _sha256_file(dataset_manifest),
+        "seed": seed,
+        "data_seed": data_seed,
+    }
+
+
+def _publish_warmup_bundle(
+    *,
+    model: nn.Module,
+    qwen_model: nn.Module,
+    backbone: LlamaFactoryBackboneBundle,
+    artifact_root: Path,
+    global_step: int,
+    qwen_sha256: str,
+) -> tuple[Path, dict[str, object]]:
+    """Atomically publish the non-Qwen handoff only after a successful 128-step run."""
+
+    expected_steps = int(backbone.project_config.a5.warmup.max_steps)
+    if global_step != expected_steps:
+        raise RuntimeError(
+            f"warmup bundle requires step {expected_steps}, found {global_step}"
+        )
+    destination = artifact_root / "a5_warmup_bundle"
+    incomplete = artifact_root / ".a5_warmup_bundle.incomplete"
+    if destination.exists() or incomplete.exists():
+        raise FileExistsError("refusing to overwrite a warmup handoff bundle")
+    allowlist = _warmup_bundle_allowlist(model, qwen_model)
+    state = model.state_dict()
+    tensors = {
+        name: state[name].detach().cpu().contiguous().clone()
+        for name in allowlist
+    }
+    incomplete.mkdir(parents=False)
+    weights = incomplete / "model.safetensors"
+    save_file(tensors, str(weights))
+    source = _warmup_source_manifest(backbone=backbone, code_root=Path.cwd())
+    manifest: dict[str, object] = {
+        "bundle_schema_version": _WARMUP_BUNDLE_SCHEMA_VERSION,
+        "associative_contract": backbone.project_config.associative_ttt.contract,
+        "associative_contract_version": 2,
+        "config_schema_version": backbone.project_config.config_schema_version,
+        **source,
+        "optimizer_steps": global_step,
+        "parameter_allowlist": list(allowlist),
+        "tensor_count": len(tensors),
+        "qwen_bitwise_sha256": qwen_sha256,
+        "bundle_sha256": _sha256_file(weights),
+    }
+    _write_json(incomplete / "manifest.json", manifest)
+    incomplete.rename(destination)
+    return destination, manifest
+
+
+def _load_warmup_bundle(
+    *,
+    model: nn.Module,
+    qwen_model: nn.Module,
+    backbone: LlamaFactoryBackboneBundle,
+) -> dict[str, object]:
+    """Strictly overlay a verified non-Qwen handoff before optimizer creation."""
+
+    raw_path = backbone.ttt_config.warmup_bundle
+    if raw_path is None:
+        raise RuntimeError("A5 main lost the required warmup handoff path")
+    root = Path(raw_path).expanduser().resolve()
+    weights = root / "model.safetensors"
+    manifest_path = root / "manifest.json"
+    if not weights.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError("warmup bundle requires model.safetensors and manifest.json")
+    manifest = cast(object, json.loads(manifest_path.read_text(encoding="utf-8")))
+    if not isinstance(manifest, dict):
+        raise ValueError("warmup bundle manifest must be a JSON object")
+    expected_source = _warmup_source_manifest(backbone=backbone, code_root=Path.cwd())
+    expected_scalars: dict[str, object] = {
+        "bundle_schema_version": _WARMUP_BUNDLE_SCHEMA_VERSION,
+        "associative_contract": backbone.project_config.associative_ttt.contract,
+        "associative_contract_version": 2,
+        "config_schema_version": backbone.project_config.config_schema_version,
+        "optimizer_steps": int(backbone.project_config.a5.warmup.max_steps),
+        "qwen_bitwise_sha256": _module_bitwise_sha256(qwen_model),
+        **expected_source,
+        "bundle_sha256": _sha256_file(weights),
+    }
+    mismatches = {
+        key: (manifest.get(key), expected)
+        for key, expected in expected_scalars.items()
+        if manifest.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(f"warmup bundle provenance mismatch: {mismatches}")
+    allowlist = _warmup_bundle_allowlist(model, qwen_model)
+    if manifest.get("parameter_allowlist") != list(allowlist):
+        raise ValueError("warmup bundle parameter allowlist does not match the current model")
+    if manifest.get("tensor_count") != len(allowlist):
+        raise ValueError("warmup bundle tensor count does not match its strict allowlist")
+    tensors = load_file(str(weights), device="cpu")
+    if tuple(sorted(tensors)) != allowlist:
+        raise ValueError("warmup bundle tensor keys do not match its strict allowlist")
+    current = model.state_dict()
+    for name, value in tensors.items():
+        expected = current[name]
+        if value.shape != expected.shape or value.dtype != expected.dtype:
+            raise ValueError(
+                f"warmup tensor {name} must be {expected.dtype} {tuple(expected.shape)}, "
+                f"found {value.dtype} {tuple(value.shape)}"
+            )
+    result = model.load_state_dict(tensors, strict=False)
+    if result.unexpected_keys:
+        raise RuntimeError(f"warmup bundle produced unexpected keys: {result.unexpected_keys}")
+    expected_missing = tuple(sorted(set(current) - set(allowlist)))
+    if tuple(sorted(result.missing_keys)) != expected_missing:
+        raise RuntimeError("warmup bundle missing-key boundary drifted")
+    return {
+        "path": str(root),
+        "bundle_sha256": expected_scalars["bundle_sha256"],
+        "tensor_count": len(tensors),
+        "parameter_allowlist_sha256": hashlib.sha256(
+            "\n".join(allowlist).encode("utf-8")
+        ).hexdigest(),
+        "source": expected_source,
+    }
 
 
 def _write_json(path: Path, value: object) -> None:

@@ -50,9 +50,9 @@ class QwenOuterTrainabilityConfig(BaseModel):  # type: ignore[misc]
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    mode: Literal["full", "partial"] = "full"
+    mode: Literal["full", "partial", "frozen"] = "full"
     vision_freeze_first_blocks: int = Field(default=0, ge=0)
-    decoder_train_last_layers: int = Field(default=36, gt=0)
+    decoder_train_last_layers: int = Field(default=36, ge=0)
     train_vision_patch_embed: bool = True
     train_main_merger: bool = True
     train_deepstack_mergers: bool = True
@@ -61,7 +61,7 @@ class QwenOuterTrainabilityConfig(BaseModel):  # type: ignore[misc]
     train_lm_head: bool = True
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
-    def validate_full_policy(self) -> Self:
+    def validate_canonical_policy(self) -> Self:
         if self.mode == "full":
             expected = (0, 36, True, True, True, True, True, True)
             actual = (
@@ -78,6 +78,22 @@ class QwenOuterTrainabilityConfig(BaseModel):  # type: ignore[misc]
                 raise ValueError(
                     "full Qwen trainability must use the canonical all-trainable policy"
                 )
+        elif self.mode == "frozen":
+            expected = (27, 0, False, False, False, False, False, False)
+            actual = (
+                self.vision_freeze_first_blocks,
+                self.decoder_train_last_layers,
+                self.train_vision_patch_embed,
+                self.train_main_merger,
+                self.train_deepstack_mergers,
+                self.train_language_model_norm,
+                self.train_input_embeddings,
+                self.train_lm_head,
+            )
+            if actual != expected:
+                raise ValueError(
+                    "frozen Qwen trainability must use the canonical all-frozen policy"
+                )
         return self
 
 
@@ -88,6 +104,8 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
 
     stage: Literal["a2", "a5"]
     a5_adaptation_mode: Literal["meta_ttt", "static_w0"] = "meta_ttt"
+    a5_phase: Literal["fast_state_warmup", "main"] = "main"
+    warmup_bundle: str | None = Field(default=None, min_length=1)
     project_config: str = Field(min_length=1)
     dataset_manifest: str = Field(min_length=1)
     qwen_outer_trainability: QwenOuterTrainabilityConfig = Field(
@@ -130,10 +148,30 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             raise ValueError("A2 must not initialize from an A2 checkpoint")
         if self.stage == "a2" and self.a5_adaptation_mode != "meta_ttt":
             raise ValueError("a5_adaptation_mode applies only to A5")
+        if self.stage == "a2" and (
+            self.a5_phase != "main" or self.warmup_bundle is not None
+        ):
+            raise ValueError("A5 phase/bundle fields apply only to A5")
         if self.stage == "a5" and self.initialize_from_a2_checkpoint is None:
             raise ValueError("A5 requires initialize_from_a2_checkpoint")
         if self.stage == "a2" and self.qwen_outer_trainability.mode != "full":
             raise ValueError("A2 requires full Qwen outer trainability")
+        if self.stage == "a5" and self.a5_adaptation_mode == "static_w0":
+            if self.a5_phase != "main" or self.warmup_bundle is not None:
+                raise ValueError("static-W0 A5 cannot use the Fast/State warmup handoff")
+            if self.qwen_outer_trainability.mode == "frozen":
+                raise ValueError("static-W0 A5 requires a trainable Qwen policy")
+        if self.stage == "a5" and self.a5_adaptation_mode == "meta_ttt":
+            if self.a5_phase == "fast_state_warmup":
+                if self.qwen_outer_trainability.mode != "frozen":
+                    raise ValueError("Fast/State warmup requires fully frozen Qwen")
+                if self.warmup_bundle is not None:
+                    raise ValueError("Fast/State warmup cannot consume a warmup bundle")
+            else:
+                if self.qwen_outer_trainability.mode == "frozen":
+                    raise ValueError("A5 main requires the configured partial Qwen policy")
+                if self.warmup_bundle is None:
+                    raise ValueError("A5 main Meta-TTT requires a warmup handoff bundle")
         required_materialization = {
             "a2": "dataloader_episode",
             "a5": "segment_double_buffer",
@@ -273,10 +311,10 @@ class QwenTrainabilityAudit:
     all_qwen_parameters_trainable: bool
 
     def __post_init__(self) -> None:
-        if self.mode not in {"full", "partial"}:
+        if self.mode not in {"full", "partial", "frozen"}:
             raise ValueError("Qwen trainability audit has an invalid mode")
-        if self.total_parameters <= 0 or self.trainable_parameters <= 0:
-            raise ValueError("Qwen trainability audit requires positive parameter counts")
+        if self.total_parameters <= 0 or self.trainable_parameters < 0:
+            raise ValueError("Qwen trainability audit has invalid parameter counts")
         if self.trainable_parameters > self.total_parameters:
             raise ValueError("Qwen trainability audit trainable count exceeds total count")
         if self.vision_block_count != 27 or self.decoder_layer_count != 36:
@@ -294,8 +332,23 @@ class QwenTrainabilityAudit:
                 raise ValueError("full Qwen policy cannot freeze formal layers")
             if not self.all_qwen_parameters_trainable:
                 raise ValueError("full Qwen policy audit reports frozen parameters")
-        elif self.all_qwen_parameters_trainable:
+        elif self.mode == "partial" and self.all_qwen_parameters_trainable:
             raise ValueError("partial Qwen policy must leave at least one parameter frozen")
+        elif self.mode == "frozen":
+            if self.trainable_parameters != 0 or self.all_qwen_parameters_trainable:
+                raise ValueError("frozen Qwen policy cannot expose trainable parameters")
+            if self.trainable_vision_block_indices or self.trainable_decoder_layer_indices:
+                raise ValueError("frozen Qwen policy cannot expose trainable formal layers")
+            trainability_flags = (
+                self.vision_patch_embed_trainable,
+                self.main_merger_trainable,
+                self.deepstack_mergers_trainable,
+                self.language_model_norm_trainable,
+                self.input_embeddings_trainable,
+                self.lm_head_trainable,
+            )
+            if any(trainability_flags):
+                raise ValueError("frozen Qwen policy cannot expose trainable boundary modules")
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,6 +554,8 @@ def configure_qwen_outer_trainability(
 
     if policy.mode == "full":
         model.requires_grad_(True)
+    elif policy.mode == "frozen":
+        model.requires_grad_(False)
     else:
         model.requires_grad_(False)
         trainable_modules: list[nn.Module] = []
@@ -814,7 +869,7 @@ def environment_manifest(bundle: LlamaFactoryBackboneBundle) -> dict[str, object
         "project_spec_version": bundle.project_config.spec_version,
         "config_schema_version": bundle.project_config.config_schema_version,
         "associative_ttt_contract": bundle.project_config.associative_ttt.contract,
-        "associative_ttt_contract_version": 1,
+        "associative_ttt_contract_version": 2,
         "ttt_config": json.loads(bundle.ttt_config.model_dump_json()),
     }
 

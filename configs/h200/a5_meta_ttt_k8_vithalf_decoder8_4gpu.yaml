@@ -29,9 +29,8 @@ remove_unused_columns: false
 
 output_dir: $OUTPUT_DIR
 logging_steps: 1
-save_strategy: steps
-save_steps: 0.5
-save_total_limit: 2
+save_strategy: "no"
+save_total_limit: 1
 save_only_model: false
 overwrite_output_dir: false
 report_to: none
@@ -58,6 +57,8 @@ resume_from_checkpoint: null
 ttt_qwen:
   stage: a5
   a5_adaptation_mode: meta_ttt
+  a5_phase: main
+  warmup_bundle: $A5_WARMUP_BUNDLE
   project_config: configs/model_state_ttt_8b.yaml
   dataset_manifest: $SVCBENCH_DATASET_MANIFEST
   initialize_from_a2_checkpoint: $A2_CHECKPOINT

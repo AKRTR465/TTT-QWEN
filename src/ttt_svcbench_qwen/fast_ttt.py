@@ -250,11 +250,6 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             config.bottleneck_dim,
             bias=config.slow_projection_bias,
         )
-        self.p_value = nn.Linear(
-            config.input_dim,
-            config.bottleneck_dim,
-            bias=config.slow_projection_bias,
-        )
         self.w0_1 = nn.Parameter(torch.empty(config.bottleneck_dim, config.bottleneck_dim))
         self.w0_2 = nn.Parameter(torch.empty(config.bottleneck_dim, config.bottleneck_dim))
         self.p_out = nn.Linear(
@@ -321,12 +316,8 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
         p_in_bias = self._online_value(self.p_in.bias, detach_slow)
         p_context_weight = self._online_value(self.p_context.weight, detach_slow)
         p_context_bias = self._online_value(self.p_context.bias, detach_slow)
-        p_value_weight = self._online_value(self.p_value.weight, detach_slow)
-        p_value_bias = self._online_value(self.p_value.bias, detach_slow)
         p_out_weight = self._online_value(self.p_out.weight, detach_slow)
         p_out_bias = self._online_value(self.p_out.bias, detach_slow)
-        if p_value_weight is None or p_value_bias is None:
-            raise RuntimeError("associative value projection parameters disappeared")
         normalized = F.rms_norm(
             visual_embeddings,
             (self.input_dim,),
@@ -363,12 +354,6 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             p_context_weight,
             p_context_bias,
         ).unsqueeze(1)
-        value_normalized = F.rms_norm(
-            visual_embeddings.detach(),
-            (self.input_dim,),
-            rms_weight,
-            self.config.rms_norm_eps,
-        )
         core_context = (
             torch.autocast(device_type=visual_embeddings.device.type, enabled=False)
             if visual_embeddings.device.type in {"cpu", "cuda"}
@@ -376,11 +361,6 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
         )
         with core_context:
             projected = projected.float()
-            values = F.linear(
-                value_normalized.float(),
-                p_value_weight.float(),
-                p_value_bias.float(),
-            )
             if runtime_states is None:
                 hidden = F.linear(projected, w_t_1, None)
             else:
@@ -392,7 +372,6 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
                 predictions = torch.bmm(hidden, w_t_2.transpose(1, 2))
         self._last_associative_intermediates = AssociativeTTTIntermediates(
             keys=projected,
-            values=values,
             predictions=predictions,
             valid_mask=mask,
             bank_record_counts=bank_record_counts,
@@ -570,17 +549,11 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
 
     @torch.no_grad()  # type: ignore[untyped-decorator]
     def reset_associative_projections(self) -> None:
-        """Apply the frozen A2→A5 initialization without changing the W0 forward."""
+        """Initialize the state-write associative context without changing W0."""
 
         self.p_context.weight.zero_()
         if self.p_context.bias is not None:
             self.p_context.bias.zero_()
-        self.p_value.weight.copy_(self.p_in.weight)
-        if self.p_value.bias is not None:
-            if self.p_in.bias is None:
-                self.p_value.bias.zero_()
-            else:
-                self.p_value.bias.copy_(self.p_in.bias)
 
     def collect_meta_fast_parameters(self) -> tuple[nn.Parameter, nn.Parameter]:
         return (self.w0_1, self.w0_2)
@@ -600,14 +573,11 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
 
     def collect_associative_parameters(self) -> tuple[nn.Parameter, ...]:
         context_bias = self.p_context.bias
-        value_bias = self.p_value.bias
-        if context_bias is None or value_bias is None:
+        if context_bias is None:
             raise RuntimeError("associative projection biases disappeared")
         return (
             self.p_context.weight,
             context_bias,
-            self.p_value.weight,
-            value_bias,
         )
 
     def parameter_groups(self, state: FastWeightsState) -> FastParameterGroups:

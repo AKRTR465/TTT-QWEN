@@ -10,6 +10,7 @@ from torch import Tensor
 
 from ttt_svcbench_qwen.associative_ttt import (
     AssociativeScaleAudit,
+    AssociativeTargetAudit,
     AssociativeTTTLossOutput,
 )
 from ttt_svcbench_qwen.config import InnerSGDConfig, load_config
@@ -95,6 +96,14 @@ def make_associative_output(
             value_max_abs=zero.clone(),
             prediction_max_abs=torch.zeros((), dtype=torch.float32),
             error_max_abs=torch.zeros((), dtype=torch.float32),
+        ),
+        target_audit=AssociativeTargetAudit(
+            active_head_counts=(0, 0, 0, 0),
+            valid_target_counts=(0, 0, 0, 0),
+            unsupported_count=0,
+            empty_target_count=0,
+            prediction_target_cosine_sum=zero.clone(),
+            prediction_target_cosine_count=torch.zeros((), dtype=torch.int64),
         ),
     )
 

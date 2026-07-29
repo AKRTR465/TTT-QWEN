@@ -18,8 +18,8 @@ import transformers
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION = "state_ttt_qwen3vl8b_bank_associative_v2"
-CONFIG_SCHEMA_VERSION = 11
+SPEC_VERSION = "state_ttt_qwen3vl8b_state_write_associative_v3"
+CONFIG_SCHEMA_VERSION = 12
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -528,15 +528,16 @@ class InputComposerConfig(FrozenModel):
 
 
 class AssociativeTTTConfig(FrozenModel):
-    """Frozen Bank-conditioned visual association contract."""
+    """Frozen Bank-conditioned state-write association contract."""
 
-    contract: Literal["bank_conditioned_visual_v1"]
+    contract: Literal["bank_conditioned_state_write_v2"]
     bank_embedding_dim: PositiveInt
     key_dim: PositiveInt
-    value_dim: PositiveInt
+    target_dim: PositiveInt
     bank_empty_policy: Literal["zero"]
-    value_source: Literal["raw_main_merger_stopgrad"]
-    loss: Literal["masked_fp32_mse"]
+    target_source: Literal["predicted_active_head_soft_write_stopgrad"]
+    unsupported_target_policy: Literal["skip"]
+    loss: Literal["normalized_fp32_cosine"]
 
 
 class OfficialWeakBalanceConfig(FrozenModel):
@@ -580,6 +581,7 @@ class OuterNonfinitePolicy(StrEnum):
 
 class OuterMaxGradNormConfig(FrozenModel):
     qwen: PositiveFloat
+    fast_slow: PositiveFloat
     state_shared: PositiveFloat
     state_task: PositiveFloat
     state_router_time: PositiveFloat
@@ -610,6 +612,7 @@ class A2TrainingConfig(FrozenModel):
 class A5OptimizerConfig(FrozenModel):
     """Non-Qwen A5 parameter-group learning rates owned by State-TTT."""
 
+    fast_slow_learning_rate: PositiveFloat
     state_learning_rate: PositiveFloat
     w0_learning_rate: PositiveFloat
     associative_learning_rate: PositiveFloat
@@ -645,12 +648,38 @@ class A5QueryMetaGradientConfig(FrozenModel):
     epsilon: PositiveFloat
 
 
+class A5WarmupConfig(FrozenModel):
+    """Independent Fast/State handoff stage; values are part of schema-12."""
+
+    max_steps: Literal[128]
+    linear_warmup_steps: Literal[4]
+    fast_slow_learning_rate: PositiveFloat
+    state_learning_rate: PositiveFloat
+    w0_learning_rate: PositiveFloat
+    associative_learning_rate: PositiveFloat
+    bundle_schema_version: Literal[1]
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_warmup_contract(self) -> Self:
+        expected = (5.0e-5, 1.0e-5, 5.0e-5, 5.0e-5)
+        actual = (
+            float(self.fast_slow_learning_rate),
+            float(self.state_learning_rate),
+            float(self.w0_learning_rate),
+            float(self.associative_learning_rate),
+        )
+        if actual != expected:
+            raise ValueError("A5 Fast/State warmup learning rates drifted from schema-12")
+        return self
+
+
 class A5TrainingConfig(FrozenModel):
     """Direct A5 contract with K-step truncation and one episode seed."""
 
     truncation_horizon: PositiveInt
     seed: NonNegativeInt
     optimizer: A5OptimizerConfig
+    warmup: A5WarmupConfig
     query_meta_gradient: A5QueryMetaGradientConfig
     counterfactual_audit: A5CounterfactualAuditConfig = A5CounterfactualAuditConfig()
 
@@ -662,7 +691,7 @@ class InferenceRuntimeConfig(FrozenModel):
 
 
 class ProjectConfig(FrozenModel):
-    """Schema-11 production configuration with cross-component contract validation."""
+    """Schema-12 production configuration with cross-component contract validation."""
 
     spec_version: str
     config_schema_version: int
@@ -1577,18 +1606,23 @@ class ProjectConfig(FrozenModel):
             (
                 "associative_ttt.contract",
                 self.associative_ttt.contract,
-                "bank_conditioned_visual_v1",
+                "bank_conditioned_state_write_v2",
             ),
             ("associative_ttt.bank_embedding_dim", self.associative_ttt.bank_embedding_dim, 512),
             ("associative_ttt.key_dim", self.associative_ttt.key_dim, 768),
-            ("associative_ttt.value_dim", self.associative_ttt.value_dim, 768),
+            ("associative_ttt.target_dim", self.associative_ttt.target_dim, 768),
             ("associative_ttt.bank_empty_policy", self.associative_ttt.bank_empty_policy, "zero"),
             (
-                "associative_ttt.value_source",
-                self.associative_ttt.value_source,
-                "raw_main_merger_stopgrad",
+                "associative_ttt.target_source",
+                self.associative_ttt.target_source,
+                "predicted_active_head_soft_write_stopgrad",
             ),
-            ("associative_ttt.loss", self.associative_ttt.loss, "masked_fp32_mse"),
+            (
+                "associative_ttt.unsupported_target_policy",
+                self.associative_ttt.unsupported_target_policy,
+                "skip",
+            ),
+            ("associative_ttt.loss", self.associative_ttt.loss, "normalized_fp32_cosine"),
             ("loss.operator_weight", self.loss.operator_weight, 1.0),
             ("loss.retrieval_weight", self.loss.retrieval_weight, 1.0),
             ("loss.time_weight", self.loss.time_weight, 1.0),
@@ -2099,21 +2133,21 @@ class ProjectConfig(FrozenModel):
 
 
 def _normalize_project_schema(value: object) -> object:
-    """Reject every legacy precision/gradient contract at the v2 boundary."""
+    """Reject every legacy inner-target contract at the state-write boundary."""
 
     if not isinstance(value, dict):
         return value
     schema = value.get("config_schema_version")
     if schema == CONFIG_SCHEMA_VERSION:
         return value
-    if schema in {9, 10}:
+    if schema == 11:
         raise ValueError(
-            "schema 9-10 predates the FP32-fast/robust-Query contract; "
-            "rebuild a schema-11 Bank-conditioned associative configuration"
+            "schema 11 uses the removed raw-Main-Merger/P_value reconstruction target; "
+            "rebuild a schema-12 state-write associative configuration"
         )
     raise ValueError(
-        "config_schema_version must be 11; legacy schema 6-10 configurations "
-        "cannot be migrated across the precision/Query-gradient boundary"
+        "config_schema_version must be 12; legacy schema 6-11 configurations "
+        "cannot be migrated across the state-write inner-target boundary"
     )
 
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:

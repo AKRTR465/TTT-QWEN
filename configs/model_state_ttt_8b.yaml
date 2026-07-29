@@ -1,5 +1,5 @@
-spec_version: state_ttt_qwen3vl8b_bank_associative_v2
-config_schema_version: 11
+spec_version: state_ttt_qwen3vl8b_state_write_associative_v3
+config_schema_version: 12
 
 paths:
   model_root_env: QWEN_MODEL_ROOT
@@ -439,13 +439,14 @@ input_composer:
   generation_num_beams: 1
 
 associative_ttt:
-  contract: bank_conditioned_visual_v1
+  contract: bank_conditioned_state_write_v2
   bank_embedding_dim: 512
   key_dim: 768
-  value_dim: 768
+  target_dim: 768
   bank_empty_policy: zero
-  value_source: raw_main_merger_stopgrad
-  loss: masked_fp32_mse
+  target_source: predicted_active_head_soft_write_stopgrad
+  unsupported_target_policy: skip
+  loss: normalized_fp32_cosine
 
 loss:
   operator_weight: 1.0
@@ -468,6 +469,7 @@ outer_gradient_control:
   mode: per_group_l2_equal_update_cap
   max_grad_norm:
     qwen: 1.0
+    fast_slow: 0.1
     state_shared: 0.05
     state_task: 0.05
     state_router_time: 0.05
@@ -487,15 +489,24 @@ a5:
   truncation_horizon: 8
   seed: 42
   optimizer:
+    fast_slow_learning_rate: 5.0e-5
     state_learning_rate: 5.0e-5
     w0_learning_rate: 5.0e-5
     associative_learning_rate: 5.0e-5
+  warmup:
+    max_steps: 128
+    linear_warmup_steps: 4
+    fast_slow_learning_rate: 5.0e-5
+    state_learning_rate: 1.0e-5
+    w0_learning_rate: 5.0e-5
+    associative_learning_rate: 5.0e-5
+    bundle_schema_version: 1
   query_meta_gradient:
     mode: per_query_global_norm_clip_sum
     max_norm: 1.0
     epsilon: 1.0e-12
   counterfactual_audit:
-    enabled: false
+    enabled: true
     interval_steps: 8
     queries_per_rank: 1
     references:

@@ -43,8 +43,6 @@ def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> N
     assert adapter.p_out.out_features == 4096
     assert adapter.p_context.in_features == 512
     assert adapter.p_context.out_features == 768
-    assert adapter.p_value.in_features == 4096
-    assert adapter.p_value.out_features == 768
     assert adapter.p_in.bias is not None
     assert adapter.p_out.bias is not None
     assert adapter.w0_1.shape == adapter.w0_2.shape == (768, 768)
@@ -52,12 +50,11 @@ def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> N
         "rms_norm",
         "p_in",
         "p_context",
-        "p_value",
         "p_out",
     }
-    assert parameter_count(adapter) == 11_020_544
+    assert parameter_count(adapter) == 7_874_048
     assert tensor_count(adapter.collect_slow_parameters()) == 6_300_416
-    assert tensor_count(adapter.collect_associative_parameters()) == 3_540_480
+    assert tensor_count(adapter.collect_associative_parameters()) == 393_984
     assert (
         sum(parameter.numel() for parameter in adapter.collect_meta_fast_parameters()) == 1_179_648
     )
@@ -67,8 +64,6 @@ def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> N
         "p_in.bias",
         "p_context.weight",
         "p_context.bias",
-        "p_value.weight",
-        "p_value.bias",
         "w0_1",
         "w0_2",
         "p_out.weight",
@@ -217,7 +212,7 @@ def test_differentiable_state_preserves_outer_gradients_to_w0_and_slow_parameter
         assert torch.isfinite(parameter.grad).all()
         assert parameter.grad.abs().sum() > 0
     assert all(parameter.grad is not None for parameter in adapter.p_context.parameters())
-    assert all(parameter.grad is None for parameter in adapter.p_value.parameters())
+    assert not hasattr(adapter, "p_value")
 
 
 def test_initial_bound_fast_state_matches_static_w0_forward() -> None:
@@ -277,7 +272,7 @@ def test_parameter_collection_is_stable_exact_and_rejects_boundary_drift() -> No
     assert groups.slow == adapter.collect_slow_parameters()
     assert tensor_count(collect_fast_parameters(state)) == 2 * 768 * 768 == 1_179_648
     assert tensor_count(adapter.collect_slow_parameters()) == 6_300_416
-    assert tensor_count(adapter.collect_associative_parameters()) == 3_540_480
+    assert tensor_count(adapter.collect_associative_parameters()) == 393_984
     assert not ({id(parameter) for parameter in groups.online_fast} & {id(p) for p in groups.slow})
     adapter.assert_online_parameter_boundary(groups.online_fast, state)
 
@@ -388,7 +383,7 @@ def test_online_binding_rejects_stale_slow_grad_and_differentiable_binding_stays
         )
     )
     assert all(parameter.grad is not None for parameter in adapter.p_context.parameters())
-    assert all(parameter.grad is None for parameter in adapter.p_value.parameters())
+    assert not hasattr(adapter, "p_value")
 
 
 def test_float64_is_preserved_and_stale_state_after_module_move_fails() -> None:

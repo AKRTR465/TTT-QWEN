@@ -723,6 +723,11 @@ class TruncatedMetaTTTEpisodeAudit:
     associative_element_count: int
     bank_record_count: int
     empty_bank_count: int
+    active_head_counts: tuple[tuple[str, int], ...]
+    valid_target_counts: tuple[tuple[str, int], ...]
+    unsupported_target_count: int
+    empty_target_skip_count: int
+    prediction_target_cosine_mean: float
     parameter_versions_unchanged_before_outer_step: bool
     bank_context_detached: bool
     support_supervision_reachable: bool
@@ -800,13 +805,32 @@ class TruncatedMetaTTTEpisodeAudit:
             type(self.associative_element_count) is not int
             or type(self.bank_record_count) is not int
             or type(self.empty_bank_count) is not int
+            or type(self.unsupported_target_count) is not int
+            or type(self.empty_target_skip_count) is not int
             or min(
                 self.associative_element_count,
                 self.bank_record_count,
                 self.empty_bank_count,
+                self.unsupported_target_count,
+                self.empty_target_skip_count,
             ) < 0
         ):
             raise ValueError("A5 associative audit counts must be non-negative integers")
+        expected_heads = ("o1", "o2", "e1", "e2")
+        if (
+            tuple(name for name, _ in self.active_head_counts) != expected_heads
+            or tuple(name for name, _ in self.valid_target_counts) != expected_heads
+            or any(
+                type(count) is not int or count < 0
+                for _, count in (*self.active_head_counts, *self.valid_target_counts)
+            )
+        ):
+            raise ValueError("A5 state-write target head audit is invalid")
+        if (
+            not math.isfinite(self.prediction_target_cosine_mean)
+            or not -1.0 <= self.prediction_target_cosine_mean <= 1.0
+        ):
+            raise ValueError("A5 prediction-target cosine mean must be in [-1, 1]")
         if len(self.segments) != self.segment_count:
             raise ValueError("A5 segment audit count drifted")
         expected_update_audits = self.support_count if self.ttt_enabled else 0
@@ -1018,6 +1042,16 @@ class MetaTTTEpisodeRunner:
         associative_value_max_abs = torch.zeros((), dtype=torch.float32, device=device)
         associative_prediction_max_abs = torch.zeros((), dtype=torch.float32, device=device)
         associative_error_max_abs = torch.zeros((), dtype=torch.float32, device=device)
+        state_write_active_head_counts = [0, 0, 0, 0]
+        state_write_valid_target_counts = [0, 0, 0, 0]
+        unsupported_target_count = 0
+        empty_target_skip_count = 0
+        prediction_target_cosine_sum = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        prediction_target_cosine_count = torch.zeros(
+            (), dtype=torch.int64, device=device
+        )
         bank_record_count = 0
         empty_bank_count = 0
         support_lifecycle = PrefillLifecycle(episode.owner)
@@ -1127,7 +1161,14 @@ class MetaTTTEpisodeRunner:
                 intermediates = observation.soft_intermediates.fast_associative
                 if intermediates is None:
                     raise RuntimeError("Meta-TTT Support did not capture associative tensors")
-                associative_output = compute_associative_ttt_loss(intermediates)
+                state_write = observation.soft_intermediates.state_write
+                if state_write is None:
+                    raise RuntimeError("Meta-TTT Support did not produce state-write targets")
+                associative_output = compute_associative_ttt_loss(
+                    intermediates,
+                    state_write,
+                    observation.query.head_types,
+                )
                 before_versions = tuple(state.fast_version for state in adapted.fast_states)
                 results = functional_sgd_steps_from_associative(
                     associative_output=associative_output,
@@ -1176,6 +1217,31 @@ class MetaTTTEpisodeRunner:
                 )
                 associative_error_max_abs = torch.maximum(
                     associative_error_max_abs, scale_audit.error_max_abs
+                )
+                target_audit = associative_output.target_audit
+                state_write_active_head_counts = [
+                    current + observed
+                    for current, observed in zip(
+                        state_write_active_head_counts,
+                        target_audit.active_head_counts,
+                        strict=True,
+                    )
+                ]
+                state_write_valid_target_counts = [
+                    current + observed
+                    for current, observed in zip(
+                        state_write_valid_target_counts,
+                        target_audit.valid_target_counts,
+                        strict=True,
+                    )
+                ]
+                unsupported_target_count += target_audit.unsupported_count
+                empty_target_skip_count += target_audit.empty_target_count
+                prediction_target_cosine_sum += (
+                    target_audit.prediction_target_cosine_sum
+                )
+                prediction_target_cosine_count += (
+                    target_audit.prediction_target_cosine_count
                 )
                 counts = tuple(int(value.item()) for value in intermediates.bank_record_counts)
                 bank_record_count += sum(counts)
@@ -1576,6 +1642,19 @@ class MetaTTTEpisodeRunner:
         detached_total = detached_query.detach().clone()
         associative_loss_mean = float((support_total_detached / support_count).item())
         associative_elements = int(associative_element_count.item())
+        cosine_count = int(prediction_target_cosine_count.item())
+        prediction_target_cosine_mean = (
+            float((prediction_target_cosine_sum / cosine_count).item())
+            if cosine_count
+            else 0.0
+        )
+        head_names = ("o1", "o2", "e1", "e2")
+        active_head_counts = tuple(
+            zip(head_names, state_write_active_head_counts, strict=True)
+        )
+        valid_target_counts = tuple(
+            zip(head_names, state_write_valid_target_counts, strict=True)
+        )
 
         def rms(sum_squares: Tensor, count: int) -> float:
             return math.sqrt(float(sum_squares.item()) / count) if count else 0.0
@@ -1603,6 +1682,11 @@ class MetaTTTEpisodeRunner:
             associative_element_count=associative_elements,
             bank_record_count=bank_record_count,
             empty_bank_count=empty_bank_count,
+            active_head_counts=active_head_counts,
+            valid_target_counts=valid_target_counts,
+            unsupported_target_count=unsupported_target_count,
+            empty_target_skip_count=empty_target_skip_count,
+            prediction_target_cosine_mean=prediction_target_cosine_mean,
         )
         episode_audit = TruncatedMetaTTTEpisodeAudit(
             associative_contract=ASSOCIATIVE_CONTRACT,
@@ -1639,6 +1723,11 @@ class MetaTTTEpisodeRunner:
             associative_element_count=associative_elements,
             bank_record_count=bank_record_count,
             empty_bank_count=empty_bank_count,
+            active_head_counts=active_head_counts,
+            valid_target_counts=valid_target_counts,
+            unsupported_target_count=unsupported_target_count,
+            empty_target_skip_count=empty_target_skip_count,
+            prediction_target_cosine_mean=prediction_target_cosine_mean,
             parameter_versions_unchanged_before_outer_step=versions_before == versions_after,
             bank_context_detached=True,
             support_supervision_reachable=False,

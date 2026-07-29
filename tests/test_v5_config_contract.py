@@ -23,29 +23,40 @@ def _raw() -> dict[str, object]:
     return value
 
 
-def test_schema11_fp32_fast_and_robust_query_contract_is_frozen_and_roundtrips() -> None:
+def test_schema12_state_write_fast_and_robust_query_contract_roundtrips() -> None:
     config = load_config(CONFIG_PATH)
-    assert config.config_schema_version == CONFIG_SCHEMA_VERSION == 11
-    assert config.spec_version == SPEC_VERSION == "state_ttt_qwen3vl8b_bank_associative_v2"
+    assert config.config_schema_version == CONFIG_SCHEMA_VERSION == 12
+    assert (
+        config.spec_version
+        == SPEC_VERSION
+        == "state_ttt_qwen3vl8b_state_write_associative_v3"
+    )
     assert config.fast_ttt.optimizer.fast_weight_dtype == "float32"
     assert config.fast_ttt.optimizer.fast_core_dtype == "float32"
     assert config.a5.query_meta_gradient.mode == "per_query_global_norm_clip_sum"
     assert config.a5.query_meta_gradient.max_norm == 1.0
     assert config.a5.query_meta_gradient.epsilon == 1.0e-12
-    assert config.associative_ttt.contract == "bank_conditioned_visual_v1"
+    assert config.associative_ttt.contract == "bank_conditioned_state_write_v2"
     assert config.associative_ttt.bank_embedding_dim == 512
-    assert config.associative_ttt.key_dim == config.associative_ttt.value_dim == 768
+    assert config.associative_ttt.key_dim == config.associative_ttt.target_dim == 768
     assert config.associative_ttt.bank_empty_policy == "zero"
-    assert config.associative_ttt.value_source == "raw_main_merger_stopgrad"
-    assert config.associative_ttt.loss == "masked_fp32_mse"
+    assert (
+        config.associative_ttt.target_source
+        == "predicted_active_head_soft_write_stopgrad"
+    )
+    assert config.associative_ttt.unsupported_target_policy == "skip"
+    assert config.associative_ttt.loss == "normalized_fp32_cosine"
+    assert config.a5.warmup.max_steps == 128
+    assert config.a5.warmup.linear_warmup_steps == 4
+    assert config.a5.warmup.state_learning_rate == 1.0e-5
     assert ProjectConfig.model_validate(config.model_dump()) == config
 
 
-@pytest.mark.parametrize("schema", [6, 7, 8, 9, 10])
+@pytest.mark.parametrize("schema", [6, 7, 8, 9, 10, 11])
 def test_legacy_schema_cannot_cross_associative_boundary(schema: int) -> None:
     raw = _raw()
     raw["config_schema_version"] = schema
-    with pytest.raises(ValueError, match="schema-11|config_schema_version must be 11"):
+    with pytest.raises(ValueError, match="schema 11|config_schema_version must be 12"):
         ProjectConfig.model_validate(raw)
 
 
@@ -55,9 +66,10 @@ def test_legacy_schema_cannot_cross_associative_boundary(schema: int) -> None:
         ("contract", "legacy"),
         ("bank_embedding_dim", 256),
         ("key_dim", 512),
-        ("value_dim", 512),
+        ("target_dim", 512),
         ("bank_empty_policy", "learned"),
-        ("value_source", "adapted"),
+        ("target_source", "adapted"),
+        ("unsupported_target_policy", "zero"),
         ("loss", "cosine"),
     ],
 )

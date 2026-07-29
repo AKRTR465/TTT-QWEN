@@ -65,7 +65,7 @@ from ttt_svcbench_qwen.observation_heads import (
     StreamReplayAudit,
 )
 from ttt_svcbench_qwen.query_encoder import Operator
-from ttt_svcbench_qwen.stage_a_runtime import StageAWriteAudit
+from ttt_svcbench_qwen.stage_a_runtime import StageASoftWriteOutput, StageAWriteAudit
 from ttt_svcbench_qwen.stage_a_targets import (
     AnswerTargetLabels,
     OfficialWeakLossAudit,
@@ -235,11 +235,10 @@ class _TinyFastController(nn.Module):
             context.combined_query.mean(dim=-1, keepdim=True).unsqueeze(1)
             * self.context_scale
         )
-        keys = visual.value + context_term
+        keys = visual.value * self.value_scale + context_term
         w1 = torch.stack(tuple(state.w_t_1 for state in self._active))
         w2 = torch.stack(tuple(state.w_t_2 for state in self._active))
         predictions = torch.bmm(F.silu(torch.bmm(keys, w1.transpose(1, 2))), w2.transpose(1, 2))
-        values = visual.value.detach() * self.value_scale
         payload = _request.video_input
         if not isinstance(payload, _VideoChunk):
             raise TypeError("tiny Fast forward requires a _VideoChunk payload")
@@ -249,7 +248,6 @@ class _TinyFastController(nn.Module):
         ).to(device=keys.device)
         self._intermediates = AssociativeTTTIntermediates(
             keys=keys,
-            values=values,
             predictions=predictions,
             valid_mask=valid_mask,
             bank_record_counts=context.bank_record_counts,
@@ -307,6 +305,7 @@ class _QueryStage(nn.Module):
         return SimpleNamespace(
             q_target=torch.zeros((1, 512)),
             hard_operators=(Operator.O1_SNAP,),
+            head_types=(HeadType.O1,),
         )
 
 
@@ -490,7 +489,46 @@ class _BankWriter:
             identity_decisions=decisions,
             skipped_rows=(),
         )
-        return BankWriteOutput(next_runtime, next_banks, audit)
+        valid = _temporal.valid_mask
+        counts = valid.sum(dim=1).clamp_min(1).to(_temporal.hidden.dtype)
+        source = (
+            (_temporal.hidden * valid.unsqueeze(-1).to(_temporal.hidden.dtype)).sum(dim=1)
+            / counts.unsqueeze(-1)
+        )
+        present = valid.any(dim=1)
+        o2_present = _observations.o2.valid_mask
+        soft_write = StageASoftWriteOutput(
+            o1_semantics=torch.zeros(
+                source.shape[0], 512, dtype=source.dtype, device=source.device
+            ),
+            o1_present_mask=present,
+            o2_semantics=torch.zeros(
+                *o2_present.shape,
+                512,
+                dtype=source.dtype,
+                device=source.device,
+            ),
+            o2_present_mask=o2_present,
+            e1_semantics=torch.zeros(
+                *valid.shape,
+                512,
+                dtype=source.dtype,
+                device=source.device,
+            ),
+            e1_present_mask=valid,
+            e2_semantics=torch.zeros(
+                *valid.shape,
+                512,
+                dtype=source.dtype,
+                device=source.device,
+            ),
+            e2_present_mask=valid,
+            o1_sources=source,
+            o2_sources=source.unsqueeze(1).expand(-1, o2_present.shape[1], -1),
+            e1_sources=source,
+            e2_sources=source,
+        )
+        return BankWriteOutput(next_runtime, next_banks, audit, soft_write=soft_write)
 
 
 class _Retriever:
@@ -1583,7 +1621,9 @@ def test_later_support_cannot_change_earlier_intermediate_query(
     later = changed_supports[-1]
     payload = later.request.video_input
     assert isinstance(payload, _VideoChunk)
-    changed_payload = replace(payload, features=payload.features + 100.0)
+    changed_features = payload.features.clone()
+    changed_features[..., 1] += 100.0
+    changed_payload = replace(payload, features=changed_features)
     changed_supports[-1] = replace(
         later,
         request=replace(later.request, video_input=changed_payload),

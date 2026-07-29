@@ -10,11 +10,12 @@ synthetic ablation harness 已从主线删除。
 - A5 对 Support 数不设上限，按处理过的 Support 每 `K=8` 步截断。段内
   `create_graph=True`，截断点使用
   `stopgrad(W_t) + W0 - stopgrad(W0)`，保留数值状态并重新建立到 `W0` 的梯度路径。
-- 每个 Support 先用写入前 Bank 语义构造 key、用 stop-gradient 原始视觉构造 value，执行一次
-  masked FP32 association MSE 的 functional SGD；该损失只更新 transient `w_t_1/w_t_2`，
+- 每个 Support 先用写入前 Bank 语义构造 key，再以 stop-gradient 的 active-head 768D
+  soft-write source 为 target，执行一次 normalized FP32 cosine objective 的 functional SGD；
+  该损失只更新 transient `w_t_1/w_t_2`，
   不执行 Support auxiliary backward。一个 episode 只由外层 Trainer 裁剪和执行一次 AdamW step。
 - Inner SGD 的唯一参数是 transient `w_t_1/w_t_2`，momentum 固定为 0。Qwen、状态模块、
-  `W0` 和 `P_C/P_V` 只能进入 Outer AdamW；Query Answer/State loss 是唯一 Outer objective。
+  `W0` 和 `P_C` 只能进入 Outer AdamW；Query Answer/State loss 是唯一 Outer objective。
 - hard Bank/FSM commit 与 soft observation forward 分离；activation checkpoint 重算只能经过
   soft 路径。
 - Support 每一步只物化一个 8/16 帧动态 chunk，处理后不保留历史视觉 Token；Query 单独从
@@ -61,8 +62,8 @@ factory。中央 bridge 会覆盖 runtime 的 dataset 字段，强制使用 mani
 运行时边界为：
 
 - 返回模型注册加载得到的同一个 `backbone.model`，并注册状态模块、`W0` 和 Associative 投影；
-- A2 返回 `stage_a_loss_step`，且 `P_C/P_V` 全冻结；A5 返回 `MetaTTTEpisodeRunner` 与
-  `episode_adapter`，且 `P_C/P_V` 可训练；
+- A2 返回 `stage_a_loss_step`，且 `P_C` 冻结；A5 返回 `MetaTTTEpisodeRunner` 与
+  `episode_adapter`，且 `P_C` 可训练；
 - collator 接收 `A2QueryRecord` 或 `A5EpisodeRecord`，Support 先保持轻量时间区间，执行到该步
   才解码并处理当前 chunk；
 - Query/weak/answer sidecar 的 join 发生在 forward 后；
@@ -82,12 +83,22 @@ cd /mnt/shared-storage-user/mineru2-shared/niujunbo/play/projects/ttt_qwen
 bash scripts/h200/train_fullprefix256.sh a2
 ```
 
-A2 成功后，使用最后 epoch 的完整模型权重初始化 A5；不会继承 A2 optimizer、scheduler 或
-Trainer step：
+A2 成功后，先运行独立 128-step Fast/State Warmup。Warmup 完全冻结 Qwen，只保存非 Qwen
+handoff bundle，不继承 A2 optimizer、scheduler 或 Trainer step：
 
 ```bash
-bash scripts/h200/train_fullprefix256.sh a5 \
+bash scripts/h200/train_a5_fast_state_warmup.sh \
   /absolute/path/a2_run/checkpoints/final-checkpoint \
+  /absolute/path/dataset_manifest.json
+```
+
+门槛通过后，Main 重新加载同一个 A2 checkpoint，严格叠加 warmup bundle，恢复部分 Qwen
+解冻并训练 4 epoch：
+
+```bash
+bash scripts/h200/train_a5_associative_lttt_finalonly.sh \
+  /absolute/path/a2_run/checkpoints/final-checkpoint \
+  /absolute/path/warmup_run/a5_warmup_bundle \
   /absolute/path/dataset_manifest.json
 ```
 
@@ -105,14 +116,15 @@ bash scripts/h200/benchmark_fullprefix256_8step.sh a5 /absolute/path/a2/checkpoi
 
 ## Checkpoint 与续训
 
-- A2/A5 每个 epoch 写一个标准 Trainer checkpoint，`save_total_limit=1`。训练结束后先在
+- A2 按既定阶段策略保存完整 Trainer checkpoint。A5 Warmup 不保存完整 checkpoint，只在
+  成功完成 128 step 后原子发布 `a5_warmup_bundle/`。A5 Main 禁用周期 checkpoint，结束后先在
   `.final-checkpoint.incomplete` 写入并校验模型、optimizer/scheduler/RNG 和 Trainer state，
-  再原子发布为 `final-checkpoint/`，最后删除 `checkpoint-*`，完成态只保留一个 checkpoint。
+  再原子发布为 `final-checkpoint/`，完成态只保留一个 checkpoint。
 - 同阶段续训必须新建 run，并显式设置
   `TTT_RESUME_CHECKPOINT=/old/run/checkpoints/checkpoint-N`。入口校验 checkpoint 的 stage 与
   `run_config.json` 一致。
-- A2→A5 是阶段切换，只使用 `A2_CHECKPOINT` 中的模型/module 权重，并创建全新的 A5
-  optimizer/scheduler/RNG。
+- A2→Warmup 和 A2+handoff→Main 都创建全新的 optimizer/scheduler/RNG；handoff bundle
+  绑定 A2 checkpoint、project config、dataset manifest、seed 与代码 commit hash。
 - `final-checkpoint/` 保存最终模型，`resume_state/` 保存 Accelerator 完整分布式状态；运行中断
   时可从尚存的最后一个标准 `checkpoint-*` 新建 run 续训。
 - transient `W_t`、Bank、FSM、视觉/时序 cache 从所有 checkpoint 中排除。
