@@ -639,11 +639,7 @@ class _A5ParameterGroupStepAuditor:
             parameter_id = id(parameter)
             if not parameter.requires_grad or parameter_id in seen:
                 continue
-            group = (
-                "fast_slow"
-                if parameter_id in fast_slow_ids
-                else self._classify_parameter(name)
-            )
+            group = "fast_slow" if parameter_id in fast_slow_ids else self._classify_parameter(name)
             if group in grouped:
                 grouped[group].append(parameter)
             seen.add(parameter_id)
@@ -857,6 +853,7 @@ class ProductionTrainerRuntime:
     semantic_projector_delta_audit_steps: int = 0
     a5_parameter_delta_audit_steps: int = 0
     operator_diagnostics_interval: int = 10
+    warmup_qwen_bitwise_auditor: _WarmupQwenBitwiseAuditor | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.stage, ProductionStage) or not isinstance(self.model, nn.Module):
@@ -879,6 +876,13 @@ class ProductionTrainerRuntime:
             raise ValueError("A5 parameter delta audit steps must be non-negative")
         if self.stage is ProductionStage.A2 and self.a5_parameter_delta_audit_steps:
             raise ValueError("A2 cannot enable the A5 parameter delta audit")
+        if self.stage is ProductionStage.A2 and self.warmup_qwen_bitwise_auditor is not None:
+            raise ValueError("A2 cannot enable the warmup Qwen bitwise audit")
+        if self.warmup_qwen_bitwise_auditor is not None and not isinstance(
+            self.warmup_qwen_bitwise_auditor,
+            _WarmupQwenBitwiseAuditor,
+        ):
+            raise TypeError("warmup Qwen bitwise auditor is invalid")
         if (
             type(self.operator_diagnostics_interval) is not int
             or self.operator_diagnostics_interval <= 0
@@ -1499,9 +1503,7 @@ class TTTQwenTrainerMixin:
                     "a5/static_w0_segment_count": float(meta_audit.static_w0_segment_count),
                     "a5/ablation/ttt_enabled": float(meta_audit.ttt_enabled),
                     "a5/associative/valid": float(meta_audit.associative_valid_count > 0),
-                    "a5/associative/valid_count": float(
-                        meta_audit.associative_valid_count
-                    ),
+                    "a5/associative/valid_count": float(meta_audit.associative_valid_count),
                     "a5/ablation/associative_trainable": float(
                         self.ttt_runtime.a5_adaptation_mode == "meta_ttt"
                     ),
@@ -1525,12 +1527,8 @@ class TTTQwenTrainerMixin:
                     "a5/associative/value_max_abs": meta_audit.value_max_abs,
                     "a5/associative/prediction_max_abs": meta_audit.prediction_max_abs,
                     "a5/associative/error_max_abs": meta_audit.error_max_abs,
-                    "a5/associative/element_count": float(
-                        meta_audit.associative_element_count
-                    ),
-                    "a5/associative/bank_record_count": float(
-                        meta_audit.bank_record_count
-                    ),
+                    "a5/associative/element_count": float(meta_audit.associative_element_count),
+                    "a5/associative/bank_record_count": float(meta_audit.bank_record_count),
                     "a5/associative/empty_bank_count": float(meta_audit.empty_bank_count),
                     "a5/associative/state_write/valid_target_count": float(
                         sum(count for _, count in meta_audit.valid_target_counts)
@@ -1599,13 +1597,11 @@ class TTTQwenTrainerMixin:
                     del history_values[:-256]
                 self._last_query_tail_global_step = global_step
             for role, role_values in role_norms.items():
-                enriched[f"a5/query_proxy_grad_norm/{role}"] = sum(role_values) / len(
+                enriched[f"a5/query_proxy_grad_norm/{role}"] = sum(role_values) / len(role_values)
+            for role, role_values in role_clipped_norms.items():
+                enriched[f"a5/query_proxy_grad_norm/clipped/{role}"] = sum(role_values) / len(
                     role_values
                 )
-            for role, role_values in role_clipped_norms.items():
-                enriched[f"a5/query_proxy_grad_norm/clipped/{role}"] = sum(
-                    role_values
-                ) / len(role_values)
             for role, role_values in role_losses.items():
                 enriched[f"a5/query_outer_loss/{role}"] = sum(role_values) / len(role_values)
             for role, history in self._query_tail_history.items():
@@ -1617,12 +1613,10 @@ class TTTQwenTrainerMixin:
                     ("raw", raw_values),
                     ("clipped", clipped_values),
                 ):
-                    for statistic, value in _query_tail_distribution(
-                        distribution_values
-                    ).items():
-                        enriched[
-                            f"a5/query_proxy_grad_norm/{label}/recent_{role}/{statistic}"
-                        ] = value
+                    for statistic, value in _query_tail_distribution(distribution_values).items():
+                        enriched[f"a5/query_proxy_grad_norm/{label}/recent_{role}/{statistic}"] = (
+                            value
+                        )
                 enriched[f"a5/query_proxy_grad_clip_rate/recent_{role}"] = sum(
                     float(item[2]) for item in history
                 ) / len(history)
@@ -1659,12 +1653,12 @@ class TTTQwenTrainerMixin:
                 enriched[f"a5/query_count/segment_{segment.segment_index}"] = float(
                     segment.query_count
                 )
-                enriched[
-                    f"a5/query_cotangent_sum_norm/raw/segment_{segment.segment_index}"
-                ] = segment.raw_query_cotangent_sum_norm
-                enriched[
-                    f"a5/query_cotangent_sum_norm/clipped/segment_{segment.segment_index}"
-                ] = segment.clipped_query_cotangent_sum_norm
+                enriched[f"a5/query_cotangent_sum_norm/raw/segment_{segment.segment_index}"] = (
+                    segment.raw_query_cotangent_sum_norm
+                )
+                enriched[f"a5/query_cotangent_sum_norm/clipped/segment_{segment.segment_index}"] = (
+                    segment.clipped_query_cotangent_sum_norm
+                )
                 enriched[f"a5/meta_ttt_active/segment_{segment.segment_index}"] = float(
                     segment.training_mode == "meta_ttt"
                 )
@@ -1703,18 +1697,18 @@ class TTTQwenTrainerMixin:
                 enriched["a5/fast_weight/master_update_norm"] = sum(update_norms) / len(
                     update_norms
                 )
-                enriched["a5/fast_weight/master_changed_fraction"] = sum(
+                enriched["a5/fast_weight/master_changed_fraction"] = sum(master_changed) / len(
                     master_changed
-                ) / len(master_changed)
+                )
                 enriched["a5/fast_weight/bf16_shadow_changed_fraction"] = sum(
                     bf16_shadow_changed
                 ) / len(bf16_shadow_changed)
                 enriched["a5/fast_weight/master_delta_norm"] = sum(master_deltas) / len(
                     master_deltas
                 )
-                enriched["a5/fast_weight/fast_core_prediction_delta_norm"] = sum(
+                enriched["a5/fast_weight/fast_core_prediction_delta_norm"] = sum(core_deltas) / len(
                     core_deltas
-                ) / len(core_deltas)
+                )
                 skip_reasons = tuple(
                     reason
                     for update in meta_audit.updates
@@ -1814,6 +1808,12 @@ class TTTQwenTrainerMixin:
             return result
         if int(self.args.gradient_accumulation_steps) != 1:  # type: ignore[attr-defined]
             raise ValueError("A5 uses one complete episode/rank and episode-level GA=1")
+        warmup_qwen_auditor = self.ttt_runtime.warmup_qwen_bitwise_auditor
+        if warmup_qwen_auditor is not None:
+            trainer_state = getattr(self, "state", None)
+            warmup_qwen_auditor.capture_post_prepare_baseline(
+                global_step=int(getattr(trainer_state, "global_step", 0))
+            )
         model.train()
         optimizer = getattr(self, "optimizer", None)
         optimizer_train = getattr(optimizer, "train", None)
@@ -1832,9 +1832,7 @@ class TTTQwenTrainerMixin:
             counterfactual_config.enabled
             and next_optimizer_step % counterfactual_config.interval_steps == 0
         )
-        self._counterfactual_audit_pending = (
-            self._counterfactual_audit_pending or audit_due_now
-        )
+        self._counterfactual_audit_pending = self._counterfactual_audit_pending or audit_due_now
         segment_lengths = episode.segment_lengths
         expected_segments = len(segment_lengths)
         expected_backwards = len(episode.query_points) + expected_segments
@@ -1851,8 +1849,7 @@ class TTTQwenTrainerMixin:
             )
             gathered_eligibility = self.accelerator.gather(local_eligibility)  # type: ignore[attr-defined]
             rank_loss_weights = tuple(
-                float(value)
-                for value in gathered_eligibility.detach().cpu().reshape(-1).tolist()
+                float(value) for value in gathered_eligibility.detach().cpu().reshape(-1).tolist()
             )
             if _counterfactual_all_ranks_eligible(rank_loss_weights):
                 # Every rank in the exact-shape bucket must audit the same Query
@@ -1952,20 +1949,11 @@ class TTTQwenTrainerMixin:
         for offset, name in ((1, "episode_w0"), (5, "segment_start")):
             metrics.update(
                 {
-                    f"a5/cf/query_gain_abs/{name}": float(rows[:, offset].sum().item())
+                    f"a5/cf/query_gain_abs/{name}": float(rows[:, offset].sum().item()) / count,
+                    f"a5/cf/query_gain_rel/{name}": float(rows[:, offset + 1].sum().item()) / count,
+                    f"a5/cf/gain_positive_rate/{name}": float(rows[:, offset + 2].sum().item())
                     / count,
-                    f"a5/cf/query_gain_rel/{name}": float(
-                        rows[:, offset + 1].sum().item()
-                    )
-                    / count,
-                    f"a5/cf/gain_positive_rate/{name}": float(
-                        rows[:, offset + 2].sum().item()
-                    )
-                    / count,
-                    f"a5/cf/descent_cosine/{name}": float(
-                        rows[:, offset + 3].sum().item()
-                    )
-                    / count,
+                    f"a5/cf/descent_cosine/{name}": float(rows[:, offset + 3].sum().item()) / count,
                 }
             )
         return metrics
@@ -2136,10 +2124,7 @@ def _run_main(argv: list[str] | None = None) -> int:
         configured_stage,
         a5_adaptation_mode=backbone.ttt_config.a5_adaptation_mode,
     )
-    if (
-        backbone.ttt_config.a5_phase == "fast_state_warmup"
-        and same_stage_resume is not None
-    ):
+    if backbone.ttt_config.a5_phase == "fast_state_warmup" and same_stage_resume is not None:
         raise ValueError("Fast/State warmup is restart-only and cannot resume")
     if same_stage_resume is not None:
         _validate_resume_balance_schema(same_stage_resume)
@@ -2240,11 +2225,7 @@ def _run_main(argv: list[str] | None = None) -> int:
         )
         if configured_stage is ProductionStage.A2
         else (
-            *(
-                ("qwen",)
-                if backbone.ttt_config.a5_phase == "main"
-                else ()
-            ),
+            *(("qwen",) if backbone.ttt_config.a5_phase == "main" else ()),
             "fast_slow",
             "state_shared",
             "state_task",
@@ -2253,6 +2234,11 @@ def _run_main(argv: list[str] | None = None) -> int:
             "w0",
             *(("associative",) if backbone.ttt_config.a5_adaptation_mode == "meta_ttt" else ()),
         )
+    )
+    warmup_qwen_auditor = (
+        _WarmupQwenBitwiseAuditor(backbone.model)
+        if backbone.ttt_config.a5_phase == "fast_state_warmup"
+        else None
     )
     runtime_raw = replace(
         runtime_raw,
@@ -2271,6 +2257,7 @@ def _run_main(argv: list[str] | None = None) -> int:
         ),
         a5_parameter_delta_audit_steps=(backbone.ttt_config.a5_parameter_delta_audit_steps),
         operator_diagnostics_interval=backbone.ttt_config.operator_diagnostics_interval,
+        warmup_qwen_bitwise_auditor=warmup_qwen_auditor,
         train_sampler_factory=(
             lambda dataset, rank, world_size: build_production_train_sampler(
                 dataset,
@@ -2348,21 +2335,18 @@ def _run_main(argv: list[str] | None = None) -> int:
         _disable_smoke_checkpoints(training_args)
     if checkpoint_policy is CheckpointPolicy.EPOCH_2_AND_EPOCH_4:
         _validate_epoch_two_four_training_arguments(training_args)
-    if (
-        backbone.ttt_config.a5_phase == "fast_state_warmup"
-        and smoke_max_steps is None
-    ):
+    if backbone.ttt_config.a5_phase == "fast_state_warmup" and smoke_max_steps is None:
         _validate_fast_state_warmup_training_arguments(training_args, project)
     trainer = cast(Any, build_production_trainer(backbone, runtime_raw))
     output_dir = Path(str(training_args.output_dir))
     artifact_root = Path(os.environ.get("RUN_ROOT", str(output_dir)))
     sequence_audit: tuple[str, int] | None = None
-    initial_qwen_sha256: str | None = None
+    qwen_source_sha256: str | None = None
     if backbone.ttt_config.a5_phase == "fast_state_warmup":
-        # Every rank must perform GPU-backed state reads in the same collective phase.
-        # Letting only rank zero hash while peers enter a NCCL barrier can deadlock after
-        # DeepSpeed has prepared the model, even though the Qwen parameters are frozen.
-        initial_qwen_sha256 = _module_bitwise_sha256(backbone.model)
+        # This pre-prepare digest is provenance only.  The actual frozen-Qwen baseline
+        # is captured by the Trainer on every rank after DeepSpeed preparation and
+        # before the first optimizer update.
+        qwen_source_sha256 = _module_bitwise_sha256(backbone.model)
     if configured_stage is ProductionStage.A5:
         # The sampler synchronizes its runtime-cost EMA when advancing epochs. Every rank
         # must therefore execute this preflight in the same collective order; running it
@@ -2385,9 +2369,7 @@ def _run_main(argv: list[str] | None = None) -> int:
         if full_unfreeze_audit is not None:
             environment["full_unfreeze_audit"] = asdict(full_unfreeze_audit)
         environment["outer_parameter_audit"] = asdict(parameter_audit)
-        environment["inner_sgd_learning_rate"] = float(
-            project.fast_ttt.optimizer.learning_rate
-        )
+        environment["inner_sgd_learning_rate"] = float(project.fast_ttt.optimizer.learning_rate)
         environment["outer_update_norm_budget_audit"] = budget_audit
         checkpoint_environment = None
         if checkpoint_audit is not None:
@@ -2395,7 +2377,10 @@ def _run_main(argv: list[str] | None = None) -> int:
             checkpoint_environment["checkpoint"] = str(checkpoint_audit.checkpoint)
         environment["a2_initialization_audit"] = checkpoint_environment
         environment["warmup_bundle_audit"] = warmup_bundle_audit
-        environment["warmup_qwen_initial_sha256"] = initial_qwen_sha256
+        environment["warmup_qwen_source_sha256"] = qwen_source_sha256
+        environment["warmup_qwen_bitwise_baseline_stage"] = (
+            _WarmupQwenBitwiseAuditor.baseline_stage if warmup_qwen_auditor is not None else None
+        )
         _write_json(artifact_root / "environment.json", environment)
     if configured_stage is ProductionStage.A5:
         trainer.accelerator.wait_for_everyone()
@@ -2406,7 +2391,16 @@ def _run_main(argv: list[str] | None = None) -> int:
     finally:
         flush_runtime_metrics(resolve_cuda=True)
     if skip_final_checkpoint:
+        qwen_bitwise_audit: WarmupQwenBitwiseAudit | None = None
+        if warmup_qwen_auditor is not None:
+            qwen_bitwise_audit = warmup_qwen_auditor.finalize(device=trainer.accelerator.device)
+            _write_warmup_qwen_bitwise_audit(
+                artifact_root=artifact_root,
+                audit=qwen_bitwise_audit,
+            )
         trainer.accelerator.wait_for_everyone()
+        if qwen_bitwise_audit is not None:
+            _assert_warmup_qwen_bitwise_unchanged(qwen_bitwise_audit)
         trainer.log_metrics("train", result.metrics)
         trainer.save_metrics("train", result.metrics)
         if trainer.is_world_process_zero():
@@ -2415,15 +2409,28 @@ def _run_main(argv: list[str] | None = None) -> int:
                 {
                     "status": "smoke_completed",
                     "stage": runtime_raw.stage.value,
+                    "a5_phase": backbone.ttt_config.a5_phase,
                     "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
-                    "inner_sgd_learning_rate": float(
-                        project.fast_ttt.optimizer.learning_rate
-                    ),
+                    "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
                     "outer_update_norm_budget_audit": budget_audit,
                     "global_step": int(trainer.state.global_step),
                     "elapsed_seconds": time.monotonic() - started,
                     "metrics": result.metrics,
                     "checkpoint_policy": "none_for_smoke",
+                    "qwen_bitwise_audit": (
+                        None
+                        if qwen_bitwise_audit is None
+                        else {
+                            "baseline_stage": qwen_bitwise_audit.baseline_stage,
+                            "baseline_global_step": (qwen_bitwise_audit.baseline_global_step),
+                            "baseline_sha256": qwen_bitwise_audit.baseline_sha256,
+                            "final_sha256": qwen_bitwise_audit.final_sha256,
+                            "tensor_count": qwen_bitwise_audit.tensor_count,
+                            "changed_tensor_count": (qwen_bitwise_audit.changed_tensor_count),
+                            "all_ranks_unchanged": (qwen_bitwise_audit.all_ranks_unchanged),
+                            "path": str(artifact_root / "qwen_bitwise_audit.json"),
+                        }
+                    ),
                     "final_checkpoint": None,
                     "resume_state": None,
                     "resumed_from": None,
@@ -2434,17 +2441,24 @@ def _run_main(argv: list[str] | None = None) -> int:
         trainer.accelerator.wait_for_everyone()
         trainer.log_metrics("train", result.metrics)
         trainer.save_metrics("train", result.metrics)
-        if initial_qwen_sha256 is None:
-            raise RuntimeError("warmup lost the initial Qwen bitwise digest")
-        final_qwen_sha256, prepared_bundle = _prepare_distributed_warmup_handoff(
+        if qwen_source_sha256 is None or warmup_qwen_auditor is None:
+            raise RuntimeError("warmup lost its Qwen provenance or bitwise auditor")
+        qwen_bitwise_audit, prepared_bundle = _prepare_distributed_warmup_handoff(
             model=runtime_raw.model,
             qwen_model=backbone.model,
-            initial_qwen_sha256=initial_qwen_sha256,
+            qwen_auditor=warmup_qwen_auditor,
             device=trainer.accelerator.device,
+        )
+        _write_warmup_qwen_bitwise_audit(
+            artifact_root=artifact_root,
+            audit=qwen_bitwise_audit,
         )
         # No rank may enter the publishing barrier while another rank is still copying
         # tensors from CUDA.  From this point onward rank zero performs CPU/filesystem work.
         trainer.accelerator.wait_for_everyone()
+        _assert_warmup_qwen_bitwise_unchanged(qwen_bitwise_audit)
+        if prepared_bundle is None:
+            raise RuntimeError("unchanged warmup Qwen audit produced no handoff tensors")
         if trainer.is_world_process_zero():
             bundle_path, bundle_manifest = _publish_warmup_bundle(
                 model=runtime_raw.model,
@@ -2452,8 +2466,9 @@ def _run_main(argv: list[str] | None = None) -> int:
                 backbone=backbone,
                 artifact_root=artifact_root,
                 global_step=int(trainer.state.global_step),
-                qwen_sha256=final_qwen_sha256,
+                qwen_sha256=qwen_source_sha256,
                 prepared_bundle=prepared_bundle,
+                qwen_warmup_audit=qwen_bitwise_audit,
             )
             _write_json(
                 artifact_root / "run_summary.json",
@@ -2469,6 +2484,16 @@ def _run_main(argv: list[str] | None = None) -> int:
                     "warmup_bundle": str(bundle_path),
                     "warmup_bundle_manifest": bundle_manifest,
                     "qwen_bitwise_unchanged": True,
+                    "qwen_bitwise_audit": {
+                        "baseline_stage": qwen_bitwise_audit.baseline_stage,
+                        "baseline_global_step": qwen_bitwise_audit.baseline_global_step,
+                        "baseline_sha256": qwen_bitwise_audit.baseline_sha256,
+                        "final_sha256": qwen_bitwise_audit.final_sha256,
+                        "tensor_count": qwen_bitwise_audit.tensor_count,
+                        "changed_tensor_count": qwen_bitwise_audit.changed_tensor_count,
+                        "all_ranks_unchanged": (qwen_bitwise_audit.all_ranks_unchanged),
+                        "path": str(artifact_root / "qwen_bitwise_audit.json"),
+                    },
                     "final_checkpoint": None,
                     "resume_state": None,
                     "resumed_from": None,
@@ -2494,9 +2519,7 @@ def _run_main(argv: list[str] | None = None) -> int:
                     "status": "completed",
                     "stage": runtime_raw.stage.value,
                     "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
-                    "inner_sgd_learning_rate": float(
-                        project.fast_ttt.optimizer.learning_rate
-                    ),
+                    "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
                     "outer_update_norm_budget_audit": budget_audit,
                     "global_step": int(trainer.state.global_step),
                     "elapsed_seconds": time.monotonic() - started,
@@ -2765,9 +2788,10 @@ def resolve_same_stage_resume(
     raw = cast(object, json.loads(run_config.read_text(encoding="utf-8")))
     if not isinstance(raw, dict) or raw.get("stage") != stage.value:
         raise ValueError("resume checkpoint stage does not match the configured production stage")
-    if raw.get("config_schema_version") != 12 or raw.get(
-        "associative_ttt_contract"
-    ) != "bank_conditioned_state_write_v2":
+    if (
+        raw.get("config_schema_version") != 12
+        or raw.get("associative_ttt_contract") != "bank_conditioned_state_write_v2"
+    ):
         raise ValueError(
             "same-stage resume requires the schema-12 state-write associative contract"
         )
@@ -2845,9 +2869,7 @@ def _audit_outer_parameters(
             "production Outer model still registers removed step-controller parameters"
         )
     associative = tuple(
-        (name, parameter)
-        for name, parameter in named
-        if _is_associative_parameter_name(name)
+        (name, parameter) for name, parameter in named if _is_associative_parameter_name(name)
     )
     transient = tuple(
         name
@@ -3295,11 +3317,241 @@ def _warmup_bundle_allowlist(
     return tuple(sorted(names))
 
 
+@dataclass(frozen=True, slots=True)
+class _TensorBitwiseDigest:
+    """One parameter or buffer's metadata and content digest."""
+
+    name: str
+    tensor_kind: str
+    dtype: str
+    shape: tuple[int, ...]
+    content_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ModuleBitwiseSnapshot:
+    """Streaming module digest plus per-tensor evidence, without tensor copies."""
+
+    sha256: str
+    tensors: tuple[_TensorBitwiseDigest, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _TensorBitwiseChange:
+    """A complete per-tensor before/after difference."""
+
+    name: str
+    change_type: str
+    baseline_kind: str | None
+    final_kind: str | None
+    baseline_dtype: str | None
+    final_dtype: str | None
+    baseline_shape: tuple[int, ...] | None
+    final_shape: tuple[int, ...] | None
+    baseline_content_sha256: str | None
+    final_content_sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WarmupQwenBitwiseAudit:
+    """Post-DeepSpeed, pre-update Qwen invariance result for one rank."""
+
+    baseline_stage: str
+    baseline_global_step: int
+    baseline_sha256: str
+    final_sha256: str
+    tensor_count: int
+    parameter_count: int
+    buffer_count: int
+    changed_tensor_count: int
+    changed_parameter_count: int
+    changed_buffer_count: int
+    final_trainable_parameter_names: tuple[str, ...]
+    local_unchanged: bool
+    all_ranks_unchanged: bool
+    changed_tensors: tuple[_TensorBitwiseChange, ...]
+
+
+class _WarmupQwenBitwiseAuditor:
+    """Capture the frozen Qwen baseline only after Trainer/DeepSpeed preparation."""
+
+    baseline_stage = "post_deepspeed_prepare_pre_first_training_step"
+
+    def __init__(self, qwen_model: nn.Module) -> None:
+        if not isinstance(qwen_model, nn.Module):
+            raise TypeError("warmup Qwen bitwise audit requires an nn.Module")
+        self.qwen_model = qwen_model
+        self._baseline: _ModuleBitwiseSnapshot | None = None
+        self._baseline_global_step: int | None = None
+        self._final_audit: WarmupQwenBitwiseAudit | None = None
+
+    @property
+    def baseline_sha256(self) -> str | None:
+        return None if self._baseline is None else self._baseline.sha256
+
+    def capture_post_prepare_baseline(self, *, global_step: int) -> None:
+        """Hash once, after prepare and before the first optimizer update."""
+
+        if self._baseline is not None:
+            return
+        if type(global_step) is not int or global_step != 0:
+            raise RuntimeError("warmup Qwen baseline must be captured before optimizer step one")
+        trainable = tuple(
+            name
+            for name, parameter in self.qwen_model.named_parameters()
+            if parameter.requires_grad
+        )
+        if trainable:
+            raise RuntimeError(f"warmup Qwen baseline found trainable parameters: {trainable[:8]}")
+        self._baseline = _module_bitwise_snapshot(self.qwen_model)
+        self._baseline_global_step = global_step
+
+    def finalize(self, *, device: torch.device) -> WarmupQwenBitwiseAudit:
+        """Compare the final Qwen state on every rank without early divergence."""
+
+        if self._final_audit is not None:
+            return self._final_audit
+        baseline_ready = _all_ranks_true(self._baseline is not None, device=device)
+        if not baseline_ready or self._baseline is None:
+            raise RuntimeError("one or more ranks missed the post-prepare warmup Qwen baseline")
+        if self._baseline_global_step is None:
+            raise RuntimeError("warmup Qwen baseline lost its optimizer-step boundary")
+        final = _module_bitwise_snapshot(self.qwen_model)
+        changes = _module_bitwise_changes(self._baseline, final)
+        final_trainable = tuple(
+            name
+            for name, parameter in self.qwen_model.named_parameters()
+            if parameter.requires_grad
+        )
+        local_unchanged = (
+            not changes and not final_trainable and final.sha256 == self._baseline.sha256
+        )
+        all_ranks_unchanged = _all_ranks_true(local_unchanged, device=device)
+        baseline_tensors = self._baseline.tensors
+        parameter_count = sum(value.tensor_kind == "parameter" for value in baseline_tensors)
+        buffer_count = sum(value.tensor_kind == "buffer" for value in baseline_tensors)
+        changed_parameter_count = sum(
+            (change.baseline_kind or change.final_kind) == "parameter" for change in changes
+        )
+        changed_buffer_count = sum(
+            (change.baseline_kind or change.final_kind) == "buffer" for change in changes
+        )
+        self._final_audit = WarmupQwenBitwiseAudit(
+            baseline_stage=self.baseline_stage,
+            baseline_global_step=self._baseline_global_step,
+            baseline_sha256=self._baseline.sha256,
+            final_sha256=final.sha256,
+            tensor_count=len(baseline_tensors),
+            parameter_count=parameter_count,
+            buffer_count=buffer_count,
+            changed_tensor_count=len(changes),
+            changed_parameter_count=changed_parameter_count,
+            changed_buffer_count=changed_buffer_count,
+            final_trainable_parameter_names=final_trainable,
+            local_unchanged=local_unchanged,
+            all_ranks_unchanged=all_ranks_unchanged,
+            changed_tensors=changes,
+        )
+        return self._final_audit
+
+
+def _module_bitwise_snapshot(module: nn.Module) -> _ModuleBitwiseSnapshot:
+    """Hash every parameter and buffer, including non-persistent runtime buffers."""
+
+    named_tensors = [
+        (name, "parameter", tensor)
+        for name, tensor in module.named_parameters(remove_duplicate=False)
+    ]
+    named_tensors.extend(
+        (name, "buffer", tensor) for name, tensor in module.named_buffers(remove_duplicate=False)
+    )
+    names = tuple(name for name, _, _ in named_tensors)
+    if len(names) != len(set(names)):
+        raise RuntimeError("module exposes a parameter/buffer name collision")
+    digest = hashlib.sha256()
+    tensors: list[_TensorBitwiseDigest] = []
+    for name, tensor_kind, tensor in sorted(named_tensors, key=lambda item: item[0]):
+        value = tensor.detach().contiguous().cpu()
+        dtype = str(value.dtype)
+        shape = tuple(value.shape)
+        payload = value.view(torch.uint8).numpy().tobytes()
+        content_sha256 = hashlib.sha256(payload).hexdigest()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(dtype.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(shape).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(payload)
+        digest.update(b"\n")
+        tensors.append(
+            _TensorBitwiseDigest(
+                name=name,
+                tensor_kind=tensor_kind,
+                dtype=dtype,
+                shape=shape,
+                content_sha256=content_sha256,
+            )
+        )
+    return _ModuleBitwiseSnapshot(
+        sha256=digest.hexdigest(),
+        tensors=tuple(tensors),
+    )
+
+
+def _module_bitwise_changes(
+    baseline: _ModuleBitwiseSnapshot,
+    final: _ModuleBitwiseSnapshot,
+) -> tuple[_TensorBitwiseChange, ...]:
+    before = {value.name: value for value in baseline.tensors}
+    after = {value.name: value for value in final.tensors}
+    changes: list[_TensorBitwiseChange] = []
+    for name in sorted(before.keys() | after.keys()):
+        old = before.get(name)
+        new = after.get(name)
+        if old == new:
+            continue
+        if old is None:
+            change_type = "added"
+        elif new is None:
+            change_type = "removed"
+        else:
+            metadata_changed = (
+                old.tensor_kind != new.tensor_kind
+                or old.dtype != new.dtype
+                or old.shape != new.shape
+            )
+            content_changed = old.content_sha256 != new.content_sha256
+            if metadata_changed and content_changed:
+                change_type = "metadata_and_content"
+            elif metadata_changed:
+                change_type = "metadata"
+            else:
+                change_type = "content"
+        changes.append(
+            _TensorBitwiseChange(
+                name=name,
+                change_type=change_type,
+                baseline_kind=None if old is None else old.tensor_kind,
+                final_kind=None if new is None else new.tensor_kind,
+                baseline_dtype=None if old is None else old.dtype,
+                final_dtype=None if new is None else new.dtype,
+                baseline_shape=None if old is None else old.shape,
+                final_shape=None if new is None else new.shape,
+                baseline_content_sha256=(None if old is None else old.content_sha256),
+                final_content_sha256=(None if new is None else new.content_sha256),
+            )
+        )
+    return tuple(changes)
+
+
 def _module_bitwise_sha256(module: nn.Module) -> str:
-    """Stream a deterministic bitwise digest without retaining a second model copy."""
+    """Keep the original persistent-state digest for checkpoint provenance."""
 
     digest = hashlib.sha256()
     for name, tensor in sorted(module.state_dict().items()):
+        if not isinstance(tensor, Tensor):
+            raise TypeError(f"module state entry {name!r} is not a Tensor")
         value = tensor.detach().contiguous().cpu()
         digest.update(name.encode("utf-8"))
         digest.update(b"\0")
@@ -3330,10 +3582,7 @@ def _prepare_warmup_bundle_tensors(
 
     allowlist = _warmup_bundle_allowlist(model, qwen_model)
     state = model.state_dict()
-    tensors = {
-        name: state[name].detach().cpu().contiguous().clone()
-        for name in allowlist
-    }
+    tensors = {name: state[name].detach().cpu().contiguous().clone() for name in allowlist}
     return allowlist, tensors
 
 
@@ -3341,20 +3590,57 @@ def _prepare_distributed_warmup_handoff(
     *,
     model: nn.Module,
     qwen_model: nn.Module,
-    initial_qwen_sha256: str,
+    qwen_auditor: _WarmupQwenBitwiseAuditor,
     device: torch.device,
-) -> tuple[str, tuple[tuple[str, ...], dict[str, Tensor]]]:
+) -> tuple[
+    WarmupQwenBitwiseAudit,
+    tuple[tuple[str, ...], dict[str, Tensor]] | None,
+]:
     """Finish all GPU-backed warmup audits before any rank enters a publish barrier."""
 
-    final_qwen_sha256 = _module_bitwise_sha256(qwen_model)
-    qwen_unchanged = _all_ranks_true(
-        final_qwen_sha256 == initial_qwen_sha256,
-        device=device,
+    if qwen_auditor.qwen_model is not qwen_model:
+        raise ValueError("warmup Qwen auditor does not own the loaded Qwen module")
+    audit = qwen_auditor.finalize(device=device)
+    prepared_bundle = (
+        _prepare_warmup_bundle_tensors(model, qwen_model) if audit.all_ranks_unchanged else None
     )
-    if not qwen_unchanged:
-        raise RuntimeError("Qwen parameters/buffers changed during Fast/State warmup")
-    prepared_bundle = _prepare_warmup_bundle_tensors(model, qwen_model)
-    return final_qwen_sha256, prepared_bundle
+    return audit, prepared_bundle
+
+
+def _write_warmup_qwen_bitwise_audit(
+    *,
+    artifact_root: Path,
+    audit: WarmupQwenBitwiseAudit,
+) -> tuple[Path, Path | None]:
+    """Persist complete rank-local tensor evidence before a possible fail-closed exit."""
+
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_available() and torch.distributed.is_initialized()
+        else 0
+    )
+    payload = {"rank": rank, **asdict(audit)}
+    rank_path = artifact_root / f"qwen_bitwise_audit.rank{rank}.json"
+    _write_json(rank_path, payload)
+    canonical_path: Path | None = None
+    if rank == 0:
+        canonical_path = artifact_root / "qwen_bitwise_audit.json"
+        _write_json(canonical_path, payload)
+    return rank_path, canonical_path
+
+
+def _assert_warmup_qwen_bitwise_unchanged(
+    audit: WarmupQwenBitwiseAudit,
+) -> None:
+    if audit.all_ranks_unchanged:
+        return
+    changed_names = tuple(change.name for change in audit.changed_tensors[:8])
+    raise RuntimeError(
+        "Qwen parameters/buffers changed after the post-DeepSpeed warmup baseline: "
+        f"local_changed={audit.changed_tensor_count}, "
+        f"changed_names={changed_names}, "
+        "see qwen_bitwise_audit.rank*.json"
+    )
 
 
 def _warmup_source_manifest(
@@ -3380,9 +3666,7 @@ def _warmup_source_manifest(
         "a2_checkpoint_sha256": _a2_checkpoint_sha256(Path(checkpoint_raw)),
         "code_commit": commit,
         "code_dirty": False,
-        "project_config_sha256": _effective_project_config_sha256(
-            backbone.project_config
-        ),
+        "project_config_sha256": _effective_project_config_sha256(backbone.project_config),
         "dataset_manifest_sha256": _sha256_file(dataset_manifest),
         "seed": seed,
         "data_seed": data_seed,
@@ -3398,14 +3682,15 @@ def _publish_warmup_bundle(
     global_step: int,
     qwen_sha256: str,
     prepared_bundle: tuple[tuple[str, ...], dict[str, Tensor]] | None = None,
+    qwen_warmup_audit: WarmupQwenBitwiseAudit | None = None,
 ) -> tuple[Path, dict[str, object]]:
     """Atomically publish the non-Qwen handoff only after a successful 128-step run."""
 
     expected_steps = int(backbone.project_config.a5.warmup.max_steps)
     if global_step != expected_steps:
-        raise RuntimeError(
-            f"warmup bundle requires step {expected_steps}, found {global_step}"
-        )
+        raise RuntimeError(f"warmup bundle requires step {expected_steps}, found {global_step}")
+    if qwen_warmup_audit is not None and not qwen_warmup_audit.all_ranks_unchanged:
+        raise RuntimeError("cannot publish a bundle after Qwen bitwise drift")
     destination = artifact_root / "a5_warmup_bundle"
     incomplete = artifact_root / ".a5_warmup_bundle.incomplete"
     if destination.exists() or incomplete.exists():
@@ -3434,6 +3719,15 @@ def _publish_warmup_bundle(
         "qwen_bitwise_sha256": qwen_sha256,
         "bundle_sha256": _sha256_file(weights),
     }
+    if qwen_warmup_audit is not None:
+        manifest.update(
+            {
+                "qwen_warmup_baseline_stage": qwen_warmup_audit.baseline_stage,
+                "qwen_warmup_baseline_sha256": qwen_warmup_audit.baseline_sha256,
+                "qwen_warmup_final_sha256": qwen_warmup_audit.final_sha256,
+                "qwen_warmup_tensor_count": qwen_warmup_audit.tensor_count,
+            }
+        )
     _write_json(incomplete / "manifest.json", manifest)
     incomplete.rename(destination)
     return destination, manifest

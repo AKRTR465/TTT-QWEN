@@ -13,8 +13,8 @@ from safetensors.torch import load_file, save_file
 from torch import nn
 
 from ttt_svcbench_qwen.llamafactory_trainer import (
-    _module_bitwise_sha256,
     _prepare_distributed_warmup_handoff,
+    _WarmupQwenBitwiseAuditor,
 )
 
 
@@ -47,18 +47,23 @@ def _worker(
     try:
         torch.manual_seed(41)
         model = _DistributedWarmupToy().to(device)
-        initial_qwen_sha256 = _module_bitwise_sha256(model.qwen)
+        model.qwen.requires_grad_(False)
+        qwen_auditor = _WarmupQwenBitwiseAuditor(model.qwen)
+        model.qwen.to(dtype=torch.bfloat16)
+        qwen_auditor.capture_post_prepare_baseline(global_step=0)
         with torch.no_grad():
             model.fast_slow.weight.add_(1.0e-3)
             model.state_counter.add_(1.0)
-        final_qwen_sha256, prepared = _prepare_distributed_warmup_handoff(
+        qwen_audit, prepared = _prepare_distributed_warmup_handoff(
             model=model,
             qwen_model=model.qwen,
-            initial_qwen_sha256=initial_qwen_sha256,
+            qwen_auditor=qwen_auditor,
             device=device,
         )
-        if final_qwen_sha256 != initial_qwen_sha256:
+        if not qwen_audit.all_ranks_unchanged:
             raise RuntimeError("Qwen digest changed in the finalization smoke")
+        if prepared is None:
+            raise RuntimeError("unchanged Qwen audit produced no handoff tensors")
         torch.distributed.barrier(device_ids=[rank])
         if rank == 0:
             allowlist, tensors = prepared

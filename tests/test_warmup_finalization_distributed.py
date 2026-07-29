@@ -39,19 +39,24 @@ def _warmup_finalization_worker(
     try:
         torch.manual_seed(41)
         model = _DistributedWarmupToy().to(device)
-        initial_qwen_sha256 = trainer_module._module_bitwise_sha256(model.qwen)
+        model.qwen.requires_grad_(False)
+        qwen_auditor = trainer_module._WarmupQwenBitwiseAuditor(model.qwen)
+        # Simulate a framework preparation conversion before the baseline.  This
+        # must not be confused with a training-time Qwen mutation.
+        model.qwen.to(dtype=torch.bfloat16)
+        qwen_auditor.capture_post_prepare_baseline(global_step=0)
         with torch.no_grad():
             model.fast_slow.weight.add_(1.0e-3)
             model.state_counter.add_(1.0)
-        final_qwen_sha256, prepared = (
-            trainer_module._prepare_distributed_warmup_handoff(
-                model=model,
-                qwen_model=model.qwen,
-                initial_qwen_sha256=initial_qwen_sha256,
-                device=device,
-            )
+        qwen_audit, prepared = trainer_module._prepare_distributed_warmup_handoff(
+            model=model,
+            qwen_model=model.qwen,
+            qwen_auditor=qwen_auditor,
+            device=device,
         )
-        assert final_qwen_sha256 == initial_qwen_sha256
+        assert qwen_audit.baseline_sha256 == qwen_audit.final_sha256
+        assert qwen_audit.all_ranks_unchanged
+        assert prepared is not None
         torch.distributed.barrier(device_ids=[rank])
         if rank == 0:
             allowlist, tensors = prepared

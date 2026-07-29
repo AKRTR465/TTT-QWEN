@@ -1422,9 +1422,9 @@ def test_a5_associative_lttt_finalonly_launcher_contract(
     native, extension = load_training_yaml(
         root / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
     )
-    launcher = (
-        root / "scripts/h200/train_a5_associative_lttt_finalonly.sh"
-    ).read_text(encoding="utf-8")
+    launcher = (root / "scripts/h200/train_a5_associative_lttt_finalonly.sh").read_text(
+        encoding="utf-8"
+    )
 
     assert native["num_train_epochs"] == 4.0
     assert extension.stage == "a5"
@@ -1455,12 +1455,8 @@ def test_a5_fast_state_warmup_yaml_and_launcher_are_restart_only(
     }.items():
         monkeypatch.setenv(key, value)
 
-    native, extension = load_training_yaml(
-        root / "configs/h200/a5_fast_state_warmup_128_4gpu.yaml"
-    )
-    launcher = (
-        root / "scripts/h200/train_a5_fast_state_warmup.sh"
-    ).read_text(encoding="utf-8")
+    native, extension = load_training_yaml(root / "configs/h200/a5_fast_state_warmup_128_4gpu.yaml")
+    launcher = (root / "scripts/h200/train_a5_fast_state_warmup.sh").read_text(encoding="utf-8")
 
     assert native["max_steps"] == 128
     assert native["warmup_steps"] == 4
@@ -1645,10 +1641,7 @@ def test_frozen_qwen_trainability_is_bitwise_stable(
     wrapper = nn.Module()
     wrapper.model = owner
     wrapper.lm_head = nn.Linear(2, 8, bias=False)
-    before = {
-        name: value.detach().clone()
-        for name, value in wrapper.state_dict().items()
-    }
+    before = {name: value.detach().clone() for name, value in wrapper.state_dict().items()}
     monkeypatch.setattr(
         "ttt_svcbench_qwen.production_factory.assert_qwen_runtime_structure",
         lambda _owner, _config: None,
@@ -1672,10 +1665,7 @@ def test_frozen_qwen_trainability_is_bitwise_stable(
     assert audit.frozen_vision_block_indices == tuple(range(27))
     assert audit.frozen_decoder_layer_indices == tuple(range(36))
     assert not any(parameter.requires_grad for parameter in wrapper.parameters())
-    assert all(
-        torch.equal(before[name], value)
-        for name, value in wrapper.state_dict().items()
-    )
+    assert all(torch.equal(before[name], value) for name, value in wrapper.state_dict().items())
 
 
 def test_a2_weight_initialization_is_strict_and_excludes_runtime_state(tmp_path: Path) -> None:
@@ -2566,15 +2556,9 @@ def test_canonical_a5_builds_equal_budget_production_optimizer(
     groups = {str(group["group_name"]): group for group in optimizer.param_groups}
     caps = project.outer_gradient_control.max_grad_norm
     assert "step_controller" not in groups
-    assert float(groups["fast_slow"]["lr"]) * float(caps.fast_slow) == pytest.approx(
-        5.0e-6
-    )
-    assert float(groups["w0"]["lr"]) * float(caps.w0) == pytest.approx(
-        5.0e-6
-    )
-    assert float(groups["associative"]["lr"]) * float(caps.associative) == pytest.approx(
-        5.0e-6
-    )
+    assert float(groups["fast_slow"]["lr"]) * float(caps.fast_slow) == pytest.approx(5.0e-6)
+    assert float(groups["w0"]["lr"]) * float(caps.w0) == pytest.approx(5.0e-6)
+    assert float(groups["associative"]["lr"]) * float(caps.associative) == pytest.approx(5.0e-6)
 
 
 def test_warmup_optimizer_excludes_qwen_and_updates_fast_state_groups(
@@ -2596,12 +2580,8 @@ def test_warmup_optimizer_excludes_qwen_and_updates_fast_state_groups(
     )
 
     assert "qwen" not in groups
-    assert {
-        id(parameter)
-        for parameter in delta_auditor.parameters["fast_slow"]
-    } == {
-        id(parameter)
-        for parameter in model.fast_adapter.collect_slow_parameters()
+    assert {id(parameter) for parameter in delta_auditor.parameters["fast_slow"]} == {
+        id(parameter) for parameter in model.fast_adapter.collect_slow_parameters()
     }
     assert {name: float(group["lr"]) for name, group in groups.items()} == {
         "fast_slow": 5.0e-5,
@@ -2613,34 +2593,94 @@ def test_warmup_optimizer_excludes_qwen_and_updates_fast_state_groups(
         "associative": 5.0e-5,
     }
     qwen_before = {
-        name: value.detach().clone()
-        for name, value in bundle.model.state_dict().items()
+        name: value.detach().clone() for name, value in bundle.model.state_dict().items()
     }
-    representatives = {
-        name: group["params"][0]
-        for name, group in groups.items()
-    }
+    representatives = {name: group["params"][0] for name, group in groups.items()}
     representative_before = {
-        name: parameter.detach().clone()
-        for name, parameter in representatives.items()
+        name: parameter.detach().clone() for name, parameter in representatives.items()
     }
     for _ in range(3):
         optimizer.zero_grad(set_to_none=True)
-        loss = sum(
-            parameter.float().mean()
-            for parameter in representatives.values()
-        )
+        loss = sum(parameter.float().mean() for parameter in representatives.values())
         loss.backward()
         optimizer.step()
 
     assert all(
-        torch.equal(qwen_before[name], value)
-        for name, value in bundle.model.state_dict().items()
+        torch.equal(qwen_before[name], value) for name, value in bundle.model.state_dict().items()
     )
     assert all(
         not torch.equal(representative_before[name], parameter)
         for name, parameter in representatives.items()
     )
+
+
+def test_warmup_qwen_bitwise_baseline_starts_after_framework_prepare() -> None:
+    qwen = nn.Sequential(nn.Linear(8, 8, bias=False), nn.LayerNorm(8))
+    qwen.register_buffer("position_counter", torch.arange(4, dtype=torch.int64))
+    qwen.requires_grad_(False)
+    auditor = trainer_module._WarmupQwenBitwiseAuditor(qwen)
+
+    # A framework conversion before the first Trainer step belongs outside the
+    # frozen-training interval.
+    qwen.to(dtype=torch.bfloat16)
+    auditor.capture_post_prepare_baseline(global_step=0)
+    audit = auditor.finalize(device=torch.device("cpu"))
+
+    assert audit.baseline_stage == "post_deepspeed_prepare_pre_first_training_step"
+    assert audit.baseline_global_step == 0
+    assert audit.baseline_sha256 == audit.final_sha256
+    assert audit.changed_tensor_count == 0
+    assert audit.local_unchanged
+    assert audit.all_ranks_unchanged
+
+
+def test_warmup_qwen_bitwise_audit_reports_parameter_and_buffer_drift(
+    tmp_path: Path,
+) -> None:
+    qwen = nn.Linear(8, 8, bias=False)
+    qwen.register_buffer("state_counter", torch.zeros(2), persistent=False)
+    qwen.requires_grad_(False)
+    auditor = trainer_module._WarmupQwenBitwiseAuditor(qwen)
+    auditor.capture_post_prepare_baseline(global_step=0)
+
+    with torch.no_grad():
+        qwen.weight[0, 0].add_(1.0)
+        qwen.state_counter[0].add_(1.0)
+    audit = auditor.finalize(device=torch.device("cpu"))
+    changed = {change.name: change for change in audit.changed_tensors}
+
+    assert not audit.local_unchanged
+    assert not audit.all_ranks_unchanged
+    assert audit.changed_parameter_count == 1
+    assert audit.changed_buffer_count == 1
+    assert changed["weight"].change_type == "content"
+    assert changed["state_counter"].change_type == "content"
+    rank_path, canonical_path = trainer_module._write_warmup_qwen_bitwise_audit(
+        artifact_root=tmp_path,
+        audit=audit,
+    )
+    assert rank_path.is_file()
+    assert canonical_path == tmp_path / "qwen_bitwise_audit.json"
+    persisted = json.loads(rank_path.read_text(encoding="utf-8"))
+    assert persisted["changed_tensor_count"] == 2
+    assert {item["name"] for item in persisted["changed_tensors"]} == {
+        "weight",
+        "state_counter",
+    }
+    with pytest.raises(RuntimeError, match="post-DeepSpeed"):
+        trainer_module._assert_warmup_qwen_bitwise_unchanged(audit)
+
+
+def test_warmup_qwen_bitwise_auditor_rejects_late_or_trainable_baseline() -> None:
+    trainable = nn.Linear(4, 4)
+    auditor = trainer_module._WarmupQwenBitwiseAuditor(trainable)
+    with pytest.raises(RuntimeError, match="trainable parameters"):
+        auditor.capture_post_prepare_baseline(global_step=0)
+
+    frozen = nn.Linear(4, 4).requires_grad_(False)
+    late = trainer_module._WarmupQwenBitwiseAuditor(frozen)
+    with pytest.raises(RuntimeError, match="before optimizer step one"):
+        late.capture_post_prepare_baseline(global_step=1)
 
 
 def test_warmup_bundle_is_non_qwen_atomic_and_fail_closed(
@@ -2686,9 +2726,7 @@ def test_warmup_bundle_is_non_qwen_atomic_and_fail_closed(
     assert not any(name.startswith("qwen.") for name in manifest["parameter_allowlist"])
     assert not any("transient_w_t" in name for name in manifest["parameter_allowlist"])
     assert manifest["qwen_bitwise_sha256"] == qwen_sha256
-    main_config = bundle.ttt_config.model_copy(
-        update={"warmup_bundle": str(bundle_path)}
-    )
+    main_config = bundle.ttt_config.model_copy(update={"warmup_bundle": str(bundle_path)})
     main_bundle = replace(bundle, ttt_config=main_config)
     with torch.no_grad():
         for name, parameter in model.named_parameters():
@@ -2703,10 +2741,7 @@ def test_warmup_bundle_is_non_qwen_atomic_and_fail_closed(
         backbone=main_bundle,
     )
     assert audit["tensor_count"] == len(expected)
-    assert all(
-        torch.equal(model.state_dict()[name], value)
-        for name, value in expected.items()
-    )
+    assert all(torch.equal(model.state_dict()[name], value) for name, value in expected.items())
 
     monkeypatch.setattr(
         trainer_module,
