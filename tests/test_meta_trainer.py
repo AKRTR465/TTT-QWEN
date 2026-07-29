@@ -264,6 +264,20 @@ class _TinyFastController(nn.Module):
             bank_record_counts=tuple(int(value.item()) for value in context.bank_record_counts),
             w_t_1_norms=tuple(float(state.w_t_1.detach().norm()) for state in self._active),
             w_t_2_norms=tuple(float(state.w_t_2.detach().norm()) for state in self._active),
+            master_delta_norms=tuple(
+                float(
+                    torch.sqrt(
+                        (state.w_t_1.detach().float() - state.w0_1.detach().float())
+                        .square()
+                        .sum()
+                        + (state.w_t_2.detach().float() - state.w0_2.detach().float())
+                        .square()
+                        .sum()
+                    )
+                )
+                for state in self._active
+            ),
+            fast_core_prediction_delta_norms=(0.0,) * len(self._active),
             input_norms=tuple(
                 float(visual.value[row].detach().norm()) for row in range(len(gains))
             ),
@@ -1126,6 +1140,78 @@ def test_truncated_a5_query_bundle_sums_proxy_gradients_then_closes_once(
     assert output.audit.segments[0].skip_count == 0
     assert output.audit.segments[0].deferred_vjp_norm > 0.0
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
+
+
+def test_query_cotangents_clip_independently_then_sum_without_averaging() -> None:
+    ordinary = (
+        torch.tensor([0.3], dtype=torch.float32),
+        torch.tensor([0.4], dtype=torch.float32),
+    )
+    small = (
+        torch.tensor([0.03], dtype=torch.float32),
+        torch.tensor([0.04], dtype=torch.float32),
+    )
+    extreme = (
+        torch.tensor([6.0], dtype=torch.float32),
+        torch.tensor([8.0], dtype=torch.float32),
+    )
+    originals = tuple(
+        tuple(gradient.clone() for gradient in query)
+        for query in (ordinary, small, extreme)
+    )
+
+    clipped_queries = []
+    audits = []
+    for query in (ordinary, small, extreme):
+        clipped, audit = meta_trainer_module._clip_query_proxy_gradients(
+            query,
+            max_norm=1.0,
+            epsilon=1.0e-12,
+        )
+        clipped_queries.append(clipped)
+        audits.append(audit)
+
+    assert [audit.raw_joint_norm for audit in audits] == pytest.approx([0.5, 0.05, 10.0])
+    assert [audit.clipped_joint_norm for audit in audits] == pytest.approx(
+        [0.5, 0.05, 1.0]
+    )
+    assert [audit.clip_scale for audit in audits] == pytest.approx([1.0, 1.0, 0.1])
+    assert [audit.clipped for audit in audits] == [False, False, True]
+
+    segment_sum = tuple(
+        sum(query[matrix_index] for query in clipped_queries)
+        for matrix_index in range(2)
+    )
+    torch.testing.assert_close(segment_sum[0], torch.tensor([0.93]))
+    torch.testing.assert_close(segment_sum[1], torch.tensor([1.24]))
+    assert meta_trainer_module._cotangent_norm_float(segment_sum) > 1.0
+
+    for query, original in zip((ordinary, small, extreme), originals, strict=True):
+        for gradient, expected in zip(query, original, strict=True):
+            torch.testing.assert_close(gradient, expected)
+
+
+def test_query_cotangent_clipping_does_not_rescale_direct_outer_gradient() -> None:
+    direct_outer = nn.Parameter(torch.tensor(2.0))
+    query_proxies = (
+        nn.Parameter(torch.tensor([6.0, 8.0])),
+        nn.Parameter(torch.tensor([60.0, 80.0])),
+    )
+    clipped_queries = []
+    for direct_coefficient, proxy in zip((3.0, 5.0), query_proxies, strict=True):
+        (direct_outer * direct_coefficient + proxy.square().sum()).backward()
+        assert proxy.grad is not None
+        clipped, _ = meta_trainer_module._clip_query_proxy_gradients(
+            (proxy.grad.detach().float().clone(),),
+            max_norm=1.0,
+            epsilon=1.0e-12,
+        )
+        clipped_queries.append(clipped[0])
+        proxy.grad = None
+
+    assert direct_outer.grad is not None
+    torch.testing.assert_close(direct_outer.grad, torch.tensor(8.0))
+    assert all(float(torch.linalg.vector_norm(value)) <= 1.0 + 1.0e-6 for value in clipped_queries)
 
 
 def test_query_proxy_gradient_equals_answer_plus_state_components(

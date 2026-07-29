@@ -1269,6 +1269,41 @@ def _set_optional_metric(metrics: dict[str, float], name: str, value: float | No
         metrics[name] = value
 
 
+def _query_tail_distribution(values: Sequence[float]) -> dict[str, float]:
+    ordered = sorted(values)
+    if not ordered or any(not math.isfinite(value) or value < 0.0 for value in ordered):
+        raise ValueError("Query-tail distribution requires finite non-negative values")
+
+    def quantile(probability: float) -> float:
+        position = (len(ordered) - 1) * probability
+        lower = math.floor(position)
+        upper = math.ceil(position)
+        if lower == upper:
+            return ordered[lower]
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    return {
+        "mean": sum(ordered) / len(ordered),
+        "median": quantile(0.5),
+        "p90": quantile(0.90),
+        "p95": quantile(0.95),
+        "p99": quantile(0.99),
+        "max": ordered[-1],
+    }
+
+
+def _top_fraction_share(values: Sequence[float], fraction: float) -> float:
+    ordered = sorted(values, reverse=True)
+    if not ordered or not 0.0 < fraction <= 1.0:
+        raise ValueError("top-fraction share requires values and a fraction in (0, 1]")
+    total = math.fsum(ordered)
+    if total == 0.0:
+        return 0.0
+    count = max(1, math.ceil(len(ordered) * fraction))
+    return math.fsum(ordered[:count]) / total
+
+
 def _counterfactual_query_selector(optimizer_step: int) -> int:
     """Select one shared Query ordinal for every rank in an exact-shape bucket."""
 
@@ -1303,6 +1338,12 @@ class TTTQwenTrainerMixin:
         self._last_timed_global_step = -1
         self._last_counterfactual_metrics: dict[str, float] = {}
         self._counterfactual_audit_pending = False
+        self._query_tail_history: dict[str, list[tuple[float, float, bool]]] = {
+            "all": [],
+            "intermediate": [],
+            "final": [],
+        }
+        self._last_query_tail_global_step = -1
         super().__init__(*args, **kwargs)
 
     def _install_a2_deepspeed_gradient_control(self) -> None:
@@ -1462,6 +1503,7 @@ class TTTQwenTrainerMixin:
                 }
             )
             role_norms: dict[str, list[float]] = {}
+            role_clipped_norms: dict[str, list[float]] = {}
             role_losses: dict[str, list[float]] = {}
             for query in meta_audit.queries:
                 proxy_norm = math.sqrt(sum(value * value for value in query.proxy_gradient_norms))
@@ -1469,6 +1511,18 @@ class TTTQwenTrainerMixin:
                 enriched[
                     f"a5/query_proxy_grad_norm/query_{query.query_index}_{query.query_role}"
                 ] = proxy_norm
+                enriched[
+                    f"a5/query_proxy_grad_norm/raw/query_{query.query_index}_{query.query_role}"
+                ] = query.proxy_gradient_joint_norm_raw
+                enriched[
+                    f"a5/query_proxy_grad_norm/clipped/query_{query.query_index}_{query.query_role}"
+                ] = query.proxy_gradient_joint_norm_clipped
+                enriched[
+                    f"a5/query_proxy_grad_clip_scale/query_{query.query_index}_{query.query_role}"
+                ] = query.proxy_gradient_clip_scale
+                enriched[
+                    f"a5/query_proxy_grad_clipped/query_{query.query_index}_{query.query_role}"
+                ] = float(query.proxy_gradient_clipped)
                 enriched[
                     f"a5/query_proxy_grad_nonzero/query_{query.query_index}_{query.query_role}"
                 ] = float(query.proxy_gradient_status == "nonzero")
@@ -1478,11 +1532,63 @@ class TTTQwenTrainerMixin:
                     query.weighted_outer_loss
                 )
                 role_norms.setdefault(query.query_role, []).append(proxy_norm)
+                role_clipped_norms.setdefault(query.query_role, []).append(
+                    query.proxy_gradient_joint_norm_clipped
+                )
                 role_losses.setdefault(query.query_role, []).append(query.weighted_outer_loss)
-            for role, values in role_norms.items():
-                enriched[f"a5/query_proxy_grad_norm/{role}"] = sum(values) / len(values)
-            for role, values in role_losses.items():
-                enriched[f"a5/query_outer_loss/{role}"] = sum(values) / len(values)
+            if global_step != self._last_query_tail_global_step:
+                for query in meta_audit.queries:
+                    if query.proxy_gradient_status == "zero_padding":
+                        continue
+                    item = (
+                        query.proxy_gradient_joint_norm_raw,
+                        query.proxy_gradient_joint_norm_clipped,
+                        query.proxy_gradient_clipped,
+                    )
+                    self._query_tail_history["all"].append(item)
+                    self._query_tail_history[query.query_role].append(item)
+                for history_values in self._query_tail_history.values():
+                    del history_values[:-256]
+                self._last_query_tail_global_step = global_step
+            for role, role_values in role_norms.items():
+                enriched[f"a5/query_proxy_grad_norm/{role}"] = sum(role_values) / len(
+                    role_values
+                )
+            for role, role_values in role_clipped_norms.items():
+                enriched[f"a5/query_proxy_grad_norm/clipped/{role}"] = sum(
+                    role_values
+                ) / len(role_values)
+            for role, role_values in role_losses.items():
+                enriched[f"a5/query_outer_loss/{role}"] = sum(role_values) / len(role_values)
+            for role, history in self._query_tail_history.items():
+                if not history:
+                    continue
+                raw_values = tuple(item[0] for item in history)
+                clipped_values = tuple(item[1] for item in history)
+                for label, distribution_values in (
+                    ("raw", raw_values),
+                    ("clipped", clipped_values),
+                ):
+                    for statistic, value in _query_tail_distribution(
+                        distribution_values
+                    ).items():
+                        enriched[
+                            f"a5/query_proxy_grad_norm/{label}/recent_{role}/{statistic}"
+                        ] = value
+                enriched[f"a5/query_proxy_grad_clip_rate/recent_{role}"] = sum(
+                    float(item[2]) for item in history
+                ) / len(history)
+                enriched[f"a5/query_proxy_grad_count/recent_{role}"] = float(len(history))
+            all_history = self._query_tail_history["all"]
+            if all_history:
+                for label, index in (("raw", 0), ("clipped", 1)):
+                    share_values = tuple(item[index] for item in all_history)
+                    enriched[f"a5/query_proxy_grad_norm/{label}/recent_top1_share"] = (
+                        _top_fraction_share(share_values, 0.01)
+                    )
+                    enriched[f"a5/query_proxy_grad_norm/{label}/recent_top5_share"] = (
+                        _top_fraction_share(share_values, 0.05)
+                    )
             for segment in meta_audit.segments:
                 enriched[f"a5/deferred_vjp_norm/segment_{segment.segment_index}"] = (
                     segment.deferred_vjp_norm
@@ -1505,6 +1611,12 @@ class TTTQwenTrainerMixin:
                 enriched[f"a5/query_count/segment_{segment.segment_index}"] = float(
                     segment.query_count
                 )
+                enriched[
+                    f"a5/query_cotangent_sum_norm/raw/segment_{segment.segment_index}"
+                ] = segment.raw_query_cotangent_sum_norm
+                enriched[
+                    f"a5/query_cotangent_sum_norm/clipped/segment_{segment.segment_index}"
+                ] = segment.clipped_query_cotangent_sum_norm
                 enriched[f"a5/meta_ttt_active/segment_{segment.segment_index}"] = float(
                     segment.training_mode == "meta_ttt"
                 )
@@ -1518,6 +1630,70 @@ class TTTQwenTrainerMixin:
                     enriched[f"a5/skip_reason/segment_{segment.segment_index}/{reason}"] = float(
                         count
                     )
+            if meta_audit.updates:
+                update_norms = tuple(
+                    value for update in meta_audit.updates for value in update.update_norms
+                )
+                master_changed = tuple(
+                    value
+                    for update in meta_audit.updates
+                    for value in update.master_changed_fractions
+                )
+                bf16_shadow_changed = tuple(
+                    value
+                    for update in meta_audit.updates
+                    for value in update.bf16_shadow_changed_fractions
+                )
+                master_deltas = tuple(
+                    value for update in meta_audit.updates for value in update.master_delta_norms
+                )
+                core_deltas = tuple(
+                    value
+                    for update in meta_audit.updates
+                    for value in update.fast_core_prediction_delta_norms
+                )
+                enriched["a5/fast_weight/master_update_norm"] = sum(update_norms) / len(
+                    update_norms
+                )
+                enriched["a5/fast_weight/master_changed_fraction"] = sum(
+                    master_changed
+                ) / len(master_changed)
+                enriched["a5/fast_weight/bf16_shadow_changed_fraction"] = sum(
+                    bf16_shadow_changed
+                ) / len(bf16_shadow_changed)
+                enriched["a5/fast_weight/master_delta_norm"] = sum(master_deltas) / len(
+                    master_deltas
+                )
+                enriched["a5/fast_weight/fast_core_prediction_delta_norm"] = sum(
+                    core_deltas
+                ) / len(core_deltas)
+                skip_reasons = tuple(
+                    reason
+                    for update in meta_audit.updates
+                    for did_update, reason in zip(
+                        update.did_update,
+                        update.skip_reasons,
+                        strict=True,
+                    )
+                    if not did_update
+                )
+                enriched["a5/fast_weight/skip_count/unrepresentable"] = float(
+                    sum(reason == "unrepresentable_update" for reason in skip_reasons)
+                )
+                enriched["a5/fast_weight/skip_count/zero"] = float(
+                    sum(reason == "zero_gradient" for reason in skip_reasons)
+                )
+                enriched["a5/fast_weight/skip_count/nonfinite"] = float(
+                    sum(
+                        reason
+                        in {
+                            "nonfinite_loss",
+                            "nonfinite_gradient",
+                            "invalid_after_clip",
+                        }
+                        for reason in skip_reasons
+                    )
+                )
         enriched.update(self.last_semantic_projector_metrics)
         controller = self.ttt_runtime.gradient_controller
         if isinstance(controller, OuterGradientController) and controller.last_audit is not None:
@@ -2432,11 +2608,11 @@ def resolve_same_stage_resume(
     raw = cast(object, json.loads(run_config.read_text(encoding="utf-8")))
     if not isinstance(raw, dict) or raw.get("stage") != stage.value:
         raise ValueError("resume checkpoint stage does not match the configured production stage")
-    if raw.get("config_schema_version") != 10 or raw.get(
+    if raw.get("config_schema_version") != 11 or raw.get(
         "associative_ttt_contract"
     ) != "bank_conditioned_visual_v1":
         raise ValueError(
-            "same-stage resume requires the schema-10 Bank-conditioned associative contract"
+            "same-stage resume requires the schema-11 Bank-conditioned associative contract"
         )
     if stage is ProductionStage.A5:
         checkpoint_mode = raw.get("a5_adaptation_mode", "meta_ttt")

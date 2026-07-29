@@ -393,6 +393,10 @@ class InnerUpdateAudit:
     skip_reasons: tuple[str | None, ...]
     gradient_norms: tuple[float | None, ...]
     update_norms: tuple[float, ...]
+    master_changed_fractions: tuple[float, ...]
+    bf16_shadow_changed_fractions: tuple[float, ...]
+    master_delta_norms: tuple[float, ...]
+    fast_core_prediction_delta_norms: tuple[float, ...]
     valid_token_counts: tuple[int, ...]
     bank_record_counts: tuple[int, ...]
     runtime_detached: bool
@@ -407,6 +411,10 @@ class InnerUpdateAudit:
             self.skip_reasons,
             self.gradient_norms,
             self.update_norms,
+            self.master_changed_fractions,
+            self.bf16_shadow_changed_fractions,
+            self.master_delta_norms,
+            self.fast_core_prediction_delta_norms,
             self.valid_token_counts,
             self.bank_record_counts,
         )
@@ -416,6 +424,12 @@ class InnerUpdateAudit:
             raise ValueError("current Support was not observed with its before-update weights")
         if not self.next_only_verified:
             raise ValueError("Meta-TTT update failed the next-chunk-only audit")
+        fractions = (*self.master_changed_fractions, *self.bf16_shadow_changed_fractions)
+        if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in fractions):
+            raise ValueError("Inner update changed fractions must be finite in [0, 1]")
+        precision_norms = (*self.master_delta_norms, *self.fast_core_prediction_delta_norms)
+        if any(not math.isfinite(value) or value < 0.0 for value in precision_norms):
+            raise ValueError("Inner update precision audit norms must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,6 +443,8 @@ class TruncatedSegmentAudit:
     support_count: int
     query_count: int
     associative_loss: float
+    raw_query_cotangent_sum_norm: float
+    clipped_query_cotangent_sum_norm: float
     deferred_vjp_norm: float
     query_roles: tuple[str, ...]
     query_weights: tuple[float, ...]
@@ -466,8 +482,15 @@ class TruncatedSegmentAudit:
             raise ValueError("truncated segment Support range does not match its count")
         if not math.isfinite(self.associative_loss) or self.associative_loss < 0.0:
             raise ValueError("truncated segment associative loss must be finite and non-negative")
-        if not math.isfinite(self.deferred_vjp_norm) or self.deferred_vjp_norm < 0.0:
-            raise ValueError("truncated segment deferred VJP norm must be finite and non-negative")
+        cotangent_norms = (
+            self.raw_query_cotangent_sum_norm,
+            self.clipped_query_cotangent_sum_norm,
+            self.deferred_vjp_norm,
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in cotangent_norms):
+            raise ValueError("truncated segment cotangent norms must be finite and non-negative")
+        if self.clipped_query_cotangent_sum_norm != self.deferred_vjp_norm:
+            raise ValueError("deferred VJP norm must equal the clipped Query cotangent sum norm")
         if (
             len(self.query_roles) != self.query_count
             or len(self.query_weights) != self.query_count
@@ -564,6 +587,23 @@ class QueryCounterfactualAudit:
 
 
 @dataclass(frozen=True, slots=True)
+class QueryCotangentClipAudit:
+    raw_joint_norm: float
+    clipped_joint_norm: float
+    clip_scale: float
+    clipped: bool
+
+    def __post_init__(self) -> None:
+        values = (self.raw_joint_norm, self.clipped_joint_norm, self.clip_scale)
+        if any(not math.isfinite(value) or value < 0.0 for value in values):
+            raise ValueError("Query cotangent clip audit values must be finite and non-negative")
+        if self.clip_scale > 1.0 or self.clipped_joint_norm > 1.0 + 1.0e-6:
+            raise ValueError("Query cotangent clip audit exceeds the frozen unit-norm cap")
+        if self.clipped != (self.clip_scale < 1.0):
+            raise ValueError("Query cotangent clipped flag disagrees with its scale")
+
+
+@dataclass(frozen=True, slots=True)
 class TruncatedQueryPointAudit:
     """Adapted-only Query audit used by the production A5 path."""
 
@@ -581,6 +621,10 @@ class TruncatedQueryPointAudit:
     prefill_count: int
     observation_immutable: bool
     proxy_gradient_norms: tuple[float, ...]
+    proxy_gradient_joint_norm_raw: float
+    proxy_gradient_joint_norm_clipped: float
+    proxy_gradient_clip_scale: float
+    proxy_gradient_clipped: bool
     proxy_gradient_status: str
     proxy_storage_isolated: bool
     proxy_max_abs_value_drift: float
@@ -607,6 +651,20 @@ class TruncatedQueryPointAudit:
             not math.isfinite(value) or value < 0.0 for value in self.proxy_gradient_norms
         ):
             raise ValueError("Query proxy gradient norms must be finite and non-negative")
+        expected_joint = math.sqrt(math.fsum(value * value for value in self.proxy_gradient_norms))
+        if not math.isclose(
+            self.proxy_gradient_joint_norm_raw,
+            expected_joint,
+            rel_tol=1.0e-6,
+            abs_tol=1.0e-8,
+        ):
+            raise ValueError("Query proxy raw joint norm disagrees with per-matrix norms")
+        QueryCotangentClipAudit(
+            raw_joint_norm=self.proxy_gradient_joint_norm_raw,
+            clipped_joint_norm=self.proxy_gradient_joint_norm_clipped,
+            clip_scale=self.proxy_gradient_clip_scale,
+            clipped=self.proxy_gradient_clipped,
+        )
         gradient_nonzero = any(value > 0.0 for value in self.proxy_gradient_norms)
         if gradient_nonzero != (self.proxy_gradient_status == "nonzero"):
             raise ValueError("Query proxy gradient status disagrees with measured norms")
@@ -1127,6 +1185,7 @@ class MetaTTTEpisodeRunner:
             query_runtime_snapshot = adapted.runtime
             authoritative_fast_states = query_runtime_snapshot.fast_states
             accumulated_gradients: tuple[Tensor, ...] | None = None
+            raw_accumulated_gradients: tuple[Tensor, ...] | None = None
             fast_versions = tuple(state.fast_version for state in authoritative_fast_states)
             for bundle_offset, (query, query_role, query_weight) in enumerate(
                 zip(queries, query_roles, query_weights, strict=True)
@@ -1236,6 +1295,11 @@ class MetaTTTEpisodeRunner:
                     proxy_states,
                     backward_gradient_scale=float(backward_gradient_scale),
                 )
+                clipped_gradients, cotangent_clip_audit = _clip_query_proxy_gradients(
+                    captured_gradients,
+                    max_norm=self.config.a5.query_meta_gradient.max_norm,
+                    epsilon=self.config.a5.query_meta_gradient.epsilon,
+                )
                 query_counterfactual: QueryCounterfactualAudit | None = None
                 if (
                     global_query_index == selected_query_index
@@ -1299,12 +1363,23 @@ class MetaTTTEpisodeRunner:
                         ),
                     )
                 if accumulated_gradients is None:
-                    accumulated_gradients = captured_gradients
+                    accumulated_gradients = clipped_gradients
+                    raw_accumulated_gradients = captured_gradients
                 else:
                     accumulated_gradients = tuple(
                         total + current
                         for total, current in zip(
                             accumulated_gradients,
+                            clipped_gradients,
+                            strict=True,
+                        )
+                    )
+                    if raw_accumulated_gradients is None:
+                        raise RuntimeError("raw Query cotangent accumulator disappeared")
+                    raw_accumulated_gradients = tuple(
+                        total + current
+                        for total, current in zip(
+                            raw_accumulated_gradients,
                             captured_gradients,
                             strict=True,
                         )
@@ -1336,6 +1411,12 @@ class MetaTTTEpisodeRunner:
                         prefill_count=query_lifecycle.audit().prefill_count,
                         observation_immutable=immutable,
                         proxy_gradient_norms=proxy_gradient_norms,
+                        proxy_gradient_joint_norm_raw=cotangent_clip_audit.raw_joint_norm,
+                        proxy_gradient_joint_norm_clipped=(
+                            cotangent_clip_audit.clipped_joint_norm
+                        ),
+                        proxy_gradient_clip_scale=cotangent_clip_audit.clip_scale,
+                        proxy_gradient_clipped=cotangent_clip_audit.clipped,
                         proxy_gradient_status=_proxy_gradient_status(
                             proxy_gradient_norms,
                             objective.metrics,
@@ -1354,6 +1435,8 @@ class MetaTTTEpisodeRunner:
                 adapted.runtime = query_runtime_snapshot
                 del (
                     captured_gradients,
+                    clipped_gradients,
+                    cotangent_clip_audit,
                     query_counterfactual,
                     gradient_statistics,
                     query_loss,
@@ -1370,19 +1453,15 @@ class MetaTTTEpisodeRunner:
                     balanced_outer,
                 )
 
-            if accumulated_gradients is None:
+            if accumulated_gradients is None or raw_accumulated_gradients is None:
                 raise RuntimeError("A5 Query bundle produced no proxy cotangent")
-            deferred_vjp_norm = float(
-                torch.stack(
-                    tuple(
-                        gradient.to(torch.float32).square().sum()
-                        for gradient in accumulated_gradients
-                    )
-                )
-                .sum()
-                .sqrt()
-                .item()
+            raw_query_cotangent_sum_norm = _cotangent_norm_float(
+                raw_accumulated_gradients
             )
+            clipped_query_cotangent_sum_norm = _cotangent_norm_float(
+                accumulated_gradients
+            )
+            deferred_vjp_norm = clipped_query_cotangent_sum_norm
             deferred_vjp = deferred_fast_vjp_loss(
                 authoritative_fast_states,
                 accumulated_gradients,
@@ -1427,6 +1506,8 @@ class MetaTTTEpisodeRunner:
                     support_count=segment_length,
                     query_count=segment_query_count,
                     associative_loss=segment_associative_loss,
+                    raw_query_cotangent_sum_norm=raw_query_cotangent_sum_norm,
+                    clipped_query_cotangent_sum_norm=clipped_query_cotangent_sum_norm,
                     deferred_vjp_norm=deferred_vjp_norm,
                     query_roles=query_roles,
                     query_weights=query_weights,
@@ -1460,6 +1541,8 @@ class MetaTTTEpisodeRunner:
                 update_count=segment_update_count,
                 skip_count=segment_update_attempts - segment_update_count,
                 skip_reason_counts=tuple(sorted(segment_skip_reasons.items())),
+                raw_query_cotangent_sum_norm=raw_query_cotangent_sum_norm,
+                clipped_query_cotangent_sum_norm=clipped_query_cotangent_sum_norm,
                 deferred_vjp_norm=deferred_vjp_norm,
                 cuda_allocated_bytes=(
                     torch.cuda.memory_allocated(device) if device.type == "cuda" else 0
@@ -1475,6 +1558,7 @@ class MetaTTTEpisodeRunner:
             query_offset += segment_query_count
             del (
                 accumulated_gradients,
+                raw_accumulated_gradients,
                 deferred_vjp,
                 segment_outputs,
                 segment_query,
@@ -1918,6 +2002,16 @@ def _make_inner_update_audit(
         ),
         gradient_norms=tuple(result.gradient_norm for result in results),
         update_norms=tuple(result.update_norm for result in results),
+        master_changed_fractions=tuple(
+            result.master_changed_fraction for result in results
+        ),
+        bf16_shadow_changed_fractions=tuple(
+            result.bf16_shadow_changed_fraction for result in results
+        ),
+        master_delta_norms=observed_fast_audit.master_delta_norms,
+        fast_core_prediction_delta_norms=(
+            observed_fast_audit.fast_core_prediction_delta_norms
+        ),
         valid_token_counts=tuple(
             int(value.item()) for value in associative_output.valid_token_counts
         ),
@@ -2119,6 +2213,59 @@ def _capture_query_proxy_gradients(
         gradients.append(unscaled)
         norms.append(float(torch.linalg.vector_norm(unscaled).cpu().item()))
     return tuple(gradients), tuple(norms)
+
+
+def _clip_query_proxy_gradients(
+    gradients: Sequence[Tensor],
+    *,
+    max_norm: float,
+    epsilon: float,
+) -> tuple[tuple[Tensor, ...], QueryCotangentClipAudit]:
+    """Clip one Query's complete FP32 cotangent before segment-level summation."""
+
+    values = tuple(gradients)
+    if not values or any(
+        gradient.dtype != torch.float32
+        or gradient.requires_grad
+        or gradient.grad_fn is not None
+        for gradient in values
+    ):
+        raise ValueError("Query cotangent clipping requires detached FP32 gradients")
+    if not math.isfinite(max_norm) or max_norm != 1.0:
+        raise ValueError("Query cotangent max_norm must be the frozen value 1.0")
+    if not math.isfinite(epsilon) or epsilon != 1.0e-12:
+        raise ValueError("Query cotangent epsilon must be the frozen value 1e-12")
+    raw_norm = _cotangent_norm_float(values)
+    scale = min(1.0, max_norm / max(raw_norm, epsilon))
+    clipped = tuple(gradient * scale for gradient in values)
+    clipped_norm = _cotangent_norm_float(clipped)
+    return clipped, QueryCotangentClipAudit(
+        raw_joint_norm=raw_norm,
+        clipped_joint_norm=clipped_norm,
+        clip_scale=scale,
+        clipped=scale < 1.0,
+    )
+
+
+def _cotangent_norm_float(gradients: Sequence[Tensor]) -> float:
+    values = tuple(gradients)
+    if not values:
+        raise ValueError("Query cotangent norm requires at least one tensor")
+    squared_sums = tuple(
+        float(
+            gradient.detach()
+            .float()
+            .square()
+            .sum(dtype=torch.float32)
+            .to(device="cpu", dtype=torch.float64)
+            .item()
+        )
+        for gradient in values
+    )
+    result = math.sqrt(math.fsum(squared_sums))
+    if not math.isfinite(result):
+        raise ValueError("Query cotangent norm must be finite")
+    return result
 
 
 class _SeededRNG:

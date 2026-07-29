@@ -5,7 +5,7 @@
 - A2 全量状态模型训练，再初始化 A5 Meta-TTT；
 - 按视频隔离、按 chunk 因果更新的在线推理。
 
-当前架构规范为 `state_ttt_qwen3vl8b_bank_associative_v1`，正式配置 schema 为 10；历史阶段 gate 与 synthetic 报告不再随源码分发。
+当前架构规范为 `state_ttt_qwen3vl8b_bank_associative_v2`，正式配置 schema 为 11；历史阶段 gate 与 synthetic 报告不再随源码分发。
 
 ## 架构摘要
 
@@ -53,7 +53,10 @@ bash scripts/h200/train_fullprefix256.sh a5 /absolute/path/a2/checkpoints/final-
 - Support 保持 8/16 帧动态块；每个 Query 独立读取 `[0, query_time]` 因果前缀，2 FPS、最多
   256 帧，动态视觉 Token 数不变；
 - A5 多 Query 逐个 forward/backward，释放各自激活；所有 Query 使用同一段末 fast state，
-  Bank/FSM 仍是只读权威状态；Support 内层损失不进入 Outer backward，关联中间量不跨调用保存。
+  Bank/FSM 仍是只读权威状态；每个 Query 的 FP32 fast-weight cotangent 按联合范数裁剪到
+  1.0 后在 segment 内求和，直接 Query→Qwen/State 梯度不参与该逐 Query 裁剪；
+- W0 保持 checkpoint/model dtype，瞬态 Wt 和 fast MLP 核心固定为 FP32；Support 内层损失不
+  进入 Outer backward，关联中间量不跨调用保存。
 - 四卡 sampler 保持任务/segment parity，padding 样本 loss 权重为零；
 - checkpoint 保存模型、optimizer、scheduler、RNG，但排除 Wt、Bank、cache 和 FSM runtime。
 

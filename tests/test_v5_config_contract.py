@@ -23,10 +23,15 @@ def _raw() -> dict[str, object]:
     return value
 
 
-def test_schema10_bank_associative_contract_is_frozen_and_roundtrips() -> None:
+def test_schema11_fp32_fast_and_robust_query_contract_is_frozen_and_roundtrips() -> None:
     config = load_config(CONFIG_PATH)
-    assert config.config_schema_version == CONFIG_SCHEMA_VERSION == 10
-    assert config.spec_version == SPEC_VERSION == "state_ttt_qwen3vl8b_bank_associative_v1"
+    assert config.config_schema_version == CONFIG_SCHEMA_VERSION == 11
+    assert config.spec_version == SPEC_VERSION == "state_ttt_qwen3vl8b_bank_associative_v2"
+    assert config.fast_ttt.optimizer.fast_weight_dtype == "float32"
+    assert config.fast_ttt.optimizer.fast_core_dtype == "float32"
+    assert config.a5.query_meta_gradient.mode == "per_query_global_norm_clip_sum"
+    assert config.a5.query_meta_gradient.max_norm == 1.0
+    assert config.a5.query_meta_gradient.epsilon == 1.0e-12
     assert config.associative_ttt.contract == "bank_conditioned_visual_v1"
     assert config.associative_ttt.bank_embedding_dim == 512
     assert config.associative_ttt.key_dim == config.associative_ttt.value_dim == 768
@@ -36,11 +41,11 @@ def test_schema10_bank_associative_contract_is_frozen_and_roundtrips() -> None:
     assert ProjectConfig.model_validate(config.model_dump()) == config
 
 
-@pytest.mark.parametrize("schema", [6, 7, 8, 9])
+@pytest.mark.parametrize("schema", [6, 7, 8, 9, 10])
 def test_legacy_schema_cannot_cross_associative_boundary(schema: int) -> None:
     raw = _raw()
     raw["config_schema_version"] = schema
-    with pytest.raises(ValueError, match="schema-10|config_schema_version must be 10"):
+    with pytest.raises(ValueError, match="schema-11|config_schema_version must be 11"):
         ProjectConfig.model_validate(raw)
 
 

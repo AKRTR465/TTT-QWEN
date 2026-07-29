@@ -50,11 +50,11 @@ def make_state(
     if differentiable:
         w0_1.requires_grad_(True)
         w0_2.requires_grad_(True)
-        w_t_1 = w0_1.clone()
-        w_t_2 = w0_2.clone()
+        w_t_1 = w0_1.float().clone()
+        w_t_2 = w0_2.float().clone()
     else:
-        w_t_1 = w0_1.clone().requires_grad_(True)
-        w_t_2 = w0_2.clone().requires_grad_(True)
+        w_t_1 = w0_1.float().clone().requires_grad_(True)
+        w_t_2 = w0_2.float().clone().requires_grad_(True)
     return FastWeightsState(
         w0_1=w0_1,
         w0_2=w0_2,
@@ -260,7 +260,7 @@ def test_nonfinite_gradient_fault_injection_skips_without_touching_grad_fields(
     assert state.w_t_1.grad is None and state.w_t_2.grad is None
 
 
-def test_zero_gradient_and_bfloat16_unrepresentable_delta_are_explicit_skips(
+def test_zero_gradient_skips_but_bfloat16_w0_uses_representable_fp32_master_update(
     optimizer_config: InnerSGDConfig,
 ) -> None:
     zero_state = make_state()
@@ -273,10 +273,13 @@ def test_zero_gradient_and_bfloat16_unrepresentable_delta_are_explicit_skips(
 
     assert zero.skip_reason is UpdateSkipReason.ZERO_GRADIENT
     assert zero.skip_detail == "clipped_gradient_has_zero_global_norm"
-    assert bf16.skip_reason is UpdateSkipReason.UNREPRESENTABLE_UPDATE
-    assert bf16.skip_detail == "update_not_representable_in_fast_dtype"
-    assert torch.equal(bf16.fast_state.w_t_1, bf16_state.w_t_1)
-    assert torch.equal(bf16.fast_state.w_t_2, bf16_state.w_t_2)
+    assert bf16.did_update
+    assert bf16.skip_reason is None
+    assert bf16.update_norm > 0.0
+    assert bf16.master_changed_fraction > 0.0
+    assert bf16.bf16_shadow_changed_fraction == 0.0
+    assert not torch.equal(bf16.fast_state.w_t_1, bf16_state.w_t_1)
+    assert not torch.equal(bf16.fast_state.w_t_2, bf16_state.w_t_2)
 
 
 def test_meta_update_keeps_full_outer_gradient_to_w0(
@@ -531,6 +534,8 @@ def test_non_scalar_loss_is_rejected_before_autograd(
         ("grad_clip_norm", 2.0),
         ("reset_per_video", False),
         ("meta_gradient_mode", "first_order"),
+        ("fast_weight_dtype", "bfloat16"),
+        ("fast_core_dtype", "bfloat16"),
     ),
 )
 def test_frozen_optimizer_config_drift_is_rejected(
@@ -565,6 +570,8 @@ def test_result_rejects_nonfinite_audit_values(
             per_matrix_gradient_norms=None,
             per_matrix_clipped_norms=None,
             update_norm=0.0,
+            master_changed_fraction=0.0,
+            bf16_shadow_changed_fraction=0.0,
             skip_reason=UpdateSkipReason.NO_VALID_TOKEN,
             skip_detail="fault",
             gradient_mode=GradientMode.ONLINE_LEAF,

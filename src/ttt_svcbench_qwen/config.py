@@ -18,8 +18,8 @@ import transformers
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION = "state_ttt_qwen3vl8b_bank_associative_v1"
-CONFIG_SCHEMA_VERSION = 10
+SPEC_VERSION = "state_ttt_qwen3vl8b_bank_associative_v2"
+CONFIG_SCHEMA_VERSION = 11
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -129,6 +129,8 @@ class InnerSGDConfig(FrozenModel):
     grad_clip_norm: PositiveFloat
     reset_per_video: bool
     meta_gradient_mode: str
+    fast_weight_dtype: Literal["float32"]
+    fast_core_dtype: Literal["float32"]
 
 
 class FastTTTConfig(FrozenModel):
@@ -635,12 +637,21 @@ class A5CounterfactualAuditConfig(FrozenModel):
         return self
 
 
+class A5QueryMetaGradientConfig(FrozenModel):
+    """Robust aggregation applied only to Query fast-weight cotangents."""
+
+    mode: Literal["per_query_global_norm_clip_sum"]
+    max_norm: PositiveFloat
+    epsilon: PositiveFloat
+
+
 class A5TrainingConfig(FrozenModel):
     """Direct A5 contract with K-step truncation and one episode seed."""
 
     truncation_horizon: PositiveInt
     seed: NonNegativeInt
     optimizer: A5OptimizerConfig
+    query_meta_gradient: A5QueryMetaGradientConfig
     counterfactual_audit: A5CounterfactualAuditConfig = A5CounterfactualAuditConfig()
 
 
@@ -651,7 +662,7 @@ class InferenceRuntimeConfig(FrozenModel):
 
 
 class ProjectConfig(FrozenModel):
-    """Schema-10 production configuration with cross-component contract validation."""
+    """Schema-11 production configuration with cross-component contract validation."""
 
     spec_version: str
     config_schema_version: int
@@ -804,6 +815,16 @@ class ProjectConfig(FrozenModel):
                 "full_second_order",
             ),
             ("fast_ttt.optimizer.learning_rate", self.fast_ttt.optimizer.learning_rate, 1.0e-4),
+            (
+                "fast_ttt.optimizer.fast_weight_dtype",
+                self.fast_ttt.optimizer.fast_weight_dtype,
+                "float32",
+            ),
+            (
+                "fast_ttt.optimizer.fast_core_dtype",
+                self.fast_ttt.optimizer.fast_core_dtype,
+                "float32",
+            ),
             ("spatial_encoder.input_dim", self.spatial_encoder.input_dim, 4096),
             ("spatial_encoder.hidden_dim", self.spatial_encoder.hidden_dim, 768),
             ("spatial_encoder.stages", self.spatial_encoder.stages, 2),
@@ -1701,6 +1722,14 @@ class ProjectConfig(FrozenModel):
         for path, actual, expected in checks:
             if actual != expected:
                 raise ValueError(f"{path} must be {expected!r}; got {actual!r}")
+        if self.a5.query_meta_gradient.mode != "per_query_global_norm_clip_sum":
+            raise ValueError(
+                "a5.query_meta_gradient.mode must be 'per_query_global_norm_clip_sum'"
+            )
+        if self.a5.query_meta_gradient.max_norm != 1.0:
+            raise ValueError("a5.query_meta_gradient.max_norm must be 1.0")
+        if self.a5.query_meta_gradient.epsilon != 1.0e-12:
+            raise ValueError("a5.query_meta_gradient.epsilon must be 1e-12")
         self._validate_attention_dimensions()
         self._validate_video_preprocessing_contract()
         self._validate_head_contracts()
@@ -2070,21 +2099,21 @@ class ProjectConfig(FrozenModel):
 
 
 def _normalize_project_schema(value: object) -> object:
-    """Reject every legacy loss contract at the associative boundary."""
+    """Reject every legacy precision/gradient contract at the v2 boundary."""
 
     if not isinstance(value, dict):
         return value
     schema = value.get("config_schema_version")
     if schema == CONFIG_SCHEMA_VERSION:
         return value
-    if schema == 9:
+    if schema in {9, 10}:
         raise ValueError(
-            "schema 9 uses the removed Predictor/identity/event LTTT contract; "
-            "rebuild a schema-10 Bank-conditioned associative configuration"
+            "schema 9-10 predates the FP32-fast/robust-Query contract; "
+            "rebuild a schema-11 Bank-conditioned associative configuration"
         )
     raise ValueError(
-        "config_schema_version must be 10; legacy schema 6-9 configurations "
-        "cannot be migrated across the associative LTTT boundary"
+        "config_schema_version must be 11; legacy schema 6-10 configurations "
+        "cannot be migrated across the precision/Query-gradient boundary"
     )
 
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:

@@ -1646,7 +1646,7 @@ def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Pa
         json.dumps(
             {
                 "stage": "a5",
-                "config_schema_version": 10,
+                "config_schema_version": 11,
                 "associative_ttt_contract": "bank_conditioned_visual_v1",
             }
         ),
@@ -1684,7 +1684,7 @@ def test_same_stage_resume_accepts_only_matching_static_w0_mode(tmp_path: Path) 
             {
                 "stage": "a5",
                 "a5_adaptation_mode": "static_w0",
-                "config_schema_version": 10,
+                "config_schema_version": 11,
                 "associative_ttt_contract": "bank_conditioned_visual_v1",
             }
         ),
@@ -1723,7 +1723,7 @@ def test_same_stage_resume_rejects_legacy_associative_contract(
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="schema-10 Bank-conditioned associative"):
+    with pytest.raises(ValueError, match="schema-11 Bank-conditioned associative"):
         resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
 
 

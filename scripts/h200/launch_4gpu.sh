@@ -229,6 +229,13 @@ payload = {
     "associative_ttt_contract": project.associative_ttt.contract,
     "a5_adaptation_mode": adaptation_mode,
     "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
+    "fast_weight_dtype": project.fast_ttt.optimizer.fast_weight_dtype,
+    "fast_core_dtype": project.fast_ttt.optimizer.fast_core_dtype,
+    "query_meta_gradient": {
+        "mode": project.a5.query_meta_gradient.mode,
+        "max_norm": float(project.a5.query_meta_gradient.max_norm),
+        "epsilon": float(project.a5.query_meta_gradient.epsilon),
+    },
     "outer_update_norm_budget_audit": budget_audit,
     "config": config,
     "working_directory": os.getcwd(),

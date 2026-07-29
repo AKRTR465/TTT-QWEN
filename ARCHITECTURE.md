@@ -1,8 +1,8 @@
 # Qwen3-VL-8B Bank-conditioned Associative State-TTT 架构
 
-> 规范版本：state_ttt_qwen3vl8b_bank_associative_v1
-> 配置 schema：10（旧 schema 9 及更早配置不自动升级）
-> 修订日期：2026-07-28
+> 规范版本：state_ttt_qwen3vl8b_bank_associative_v2
+> 配置 schema：11（旧 schema 10 及更早配置不自动升级）
+> 修订日期：2026-07-29
 > 状态：A2/A5 TRAINING MAINLINE IMPLEMENTED；ONLINE INFERENCE WIRED
 
 ## 1. 固定目标
@@ -60,8 +60,9 @@ L_assoc = masked_fp32_mse(f_Wt(K_t), V_t)
 
 空 Bank 的 `b` 固定为零；硬 payload、count、phase、timestamp 不进入池化。`P_C` 零初始化，
 `P_V` 在 A2→A5 初始化时复制 `P_in`，使新 A5 初始前向保持 W0 数值兼容。W0 属于 checkpoint
-和 Outer optimizer；Wt 是 per-video 临时状态，不注册为 parameter/buffer，不进入 checkpoint。
-在线更新必须有限、版本单调且 storage 隔离。
+和 Outer optimizer；Wt 是 per-video FP32 master 临时状态，不注册为 parameter/buffer，不进入
+checkpoint。fast MLP、functional SGD 和 associative loss 均固定为 FP32，残差输出边界再转回
+模型 dtype。在线更新必须有限、版本单调且 storage 隔离。
 
 ### 3.2 Spatial 与 Temporal
 
@@ -85,7 +86,7 @@ Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由�
 ### A2
 
 - 全量解冻 Qwen、状态模块与 W0；
-- schema-10 是当前唯一正式训练契约；旧 schema checkpoint 不自动迁移，A5 只能从显式允许的旧 A2
+- schema-11 是当前唯一正式训练契约；旧 schema checkpoint 不自动迁移，A5 只能从显式允许的旧 A2
   权重初始化，并重新创建 Associative 投影、optimizer、scheduler、RNG 与 runtime state；
 - `P_C/P_V` 冻结、Inner SGD 不可达；
 - Query outer loss 正式使用 `ema_answer_ref`：先用一步滞后的 loss EMA 对齐 Answer，
@@ -108,6 +109,8 @@ Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由�
 - 每 8 个 Support 截断二阶图并重锚 W0；
 - 每个 segment 只对 Query Answer/State Outer loss 执行 backward，deferred VJP 将 Query 梯度
   传回 `W_t`、W0、`P_C/P_V` 和慢模块；episode 末由 Outer optimizer 单次 step；
+- 每个 Query 的全部 fast matrix cotangent 在 unscale 后按联合范数独立裁剪到 1.0，同一
+  segment 内将裁剪结果求和；Query 对 Qwen、State 和其他 Outer 参数的直接梯度不参与此裁剪；
 - Inner SGD 使用配置中的 fast update LR（当前 `1e-4`）；Associative projection 的 Outer LR
   当前为 `5e-5`，不注册可学习步长控制器；Associative 组更新预算与 Qwen/W0 严格对齐；
 - `static_w0` 保留为 NoUpdate 对照；counterfactual 仅作为 Meta-TTT 的无梯度因果诊断，
@@ -145,7 +148,7 @@ load checkpoint
 
 ## 6. Checkpoint 与分布式
 
-正式 checkpoint 必须完整匹配 schema-10 模型 key，支持单文件和 sharded safetensors，并包含
+正式 checkpoint 必须完整匹配 schema-11 模型 key，支持单文件和 sharded safetensors，并包含
 `associative_contract_version`。禁止保存或加载 Wt、optimizer runtime、Bank、cache、FSM 和
 Associative 临时 context；旧 A5 checkpoint 缺少该版本 buffer 时直接拒绝。
 

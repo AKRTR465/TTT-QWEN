@@ -5,8 +5,8 @@ from ttt_svcbench_qwen.inference import main as inference_main
 from ttt_svcbench_qwen.llamafactory_trainer import main as training_main
 from ttt_svcbench_qwen.production_runtime import build_runtime
 
-V10_ARCHITECTURE_SNAPSHOT = {
-    "spec_version": "state_ttt_qwen3vl8b_bank_associative_v1",
+V11_ARCHITECTURE_SNAPSHOT = {
+    "spec_version": "state_ttt_qwen3vl8b_bank_associative_v2",
     "base_model": "Qwen/Qwen3-VL-8B-Instruct",
     "vision": {
         "output_size": 4096,
@@ -16,6 +16,8 @@ V10_ARCHITECTURE_SNAPSHOT = {
         "dimensions": (4096, 768, 4096),
         "online_parameter_count": 1_179_648,
         "update_order": "observe_state_then_update_for_next_chunk",
+        "fast_weight_dtype": "float32",
+        "fast_core_dtype": "float32",
     },
     "state_encoders": {
         "spatial": (768, 2, 32, 64, 24_815_360),
@@ -48,10 +50,15 @@ V10_ARCHITECTURE_SNAPSHOT = {
         "retrieval_weight": 1.0,
         "time_weight": 1.0,
     },
+    "query_meta_gradient": {
+        "mode": "per_query_global_norm_clip_sum",
+        "max_norm": 1.0,
+        "epsilon": 1.0e-12,
+    },
 }
 
 
-def test_v10_architecture_snapshot_is_unchanged() -> None:
+def test_v11_architecture_snapshot_is_unchanged() -> None:
     config = load_config()
     actual = {
         "spec_version": config.spec_version,
@@ -68,6 +75,8 @@ def test_v10_architecture_snapshot_is_unchanged() -> None:
             ),
             "online_parameter_count": config.fast_ttt.online_parameter_count,
             "update_order": config.fast_ttt.update_order,
+            "fast_weight_dtype": config.fast_ttt.optimizer.fast_weight_dtype,
+            "fast_core_dtype": config.fast_ttt.optimizer.fast_core_dtype,
         },
         "state_encoders": {
             "spatial": (
@@ -111,8 +120,13 @@ def test_v10_architecture_snapshot_is_unchanged() -> None:
             "retrieval_weight": config.loss.retrieval_weight,
             "time_weight": config.loss.time_weight,
         },
+        "query_meta_gradient": {
+            "mode": config.a5.query_meta_gradient.mode,
+            "max_norm": config.a5.query_meta_gradient.max_norm,
+            "epsilon": config.a5.query_meta_gradient.epsilon,
+        },
     }
-    assert actual == V10_ARCHITECTURE_SNAPSHOT
+    assert actual == V11_ARCHITECTURE_SNAPSHOT
 
 
 def test_production_entrypoints_remain_importable() -> None:

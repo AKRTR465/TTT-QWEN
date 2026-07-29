@@ -1,5 +1,5 @@
-spec_version: state_ttt_qwen3vl8b_bank_associative_v1
-config_schema_version: 10
+spec_version: state_ttt_qwen3vl8b_bank_associative_v2
+config_schema_version: 11
 
 paths:
   model_root_env: QWEN_MODEL_ROOT
@@ -74,6 +74,8 @@ fast_ttt:
     grad_clip_norm: 1.0
     reset_per_video: true
     meta_gradient_mode: full_second_order
+    fast_weight_dtype: float32
+    fast_core_dtype: float32
 
 spatial_encoder:
   input_dim: 4096
@@ -488,6 +490,10 @@ a5:
     state_learning_rate: 5.0e-5
     w0_learning_rate: 5.0e-5
     associative_learning_rate: 5.0e-5
+  query_meta_gradient:
+    mode: per_query_global_norm_clip_sum
+    max_norm: 1.0
+    epsilon: 1.0e-12
   counterfactual_audit:
     enabled: false
     interval_steps: 8
