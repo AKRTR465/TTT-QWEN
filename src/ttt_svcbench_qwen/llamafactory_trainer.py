@@ -2436,16 +2436,11 @@ def _run_main(argv: list[str] | None = None) -> int:
         trainer.save_metrics("train", result.metrics)
         if initial_qwen_sha256 is None:
             raise RuntimeError("warmup lost the initial Qwen bitwise digest")
-        final_qwen_sha256 = _module_bitwise_sha256(backbone.model)
-        qwen_unchanged = _all_ranks_true(
-            final_qwen_sha256 == initial_qwen_sha256,
+        final_qwen_sha256, prepared_bundle = _prepare_distributed_warmup_handoff(
+            model=runtime_raw.model,
+            qwen_model=backbone.model,
+            initial_qwen_sha256=initial_qwen_sha256,
             device=trainer.accelerator.device,
-        )
-        if not qwen_unchanged:
-            raise RuntimeError("Qwen parameters/buffers changed during Fast/State warmup")
-        prepared_bundle = _prepare_warmup_bundle_tensors(
-            runtime_raw.model,
-            backbone.model,
         )
         # No rank may enter the publishing barrier while another rank is still copying
         # tensors from CUDA.  From this point onward rank zero performs CPU/filesystem work.
@@ -3340,6 +3335,26 @@ def _prepare_warmup_bundle_tensors(
         for name in allowlist
     }
     return allowlist, tensors
+
+
+def _prepare_distributed_warmup_handoff(
+    *,
+    model: nn.Module,
+    qwen_model: nn.Module,
+    initial_qwen_sha256: str,
+    device: torch.device,
+) -> tuple[str, tuple[tuple[str, ...], dict[str, Tensor]]]:
+    """Finish all GPU-backed warmup audits before any rank enters a publish barrier."""
+
+    final_qwen_sha256 = _module_bitwise_sha256(qwen_model)
+    qwen_unchanged = _all_ranks_true(
+        final_qwen_sha256 == initial_qwen_sha256,
+        device=device,
+    )
+    if not qwen_unchanged:
+        raise RuntimeError("Qwen parameters/buffers changed during Fast/State warmup")
+    prepared_bundle = _prepare_warmup_bundle_tensors(model, qwen_model)
+    return final_qwen_sha256, prepared_bundle
 
 
 def _warmup_source_manifest(
