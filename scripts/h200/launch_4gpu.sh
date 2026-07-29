@@ -205,18 +205,31 @@ if stage == "a2":
     independent_budgets = {"w0": w0_lr * float(caps.w0)}
 else:
     qwen_lr = float(native["learning_rate"])
-    state_lr = float(project.a5.optimizer.state_learning_rate)
-    w0_lr = float(project.a5.optimizer.w0_learning_rate)
-    independent_budgets = {"w0": w0_lr * float(caps.w0)}
+    optimizer = (
+        project.a5.warmup
+        if extension.a5_phase == "fast_state_warmup"
+        else project.a5.optimizer
+    )
+    fast_slow_lr = float(optimizer.fast_slow_learning_rate)
+    state_lr = float(optimizer.state_learning_rate)
+    w0_lr = float(optimizer.w0_learning_rate)
+    independent_budgets = {
+        "fast_slow": fast_slow_lr * float(caps.fast_slow),
+        "w0": w0_lr * float(caps.w0),
+    }
     if adaptation_mode == "meta_ttt":
         independent_budgets["associative"] = (
-            float(project.a5.optimizer.associative_learning_rate) * float(caps.associative)
+            float(optimizer.associative_learning_rate) * float(caps.associative)
         )
 state_names = ("state_shared", "state_task", "state_router_time", "state_retrieval")
 budget_audit = {
     "policy": project.outer_gradient_control.mode.value,
     "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
-    "reference": qwen_lr * float(caps.qwen),
+    "reference": (
+        fast_slow_lr * float(caps.fast_slow)
+        if stage == "a5" and extension.a5_phase == "fast_state_warmup"
+        else qwen_lr * float(caps.qwen)
+    ),
     "independent": independent_budgets,
     "state_rss": math.sqrt(
         sum((state_lr * float(getattr(caps, name))) ** 2 for name in state_names)
@@ -228,7 +241,16 @@ payload = {
     "config_schema_version": project.config_schema_version,
     "associative_ttt_contract": project.associative_ttt.contract,
     "a5_adaptation_mode": adaptation_mode,
+    "a5_phase": extension.a5_phase if stage == "a5" else None,
+    "warmup_bundle": extension.warmup_bundle if stage == "a5" else None,
     "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
+    "fast_weight_dtype": project.fast_ttt.optimizer.fast_weight_dtype,
+    "fast_core_dtype": project.fast_ttt.optimizer.fast_core_dtype,
+    "query_meta_gradient": {
+        "mode": project.a5.query_meta_gradient.mode,
+        "max_norm": float(project.a5.query_meta_gradient.max_norm),
+        "epsilon": float(project.a5.query_meta_gradient.epsilon),
+    },
     "outer_update_norm_budget_audit": budget_audit,
     "config": config,
     "working_directory": os.getcwd(),
@@ -317,6 +339,7 @@ START_EPOCH="$(date +%s)"
   fi
   if [[ "$STAGE" == "a5" ]]; then
     echo "a5_adaptation_mode=${TTT_A5_ADAPTATION_MODE:-from_yaml}"
+    echo "a5_warmup_bundle=${A5_WARMUP_BUNDLE:-none}"
   fi
   echo "launch world_size=4 config=$CONFIG"
 } > "$RUN_ROOT/experiment.log"

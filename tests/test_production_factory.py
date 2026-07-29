@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterator
+from dataclasses import replace
 from enum import StrEnum
 from fractions import Fraction
 from pathlib import Path
@@ -16,6 +17,7 @@ from torch import nn
 
 import ttt_svcbench_qwen.llamafactory_trainer as trainer_module
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
+from ttt_svcbench_qwen.fast_ttt import build_fast_ttt_adapter
 from ttt_svcbench_qwen.llamafactory_trainer import (
     CheckpointPolicy,
     OuterParameterAudit,
@@ -250,10 +252,9 @@ class _GroupedOuterToy(nn.Module):
                 "state_bank": _GroupedStateBankToy(),
             }
         )
-        self.w0_1 = nn.Parameter(torch.ones(4, 4))
-        self.w0_2 = nn.Parameter(torch.ones(4, 4))
-        self.p_context = nn.Linear(4, 4)
-        self.p_context.requires_grad_(associative_trainable)
+        self.fast_adapter = build_fast_ttt_adapter(load_config())
+        for parameter in self.fast_adapter.collect_associative_parameters():
+            parameter.requires_grad_(associative_trainable)
 
 
 class _GroupedQueryToy(nn.Module):
@@ -298,6 +299,8 @@ def _grouped_bundle(
             adam_beta2=0.999,
             adam_epsilon=1.0e-8,
             weight_decay=0.01,
+            seed=42,
+            data_seed=42,
         ),
         finetuning_args=object(),
         generating_args=object(),
@@ -305,6 +308,7 @@ def _grouped_bundle(
         ttt_config=ProductionTTTConfig(
             stage="a5",
             a5_adaptation_mode=adaptation_mode,
+            warmup_bundle="warmup" if adaptation_mode == "meta_ttt" else None,
             project_config="configs/model_state_ttt_8b.yaml",
             dataset_manifest="manifest.json",
             initialize_from_a2_checkpoint="a2-final",
@@ -616,6 +620,7 @@ def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
     assert set(extension.model_dump(exclude_none=True)) == {
         "stage",
         "a5_adaptation_mode",
+        "a5_phase",
         "project_config",
         "dataset_manifest",
         "qwen_outer_trainability",
@@ -1333,6 +1338,7 @@ def test_training_yaml_expands_required_environment_and_keeps_a5_fresh(
     monkeypatch.setenv("OUTPUT_DIR", "/tmp/output")
     monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/dataset_manifest.json")
     monkeypatch.setenv("A2_CHECKPOINT", "/tmp/a2-final")
+    monkeypatch.setenv("A5_WARMUP_BUNDLE", "/tmp/a5-warmup")
     monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
     monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
     monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
@@ -1345,6 +1351,8 @@ def test_training_yaml_expands_required_environment_and_keeps_a5_fresh(
     assert native["output_dir"] == "/tmp/output"
     assert extension.initialize_from_a2_checkpoint == "/tmp/a2-final"
     assert extension.stage == "a5"
+    assert extension.a5_phase == "main"
+    assert extension.warmup_bundle == "/tmp/a5-warmup"
 
     monkeypatch.delenv("A2_CHECKPOINT")
     with pytest.raises(ValueError, match="unresolved environment variables"):
@@ -1358,6 +1366,7 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
     monkeypatch.setenv("OUTPUT_DIR", "/tmp/output")
     monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/dataset_manifest.json")
     monkeypatch.setenv("A2_CHECKPOINT", "/tmp/a2-final")
+    monkeypatch.setenv("A5_WARMUP_BUNDLE", "/tmp/a5-warmup")
     monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
     monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
     monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
@@ -1369,12 +1378,13 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
 
     assert native["finetuning_type"] == "full"
     assert native["num_train_epochs"] == 4.0
-    assert native["save_strategy"] == "steps"
-    assert native["save_steps"] == 0.5
-    assert native["save_total_limit"] == 2
+    assert native["save_strategy"] == "no"
+    assert native["save_total_limit"] == 1
     assert native["save_only_model"] is False
     assert native["deepspeed"] == "configs/h200/deepspeed_zero1_dynamic_graph.json"
     assert extension.stage == "a5"
+    assert extension.a5_phase == "main"
+    assert extension.warmup_bundle == "/tmp/a5-warmup"
     assert policy.mode == "partial"
     assert policy.vision_freeze_first_blocks == 13
     assert policy.decoder_train_last_layers == 8
@@ -1386,11 +1396,79 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
     assert not policy.train_lm_head
 
     launcher = (root / "scripts/h200/train_a5_vithalf_decoder8.sh").read_text(encoding="utf-8")
-    assert 'TTT_CHECKPOINT_POLICY="${TTT_CHECKPOINT_POLICY:-epoch_2_and_epoch_4}"' in launcher
     assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
     assert 'TTT_DATALOADER_TRACE="${TTT_DATALOADER_TRACE:-1}"' in launcher
-    assert "[[ $# -eq 2 ]] || usage" in launcher
+    assert 'TTT_SKIP_ENV_SETUP="${TTT_SKIP_ENV_SETUP:-1}"' in launcher
+    assert "[[ $# -eq 3 ]] || usage" in launcher
+    assert "<a5_warmup_bundle>" in launcher
     assert "<dataset_manifest.json>" in launcher
+
+
+def test_a5_associative_lttt_finalonly_launcher_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[1]
+    for key, value in {
+        "OUTPUT_DIR": "/tmp/output",
+        "SVCBENCH_DATASET_MANIFEST": "/tmp/v4_manifest.json",
+        "A2_CHECKPOINT": "/tmp/a2-final",
+        "A5_WARMUP_BUNDLE": "/tmp/a5-warmup",
+        "MODEL": "/tmp/qwen3vl8b",
+        "DATASET_DIR": "/tmp/svcbench",
+        "DATASET_NAME": "svcbench_qwen3vl_sft",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    native, extension = load_training_yaml(
+        root / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
+    )
+    launcher = (root / "scripts/h200/train_a5_associative_lttt_finalonly.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert native["num_train_epochs"] == 4.0
+    assert extension.stage == "a5"
+    assert extension.a5_adaptation_mode == "meta_ttt"
+    assert extension.a5_phase == "main"
+    assert extension.warmup_bundle == "/tmp/a5-warmup"
+    assert extension.initialize_from_a2_checkpoint == "/tmp/a2-final"
+    assert 'TTT_A5_ADAPTATION_MODE="meta_ttt"' in launcher
+    assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
+    assert "a5_dense_querybundle_train_support_statequery_fp16_v4" in launcher
+    assert 'TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"' in launcher
+    assert 'TTT_SKIP_ENV_SETUP="${TTT_SKIP_ENV_SETUP:-1}"' in launcher
+    assert "[[ $# -eq 3 ]] || usage" in launcher
+    assert 'train_a2_a5.sh" a5 "$1" "$3"' in launcher
+
+
+def test_a5_fast_state_warmup_yaml_and_launcher_are_restart_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).parents[1]
+    for key, value in {
+        "OUTPUT_DIR": "/tmp/output",
+        "SVCBENCH_DATASET_MANIFEST": "/tmp/v4_manifest.json",
+        "A2_CHECKPOINT": "/tmp/a2-final",
+        "MODEL": "/tmp/qwen3vl8b",
+        "DATASET_DIR": "/tmp/svcbench",
+        "DATASET_NAME": "svcbench_qwen3vl_sft",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    native, extension = load_training_yaml(root / "configs/h200/a5_fast_state_warmup_128_4gpu.yaml")
+    launcher = (root / "scripts/h200/train_a5_fast_state_warmup.sh").read_text(encoding="utf-8")
+
+    assert native["max_steps"] == 128
+    assert native["warmup_steps"] == 4
+    assert native["lr_scheduler_type"] == "cosine"
+    assert native["save_strategy"] == "no"
+    assert native["resume_from_checkpoint"] is None
+    assert extension.a5_phase == "fast_state_warmup"
+    assert extension.warmup_bundle is None
+    assert extension.qwen_outer_trainability.mode == "frozen"
+    assert "[[ $# -eq 2 ]] || usage" in launcher
+    assert "a5_warmup_bundle only" in launcher
+    assert 'TTT_SKIP_ENV_SETUP="${TTT_SKIP_ENV_SETUP:-1}"' in launcher
 
 
 def test_a5_static_w0_yaml_and_launcher_match_meta_ttt_data_contract(
@@ -1401,6 +1479,7 @@ def test_a5_static_w0_yaml_and_launcher_match_meta_ttt_data_contract(
         "OUTPUT_DIR": "/tmp/output",
         "SVCBENCH_DATASET_MANIFEST": "/tmp/v4_manifest.json",
         "A2_CHECKPOINT": "/tmp/a2-final",
+        "A5_WARMUP_BUNDLE": "/tmp/a5-warmup",
         "MODEL": "/tmp/qwen3vl8b",
         "DATASET_DIR": "/tmp/svcbench",
         "DATASET_NAME": "svcbench_qwen3vl_sft",
@@ -1555,6 +1634,40 @@ def test_partial_qwen_trainability_freezes_vit_prefix_and_decoder_prefix(
     )
 
 
+def test_frozen_qwen_trainability_is_bitwise_stable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _QwenOwnerToy()
+    wrapper = nn.Module()
+    wrapper.model = owner
+    wrapper.lm_head = nn.Linear(2, 8, bias=False)
+    before = {name: value.detach().clone() for name, value in wrapper.state_dict().items()}
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.production_factory.assert_qwen_runtime_structure",
+        lambda _owner, _config: None,
+    )
+    policy = QwenOuterTrainabilityConfig(
+        mode="frozen",
+        vision_freeze_first_blocks=27,
+        decoder_train_last_layers=0,
+        train_vision_patch_embed=False,
+        train_main_merger=False,
+        train_deepstack_mergers=False,
+        train_language_model_norm=False,
+        train_input_embeddings=False,
+        train_lm_head=False,
+    )
+
+    audit = configure_qwen_outer_trainability(wrapper, load_config(), policy)
+
+    assert audit.mode == "frozen"
+    assert audit.trainable_parameters == 0
+    assert audit.frozen_vision_block_indices == tuple(range(27))
+    assert audit.frozen_decoder_layer_indices == tuple(range(36))
+    assert not any(parameter.requires_grad for parameter in wrapper.parameters())
+    assert all(torch.equal(before[name], value) for name, value in wrapper.state_dict().items())
+
+
 def test_a2_weight_initialization_is_strict_and_excludes_runtime_state(tmp_path: Path) -> None:
     torch.manual_seed(41)
     source = _OuterToy()
@@ -1586,6 +1699,32 @@ def test_a2_weight_initialization_is_strict_and_excludes_runtime_state(tmp_path:
         audit_outer_checkpoint_boundary(_BadOuter())
 
 
+def test_a2_migration_allows_removed_p_value_and_new_associative_state(
+    tmp_path: Path,
+) -> None:
+    target = _GroupedOuterToy(nn.Linear(4, 4), associative_trainable=True)
+    state = {
+        name: value.detach().clone()
+        for name, value in target.state_dict().items()
+        if ".p_context." not in name and "associative_contract_version" not in name
+    }
+    state["fast_adapter.p_value.weight"] = torch.zeros((768, 768))
+    state["fast_adapter.p_value.bias"] = torch.zeros(768)
+    checkpoint = tmp_path / "a2-final"
+    checkpoint.mkdir()
+    save_file(state, checkpoint / "model.safetensors")
+
+    audit = initialize_outer_model_from_a2(
+        target,
+        checkpoint,
+        allowed_missing_fragments=(".p_context.", "associative_contract_version"),
+        allowed_unexpected_prefixes=("p_value.",),
+    )
+
+    assert not audit.missing_keys
+    assert not audit.unexpected_keys
+
+
 def test_production_runtime_defers_optimizer_and_sampler_to_central_bridge() -> None:
     model = _OuterToy()
     model.p_context.requires_grad_(False)
@@ -1613,8 +1752,8 @@ def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Pa
         json.dumps(
             {
                 "stage": "a5",
-                "config_schema_version": 10,
-                "associative_ttt_contract": "bank_conditioned_visual_v1",
+                "config_schema_version": 12,
+                "associative_ttt_contract": "bank_conditioned_state_write_v2",
             }
         ),
         encoding="utf-8",
@@ -1651,8 +1790,8 @@ def test_same_stage_resume_accepts_only_matching_static_w0_mode(tmp_path: Path) 
             {
                 "stage": "a5",
                 "a5_adaptation_mode": "static_w0",
-                "config_schema_version": 10,
-                "associative_ttt_contract": "bank_conditioned_visual_v1",
+                "config_schema_version": 12,
+                "associative_ttt_contract": "bank_conditioned_state_write_v2",
             }
         ),
         encoding="utf-8",
@@ -1690,7 +1829,7 @@ def test_same_stage_resume_rejects_legacy_associative_contract(
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="schema-10 Bank-conditioned associative"):
+    with pytest.raises(ValueError, match="schema-12 state-write associative"):
         resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
 
 
@@ -2306,6 +2445,7 @@ def test_explicit_smoke_disables_all_periodic_checkpoints() -> None:
             True,
             {
                 "qwen": 5.0e-6,
+                "fast_slow": 5.0e-5,
                 "state_shared": 5.0e-5,
                 "state_task": 5.0e-5,
                 "state_router_time": 5.0e-5,
@@ -2320,6 +2460,7 @@ def test_explicit_smoke_disables_all_periodic_checkpoints() -> None:
             False,
             {
                 "qwen": 5.0e-6,
+                "fast_slow": 5.0e-5,
                 "state_shared": 5.0e-5,
                 "state_task": 5.0e-5,
                 "state_router_time": 5.0e-5,
@@ -2365,6 +2506,7 @@ def test_central_outer_optimizer_has_exact_stage_groups(
         ttt_config=ProductionTTTConfig(
             stage="a5",
             a5_adaptation_mode=adaptation_mode,
+            warmup_bundle="warmup" if adaptation_mode == "meta_ttt" else None,
             project_config="configs/model_state_ttt_8b.yaml",
             dataset_manifest="manifest.json",
             initialize_from_a2_checkpoint="a2-final",
@@ -2414,12 +2556,265 @@ def test_canonical_a5_builds_equal_budget_production_optimizer(
     groups = {str(group["group_name"]): group for group in optimizer.param_groups}
     caps = project.outer_gradient_control.max_grad_norm
     assert "step_controller" not in groups
-    assert float(groups["w0"]["lr"]) * float(caps.w0) == pytest.approx(
-        5.0e-6
+    assert float(groups["fast_slow"]["lr"]) * float(caps.fast_slow) == pytest.approx(5.0e-6)
+    assert float(groups["w0"]["lr"]) * float(caps.w0) == pytest.approx(5.0e-6)
+    assert float(groups["associative"]["lr"]) * float(caps.associative) == pytest.approx(5.0e-6)
+
+
+def test_warmup_optimizer_excludes_qwen_and_updates_fast_state_groups(
+    tmp_path: Path,
+) -> None:
+    project = load_config()
+    bundle, model = _grouped_bundle(tmp_path, project)
+    bundle.model.requires_grad_(False)
+    optimizer = make_production_outer_optimizer_factory(
+        bundle,
+        ProductionStage.A5,
+        a5_phase="fast_state_warmup",
+    )(model)
+    groups = {str(group["group_name"]): group for group in optimizer.param_groups}
+    delta_auditor = trainer_module._A5ParameterGroupStepAuditor(
+        model,
+        delta_audit_steps=3,
+        group_names=("fast_slow",),
     )
-    assert float(groups["associative"]["lr"]) * float(caps.associative) == pytest.approx(
-        5.0e-6
+
+    assert "qwen" not in groups
+    assert {id(parameter) for parameter in delta_auditor.parameters["fast_slow"]} == {
+        id(parameter) for parameter in model.fast_adapter.collect_slow_parameters()
+    }
+    assert {name: float(group["lr"]) for name, group in groups.items()} == {
+        "fast_slow": 5.0e-5,
+        "state_shared": 1.0e-5,
+        "state_task": 1.0e-5,
+        "state_router_time": 1.0e-5,
+        "state_retrieval": 1.0e-5,
+        "w0": 5.0e-5,
+        "associative": 5.0e-5,
+    }
+    qwen_before = {
+        name: value.detach().clone() for name, value in bundle.model.state_dict().items()
+    }
+    representatives = {name: group["params"][0] for name, group in groups.items()}
+    representative_before = {
+        name: parameter.detach().clone() for name, parameter in representatives.items()
+    }
+    for _ in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        loss = sum(parameter.float().mean() for parameter in representatives.values())
+        loss.backward()
+        optimizer.step()
+
+    assert all(
+        torch.equal(qwen_before[name], value) for name, value in bundle.model.state_dict().items()
     )
+    assert all(
+        not torch.equal(representative_before[name], parameter)
+        for name, parameter in representatives.items()
+    )
+
+
+def test_warmup_qwen_bitwise_baseline_starts_after_framework_prepare() -> None:
+    qwen = nn.Sequential(nn.Linear(8, 8, bias=False), nn.LayerNorm(8))
+    qwen.register_buffer("position_counter", torch.arange(4, dtype=torch.int64))
+    qwen.requires_grad_(False)
+    auditor = trainer_module._WarmupQwenBitwiseAuditor(qwen)
+
+    # A framework conversion before the first Trainer step belongs outside the
+    # frozen-training interval.
+    qwen.to(dtype=torch.bfloat16)
+    auditor.capture_post_prepare_baseline(global_step=0)
+    audit = auditor.finalize(device=torch.device("cpu"))
+
+    assert audit.baseline_stage == "post_deepspeed_prepare_pre_first_training_step"
+    assert audit.baseline_global_step == 0
+    assert audit.baseline_sha256 == audit.final_sha256
+    assert audit.changed_tensor_count == 0
+    assert audit.local_unchanged
+    assert audit.all_ranks_unchanged
+
+
+def test_warmup_qwen_bitwise_audit_reports_parameter_and_buffer_drift(
+    tmp_path: Path,
+) -> None:
+    qwen = nn.Linear(8, 8, bias=False)
+    qwen.register_buffer("state_counter", torch.zeros(2), persistent=False)
+    qwen.requires_grad_(False)
+    auditor = trainer_module._WarmupQwenBitwiseAuditor(qwen)
+    auditor.capture_post_prepare_baseline(global_step=0)
+
+    with torch.no_grad():
+        qwen.weight[0, 0].add_(1.0)
+        qwen.state_counter[0].add_(1.0)
+    audit = auditor.finalize(device=torch.device("cpu"))
+    changed = {change.name: change for change in audit.changed_tensors}
+
+    assert not audit.local_unchanged
+    assert not audit.all_ranks_unchanged
+    assert audit.changed_parameter_count == 1
+    assert audit.changed_buffer_count == 1
+    assert changed["weight"].change_type == "content"
+    assert changed["state_counter"].change_type == "content"
+    rank_path, canonical_path = trainer_module._write_warmup_qwen_bitwise_audit(
+        artifact_root=tmp_path,
+        audit=audit,
+    )
+    assert rank_path.is_file()
+    assert canonical_path == tmp_path / "qwen_bitwise_audit.json"
+    persisted = json.loads(rank_path.read_text(encoding="utf-8"))
+    assert persisted["changed_tensor_count"] == 2
+    assert {item["name"] for item in persisted["changed_tensors"]} == {
+        "weight",
+        "state_counter",
+    }
+    with pytest.raises(RuntimeError, match="post-DeepSpeed"):
+        trainer_module._assert_warmup_qwen_bitwise_unchanged(audit)
+
+
+def test_warmup_qwen_bitwise_auditor_rejects_late_or_trainable_baseline() -> None:
+    trainable = nn.Linear(4, 4)
+    auditor = trainer_module._WarmupQwenBitwiseAuditor(trainable)
+    with pytest.raises(RuntimeError, match="trainable parameters"):
+        auditor.capture_post_prepare_baseline(global_step=0)
+
+    frozen = nn.Linear(4, 4).requires_grad_(False)
+    late = trainer_module._WarmupQwenBitwiseAuditor(frozen)
+    with pytest.raises(RuntimeError, match="before optimizer step one"):
+        late.capture_post_prepare_baseline(global_step=1)
+
+
+def test_warmup_bundle_is_non_qwen_atomic_and_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = load_config()
+    bundle, model = _grouped_bundle(tmp_path, project)
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    source = {
+        "a2_checkpoint_sha256": "a2-hash",
+        "code_commit": "commit",
+        "code_dirty": False,
+        "project_config_sha256": "config-hash",
+        "dataset_manifest_sha256": "manifest-hash",
+        "seed": 42,
+        "data_seed": 42,
+    }
+    monkeypatch.setattr(
+        trainer_module,
+        "_warmup_source_manifest",
+        lambda **_kwargs: dict(source),
+    )
+    qwen_sha256 = trainer_module._module_bitwise_sha256(bundle.model)
+    expected = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+        if name in trainer_module._warmup_bundle_allowlist(model, bundle.model)
+    }
+
+    bundle_path, manifest = trainer_module._publish_warmup_bundle(
+        model=model,
+        qwen_model=bundle.model,
+        backbone=bundle,
+        artifact_root=artifact_root,
+        global_step=128,
+        qwen_sha256=qwen_sha256,
+    )
+
+    assert bundle_path.name == "a5_warmup_bundle"
+    assert not (artifact_root / ".a5_warmup_bundle.incomplete").exists()
+    assert not any(name.startswith("qwen.") for name in manifest["parameter_allowlist"])
+    assert not any("transient_w_t" in name for name in manifest["parameter_allowlist"])
+    assert manifest["qwen_bitwise_sha256"] == qwen_sha256
+    main_config = bundle.ttt_config.model_copy(update={"warmup_bundle": str(bundle_path)})
+    main_bundle = replace(bundle, ttt_config=main_config)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if name in expected:
+                parameter.zero_()
+        for name, buffer in model.named_buffers():
+            if name in expected:
+                buffer.zero_()
+    audit = trainer_module._load_warmup_bundle(
+        model=model,
+        qwen_model=bundle.model,
+        backbone=main_bundle,
+    )
+    assert audit["tensor_count"] == len(expected)
+    assert all(torch.equal(model.state_dict()[name], value) for name, value in expected.items())
+
+    monkeypatch.setattr(
+        trainer_module,
+        "_warmup_source_manifest",
+        lambda **_kwargs: {**source, "a2_checkpoint_sha256": "wrong-a2"},
+    )
+    with pytest.raises(ValueError, match="provenance mismatch"):
+        trainer_module._load_warmup_bundle(
+            model=model,
+            qwen_model=bundle.model,
+            backbone=main_bundle,
+        )
+
+
+def test_warmup_bundle_can_publish_prepared_cpu_tensors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = load_config()
+    bundle, model = _grouped_bundle(tmp_path, project)
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    monkeypatch.setattr(
+        trainer_module,
+        "_warmup_source_manifest",
+        lambda **_kwargs: {
+            "a2_checkpoint_sha256": "a2-hash",
+            "code_commit": "commit",
+            "code_dirty": False,
+            "project_config_sha256": "config-hash",
+            "dataset_manifest_sha256": "manifest-hash",
+            "seed": 42,
+            "data_seed": 42,
+        },
+    )
+    prepared = trainer_module._prepare_warmup_bundle_tensors(model, bundle.model)
+    allowlist, tensors = prepared
+
+    assert tuple(sorted(tensors)) == allowlist
+    assert all(value.device.type == "cpu" for value in tensors.values())
+    assert not any(name.startswith("qwen.") for name in allowlist)
+    bundle_path, manifest = trainer_module._publish_warmup_bundle(
+        model=model,
+        qwen_model=bundle.model,
+        backbone=bundle,
+        artifact_root=artifact_root,
+        global_step=128,
+        qwen_sha256=trainer_module._module_bitwise_sha256(bundle.model),
+        prepared_bundle=prepared,
+    )
+
+    assert bundle_path.is_dir()
+    assert manifest["parameter_allowlist"] == list(allowlist)
+    with pytest.raises(ValueError, match="keys do not match"):
+        trainer_module._publish_warmup_bundle(
+            model=model,
+            qwen_model=bundle.model,
+            backbone=bundle,
+            artifact_root=tmp_path / "other-artifacts",
+            global_step=128,
+            qwen_sha256="qwen-hash",
+            prepared_bundle=(allowlist, {**tensors, "unexpected": torch.ones(1)}),
+        )
+
+
+def test_all_ranks_true_uses_local_value_without_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    assert trainer_module._all_ranks_true(True, device=torch.device("cpu"))
+    assert not trainer_module._all_ranks_true(False, device=torch.device("cpu"))
 
 
 def test_optimizer_rejects_noncanonical_budget_drift(tmp_path: Path) -> None:
@@ -2474,6 +2869,7 @@ def test_outer_optimizer_rejects_removed_step_controller_parameters(
         ttt_config=ProductionTTTConfig(
             stage="a5",
             a5_adaptation_mode="meta_ttt",
+            warmup_bundle="warmup",
             project_config="configs/model_state_ttt_8b.yaml",
             dataset_manifest="manifest.json",
             initialize_from_a2_checkpoint="a2-final",

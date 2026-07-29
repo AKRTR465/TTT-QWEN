@@ -12,7 +12,7 @@ finetuning_type: full
 freeze_vision_tower: false
 freeze_multi_modal_projector: false
 freeze_language_model: false
-deepspeed: configs/h200/deepspeed_zero2_group_clip.json
+deepspeed: configs/h200/deepspeed_zero1_dynamic_graph.json
 
 dataset_dir: $DATASET_DIR
 dataset: $DATASET_NAME
@@ -38,10 +38,12 @@ load_best_model_at_end: false
 
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 1
-learning_rate: 5.0e-6
-num_train_epochs: 2.0
+learning_rate: 5.0e-5
+max_steps: 128
+num_train_epochs: 1.0
 lr_scheduler_type: cosine
-warmup_ratio: 0.03
+warmup_steps: 4
+warmup_ratio: 0.0
 weight_decay: 0.01
 max_grad_norm: 0.0
 optim: adamw_torch
@@ -57,11 +59,21 @@ resume_from_checkpoint: null
 ttt_qwen:
   stage: a5
   a5_adaptation_mode: meta_ttt
-  a5_phase: main
-  warmup_bundle: $A5_WARMUP_BUNDLE
+  a5_phase: fast_state_warmup
+  warmup_bundle: null
   project_config: configs/model_state_ttt_8b.yaml
   dataset_manifest: $SVCBENCH_DATASET_MANIFEST
   initialize_from_a2_checkpoint: $A2_CHECKPOINT
+  qwen_outer_trainability:
+    mode: frozen
+    vision_freeze_first_blocks: 27
+    decoder_train_last_layers: 0
+    train_vision_patch_embed: false
+    train_main_merger: false
+    train_deepstack_mergers: false
+    train_language_model_norm: false
+    train_input_embeddings: false
+    train_lm_head: false
   support_prefetch_depth: 2
   support_decode_coalesce: true
   support_materialization: segment_double_buffer
@@ -74,6 +86,7 @@ ttt_qwen:
   state_query_max_frames: 16
   answer_query_visual_mode: causal_prefix
   answer_query_max_frames: 256
+  query_decode_max_groups: 16
   state_query_cache_mode: inherit
   answer_query_cache_mode: disabled
   query_activation_offload: false
@@ -81,11 +94,11 @@ ttt_qwen:
   preprocess_cache_miss_policy: error
   preprocess_cache_root_env: TTT_PREPROCESS_CACHE_ROOT
   preprocess_cache_max_gb: 200
-  preprocess_cache_dtype: float32
+  preprocess_cache_dtype: float16
   visual_cost_mode: proxy
   runtime_trace_mode: "off"
   runtime_trace_dir: null
   segment_prefetch_depth: 1
   semantic_projector_delta_audit_steps: 0
-  a5_parameter_delta_audit_steps: 0
-  operator_diagnostics_interval: 10
+  a5_parameter_delta_audit_steps: 128
+  operator_diagnostics_interval: 8

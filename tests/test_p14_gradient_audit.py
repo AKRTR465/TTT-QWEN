@@ -258,7 +258,7 @@ def test_actual_fast_bridge_observation_chain_has_exact_inner_update_boundary() 
         )
     )
 
-    assert audits["adapter_checkpointed"].parameter_count == 11_020_544
+    assert audits["adapter_checkpointed"].parameter_count == 7_874_048
     assert audits["frozen_bridge"].parameter_count == 3_145_728
     assert audits["observation_o1"].parameter_count == 2_632_710
     assert audits["state_bank.semantic_projector"].parameter_count == 1_316_864

@@ -43,8 +43,6 @@ def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> N
     assert adapter.p_out.out_features == 4096
     assert adapter.p_context.in_features == 512
     assert adapter.p_context.out_features == 768
-    assert adapter.p_value.in_features == 4096
-    assert adapter.p_value.out_features == 768
     assert adapter.p_in.bias is not None
     assert adapter.p_out.bias is not None
     assert adapter.w0_1.shape == adapter.w0_2.shape == (768, 768)
@@ -52,12 +50,11 @@ def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> N
         "rms_norm",
         "p_in",
         "p_context",
-        "p_value",
         "p_out",
     }
-    assert parameter_count(adapter) == 11_020_544
+    assert parameter_count(adapter) == 7_874_048
     assert tensor_count(adapter.collect_slow_parameters()) == 6_300_416
-    assert tensor_count(adapter.collect_associative_parameters()) == 3_540_480
+    assert tensor_count(adapter.collect_associative_parameters()) == 393_984
     assert (
         sum(parameter.numel() for parameter in adapter.collect_meta_fast_parameters()) == 1_179_648
     )
@@ -67,8 +64,6 @@ def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> N
         "p_in.bias",
         "p_context.weight",
         "p_context.bias",
-        "p_value.weight",
-        "p_value.bias",
         "w0_1",
         "w0_2",
         "p_out.weight",
@@ -217,7 +212,7 @@ def test_differentiable_state_preserves_outer_gradients_to_w0_and_slow_parameter
         assert torch.isfinite(parameter.grad).all()
         assert parameter.grad.abs().sum() > 0
     assert all(parameter.grad is not None for parameter in adapter.p_context.parameters())
-    assert all(parameter.grad is None for parameter in adapter.p_value.parameters())
+    assert not hasattr(adapter, "p_value")
 
 
 def test_initial_bound_fast_state_matches_static_w0_forward() -> None:
@@ -277,7 +272,7 @@ def test_parameter_collection_is_stable_exact_and_rejects_boundary_drift() -> No
     assert groups.slow == adapter.collect_slow_parameters()
     assert tensor_count(collect_fast_parameters(state)) == 2 * 768 * 768 == 1_179_648
     assert tensor_count(adapter.collect_slow_parameters()) == 6_300_416
-    assert tensor_count(adapter.collect_associative_parameters()) == 3_540_480
+    assert tensor_count(adapter.collect_associative_parameters()) == 393_984
     assert not ({id(parameter) for parameter in groups.online_fast} & {id(p) for p in groups.slow})
     adapter.assert_online_parameter_boundary(groups.online_fast, state)
 
@@ -388,7 +383,7 @@ def test_online_binding_rejects_stale_slow_grad_and_differentiable_binding_stays
         )
     )
     assert all(parameter.grad is not None for parameter in adapter.p_context.parameters())
-    assert all(parameter.grad is None for parameter in adapter.p_value.parameters())
+    assert not hasattr(adapter, "p_value")
 
 
 def test_float64_is_preserved_and_stale_state_after_module_move_fails() -> None:
@@ -401,7 +396,7 @@ def test_float64_is_preserved_and_stale_state_after_module_move_fails() -> None:
 
     assert output.dtype == torch.float64
     assert output.device == visual.device
-    with pytest.raises(ValueError, match="module dtype/device"):
+    with pytest.raises(ValueError, match="runtime W0 must match the module"):
         adapter(visual, fast_state=stale)
 
 
@@ -415,6 +410,29 @@ def test_bfloat16_online_runtime_preserves_dtype() -> None:
     assert output.dtype == torch.bfloat16
     assert output.device == visual.device
     assert torch.isfinite(output).all()
+    assert state.w0_1.dtype == state.w0_2.dtype == torch.bfloat16
+    assert state.w_t_1.dtype == state.w_t_2.dtype == torch.float32
+
+
+def test_sub_bfloat16_ulp_master_delta_changes_fp32_fast_core_prediction() -> None:
+    adapter = make_adapter(dtype=torch.bfloat16)
+    baseline = adapter.initialize_fast_state()
+    visual = torch.randn(1, 1, 4096, dtype=torch.bfloat16)
+
+    adapter(visual, fast_state=baseline)
+    baseline_prediction = adapter.consume_associative_intermediates().predictions.detach()
+    changed_w1 = (baseline.w_t_1.detach() + 1.0e-5).requires_grad_(True)
+    changed_w2 = baseline.w_t_2.detach().clone().requires_grad_(True)
+    changed = replace(baseline, w_t_1=changed_w1, w_t_2=changed_w2)
+
+    adapter(visual, fast_state=changed)
+    changed_prediction = adapter.consume_associative_intermediates().predictions.detach()
+
+    assert baseline_prediction.dtype == changed_prediction.dtype == torch.float32
+    assert not torch.equal(baseline_prediction, changed_prediction)
+    assert adapter.last_audit is not None
+    assert adapter.last_audit.master_delta_norms[0] > 0.0
+    assert adapter.last_audit.fast_core_prediction_delta_norms[0] > 0.0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is optional for local P5 checks")
@@ -503,6 +521,8 @@ def test_fast_state_rejects_alias_nonfinite_nonleaf_and_invalid_metadata() -> No
             bank_record_counts=(0,),
             w_t_1_norms=(0.0,),
             w_t_2_norms=(0.0,),
+            master_delta_norms=(0.0,),
+            fast_core_prediction_delta_norms=(0.0,),
             input_norms=(0.0,),
             residual_norms=(0.0,),
         )
@@ -516,6 +536,8 @@ def test_fast_state_rejects_alias_nonfinite_nonleaf_and_invalid_metadata() -> No
             bank_record_counts=(0,),
             w_t_1_norms=(0.0,),
             w_t_2_norms=(0.0,),
+            master_delta_norms=(0.0,),
+            fast_core_prediction_delta_norms=(0.0,),
             input_norms=(0.0,),
             residual_norms=(0.0,),
         )
@@ -548,10 +570,10 @@ def test_fast_state_accepts_disjoint_w0_views_from_one_flattened_allocation() ->
 def test_query_proxy_deferred_vjp_matches_one_shot_second_order_gradient(
     query_count: int,
 ) -> None:
-    reference = make_adapter(dtype=torch.float64)
-    streamed = make_adapter(dtype=torch.float64)
+    reference = make_adapter(dtype=torch.float32)
+    streamed = make_adapter(dtype=torch.float32)
     streamed.load_state_dict(reference.state_dict())
-    direct_reference = nn.Parameter(torch.tensor(0.125, dtype=torch.float64))
+    direct_reference = nn.Parameter(torch.tensor(0.125, dtype=torch.float32))
     direct_streamed = nn.Parameter(direct_reference.detach().clone())
 
     def updated_state(adapter: FastTTTAdapter) -> FastWeightsState:
@@ -584,7 +606,7 @@ def test_query_proxy_deferred_vjp_matches_one_shot_second_order_gradient(
 
     streamed_state = updated_state(streamed)
     accumulated = tuple(
-        torch.zeros_like(value, dtype=torch.float64)
+        torch.zeros_like(value, dtype=torch.float32)
         for value in streamed_state.fast_parameters
     )
     for scale, target in cases:
@@ -610,13 +632,13 @@ def test_query_proxy_deferred_vjp_matches_one_shot_second_order_gradient(
     assert reference.w0_1.grad is not None and streamed.w0_1.grad is not None
     assert reference.w0_2.grad is not None and streamed.w0_2.grad is not None
     assert direct_reference.grad is not None and direct_streamed.grad is not None
-    assert torch.allclose(streamed.w0_1.grad, reference.w0_1.grad, atol=1.0e-12, rtol=1.0e-12)
-    assert torch.allclose(streamed.w0_2.grad, reference.w0_2.grad, atol=1.0e-12, rtol=1.0e-12)
+    assert torch.allclose(streamed.w0_1.grad, reference.w0_1.grad, atol=1.0e-6, rtol=1.0e-6)
+    assert torch.allclose(streamed.w0_2.grad, reference.w0_2.grad, atol=1.0e-6, rtol=1.0e-6)
     assert torch.allclose(
         direct_streamed.grad,
         direct_reference.grad,
-        atol=1.0e-12,
-        rtol=1.0e-12,
+        atol=1.0e-6,
+        rtol=1.0e-6,
     )
 
 

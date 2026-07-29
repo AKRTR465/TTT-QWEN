@@ -1,25 +1,56 @@
-"""Bank-conditioned associative Test-Time Training contracts.
+"""Bank-conditioned state-write Test-Time Training contracts.
 
 The hard State Bank remains authoritative and detached.  Its pre-write semantic
-records condition the Fast Adapter key, while the current raw Main Merger
-tokens provide a label-free visual value target.  This module owns no runtime
-state mutation and performs no optimizer step.
+records condition the Fast Adapter key, while the current model-predicted active
+state-write head supplies the label-free inner target.  This module owns no
+runtime state mutation and performs no optimizer step.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 from torch import Tensor
 
-from ttt_svcbench_qwen.state_bank import StateBankView
+from ttt_svcbench_qwen.state_bank import HeadType, StateBankView
 
-ASSOCIATIVE_CONTRACT = "bank_conditioned_visual_v1"
-ASSOCIATIVE_CONTRACT_VERSION = 1
+ASSOCIATIVE_CONTRACT = "bank_conditioned_state_write_v2"
+ASSOCIATIVE_CONTRACT_VERSION = 2
 BANK_EMBEDDING_DIM = 512
 ASSOCIATIVE_DIM = 768
+_NORMALIZE_EPSILON = 1.0e-6
+
+
+class StateWriteSourceView(Protocol):
+    """Minimal soft-write surface needed by the inner target selector."""
+
+    @property
+    def o1_present_mask(self) -> Tensor: ...
+
+    @property
+    def o2_present_mask(self) -> Tensor: ...
+
+    @property
+    def e1_present_mask(self) -> Tensor: ...
+
+    @property
+    def e2_present_mask(self) -> Tensor: ...
+
+    @property
+    def o1_sources(self) -> Tensor: ...
+
+    @property
+    def o2_sources(self) -> Tensor: ...
+
+    @property
+    def e1_sources(self) -> Tensor: ...
+
+    @property
+    def e2_sources(self) -> Tensor: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,10 +101,9 @@ class FastAssociativeContext:
 
 @dataclass(frozen=True, slots=True)
 class AssociativeTTTIntermediates:
-    """Ephemeral key/value/prediction tensors captured by one adapter call."""
+    """Ephemeral key/prediction tensors captured by one adapter call."""
 
     keys: Tensor
-    values: Tensor
     predictions: Tensor
     valid_mask: Tensor
     bank_record_counts: Tensor
@@ -83,9 +113,9 @@ class AssociativeTTTIntermediates:
         shape = self.keys.shape
         if len(shape) != 3 or shape[0] <= 0 or shape[1] <= 0 or shape[2] != ASSOCIATIVE_DIM:
             raise ValueError("associative keys must be non-empty [B, N, 768]")
-        tensors = (self.keys, self.values, self.predictions)
+        tensors = (self.keys, self.predictions)
         if any(tensor.shape != shape or not torch.is_floating_point(tensor) for tensor in tensors):
-            raise ValueError("associative key/value/prediction tensors must align")
+            raise ValueError("associative key/prediction tensors must align")
         if any(
             tensor.dtype != self.keys.dtype or tensor.device != self.keys.device
             for tensor in tensors[1:]
@@ -144,12 +174,49 @@ class AssociativeScaleAudit:
 
 
 @dataclass(frozen=True, slots=True)
+class AssociativeTargetAudit:
+    """Detached state-write target selection and cosine statistics."""
+
+    active_head_counts: tuple[int, int, int, int]
+    valid_target_counts: tuple[int, int, int, int]
+    unsupported_count: int
+    empty_target_count: int
+    prediction_target_cosine_sum: Tensor
+    prediction_target_cosine_count: Tensor
+
+    def __post_init__(self) -> None:
+        counts = (
+            *self.active_head_counts,
+            *self.valid_target_counts,
+            self.unsupported_count,
+            self.empty_target_count,
+        )
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise ValueError("associative target audit counts must be non-negative integers")
+        if (
+            self.prediction_target_cosine_sum.shape != ()
+            or self.prediction_target_cosine_sum.dtype != torch.float32
+            or self.prediction_target_cosine_count.shape != ()
+            or self.prediction_target_cosine_count.dtype != torch.int64
+        ):
+            raise ValueError("associative target cosine audit must use detached scalars")
+        if (
+            self.prediction_target_cosine_sum.requires_grad
+            or self.prediction_target_cosine_sum.grad_fn is not None
+            or self.prediction_target_cosine_count.requires_grad
+            or self.prediction_target_cosine_count.grad_fn is not None
+        ):
+            raise ValueError("associative target cosine audit must be detached")
+
+
+@dataclass(frozen=True, slots=True)
 class AssociativeTTTLossOutput:
     total: Tensor
     per_row_total: Tensor
     update_valid_mask: Tensor
     valid_token_counts: Tensor
     scale_audit: AssociativeScaleAudit
+    target_audit: AssociativeTargetAudit
 
     def __post_init__(self) -> None:
         batch_size = self.per_row_total.shape[0]
@@ -218,26 +285,43 @@ def build_fast_associative_context(
 
 def compute_associative_ttt_loss(
     inputs: AssociativeTTTIntermediates,
+    state_write: StateWriteSourceView,
+    head_types: Sequence[HeadType | None],
 ) -> AssociativeTTTLossOutput:
-    """Compute the sole inner loss: masked FP32 visual association MSE."""
+    """Compute the sole inner loss against the predicted active-head write source."""
 
-    error = inputs.predictions.float() - inputs.values.float()
-    item_losses = error.square().mean(dim=-1)
+    batch_size = inputs.predictions.shape[0]
+    heads = tuple(head_types)
+    if len(heads) != batch_size:
+        raise ValueError("active head metadata must align to the associative batch")
+    targets, target_valid, target_audit_counts = _select_state_write_targets(
+        state_write,
+        heads,
+        reference=inputs.predictions,
+    )
     mask = inputs.valid_mask
     counts = mask.sum(dim=1, dtype=torch.int64)
-    valid_rows = counts > 0
-    per_row = (
-        (item_losses * mask.to(dtype=item_losses.dtype)).sum(dim=1)
-        / counts.clamp_min(1).to(dtype=torch.float32)
+    visual_valid = counts > 0
+    valid_rows = visual_valid & target_valid
+    effective_counts = torch.where(target_valid, counts, torch.zeros_like(counts))
+    fp32_mask = mask.unsqueeze(-1).to(dtype=torch.float32)
+    denominator = counts.clamp_min(1).to(dtype=torch.float32).unsqueeze(-1)
+    pooled_keys = (inputs.keys.float() * fp32_mask).sum(dim=1) / denominator
+    pooled_predictions = (
+        (inputs.predictions.float() * fp32_mask).sum(dim=1) / denominator
     )
+    normalized_predictions = _smooth_normalize(pooled_predictions)
+    normalized_targets = _smooth_normalize(targets.detach().float())
+    cosine = (normalized_predictions * normalized_targets).sum(dim=-1)
+    per_row = torch.where(valid_rows, 1.0 - cosine, torch.zeros_like(cosine))
     total = per_row[valid_rows].mean() if bool(valid_rows.any().item()) else per_row.sum() * 0.0
 
-    expanded_mask = mask.unsqueeze(-1).to(dtype=torch.float32)
-    keys = inputs.keys.detach().float() * expanded_mask
-    values = inputs.values.detach().float() * expanded_mask
-    predictions = inputs.predictions.detach().float() * expanded_mask
-    errors = error.detach() * expanded_mask
-    element_count = (counts.sum() * inputs.keys.shape[-1]).detach()
+    row_mask = valid_rows.unsqueeze(-1).to(dtype=torch.float32)
+    keys = pooled_keys.detach() * row_mask
+    values = normalized_targets.detach() * row_mask
+    predictions = normalized_predictions.detach() * row_mask
+    errors = (predictions - values).detach()
+    element_count = (valid_rows.sum(dtype=torch.int64) * inputs.keys.shape[-1]).detach()
     zero = total.detach().new_zeros(())
 
     def max_abs(value: Tensor) -> Tensor:
@@ -254,10 +338,135 @@ def compute_associative_ttt_loss(
         prediction_max_abs=max_abs(predictions),
         error_max_abs=max_abs(errors),
     )
+    active_counts, valid_counts, unsupported_count, empty_target_count = target_audit_counts
+    target_audit = AssociativeTargetAudit(
+        active_head_counts=active_counts,
+        valid_target_counts=valid_counts,
+        unsupported_count=unsupported_count,
+        empty_target_count=empty_target_count,
+        prediction_target_cosine_sum=cosine[valid_rows].detach().float().sum(),
+        prediction_target_cosine_count=valid_rows.sum(dtype=torch.int64).detach(),
+    )
     return AssociativeTTTLossOutput(
         total=total,
         per_row_total=per_row,
         update_valid_mask=valid_rows,
-        valid_token_counts=counts,
+        valid_token_counts=effective_counts,
         scale_audit=audit,
+        target_audit=target_audit,
     )
+
+
+def _select_state_write_targets(
+    state_write: StateWriteSourceView,
+    head_types: tuple[HeadType | None, ...],
+    *,
+    reference: Tensor,
+) -> tuple[
+    Tensor,
+    Tensor,
+    tuple[tuple[int, int, int, int], tuple[int, int, int, int], int, int],
+]:
+    """Select one detached 768-d source per row from the predicted active head."""
+
+    required = (
+        "o1_sources",
+        "o1_present_mask",
+        "o2_sources",
+        "o2_present_mask",
+        "e1_sources",
+        "e1_present_mask",
+        "e2_sources",
+        "e2_present_mask",
+    )
+    if state_write is None or any(not hasattr(state_write, name) for name in required):
+        raise TypeError("state-write associative target requires StageASoftWriteOutput")
+    batch_size = len(head_types)
+    targets = torch.zeros(
+        (batch_size, ASSOCIATIVE_DIM),
+        dtype=torch.float32,
+        device=reference.device,
+    )
+    valid = torch.zeros(batch_size, dtype=torch.bool, device=reference.device)
+    head_order = (HeadType.O1, HeadType.O2, HeadType.E1, HeadType.E2)
+    active_counts = [0, 0, 0, 0]
+    valid_counts = [0, 0, 0, 0]
+    unsupported_count = 0
+    for row, head in enumerate(head_types):
+        if head is None:
+            unsupported_count += 1
+            continue
+        if head not in head_order:
+            raise ValueError(f"unsupported associative active head: {head!r}")
+        head_index = head_order.index(head)
+        active_counts[head_index] += 1
+        source, source_valid = _state_write_source_for_row(state_write, head, row)
+        if not source_valid:
+            continue
+        if source.shape != (ASSOCIATIVE_DIM,) or not torch.is_floating_point(source):
+            raise ValueError("active-head state-write source must be floating [768]")
+        if source.device != reference.device:
+            source = source.to(device=reference.device)
+        detached = source.detach().float()
+        if not bool(torch.isfinite(detached).all()):
+            raise ValueError("active-head state-write source must be finite")
+        targets[row] = detached
+        valid[row] = True
+        valid_counts[head_index] += 1
+    empty_target_count = batch_size - sum(valid_counts) - unsupported_count
+    active_count_tuple = (
+        active_counts[0],
+        active_counts[1],
+        active_counts[2],
+        active_counts[3],
+    )
+    valid_count_tuple = (
+        valid_counts[0],
+        valid_counts[1],
+        valid_counts[2],
+        valid_counts[3],
+    )
+    return (
+        targets,
+        valid,
+        (
+            active_count_tuple,
+            valid_count_tuple,
+            unsupported_count,
+            empty_target_count,
+        ),
+    )
+
+
+def _smooth_normalize(value: Tensor) -> Tensor:
+    """Normalize with a finite first/second derivative at the zero vector."""
+
+    inverse_norm = torch.rsqrt(
+        value.square().sum(dim=-1, keepdim=True) + _NORMALIZE_EPSILON**2
+    )
+    return value * inverse_norm
+
+
+def _state_write_source_for_row(
+    state_write: StateWriteSourceView,
+    head: HeadType,
+    row: int,
+) -> tuple[Tensor, bool]:
+    if head is HeadType.O1:
+        present = state_write.o1_present_mask[row]
+        return state_write.o1_sources[row], bool(present.item())
+    if head is HeadType.O2:
+        present = state_write.o2_present_mask[row]
+        sources = state_write.o2_sources[row]
+        if not bool(present.any().item()):
+            return sources.float().sum(dim=0) * 0.0, False
+        fp32_mask = present.unsqueeze(-1).to(dtype=torch.float32)
+        pooled = (sources.float() * fp32_mask).sum(dim=0) / present.sum().to(torch.float32)
+        return pooled, True
+    if head is HeadType.E1:
+        present = state_write.e1_present_mask[row]
+        return state_write.e1_sources[row], bool(present.any().item())
+    if head is HeadType.E2:
+        present = state_write.e2_present_mask[row]
+        return state_write.e2_sources[row], bool(present.any().item())
+    raise ValueError(f"unsupported associative active head: {head!r}")

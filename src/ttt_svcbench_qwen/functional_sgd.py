@@ -122,6 +122,8 @@ class FunctionalSGDResult:
     per_matrix_gradient_norms: tuple[float, float] | None
     per_matrix_clipped_norms: tuple[float, float] | None
     update_norm: float
+    master_changed_fraction: float
+    bf16_shadow_changed_fraction: float
     skip_reason: UpdateSkipReason | None
     skip_detail: str | None
     gradient_mode: GradientMode
@@ -136,6 +138,9 @@ class FunctionalSGDResult:
             raise ValueError("valid_token_count must be a non-negative exact integer")
         if not math.isfinite(self.update_norm) or self.update_norm < 0.0:
             raise ValueError("update_norm must be finite and non-negative")
+        fractions = (self.master_changed_fraction, self.bf16_shadow_changed_fraction)
+        if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in fractions):
+            raise ValueError("fast update changed fractions must be finite in [0, 1]")
         if not math.isfinite(self.step_size) or not 0.0 < self.step_size < 3.0e-4:
             raise ValueError("functional SGD step_size must be finite and in (0, 3e-4)")
         scalars = (self.gradient_norm, self.clipped_gradient_norm)
@@ -155,6 +160,8 @@ class FunctionalSGDResult:
                 raise ValueError("successful updates require at least one valid token")
             if any(value is None for value in scalars + pairs) or self.update_norm <= 0.0:
                 raise ValueError("successful updates require complete positive finite audits")
+            if self.master_changed_fraction <= 0.0:
+                raise ValueError("successful updates must change at least one FP32 master value")
             if self.optimizer_state.last_skip_reason is not None:
                 raise ValueError("successful optimizer state cannot retain a skip reason")
         else:
@@ -162,6 +169,8 @@ class FunctionalSGDResult:
                 raise ValueError("skipped updates require a reason and detail")
             if self.update_norm != 0.0:
                 raise ValueError("skipped updates must report zero update norm")
+            if any(fractions):
+                raise ValueError("skipped updates must report zero changed fractions")
             if self.optimizer_state.last_skip_reason != self.skip_reason.value:
                 raise ValueError("optimizer and result skip reasons must agree")
         mode_is_differentiable = self.gradient_mode is GradientMode.META_FULL_SECOND_ORDER
@@ -525,10 +534,8 @@ def functional_sgd_step(
     )
     update_norm_tensor, _ = _global_norm(deltas)
     update_norm = _audit_float(update_norm_tensor)
-    if update_norm <= 0.0 or all(
-        torch.equal(candidate.detach(), parameter.detach())
-        for candidate, parameter in zip(candidates, parameters, strict=True)
-    ):
+    master_changed_fraction = _changed_fraction(candidates, parameters)
+    if update_norm <= 0.0 or master_changed_fraction == 0.0:
         return _skip_result(
             fast_state,
             optimizer_state,
@@ -541,6 +548,10 @@ def functional_sgd_step(
             per_matrix_clipped_norms=cast_norm_pair(clipped_per_matrix),
             step_size=audited_step_size,
         )
+    bf16_shadow_changed_fraction = _changed_fraction(
+        tuple(candidate.to(dtype=torch.bfloat16) for candidate in candidates),
+        tuple(parameter.to(dtype=torch.bfloat16) for parameter in parameters),
+    )
 
     next_parameters = _next_parameters(candidates, differentiable=fast_state.differentiable)
     next_state = FastWeightsState(
@@ -564,6 +575,8 @@ def functional_sgd_step(
         per_matrix_gradient_norms=cast_norm_pair(per_matrix_norms),
         per_matrix_clipped_norms=cast_norm_pair(clipped_per_matrix),
         update_norm=update_norm,
+        master_changed_fraction=master_changed_fraction,
+        bf16_shadow_changed_fraction=bf16_shadow_changed_fraction,
         step_size=audited_step_size,
         skip_reason=None,
         skip_detail=None,
@@ -609,6 +622,8 @@ def _skip_result(
         per_matrix_gradient_norms=per_matrix_gradient_norms,
         per_matrix_clipped_norms=per_matrix_clipped_norms,
         update_norm=0.0,
+        master_changed_fraction=0.0,
+        bf16_shadow_changed_fraction=0.0,
         step_size=step_size,
         skip_reason=reason,
         skip_detail=detail,
@@ -627,6 +642,19 @@ def _next_parameters(
         values[0].detach().clone().requires_grad_(True),
         values[1].detach().clone().requires_grad_(True),
     )
+
+
+def _changed_fraction(after: Sequence[Tensor], before: Sequence[Tensor]) -> float:
+    if len(after) != len(before) or not after:
+        raise ValueError("changed-fraction tensors must be non-empty and aligned")
+    changed = 0
+    total = 0
+    for candidate, parameter in zip(after, before, strict=True):
+        if candidate.shape != parameter.shape or candidate.device != parameter.device:
+            raise ValueError("changed-fraction tensors must share shape and device")
+        changed += int(torch.count_nonzero(candidate.detach() != parameter.detach()).item())
+        total += candidate.numel()
+    return changed / float(total)
 
 
 def _global_norm(values: tuple[Tensor, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor]]:
@@ -721,12 +749,14 @@ def _validate_optimizer_config(config: InnerSGDConfig) -> None:
         "grad_clip_norm": 1.0,
         "reset_per_video": True,
         "meta_gradient_mode": "full_second_order",
+        "fast_weight_dtype": "float32",
+        "fast_core_dtype": "float32",
     }
     for name, required in expected.items():
         if getattr(config, name) != required:
             raise ValueError(f"inner SGD {name} must be {required!r}")
-    if config.learning_rate not in {1.0e-4, 2.0e-4}:
-        raise ValueError("inner SGD learning_rate must be 1e-4 or 2e-4")
+    if config.learning_rate != 1.0e-4:
+        raise ValueError("inner SGD learning_rate must be 1e-4")
 
 
 def _validate_optimizer_runtime(

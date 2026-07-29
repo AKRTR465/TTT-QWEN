@@ -2,7 +2,7 @@
 
 Inputs: differentiable soft predictions and explicit dense labels/masks.
 Outputs: FP32 per-row loss terms, validity audits, metrics, and Query-only Outer objectives.
-The label-free Bank-conditioned visual association objective lives in ``associative_ttt`` and
+The label-free Bank-conditioned state-write objective lives in ``associative_ttt`` and
 is deliberately not part of the Query Outer loss.
 """
 

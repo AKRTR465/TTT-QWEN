@@ -27,6 +27,7 @@ from torch import Tensor, nn
 from ttt_svcbench_qwen.associative_ttt import (
     AssociativeTTTIntermediates,
     FastAssociativeContext,
+    StateWriteSourceView,
     build_fast_associative_context,
 )
 from ttt_svcbench_qwen.config import ProjectConfig
@@ -481,7 +482,7 @@ class BankWriteOutput:
     runtime_state: BatchRuntimeState
     bank_states: tuple[StateBankRuntimeState, ...]
     audit: object
-    soft_write: object | None = None
+    soft_write: StateWriteSourceView | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,7 +492,7 @@ class SoftIntermediates:
     spatial: SpatialEncoderOutput | None
     temporal: TemporalEncoderOutput | None
     observations: ObservationOutputs | None
-    state_write: object | None = None
+    state_write: StateWriteSourceView | None = None
     fast_associative: AssociativeTTTIntermediates | None = None
 
 
@@ -1005,7 +1006,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             bank_states = request.bank_states
             retrieval_history: RetrievalHistoryView | None = None
             bank_audit: object | None = None
-            soft_write: object | None = None
+            soft_write: StateWriteSourceView | None = None
             if self.feature_flags.bank_enabled:
                 if request.retrieval_snapshot_required and (
                     self.feature_flags.reader_enabled or self.feature_flags.state_tokens_enabled

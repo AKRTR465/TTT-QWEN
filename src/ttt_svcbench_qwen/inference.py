@@ -363,7 +363,7 @@ class TTTUpdateStage(Protocol):
 
 
 class OnlineTTTUpdater:
-    """Apply label-free visual association and publish W_(t+1)."""
+    """Apply the label-free state-write objective and publish W_(t+1)."""
 
     def __init__(
         self,
@@ -386,7 +386,14 @@ class OnlineTTTUpdater:
         intermediates = observation.soft_intermediates.fast_associative
         if intermediates is None:
             raise InferenceProtocolError("online observation did not capture associative tensors")
-        output = compute_associative_ttt_loss(intermediates)
+        state_write = observation.soft_intermediates.state_write
+        if state_write is None:
+            raise InferenceProtocolError("online observation did not produce state-write targets")
+        output = compute_associative_ttt_loss(
+            intermediates,
+            state_write,
+            observation.query.head_types,
+        )
         result = functional_sgd_steps_from_associative(
             associative_output=output,
             fast_states=(_require_fast_state(runtime_state),),

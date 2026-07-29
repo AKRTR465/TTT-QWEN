@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -40,14 +40,20 @@ class FastWeightsState:
     differentiable: bool = False
 
     def __post_init__(self) -> None:
-        matrices = (self.w0_1, self.w0_2, self.w_t_1, self.w_t_2)
+        slow_matrices = (self.w0_1, self.w0_2)
+        fast_matrices = (self.w_t_1, self.w_t_2)
+        matrices = (*slow_matrices, *fast_matrices)
         for matrix in matrices:
             if matrix.shape != (768, 768) or not torch.is_floating_point(matrix):
                 raise ValueError("all fast matrices must be floating [768, 768]")
-            if matrix.dtype != self.w0_1.dtype or matrix.device != self.w0_1.device:
-                raise ValueError("all fast matrices must share dtype and device")
+            if matrix.device != self.w0_1.device:
+                raise ValueError("W0 and W_t matrices must share one device")
             if matrix.device.type != "meta" and not bool(torch.isfinite(matrix).all()):
                 raise ValueError("all fast matrices must be finite")
+        if self.w0_2.dtype != self.w0_1.dtype:
+            raise ValueError("both W0 matrices must share checkpoint dtype")
+        if any(matrix.dtype != torch.float32 for matrix in fast_matrices):
+            raise ValueError("W_t master matrices must use float32")
         for left_index, left in enumerate(matrices):
             for right in matrices[left_index + 1 :]:
                 if _shares_storage(left, right):
@@ -85,7 +91,7 @@ class OptimizerRuntimeState:
     def __post_init__(self) -> None:
         fixed = (
             self.optimizer_name == "sgd"
-            and self.learning_rate in {1.0e-4, 2.0e-4}
+            and self.learning_rate == 1.0e-4
             and self.momentum == 0.0
             and self.weight_decay == 0.0
             and self.steps_per_chunk == 1
@@ -166,6 +172,8 @@ class FastTTTForwardAudit:
     bank_record_counts: tuple[int, ...]
     w_t_1_norms: tuple[float, ...]
     w_t_2_norms: tuple[float, ...]
+    master_delta_norms: tuple[float, ...]
+    fast_core_prediction_delta_norms: tuple[float, ...]
     input_norms: tuple[float, ...]
     residual_norms: tuple[float, ...]
 
@@ -182,6 +190,8 @@ class FastTTTForwardAudit:
             len(self.bank_record_counts),
             len(self.w_t_1_norms),
             len(self.w_t_2_norms),
+            len(self.master_delta_norms),
+            len(self.fast_core_prediction_delta_norms),
             len(self.input_norms),
             len(self.residual_norms),
         }
@@ -204,6 +214,8 @@ class FastTTTForwardAudit:
         values = (
             *self.w_t_1_norms,
             *self.w_t_2_norms,
+            *self.master_delta_norms,
+            *self.fast_core_prediction_delta_norms,
             *self.input_norms,
             *self.residual_norms,
         )
@@ -235,11 +247,6 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
         )
         self.p_context = nn.Linear(
             BANK_EMBEDDING_DIM,
-            config.bottleneck_dim,
-            bias=config.slow_projection_bias,
-        )
-        self.p_value = nn.Linear(
-            config.input_dim,
             config.bottleneck_dim,
             bias=config.slow_projection_bias,
         )
@@ -288,7 +295,7 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             visual_embeddings.shape[0],
         )
         if runtime_states is None:
-            w_t_1, w_t_2 = self.w0_1, self.w0_2
+            w_t_1, w_t_2 = self.w0_1.float(), self.w0_2.float()
             detach_slow = False
             fast_versions = (0,) * visual_embeddings.shape[0]
             update_counts = fast_versions
@@ -309,8 +316,6 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
         p_in_bias = self._online_value(self.p_in.bias, detach_slow)
         p_context_weight = self._online_value(self.p_context.weight, detach_slow)
         p_context_bias = self._online_value(self.p_context.bias, detach_slow)
-        p_value_weight = self._online_value(self.p_value.weight, detach_slow)
-        p_value_bias = self._online_value(self.p_value.bias, detach_slow)
         p_out_weight = self._online_value(self.p_out.weight, detach_slow)
         p_out_bias = self._online_value(self.p_out.bias, detach_slow)
         normalized = F.rms_norm(
@@ -349,32 +354,34 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             p_context_weight,
             p_context_bias,
         ).unsqueeze(1)
-        value_normalized = F.rms_norm(
-            visual_embeddings.detach(),
-            (self.input_dim,),
-            rms_weight,
-            self.config.rms_norm_eps,
+        core_context = (
+            torch.autocast(device_type=visual_embeddings.device.type, enabled=False)
+            if visual_embeddings.device.type in {"cpu", "cuda"}
+            else nullcontext()
         )
-        values = F.linear(value_normalized, p_value_weight, p_value_bias)
-        if runtime_states is None:
-            hidden = F.linear(projected, w_t_1, None)
-        else:
-            hidden = torch.bmm(projected, w_t_1.transpose(1, 2))
-        hidden = F.silu(hidden)
-        if runtime_states is None:
-            hidden = F.linear(hidden, w_t_2, None)
-        else:
-            hidden = torch.bmm(hidden, w_t_2.transpose(1, 2))
-        predictions = hidden
+        with core_context:
+            projected = projected.float()
+            if runtime_states is None:
+                hidden = F.linear(projected, w_t_1, None)
+            else:
+                hidden = torch.bmm(projected, w_t_1.transpose(1, 2))
+            hidden = F.silu(hidden)
+            if runtime_states is None:
+                predictions = F.linear(hidden, w_t_2, None)
+            else:
+                predictions = torch.bmm(hidden, w_t_2.transpose(1, 2))
         self._last_associative_intermediates = AssociativeTTTIntermediates(
             keys=projected,
-            values=values,
             predictions=predictions,
             valid_mask=mask,
             bank_record_counts=bank_record_counts,
             bank_versions=bank_versions,
         )
-        residual = F.linear(predictions, p_out_weight, p_out_bias)
+        residual = F.linear(
+            predictions.to(dtype=visual_embeddings.dtype),
+            p_out_weight,
+            p_out_bias,
+        )
         residual = residual.masked_fill(~mask.unsqueeze(-1), 0.0)
         scaled_residual = self.residual_scale * residual
         output = visual_embeddings + scaled_residual
@@ -386,6 +393,25 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
         else:
             w_t_1_norms = tuple(_detached_norm(state.w_t_1) for state in runtime_states)
             w_t_2_norms = tuple(_detached_norm(state.w_t_2) for state in runtime_states)
+        if runtime_states is None:
+            master_delta_norms = (0.0,) * visual_embeddings.shape[0]
+            fast_core_prediction_delta_norms = master_delta_norms
+        else:
+            master_delta_norms = tuple(
+                _detached_pair_delta_norm(
+                    state.w_t_1,
+                    state.w_t_2,
+                    state.w0_1.float(),
+                    state.w0_2.float(),
+                )
+                for state in runtime_states
+            )
+            fast_core_prediction_delta_norms = _sampled_fast_core_prediction_delta_norms(
+                projected,
+                predictions,
+                mask,
+                runtime_states,
+            )
         self.last_audit = FastTTTForwardAudit(
             fast_versions=fast_versions,
             update_counts=update_counts,
@@ -395,6 +421,8 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             bank_record_counts=tuple(int(value.item()) for value in bank_record_counts),
             w_t_1_norms=w_t_1_norms,
             w_t_2_norms=w_t_2_norms,
+            master_delta_norms=master_delta_norms,
+            fast_core_prediction_delta_norms=fast_core_prediction_delta_norms,
             input_norms=tuple(
                 _detached_norm(visual_embeddings[row][mask[row]])
                 for row in range(visual_embeddings.shape[0])
@@ -412,13 +440,13 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
         if differentiable:
             w0_1: Tensor = self.w0_1
             w0_2: Tensor = self.w0_2
-            w_t_1 = self.w0_1.clone()
-            w_t_2 = self.w0_2.clone()
+            w_t_1 = self.w0_1.float().clone()
+            w_t_2 = self.w0_2.float().clone()
         else:
             w0_1 = self.w0_1.detach().clone()
             w0_2 = self.w0_2.detach().clone()
-            w_t_1 = w0_1.clone().requires_grad_(True)
-            w_t_2 = w0_2.clone().requires_grad_(True)
+            w_t_1 = w0_1.float().clone().requires_grad_(True)
+            w_t_2 = w0_2.float().clone().requires_grad_(True)
         state = FastWeightsState(
             w0_1=w0_1,
             w0_2=w0_2,
@@ -521,17 +549,11 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
 
     @torch.no_grad()  # type: ignore[untyped-decorator]
     def reset_associative_projections(self) -> None:
-        """Apply the frozen A2→A5 initialization without changing the W0 forward."""
+        """Initialize the state-write associative context without changing W0."""
 
         self.p_context.weight.zero_()
         if self.p_context.bias is not None:
             self.p_context.bias.zero_()
-        self.p_value.weight.copy_(self.p_in.weight)
-        if self.p_value.bias is not None:
-            if self.p_in.bias is None:
-                self.p_value.bias.zero_()
-            else:
-                self.p_value.bias.copy_(self.p_in.bias)
 
     def collect_meta_fast_parameters(self) -> tuple[nn.Parameter, nn.Parameter]:
         return (self.w0_1, self.w0_2)
@@ -551,14 +573,11 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
 
     def collect_associative_parameters(self) -> tuple[nn.Parameter, ...]:
         context_bias = self.p_context.bias
-        value_bias = self.p_value.bias
-        if context_bias is None or value_bias is None:
+        if context_bias is None:
             raise RuntimeError("associative projection biases disappeared")
         return (
             self.p_context.weight,
             context_bias,
-            self.p_value.weight,
-            value_bias,
         )
 
     def parameter_groups(self, state: FastWeightsState) -> FastParameterGroups:
@@ -636,8 +655,16 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
         return valid_mask
 
     def _validate_state_for_module(self, state: FastWeightsState) -> None:
-        if state.w_t_1.dtype != self.w0_1.dtype or state.w_t_1.device != self.w0_1.device:
-            raise ValueError("Fast TTT runtime state must share module dtype/device")
+        if (
+            state.w0_1.dtype != self.w0_1.dtype
+            or state.w0_1.device != self.w0_1.device
+            or state.w_t_1.dtype != torch.float32
+            or state.w_t_1.device != self.w0_1.device
+        ):
+            raise ValueError(
+                "Fast TTT runtime W0 must match the module and W_t master must be float32 "
+                "on the module device"
+            )
         self.assert_online_parameter_boundary(state.fast_parameters, state)
 
     def _validate_state_for_input(
@@ -647,10 +674,13 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
     ) -> None:
         self._validate_state_for_module(state)
         if (
-            state.w_t_1.dtype != visual_embeddings.dtype
+            state.w0_1.dtype != visual_embeddings.dtype
             or state.w_t_1.device != visual_embeddings.device
         ):
-            raise ValueError("Fast TTT runtime state must share input dtype/device")
+            raise ValueError(
+                "Fast TTT runtime W0 must share input dtype and all state tensors must share "
+                "the input device"
+            )
 
     def _normalize_runtime_states(
         self,
@@ -805,8 +835,8 @@ def reanchor_fast_state(
         raise ValueError("re-anchoring requires trainable W0 tensors")
 
     old_values = tuple(value.detach() for value in state.fast_parameters)
-    next_1 = old_values[0] + (state.w0_1 - state.w0_1.detach())
-    next_2 = old_values[1] + (state.w0_2 - state.w0_2.detach())
+    next_1 = old_values[0] + (state.w0_1.float() - state.w0_1.detach().float())
+    next_2 = old_values[1] + (state.w0_2.float() - state.w0_2.detach().float())
     next_state = FastWeightsState(
         w0_1=state.w0_1,
         w0_2=state.w0_2,
@@ -870,6 +900,49 @@ def build_fast_ttt_adapter(config: ProjectConfig | None = None) -> FastTTTAdapte
     if config is None:
         raise ValueError("build_fast_ttt_adapter requires a validated ProjectConfig")
     return FastTTTAdapter(config.fast_ttt)
+
+
+def _detached_pair_delta_norm(
+    current_1: Tensor,
+    current_2: Tensor,
+    reference_1: Tensor,
+    reference_2: Tensor,
+) -> float:
+    squared = (
+        (current_1.detach().float() - reference_1.detach().float()).square().sum()
+        + (current_2.detach().float() - reference_2.detach().float()).square().sum()
+    )
+    return float(torch.sqrt(squared).cpu().item())
+
+
+def _sampled_fast_core_prediction_delta_norms(
+    keys: Tensor,
+    predictions: Tensor,
+    valid_mask: Tensor,
+    states: Sequence[FastWeightsState],
+) -> tuple[float, ...]:
+    """Measure one valid token per row against W0 without retaining an audit graph."""
+
+    if keys.device.type == "meta":
+        return (0.0,) * len(states)
+    values: list[float] = []
+    core_context = (
+        torch.autocast(device_type=keys.device.type, enabled=False)
+        if keys.device.type in {"cpu", "cuda"}
+        else nullcontext()
+    )
+    with torch.no_grad(), core_context:
+        for row, state in enumerate(states):
+            first_valid = int(torch.nonzero(valid_mask[row], as_tuple=False)[0, 0].item())
+            key = keys[row, first_valid].detach().float()
+            reference = F.linear(
+                F.silu(F.linear(key, state.w0_1.detach().float(), None)),
+                state.w0_2.detach().float(),
+                None,
+            )
+            delta = predictions[row, first_valid].detach().float() - reference
+            values.append(float(torch.linalg.vector_norm(delta).cpu().item()))
+    return tuple(values)
 
 
 def _detached_norm(tensor: Tensor) -> float:

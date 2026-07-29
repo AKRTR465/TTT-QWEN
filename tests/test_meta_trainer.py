@@ -65,7 +65,7 @@ from ttt_svcbench_qwen.observation_heads import (
     StreamReplayAudit,
 )
 from ttt_svcbench_qwen.query_encoder import Operator
-from ttt_svcbench_qwen.stage_a_runtime import StageAWriteAudit
+from ttt_svcbench_qwen.stage_a_runtime import StageASoftWriteOutput, StageAWriteAudit
 from ttt_svcbench_qwen.stage_a_targets import (
     AnswerTargetLabels,
     OfficialWeakLossAudit,
@@ -235,11 +235,10 @@ class _TinyFastController(nn.Module):
             context.combined_query.mean(dim=-1, keepdim=True).unsqueeze(1)
             * self.context_scale
         )
-        keys = visual.value + context_term
+        keys = visual.value * self.value_scale + context_term
         w1 = torch.stack(tuple(state.w_t_1 for state in self._active))
         w2 = torch.stack(tuple(state.w_t_2 for state in self._active))
         predictions = torch.bmm(F.silu(torch.bmm(keys, w1.transpose(1, 2))), w2.transpose(1, 2))
-        values = visual.value.detach() * self.value_scale
         payload = _request.video_input
         if not isinstance(payload, _VideoChunk):
             raise TypeError("tiny Fast forward requires a _VideoChunk payload")
@@ -249,7 +248,6 @@ class _TinyFastController(nn.Module):
         ).to(device=keys.device)
         self._intermediates = AssociativeTTTIntermediates(
             keys=keys,
-            values=values,
             predictions=predictions,
             valid_mask=valid_mask,
             bank_record_counts=context.bank_record_counts,
@@ -264,6 +262,20 @@ class _TinyFastController(nn.Module):
             bank_record_counts=tuple(int(value.item()) for value in context.bank_record_counts),
             w_t_1_norms=tuple(float(state.w_t_1.detach().norm()) for state in self._active),
             w_t_2_norms=tuple(float(state.w_t_2.detach().norm()) for state in self._active),
+            master_delta_norms=tuple(
+                float(
+                    torch.sqrt(
+                        (state.w_t_1.detach().float() - state.w0_1.detach().float())
+                        .square()
+                        .sum()
+                        + (state.w_t_2.detach().float() - state.w0_2.detach().float())
+                        .square()
+                        .sum()
+                    )
+                )
+                for state in self._active
+            ),
+            fast_core_prediction_delta_norms=(0.0,) * len(self._active),
             input_norms=tuple(
                 float(visual.value[row].detach().norm()) for row in range(len(gains))
             ),
@@ -293,6 +305,7 @@ class _QueryStage(nn.Module):
         return SimpleNamespace(
             q_target=torch.zeros((1, 512)),
             hard_operators=(Operator.O1_SNAP,),
+            head_types=(HeadType.O1,),
         )
 
 
@@ -476,7 +489,46 @@ class _BankWriter:
             identity_decisions=decisions,
             skipped_rows=(),
         )
-        return BankWriteOutput(next_runtime, next_banks, audit)
+        valid = _temporal.valid_mask
+        counts = valid.sum(dim=1).clamp_min(1).to(_temporal.hidden.dtype)
+        source = (
+            (_temporal.hidden * valid.unsqueeze(-1).to(_temporal.hidden.dtype)).sum(dim=1)
+            / counts.unsqueeze(-1)
+        )
+        present = valid.any(dim=1)
+        o2_present = _observations.o2.valid_mask
+        soft_write = StageASoftWriteOutput(
+            o1_semantics=torch.zeros(
+                source.shape[0], 512, dtype=source.dtype, device=source.device
+            ),
+            o1_present_mask=present,
+            o2_semantics=torch.zeros(
+                *o2_present.shape,
+                512,
+                dtype=source.dtype,
+                device=source.device,
+            ),
+            o2_present_mask=o2_present,
+            e1_semantics=torch.zeros(
+                *valid.shape,
+                512,
+                dtype=source.dtype,
+                device=source.device,
+            ),
+            e1_present_mask=valid,
+            e2_semantics=torch.zeros(
+                *valid.shape,
+                512,
+                dtype=source.dtype,
+                device=source.device,
+            ),
+            e2_present_mask=valid,
+            o1_sources=source,
+            o2_sources=source.unsqueeze(1).expand(-1, o2_present.shape[1], -1),
+            e1_sources=source,
+            e2_sources=source,
+        )
+        return BankWriteOutput(next_runtime, next_banks, audit, soft_write=soft_write)
 
 
 class _Retriever:
@@ -1128,6 +1180,78 @@ def test_truncated_a5_query_bundle_sums_proxy_gradients_then_closes_once(
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
 
 
+def test_query_cotangents_clip_independently_then_sum_without_averaging() -> None:
+    ordinary = (
+        torch.tensor([0.3], dtype=torch.float32),
+        torch.tensor([0.4], dtype=torch.float32),
+    )
+    small = (
+        torch.tensor([0.03], dtype=torch.float32),
+        torch.tensor([0.04], dtype=torch.float32),
+    )
+    extreme = (
+        torch.tensor([6.0], dtype=torch.float32),
+        torch.tensor([8.0], dtype=torch.float32),
+    )
+    originals = tuple(
+        tuple(gradient.clone() for gradient in query)
+        for query in (ordinary, small, extreme)
+    )
+
+    clipped_queries = []
+    audits = []
+    for query in (ordinary, small, extreme):
+        clipped, audit = meta_trainer_module._clip_query_proxy_gradients(
+            query,
+            max_norm=1.0,
+            epsilon=1.0e-12,
+        )
+        clipped_queries.append(clipped)
+        audits.append(audit)
+
+    assert [audit.raw_joint_norm for audit in audits] == pytest.approx([0.5, 0.05, 10.0])
+    assert [audit.clipped_joint_norm for audit in audits] == pytest.approx(
+        [0.5, 0.05, 1.0]
+    )
+    assert [audit.clip_scale for audit in audits] == pytest.approx([1.0, 1.0, 0.1])
+    assert [audit.clipped for audit in audits] == [False, False, True]
+
+    segment_sum = tuple(
+        sum(query[matrix_index] for query in clipped_queries)
+        for matrix_index in range(2)
+    )
+    torch.testing.assert_close(segment_sum[0], torch.tensor([0.93]))
+    torch.testing.assert_close(segment_sum[1], torch.tensor([1.24]))
+    assert meta_trainer_module._cotangent_norm_float(segment_sum) > 1.0
+
+    for query, original in zip((ordinary, small, extreme), originals, strict=True):
+        for gradient, expected in zip(query, original, strict=True):
+            torch.testing.assert_close(gradient, expected)
+
+
+def test_query_cotangent_clipping_does_not_rescale_direct_outer_gradient() -> None:
+    direct_outer = nn.Parameter(torch.tensor(2.0))
+    query_proxies = (
+        nn.Parameter(torch.tensor([6.0, 8.0])),
+        nn.Parameter(torch.tensor([60.0, 80.0])),
+    )
+    clipped_queries = []
+    for direct_coefficient, proxy in zip((3.0, 5.0), query_proxies, strict=True):
+        (direct_outer * direct_coefficient + proxy.square().sum()).backward()
+        assert proxy.grad is not None
+        clipped, _ = meta_trainer_module._clip_query_proxy_gradients(
+            (proxy.grad.detach().float().clone(),),
+            max_norm=1.0,
+            epsilon=1.0e-12,
+        )
+        clipped_queries.append(clipped[0])
+        proxy.grad = None
+
+    assert direct_outer.grad is not None
+    torch.testing.assert_close(direct_outer.grad, torch.tensor(8.0))
+    assert all(float(torch.linalg.vector_norm(value)) <= 1.0 + 1.0e-6 for value in clipped_queries)
+
+
 def test_query_proxy_gradient_equals_answer_plus_state_components(
     config: ProjectConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -1497,7 +1621,9 @@ def test_later_support_cannot_change_earlier_intermediate_query(
     later = changed_supports[-1]
     payload = later.request.video_input
     assert isinstance(payload, _VideoChunk)
-    changed_payload = replace(payload, features=payload.features + 100.0)
+    changed_features = payload.features.clone()
+    changed_features[..., 1] += 100.0
+    changed_payload = replace(payload, features=changed_features)
     changed_supports[-1] = replace(
         later,
         request=replace(later.request, video_input=changed_payload),
