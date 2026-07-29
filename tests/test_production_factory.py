@@ -2721,6 +2721,67 @@ def test_warmup_bundle_is_non_qwen_atomic_and_fail_closed(
         )
 
 
+def test_warmup_bundle_can_publish_prepared_cpu_tensors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = load_config()
+    bundle, model = _grouped_bundle(tmp_path, project)
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    monkeypatch.setattr(
+        trainer_module,
+        "_warmup_source_manifest",
+        lambda **_kwargs: {
+            "a2_checkpoint_sha256": "a2-hash",
+            "code_commit": "commit",
+            "code_dirty": False,
+            "project_config_sha256": "config-hash",
+            "dataset_manifest_sha256": "manifest-hash",
+            "seed": 42,
+            "data_seed": 42,
+        },
+    )
+    prepared = trainer_module._prepare_warmup_bundle_tensors(model, bundle.model)
+    allowlist, tensors = prepared
+
+    assert tuple(sorted(tensors)) == allowlist
+    assert all(value.device.type == "cpu" for value in tensors.values())
+    assert not any(name.startswith("qwen.") for name in allowlist)
+    bundle_path, manifest = trainer_module._publish_warmup_bundle(
+        model=model,
+        qwen_model=bundle.model,
+        backbone=bundle,
+        artifact_root=artifact_root,
+        global_step=128,
+        qwen_sha256=trainer_module._module_bitwise_sha256(bundle.model),
+        prepared_bundle=prepared,
+    )
+
+    assert bundle_path.is_dir()
+    assert manifest["parameter_allowlist"] == list(allowlist)
+    with pytest.raises(ValueError, match="keys do not match"):
+        trainer_module._publish_warmup_bundle(
+            model=model,
+            qwen_model=bundle.model,
+            backbone=bundle,
+            artifact_root=tmp_path / "other-artifacts",
+            global_step=128,
+            qwen_sha256="qwen-hash",
+            prepared_bundle=(allowlist, {**tensors, "unexpected": torch.ones(1)}),
+        )
+
+
+def test_all_ranks_true_uses_local_value_without_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    assert trainer_module._all_ranks_true(True, device=torch.device("cpu"))
+    assert not trainer_module._all_ranks_true(False, device=torch.device("cpu"))
+
+
 def test_optimizer_rejects_noncanonical_budget_drift(tmp_path: Path) -> None:
     base = load_config()
     wrong_project = base.model_copy(

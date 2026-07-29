@@ -2358,10 +2358,10 @@ def _run_main(argv: list[str] | None = None) -> int:
     artifact_root = Path(os.environ.get("RUN_ROOT", str(output_dir)))
     sequence_audit: tuple[str, int] | None = None
     initial_qwen_sha256: str | None = None
-    if (
-        backbone.ttt_config.a5_phase == "fast_state_warmup"
-        and trainer.is_world_process_zero()
-    ):
+    if backbone.ttt_config.a5_phase == "fast_state_warmup":
+        # Every rank must perform GPU-backed state reads in the same collective phase.
+        # Letting only rank zero hash while peers enter a NCCL barrier can deadlock after
+        # DeepSpeed has prepared the model, even though the Qwen parameters are frozen.
         initial_qwen_sha256 = _module_bitwise_sha256(backbone.model)
     if configured_stage is ProductionStage.A5:
         # The sampler synchronizes its runtime-cost EMA when advancing epochs. Every rank
@@ -2434,12 +2434,23 @@ def _run_main(argv: list[str] | None = None) -> int:
         trainer.accelerator.wait_for_everyone()
         trainer.log_metrics("train", result.metrics)
         trainer.save_metrics("train", result.metrics)
+        if initial_qwen_sha256 is None:
+            raise RuntimeError("warmup lost the initial Qwen bitwise digest")
+        final_qwen_sha256 = _module_bitwise_sha256(backbone.model)
+        qwen_unchanged = _all_ranks_true(
+            final_qwen_sha256 == initial_qwen_sha256,
+            device=trainer.accelerator.device,
+        )
+        if not qwen_unchanged:
+            raise RuntimeError("Qwen parameters/buffers changed during Fast/State warmup")
+        prepared_bundle = _prepare_warmup_bundle_tensors(
+            runtime_raw.model,
+            backbone.model,
+        )
+        # No rank may enter the publishing barrier while another rank is still copying
+        # tensors from CUDA.  From this point onward rank zero performs CPU/filesystem work.
+        trainer.accelerator.wait_for_everyone()
         if trainer.is_world_process_zero():
-            if initial_qwen_sha256 is None:
-                raise RuntimeError("warmup lost the initial Qwen bitwise digest")
-            final_qwen_sha256 = _module_bitwise_sha256(backbone.model)
-            if final_qwen_sha256 != initial_qwen_sha256:
-                raise RuntimeError("Qwen parameters/buffers changed during Fast/State warmup")
             bundle_path, bundle_manifest = _publish_warmup_bundle(
                 model=runtime_raw.model,
                 qwen_model=backbone.model,
@@ -2447,6 +2458,7 @@ def _run_main(argv: list[str] | None = None) -> int:
                 artifact_root=artifact_root,
                 global_step=int(trainer.state.global_step),
                 qwen_sha256=final_qwen_sha256,
+                prepared_bundle=prepared_bundle,
             )
             _write_json(
                 artifact_root / "run_summary.json",
@@ -3305,6 +3317,31 @@ def _module_bitwise_sha256(module: nn.Module) -> str:
     return digest.hexdigest()
 
 
+def _all_ranks_true(value: bool, *, device: torch.device) -> bool:
+    """Return the distributed logical AND without letting one rank fail early."""
+
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return value
+    result = torch.tensor(int(value), dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(result, op=torch.distributed.ReduceOp.MIN)
+    return bool(result.item())
+
+
+def _prepare_warmup_bundle_tensors(
+    model: nn.Module,
+    qwen_model: nn.Module,
+) -> tuple[tuple[str, ...], dict[str, Tensor]]:
+    """Materialize the handoff state on CPU; distributed callers run this on every rank."""
+
+    allowlist = _warmup_bundle_allowlist(model, qwen_model)
+    state = model.state_dict()
+    tensors = {
+        name: state[name].detach().cpu().contiguous().clone()
+        for name in allowlist
+    }
+    return allowlist, tensors
+
+
 def _warmup_source_manifest(
     *,
     backbone: LlamaFactoryBackboneBundle,
@@ -3345,6 +3382,7 @@ def _publish_warmup_bundle(
     artifact_root: Path,
     global_step: int,
     qwen_sha256: str,
+    prepared_bundle: tuple[tuple[str, ...], dict[str, Tensor]] | None = None,
 ) -> tuple[Path, dict[str, object]]:
     """Atomically publish the non-Qwen handoff only after a successful 128-step run."""
 
@@ -3357,12 +3395,14 @@ def _publish_warmup_bundle(
     incomplete = artifact_root / ".a5_warmup_bundle.incomplete"
     if destination.exists() or incomplete.exists():
         raise FileExistsError("refusing to overwrite a warmup handoff bundle")
-    allowlist = _warmup_bundle_allowlist(model, qwen_model)
-    state = model.state_dict()
-    tensors = {
-        name: state[name].detach().cpu().contiguous().clone()
-        for name in allowlist
-    }
+    if prepared_bundle is None:
+        allowlist, tensors = _prepare_warmup_bundle_tensors(model, qwen_model)
+    else:
+        allowlist, tensors = prepared_bundle
+        if tuple(sorted(tensors)) != allowlist:
+            raise ValueError("prepared warmup bundle keys do not match its allowlist")
+        if any(value.device.type != "cpu" for value in tensors.values()):
+            raise ValueError("prepared warmup bundle tensors must be on CPU")
     incomplete.mkdir(parents=False)
     weights = incomplete / "model.safetensors"
     save_file(tensors, str(weights))
