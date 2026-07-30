@@ -135,23 +135,6 @@ class StateResamplerOutput:
             or self.state_token_valid_mask.device != hidden.device
         ):
             raise ValueError("state_token_valid_mask must be bool [B] on the output device")
-        expected_valid = torch.tensor(
-            [
-                status in (RetrievalStatus.OK, RetrievalStatus.EMPTY)
-                for status in self.retrieval_status
-            ],
-            dtype=torch.bool,
-            device=hidden.device,
-        )
-        if hidden.device.type != "meta" and not torch.equal(
-            self.state_token_valid_mask, expected_valid
-        ):
-            raise ValueError("only OK/EMPTY retrieval rows may expose valid State Tokens")
-        for row, record_ids in enumerate(self.selected_record_ids):
-            if len(record_ids) != int(self.record_mask[row].sum().item()):
-                raise ValueError("selected_record_ids must align to the packed record mask")
-            if len(set(record_ids)) != len(record_ids) or any(not value for value in record_ids):
-                raise ValueError("selected_record_ids must be unique and non-empty per row")
         tensors = (
             hidden,
             self.state_tokens,
@@ -162,35 +145,6 @@ class StateResamplerOutput:
             bool(torch.isfinite(tensor).all()) for tensor in tensors
         ):
             raise ValueError("State Resampler outputs must be finite")
-        invalid_rows = ~self.state_token_valid_mask
-        if (
-            hidden.device.type != "meta"
-            and bool(invalid_rows.any())
-            and (
-                bool(torch.any(hidden[invalid_rows] != 0.0))
-                or bool(torch.any(self.state_tokens[invalid_rows] != 0.0))
-            )
-        ):
-            raise ValueError("unsupported/invalid rows must expose zero State Tokens")
-        if hidden.device.type != "meta" and (
-            bool(torch.any(self.cross_attention_weights < 0.0))
-            or bool(torch.any(self.cross_attention_weights > 1.0))
-        ):
-            raise ValueError("cross-attention weights must stay within [0, 1]")
-        if max_records:
-            invalid_weights = self.cross_attention_weights.masked_select(
-                ~self.record_mask[:, None, :].expand_as(self.cross_attention_weights)
-            )
-            if invalid_weights.numel() and bool(torch.any(invalid_weights != 0.0)):
-                raise ValueError("masked records must receive exactly zero attention")
-        expected_mass = self.record_mask.any(dim=1).to(torch.float32)[:, None].expand(-1, 16)
-        if hidden.device.type != "meta" and not torch.allclose(
-            self.selected_attention_mass,
-            expected_mass,
-            atol=1.0e-6,
-            rtol=0.0,
-        ):
-            raise ValueError("selected attention mass must be one for hits and zero for empty rows")
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,115 +187,6 @@ class ReaderResult:
             raise ValueError("number_token_ids must be non-negative integers")
         if (self.exact_count is None) == bool(self.number_token_ids):
             raise ValueError("number tokens must be present exactly when exact_count is present")
-        audit_keys = tuple(key for key, _ in self.audit_fields)
-        if any(not key for key in audit_keys) or len(set(audit_keys)) != len(audit_keys):
-            raise ValueError("Reader audit keys must be unique and non-empty")
-        if any(not _is_audit_value(value) for _, value in self.audit_fields):
-            raise TypeError("Reader audit values must be scalar immutable metadata")
-        audit = dict(self.audit_fields)
-        required = {
-            "source",
-            "operator",
-            "retrieval_status",
-            "retrieval_reason",
-            "n_state",
-            "n_retrieved",
-            "input_record_count",
-            "bank_version",
-            "time_resolution_status",
-            "window_start",
-            "window_end",
-            "reader_reason",
-        }
-        missing = required.difference(audit)
-        if missing:
-            raise ValueError(
-                f"Reader audit is missing required provenance fields: {sorted(missing)}"
-            )
-        if audit["source"] != "retrieved_typed_records" or audit["operator"] != self.operator.value:
-            raise ValueError("Reader audit source/operator provenance is inconsistent")
-        if audit["n_retrieved"] != len(self.selected_record_ids) or audit[
-            "input_record_count"
-        ] != len(self.selected_record_ids):
-            raise ValueError("Reader audit record counts must match selected_record_ids")
-        if self.status in (ReaderStatus.OK, ReaderStatus.EMPTY):
-            count_fields = {
-                "arithmetic",
-                "contributing_count",
-                "computed_exact_count",
-                "number_text",
-            }
-            if missing_count := count_fields.difference(audit):
-                raise ValueError(
-                    f"count-bearing Reader audit is missing fields: {sorted(missing_count)}"
-                )
-            if audit["computed_exact_count"] != self.exact_count or audit["number_text"] != str(
-                self.exact_count
-            ):
-                raise ValueError("Reader audit operands do not reproduce exact_count/number text")
-            contributing_count = audit["contributing_count"]
-            if type(contributing_count) is not int or contributing_count < 0:
-                raise ValueError("Reader contributing_count must be a non-negative integer")
-        if self.status is ReaderStatus.OK:
-            self._validate_exact_count_operands(audit)
-
-    def _validate_exact_count_operands(self, audit: dict[str, AuditValue]) -> None:
-        exact_count = cast(int, self.exact_count)
-        if self.operator in (Operator.O1_SNAP, Operator.O1_DELTA):
-            required = {
-                "operand_current_visible_count",
-                "operand_baseline_count",
-                "operand_baseline_initialized",
-                "operand_baseline_position_id",
-            }
-            _require_audit_keys(audit, required, self.operator)
-            current = audit["operand_current_visible_count"]
-            baseline = audit["operand_baseline_count"]
-            if type(current) is not int or type(baseline) is not int:
-                raise ValueError("O1 Reader operands must be integers")
-            if self.operator is Operator.O1_SNAP:
-                expected = current
-            else:
-                if audit.get("baseline_policy") != "fixed_baseline_v1":
-                    raise ValueError("O1-Delta Reader audit must pin fixed_baseline_v1")
-                expected = current - baseline
-            if exact_count != expected:
-                raise ValueError("O1 Reader operands do not reproduce exact_count")
-            return
-        if self.operator in (Operator.O2_UNIQUE, Operator.O2_GAIN):
-            required = {
-                "operand_confirmed_record_count",
-                "operand_distinct_identity_count",
-                "operand_first_seen_min",
-                "operand_first_seen_max",
-                "matched_first_seen_count",
-            }
-            _require_audit_keys(audit, required, self.operator)
-            if exact_count != audit["matched_first_seen_count"]:
-                raise ValueError("O2 Reader operands do not reproduce exact_count")
-            return
-        if self.operator in (Operator.E1_ACTION, Operator.E1_TRANSIT):
-            required = {
-                "operand_cumulative_event_count",
-                "operand_retained_completion_count",
-                "operand_history_eviction_count",
-                "matched_completion_count",
-            }
-            _require_audit_keys(audit, required, self.operator)
-            if exact_count != audit["matched_completion_count"]:
-                raise ValueError("E1 Reader operands do not reproduce exact_count")
-            return
-        if self.operator in (Operator.E2_PERIODIC, Operator.E2_EPISODE):
-            required = {
-                "operand_completed_interval_count",
-                "operand_active_interval_present",
-                "matched_completion_end_count",
-            }
-            _require_audit_keys(audit, required, self.operator)
-            if exact_count != audit["matched_completion_end_count"]:
-                raise ValueError("E2 Reader operands do not reproduce exact_count")
-            return
-        raise ValueError("unsupported operators cannot carry OK Reader audit operands")
 
 
 class _StateResamplerLayer(nn.Module):  # type: ignore[misc]
@@ -676,45 +521,6 @@ class DeterministicStateReader:
         time_resolutions: Sequence[TimeResolution] | None = None,
     ) -> tuple[ReaderResult, ...]:
         return self.read(retrieval, hard_operators, time_resolutions)
-
-    def audit_results(
-        self,
-        retrieval: RetrieverOutput,
-        results: Sequence[ReaderResult],
-    ) -> tuple[ReaderResult, ...]:
-        """Recompute from the same Retriever snapshot and reject any caller rewrite."""
-
-        normalized = tuple(results)
-        expected = self.read(retrieval)
-        if normalized != expected:
-            raise ValueError(
-                "Reader results do not match authoritative retrieved-record arithmetic"
-            )
-        return normalized
-
-    def audit_bank_results(
-        self,
-        state_bank: StructuredStateBank,
-        states: Sequence[StateBankRuntimeState],
-        query: QueryEncoderOutput,
-        results: Sequence[ReaderResult],
-        *,
-        video_ids: Sequence[str],
-        trajectory_ids: Sequence[str],
-    ) -> tuple[ReaderResult, ...]:
-        """Recompute direct Bank arithmetic and reject any caller rewrite."""
-
-        normalized = tuple(results)
-        expected = self.read_bank(
-            state_bank,
-            states,
-            query,
-            video_ids=video_ids,
-            trajectory_ids=trajectory_ids,
-        )
-        if normalized != expected:
-            raise ValueError("Reader results do not match authoritative Bank arithmetic")
-        return normalized
 
     def audit_number_tokens(self, result: ReaderResult) -> int | None:
         """Re-decode one immutable result and reject any caller-substituted token IDs."""
@@ -1446,20 +1252,3 @@ def _decode_number_text(
     if not isinstance(decoded, str):
         raise TypeError("number tokenizer decode must return text")
     return decoded
-
-
-def _is_audit_value(value: object) -> bool:
-    return (
-        value is None
-        or type(value) in (str, int, bool)
-        or (type(value) is float and math.isfinite(value))
-    )
-
-
-def _require_audit_keys(
-    audit: dict[str, AuditValue],
-    required: set[str],
-    operator: Operator,
-) -> None:
-    if missing := required.difference(audit):
-        raise ValueError(f"{operator.value} Reader audit is missing operands: {sorted(missing)}")

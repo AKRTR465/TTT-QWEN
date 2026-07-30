@@ -8,7 +8,7 @@ Forbidden: hard thresholds, integer accumulation, Bank/FSM mutation, or input de
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import ClassVar
 
 import torch
@@ -24,7 +24,11 @@ from ttt_svcbench_qwen.config import (
     ProjectConfig,
 )
 from ttt_svcbench_qwen.state_encoder import SpatialEncoderOutput, TemporalEncoderOutput
-from ttt_svcbench_qwen.tensor_contracts import timestamps_match
+from ttt_svcbench_qwen.tensor_contracts import (
+    assert_storage_disjoint,
+    assert_tensors_disjoint,
+    timestamps_match,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,35 +194,7 @@ class E1RuntimeState:
         ):
             raise ValueError("E1 projected_history must be floating [L<=66, 512]")
         length = int(self.projected_history.shape[0])
-        if (
-            self.query_signature.shape != (512,)
-            or not torch.is_floating_point(self.query_signature)
-            or self.query_signature.dtype != self.projected_history.dtype
-            or self.query_signature.device != self.projected_history.device
-        ):
-            raise ValueError("E1 query_signature must match history as floating [512]")
-        if (
-            self.timestamps.shape != (length,)
-            or self.timestamps.dtype != torch.float64
-            or self.timestamps.device != self.projected_history.device
-        ):
-            raise ValueError("E1 runtime timestamps must be float64 [L]")
-        if (
-            self.position_ids.shape != (length,)
-            or self.position_ids.dtype != torch.int64
-            or self.position_ids.device != self.projected_history.device
-        ):
-            raise ValueError("E1 runtime position_ids must be int64 [L]")
-        if type(self.total_seen) is not int or self.total_seen < 0:
-            raise ValueError("E1 runtime total_seen must be a non-negative integer")
-        if type(self.differentiable) is not bool:
-            raise TypeError("E1 runtime differentiable must be a bool")
-        if not self.differentiable and (
-            self.projected_history.requires_grad
-            or self.query_signature.requires_grad
-            or self.timestamps.requires_grad
-        ):
-            raise ValueError("non-differentiable E1 runtime tensors must be detached")
+        _validate_stream_state_fields(self, self.projected_history, "history", length, "E1")
         if self.projected_history.device.type == "meta":
             return
         if not bool(torch.isfinite(self.query_signature).all()) or not bool(
@@ -241,15 +217,9 @@ class E1RuntimeState:
                 or bool(torch.any(self.position_ids[1:] != self.position_ids[:-1] + 1))
             ):
                 raise ValueError("E1 runtime metadata must increase strictly")
-        if _shares_any_storage(
-            (
-                self.query_signature,
-                self.projected_history,
-                self.timestamps,
-                self.position_ids,
-            )
-        ):
-            raise ValueError("E1 runtime fields must use independent storage")
+        assert_tensors_disjoint(
+            _stream_state_tensors(self), "E1 runtime fields must use independent storage"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,7 +258,7 @@ class E1SoftOutput:
                 (self.probabilities[..., 1] * self.valid_mask).sum(dim=1),
             )
         _validate_count_prediction(self.count_prediction, self.logits, "E1")
-        _assert_e1_state_storage_isolated(self.next_states)
+        _assert_stream_state_storage_isolated(self.next_states, "E1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,36 +290,7 @@ class E2RuntimeState:
         ):
             raise ValueError("E2 checkpoint_hidden must match hidden as [L<=5, 2, 768]")
         length = int(self.checkpoint_hidden.shape[0])
-        if (
-            self.query_signature.shape != (512,)
-            or not torch.is_floating_point(self.query_signature)
-            or self.query_signature.dtype != self.hidden.dtype
-            or self.query_signature.device != self.hidden.device
-        ):
-            raise ValueError("E2 query_signature must match hidden as floating [512]")
-        if (
-            self.timestamps.shape != (length,)
-            or self.timestamps.dtype != torch.float64
-            or self.timestamps.device != self.hidden.device
-        ):
-            raise ValueError("E2 runtime timestamps must be float64 [L]")
-        if (
-            self.position_ids.shape != (length,)
-            or self.position_ids.dtype != torch.int64
-            or self.position_ids.device != self.hidden.device
-        ):
-            raise ValueError("E2 runtime position_ids must be int64 [L]")
-        if type(self.total_seen) is not int or self.total_seen < 0:
-            raise ValueError("E2 runtime total_seen must be a non-negative integer")
-        if type(self.differentiable) is not bool:
-            raise TypeError("E2 runtime differentiable must be a bool")
-        if not self.differentiable and (
-            self.hidden.requires_grad
-            or self.checkpoint_hidden.requires_grad
-            or self.query_signature.requires_grad
-            or self.timestamps.requires_grad
-        ):
-            raise ValueError("non-differentiable E2 runtime tensors must be detached")
+        _validate_stream_state_fields(self, self.hidden, "hidden", length, "E2")
         if self.hidden.device.type == "meta":
             return
         if (
@@ -377,16 +318,9 @@ class E2RuntimeState:
                 raise ValueError("E2 runtime metadata must increase strictly")
         elif bool(torch.any(self.hidden != 0.0)):
             raise ValueError("a fresh E2 runtime must have zero hidden state")
-        if _shares_any_storage(
-            (
-                self.query_signature,
-                self.hidden,
-                self.checkpoint_hidden,
-                self.timestamps,
-                self.position_ids,
-            )
-        ):
-            raise ValueError("E2 runtime fields must use independent storage")
+        assert_tensors_disjoint(
+            _stream_state_tensors(self), "E2 runtime fields must use independent storage"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,7 +392,7 @@ class E2SoftOutput:
                 rtol=0.0,
             ):
                 raise ValueError("valid E2 phase probabilities must sum to one")
-        _assert_e2_state_storage_isolated(self.next_states)
+        _assert_stream_state_storage_isolated(self.next_states, "E2")
 
 
 @dataclass(frozen=True, slots=True)
@@ -709,8 +643,8 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
         )
         owners = _normalize_stream_owners(video_ids, trajectory_ids, hidden.shape[0], "E1")
         _validate_query_signatures(query_signatures, hidden, owners[0], "E1")
-        states = _normalize_e1_states(prior_states, hidden.shape[0])
-        _validate_e1_prior_states(states, owners, query_signatures, hidden)
+        states = _normalize_stream_states(prior_states, hidden.shape[0], E1RuntimeState, "E1")
+        _validate_stream_prior_states(states, owners, query_signatures, hidden, "E1")
         projected = self.input_projection(self.input_norm(safe_hidden))
         projected = torch.where(valid_mask.unsqueeze(-1), projected, 0.0)
         output_rows: list[Tensor] = []
@@ -919,8 +853,8 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
         )
         owners = _normalize_stream_owners(video_ids, trajectory_ids, hidden.shape[0], "E2")
         _validate_query_signatures(query_signatures, hidden, owners[0], "E2")
-        states = _normalize_e2_states(prior_states, hidden.shape[0])
-        _validate_e2_prior_states(states, owners, query_signatures, hidden)
+        states = _normalize_stream_states(prior_states, hidden.shape[0], E2RuntimeState, "E2")
+        _validate_stream_prior_states(states, owners, query_signatures, hidden, "E2")
         normalized = self.input_norm(safe_hidden)
         event_rows: list[Tensor] = []
         phase_rows: list[Tensor] = []
@@ -1486,71 +1420,40 @@ def _validate_query_signatures(
         raise ValueError(f"{name} query_signatures must be finite")
 
 
-def _normalize_e1_states(
-    states: Sequence[E1RuntimeState | None] | None,
+def _normalize_stream_states[StateT: (E1RuntimeState, E2RuntimeState)](
+    states: Sequence[StateT | None] | None,
     batch_size: int,
-) -> tuple[E1RuntimeState | None, ...]:
+    state_class: type[StateT],
+    name: str,
+) -> tuple[StateT | None, ...]:
     if states is None:
         return (None,) * batch_size
     normalized = tuple(states)
     if len(normalized) != batch_size or any(
-        state is not None and not isinstance(state, E1RuntimeState) for state in normalized
+        state is not None and not isinstance(state, state_class) for state in normalized
     ):
-        raise ValueError("E1 requires one E1RuntimeState or None per batch row")
+        raise ValueError(f"{name} requires one {state_class.__name__} or None per batch row")
     return normalized
 
 
-def _normalize_e2_states(
-    states: Sequence[E2RuntimeState | None] | None,
-    batch_size: int,
-) -> tuple[E2RuntimeState | None, ...]:
-    if states is None:
-        return (None,) * batch_size
-    normalized = tuple(states)
-    if len(normalized) != batch_size or any(
-        state is not None and not isinstance(state, E2RuntimeState) for state in normalized
-    ):
-        raise ValueError("E2 requires one E2RuntimeState or None per batch row")
-    return normalized
-
-
-def _validate_e1_prior_states(
-    states: tuple[E1RuntimeState | None, ...],
+def _validate_stream_prior_states(
+    states: Sequence[E1RuntimeState | None] | Sequence[E2RuntimeState | None],
     owners: tuple[tuple[str, ...], tuple[str, ...]],
     signatures: Tensor,
     reference: Tensor,
+    name: str,
 ) -> None:
     for row, state in enumerate(states):
         if state is None:
             continue
         if state.video_id != owners[0][row] or state.trajectory_id != owners[1][row]:
-            raise ValueError("E1 runtime owner must match its exact batch row")
-        if (
-            state.projected_history.dtype != reference.dtype
-            or state.projected_history.device != reference.device
-        ):
-            raise ValueError("E1 runtime and inputs must share dtype/device")
+            raise ValueError(f"{name} runtime owner must match its exact batch row")
+        anchor = state.projected_history if isinstance(state, E1RuntimeState) else state.hidden
+        if anchor.dtype != reference.dtype or anchor.device != reference.device:
+            raise ValueError(f"{name} runtime and inputs must share dtype/device")
         if not torch.equal(state.query_signature, signatures[row].detach()):
-            raise ValueError("E1 runtime query signature drift requires reset")
-    _assert_optional_e1_state_storage_isolated(states)
-
-
-def _validate_e2_prior_states(
-    states: tuple[E2RuntimeState | None, ...],
-    owners: tuple[tuple[str, ...], tuple[str, ...]],
-    signatures: Tensor,
-    reference: Tensor,
-) -> None:
-    for row, state in enumerate(states):
-        if state is None:
-            continue
-        if state.video_id != owners[0][row] or state.trajectory_id != owners[1][row]:
-            raise ValueError("E2 runtime owner must match its exact batch row")
-        if state.hidden.dtype != reference.dtype or state.hidden.device != reference.device:
-            raise ValueError("E2 runtime and inputs must share dtype/device")
-        if not torch.equal(state.query_signature, signatures[row].detach()):
-            raise ValueError("E2 runtime query signature drift requires reset")
-    _assert_optional_e2_state_storage_isolated(states)
+            raise ValueError(f"{name} runtime query signature drift requires reset")
+    _assert_stream_state_storage_isolated(states, name)
 
 
 def _runtime_tensor(tensor: Tensor, detach: bool) -> Tensor:
@@ -1584,66 +1487,55 @@ def _clone_e2_state(state: E2RuntimeState, *, detach: bool) -> E2RuntimeState:
     )
 
 
-def _shares_storage(left: Tensor, right: Tensor) -> bool:
-    if left.numel() == 0 or right.numel() == 0:
-        return False
-    if left.device.type == "meta" or right.device.type == "meta":
-        return left is right
-    return int(left.untyped_storage().data_ptr()) == int(right.untyped_storage().data_ptr())
-
-
-def _shares_any_storage(tensors: Sequence[Tensor]) -> bool:
-    for index, left in enumerate(tensors):
-        for right in tensors[index + 1 :]:
-            if _shares_storage(left, right):
-                return True
-    return False
-
-
-def _e1_state_tensors(state: E1RuntimeState) -> tuple[Tensor, ...]:
-    return (
-        state.query_signature,
-        state.projected_history,
-        state.timestamps,
-        state.position_ids,
-    )
-
-
-def _e2_state_tensors(state: E2RuntimeState) -> tuple[Tensor, ...]:
-    return (
-        state.query_signature,
-        state.hidden,
-        state.checkpoint_hidden,
-        state.timestamps,
-        state.position_ids,
-    )
-
-
-def _assert_e1_state_storage_isolated(states: Sequence[E1RuntimeState]) -> None:
-    _assert_state_storage_isolated(tuple(_e1_state_tensors(state) for state in states), "E1")
-
-
-def _assert_e2_state_storage_isolated(states: Sequence[E2RuntimeState]) -> None:
-    _assert_state_storage_isolated(tuple(_e2_state_tensors(state) for state in states), "E2")
-
-
-def _assert_optional_e1_state_storage_isolated(
-    states: Sequence[E1RuntimeState | None],
+def _validate_stream_state_fields(
+    state: E1RuntimeState | E2RuntimeState,
+    anchor: Tensor,
+    anchor_name: str,
+    length: int,
+    name: str,
 ) -> None:
-    _assert_e1_state_storage_isolated(tuple(state for state in states if state is not None))
+    if (
+        state.query_signature.shape != (512,)
+        or not torch.is_floating_point(state.query_signature)
+        or state.query_signature.dtype != anchor.dtype
+        or state.query_signature.device != anchor.device
+    ):
+        raise ValueError(f"{name} query_signature must match {anchor_name} as floating [512]")
+    if (
+        state.timestamps.shape != (length,)
+        or state.timestamps.dtype != torch.float64
+        or state.timestamps.device != anchor.device
+    ):
+        raise ValueError(f"{name} runtime timestamps must be float64 [L]")
+    if (
+        state.position_ids.shape != (length,)
+        or state.position_ids.dtype != torch.int64
+        or state.position_ids.device != anchor.device
+    ):
+        raise ValueError(f"{name} runtime position_ids must be int64 [L]")
+    if type(state.total_seen) is not int or state.total_seen < 0:
+        raise ValueError(f"{name} runtime total_seen must be a non-negative integer")
+    if type(state.differentiable) is not bool:
+        raise TypeError(f"{name} runtime differentiable must be a bool")
+    if not state.differentiable and any(
+        tensor.requires_grad for tensor in _stream_state_tensors(state)
+    ):
+        raise ValueError(f"non-differentiable {name} runtime tensors must be detached")
 
 
-def _assert_optional_e2_state_storage_isolated(
-    states: Sequence[E2RuntimeState | None],
+def _stream_state_tensors(state: E1RuntimeState | E2RuntimeState) -> tuple[Tensor, ...]:
+    values = (getattr(state, entry.name) for entry in fields(state))
+    return tuple(value for value in values if isinstance(value, Tensor))
+
+
+def _assert_stream_state_storage_isolated(
+    states: Sequence[E1RuntimeState | None] | Sequence[E2RuntimeState | None],
+    name: str,
 ) -> None:
-    _assert_e2_state_storage_isolated(tuple(state for state in states if state is not None))
-
-
-def _assert_state_storage_isolated(state_tensors: Sequence[tuple[Tensor, ...]], name: str) -> None:
-    for left_index, left_group in enumerate(state_tensors):
-        for right_group in state_tensors[left_index + 1 :]:
-            if any(_shares_storage(left, right) for left in left_group for right in right_group):
-                raise ValueError(f"{name} runtime batch rows must not share mutable storage")
+    assert_storage_disjoint(
+        tuple(_stream_state_tensors(state) for state in states if state is not None),
+        f"{name} runtime batch rows must not share mutable storage",
+    )
 
 
 def _validate_observation_heads_config(config: ObservationHeadsConfig) -> None:

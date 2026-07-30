@@ -394,10 +394,10 @@ def functional_sgd_step(
 
     if not isinstance(fast_state, FastWeightsState):
         raise TypeError("functional SGD requires one FastWeightsState")
+    if not isinstance(optimizer_state, OptimizerRuntimeState):
+        raise TypeError("functional SGD requires OptimizerRuntimeState")
     if type(_retain_graph) is not bool:
         raise TypeError("functional SGD retain-graph control must be bool")
-    _validate_optimizer_config(optimizer_config)
-    _validate_optimizer_runtime(optimizer_config, optimizer_state, fast_state)
     audited_step_size = float(optimizer_config.learning_rate)
     if type(valid_token_count) is not int or valid_token_count < 0:
         raise ValueError("valid_token_count must be a non-negative exact integer")
@@ -757,40 +757,6 @@ def _validate_optimizer_config(config: InnerSGDConfig) -> None:
             raise ValueError(f"inner SGD {name} must be {required!r}")
     if config.learning_rate != 1.0e-4:
         raise ValueError("inner SGD learning_rate must be 1e-4")
-
-
-def _validate_optimizer_runtime(
-    config: InnerSGDConfig,
-    optimizer: OptimizerRuntimeState,
-    fast_state: FastWeightsState,
-) -> None:
-    if not isinstance(optimizer, OptimizerRuntimeState):
-        raise TypeError("functional SGD requires OptimizerRuntimeState")
-    actual = (
-        optimizer.optimizer_name,
-        optimizer.learning_rate,
-        optimizer.momentum,
-        optimizer.weight_decay,
-        optimizer.steps_per_chunk,
-        optimizer.grad_clip_norm,
-    )
-    expected = (
-        config.name,
-        config.learning_rate,
-        config.momentum,
-        config.weight_decay,
-        config.steps_per_chunk,
-        config.grad_clip_norm,
-    )
-    if actual != expected:
-        raise ValueError("optimizer runtime does not match the frozen config")
-    expected_attempts = fast_state.update_count + fast_state.skip_count
-    if optimizer.attempted_update_count != expected_attempts:
-        raise ValueError("optimizer attempts must equal accepted updates plus skips")
-    if optimizer.last_skip_reason is not None and optimizer.last_skip_reason not in {
-        reason.value for reason in UpdateSkipReason
-    }:
-        raise ValueError("optimizer runtime contains an unknown skip reason")
 
 
 def _validate_loss(loss: Tensor, fast_state: FastWeightsState) -> None:

@@ -8,6 +8,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 import ttt_svcbench_qwen.identity_bank as identity_bank_types
+from tests.support.runtime_factories import make_state_record
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.identity_bank import (
     CandidateIdentity,
@@ -25,7 +26,6 @@ from ttt_svcbench_qwen.observation_heads import O2SoftOutput
 from ttt_svcbench_qwen.state_bank import (
     HeadType,
     StateBankRuntimeState,
-    StateRecord,
     StateRecordKind,
     StructuredStateBank,
     build_state_bank,
@@ -211,20 +211,18 @@ def _candidate_runtime(
         for index, prototype in enumerate(prototypes)
     )
     records = tuple(
-        StateRecord(
-            record_id=candidate.semantic_record_id or "",
-            video_id=video_id,
-            trajectory_id=trajectory_id,
-            head_type=HeadType.O2,
-            semantic_embedding=_unit_semantics(1, offset=index)[0].clone(),
-            timestamp=candidate.first_seen,
-            time_range=None,
-            valid=True,
-            confidence=candidate.confidence,
-            payload=replace(
+        make_state_record(
+            candidate.semantic_record_id or "",
+            HeadType.O2,
+            replace(
                 candidate,
                 identity_prototype=candidate.identity_prototype.detach().clone(),
             ),
+            semantic_embedding=_unit_semantics(1, offset=index)[0].clone(),
+            video_id=video_id,
+            trajectory_id=trajectory_id,
+            timestamp=candidate.first_seen,
+            confidence=candidate.confidence,
         )
         for index, candidate in enumerate(candidates)
     )
@@ -337,17 +335,10 @@ def _confirmed_state_pair(
 ) -> tuple[IdentityBankRuntimeState, StateBankRuntimeState]:
     identity_state = _confirmed_runtime(bank, prototypes)
     records = tuple(
-        StateRecord(
-            record_id=f"record-{index:08d}",
-            video_id=identity_state.video_id,
-            trajectory_id=identity_state.trajectory_id,
-            head_type=HeadType.O2,
-            semantic_embedding=_unit_semantics(1, offset=index)[0].clone(),
-            timestamp=0.0,
-            time_range=None,
-            valid=True,
-            confidence=0.95,
-            payload=ConfirmedIdentity(
+        make_state_record(
+            f"record-{index:08d}",
+            HeadType.O2,
+            ConfirmedIdentity(
                 identity_id=f"identity-{index:08d}",
                 identity_prototype=prototype.detach().to(dtype=torch.float32).clone(),
                 first_seen=0.0,
@@ -357,6 +348,10 @@ def _confirmed_state_pair(
                 first_seen_position_id=0,
                 last_seen_position_id=1,
             ),
+            semantic_embedding=_unit_semantics(1, offset=index)[0].clone(),
+            video_id=identity_state.video_id,
+            trajectory_id=identity_state.trajectory_id,
+            confidence=0.95,
         )
         for index, prototype in enumerate(prototypes)
     )

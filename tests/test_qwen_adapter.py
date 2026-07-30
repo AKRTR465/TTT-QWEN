@@ -16,7 +16,12 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionModel,
 )
 
-from ttt_svcbench_qwen.config import ProjectConfig, load_config
+from tests.support.tiny_qwen import (
+    make_tiny_hf_config,
+    make_tiny_hf_model,
+    make_tiny_project_config,
+)
+from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.qwen_adapter import (
     CurrentChunkVisualTokenAudit,
     MergedVideoMetadata,
@@ -32,68 +37,6 @@ from ttt_svcbench_qwen.qwen_adapter import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def make_tiny_project_config() -> ProjectConfig:
-    base = load_config()
-    vision = base.model.vision.model_copy(
-        update={
-            "depth": 3,
-            "hidden_size": 8,
-            "num_heads": 2,
-            "patch_size": 2,
-            "temporal_patch_size": 1,
-            "spatial_merge_size": 2,
-            "output_size": 8,
-            "deepstack_visual_indexes": (0, 1, 2),
-        }
-    )
-    llm = base.model.llm.model_copy(update={"num_layers": 3, "hidden_size": 8})
-    model = base.model.model_copy(update={"vision": vision, "llm": llm})
-    return base.model_copy(update={"model": model})
-
-
-def make_tiny_hf_config() -> Qwen3VLConfig:
-    return Qwen3VLConfig(
-        vision_config={
-            "depth": 3,
-            "hidden_size": 8,
-            "intermediate_size": 16,
-            "num_heads": 2,
-            "in_channels": 3,
-            "patch_size": 2,
-            "spatial_merge_size": 2,
-            "temporal_patch_size": 1,
-            "out_hidden_size": 8,
-            "num_position_embeddings": 16,
-            "deepstack_visual_indexes": [0, 1, 2],
-        },
-        text_config={
-            "vocab_size": 32,
-            "hidden_size": 8,
-            "intermediate_size": 16,
-            "num_hidden_layers": 3,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-            "head_dim": 4,
-            "max_position_embeddings": 128,
-            "use_cache": False,
-            "rope_scaling": {
-                "rope_type": "default",
-                "mrope_section": [1, 1, 0],
-                "mrope_interleaved": True,
-            },
-        },
-        image_token_id=28,
-        video_token_id=29,
-        vision_start_token_id=26,
-        vision_end_token_id=27,
-    )
-
-
-def make_tiny_hf_model() -> Qwen3VLForConditionalGeneration:
-    torch.manual_seed(0)
-    return Qwen3VLForConditionalGeneration(make_tiny_hf_config()).eval()
 
 
 def video_inputs() -> dict[str, Tensor | bool]:
@@ -411,7 +354,7 @@ def test_enabled_boundary_adapts_only_main_and_rejects_shape_changes() -> None:
 
 
 def test_tiny_real_hf_disabled_wrapper_is_bitwise_equivalent_for_all_input_kinds() -> None:
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     wrapper = Qwen3VLAdapter(model, make_tiny_project_config())
     video = video_inputs()
     image = image_inputs()
@@ -450,7 +393,7 @@ def test_tiny_real_hf_disabled_wrapper_is_bitwise_equivalent_for_all_input_kinds
 
 def test_enabled_adapter_does_not_run_for_image_only_or_text_only() -> None:
     events: list[str] = []
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     wrapper = Qwen3VLAdapter(
         model,
         make_tiny_project_config(),
@@ -470,7 +413,7 @@ def test_enabled_adapter_does_not_run_for_image_only_or_text_only() -> None:
 def test_mixed_image_video_input_adapts_only_video_main_features(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     owner = model.model
     inputs = mixed_inputs()
     pixel_values = inputs["pixel_values"]
@@ -529,7 +472,7 @@ def test_mixed_image_video_input_adapts_only_video_main_features(
 
 def test_tiny_real_hf_order_and_deepstack_injection_are_unchanged() -> None:
     events: list[str] = []
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     owner = model.model
     captured_deepstack_ids: list[int] = []
     injected_deepstack_ids: list[int] = []
@@ -611,7 +554,7 @@ def test_tiny_real_hf_order_and_deepstack_injection_are_unchanged() -> None:
 
 
 def test_frozen_qwen_stays_eval_while_gradient_reaches_video_adapter() -> None:
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     adapter = TrainableScaleAdapter()
     wrapper = Qwen3VLAdapter(
         model,
@@ -635,7 +578,7 @@ def test_frozen_qwen_stays_eval_while_gradient_reaches_video_adapter() -> None:
 
 
 def test_inner_feature_owner_is_not_registered_twice() -> None:
-    wrapper = Qwen3VLAdapter(make_tiny_hf_model(), make_tiny_project_config())
+    wrapper = Qwen3VLAdapter(make_tiny_hf_model(seed=0), make_tiny_project_config())
 
     assert set(wrapper._modules) == {"qwen_model", "video_boundary"}
     assert wrapper.feature_owner is wrapper.qwen_model.model
@@ -644,7 +587,7 @@ def test_inner_feature_owner_is_not_registered_twice() -> None:
 
 def test_generate_adapts_video_only_during_prefill() -> None:
     events: list[str] = []
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     wrapper = Qwen3VLAdapter(
         model,
         make_tiny_project_config(),
@@ -665,7 +608,7 @@ def test_generate_adapts_video_only_during_prefill() -> None:
 def test_state_embedding_payload_scatters_once_and_decode_preserves_native_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     owner = model.model
     wrapper = Qwen3VLAdapter(model, make_tiny_project_config())
     inputs, payload = state_video_inputs()
@@ -737,7 +680,7 @@ def test_state_embedding_payload_scatters_once_and_decode_preserves_native_paths
 
 
 def test_state_embedding_payload_fails_closed_on_invalid_or_unconsumed_input() -> None:
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     wrapper = Qwen3VLAdapter(model, make_tiny_project_config())
     inputs, payload = state_video_inputs()
     input_ids = inputs["input_ids"]
@@ -779,7 +722,7 @@ def test_state_embedding_payload_fails_closed_on_invalid_or_unconsumed_input() -
 
 
 def test_state_embedding_payload_rejects_reentry_and_expanded_generation() -> None:
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     wrapper = Qwen3VLAdapter(model, make_tiny_project_config())
     inputs, payload = state_video_inputs()
     input_ids = inputs["input_ids"]
@@ -807,7 +750,7 @@ def test_state_embedding_payload_rejects_reentry_and_expanded_generation() -> No
 
 def test_answer_forward_reruns_visual_and_adapter_independently() -> None:
     events: list[str] = []
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     owner = model.model
     adapter = TrainableScaleAdapter(events)
     with torch.no_grad():
@@ -844,7 +787,7 @@ def test_answer_forward_reruns_visual_and_adapter_independently() -> None:
 
 
 def test_state_and_answer_geometry_may_differ_and_answer_visual_receives_gradient() -> None:
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     wrapper = Qwen3VLAdapter(
         model,
         make_tiny_project_config(),
@@ -895,7 +838,7 @@ def test_answer_visual_logits_reach_both_bound_query_proxy_matrices() -> None:
             return visual_embeddings + 0.1 * residual
 
     wrapper = Qwen3VLAdapter(
-        make_tiny_hf_model(),
+        make_tiny_hf_model(seed=0),
         project,
         ProxyAdapter(),
         adapter_enabled=True,
@@ -913,7 +856,7 @@ def test_answer_visual_logits_reach_both_bound_query_proxy_matrices() -> None:
 
 
 def test_video_interception_scope_rejects_reentry_but_allows_multiple_native_calls() -> None:
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     owner = model.model
     wrapper = Qwen3VLAdapter(
         model,
@@ -941,7 +884,7 @@ def test_video_interception_scope_rejects_reentry_but_allows_multiple_native_cal
 
 
 def test_hook_and_capture_are_restored_after_upstream_failure() -> None:
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     owner = model.model
     wrapper = Qwen3VLAdapter(model, make_tiny_project_config())
     assert "get_video_features" not in vars(owner)
@@ -960,7 +903,7 @@ def test_hook_and_capture_are_restored_after_upstream_failure() -> None:
 
 
 def test_direct_video_feature_call_is_rejected_while_forward_hook_is_active() -> None:
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     wrapper = Qwen3VLAdapter(model, make_tiny_project_config())
     inputs = video_inputs()
     pixel_values_videos = inputs["pixel_values_videos"]
@@ -978,7 +921,7 @@ def test_direct_video_feature_call_is_rejected_while_forward_hook_is_active() ->
 def test_direct_video_feature_failure_clears_stale_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = make_tiny_hf_model()
+    model = make_tiny_hf_model(seed=0)
     owner = model.model
     wrapper = Qwen3VLAdapter(model, make_tiny_project_config())
     inputs = video_inputs()
@@ -1062,7 +1005,7 @@ def test_loader_forces_local_files_only(
 ) -> None:
     model_root = tmp_path / "tiny-local-checkpoint"
     model_root.mkdir()
-    tiny_model = make_tiny_hf_model()
+    tiny_model = make_tiny_hf_model(seed=0)
     captured: dict[str, object] = {}
     load_order: list[str] = []
 

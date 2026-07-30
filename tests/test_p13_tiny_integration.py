@@ -7,10 +7,8 @@ from types import MethodType
 import torch
 from torch import Tensor, nn
 from torch.utils._python_dispatch import TorchDispatchMode
-from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
 
-from ttt_svcbench_qwen.config import ProjectConfig, load_config
+from tests.support.tiny_qwen import make_tiny_hf_model, make_tiny_project_config
 from ttt_svcbench_qwen.input_composer import compose_inputs
 from ttt_svcbench_qwen.qwen_adapter import Qwen3VLAdapter, StateEmbeddingPayload
 from ttt_svcbench_qwen.state_reader import ReaderStatus
@@ -94,68 +92,8 @@ class MaskedScatterCounter(TorchDispatchMode):
         return func(*args, **(kwargs or {}))  # type: ignore[operator]
 
 
-def _tiny_project_config() -> ProjectConfig:
-    base = load_config()
-    vision = base.model.vision.model_copy(
-        update={
-            "depth": 3,
-            "hidden_size": 8,
-            "num_heads": 2,
-            "patch_size": 2,
-            "temporal_patch_size": 1,
-            "spatial_merge_size": 2,
-            "output_size": 8,
-            "deepstack_visual_indexes": (0, 1, 2),
-        }
-    )
-    llm = base.model.llm.model_copy(update={"num_layers": 3, "hidden_size": 8})
-    return base.model_copy(
-        update={"model": base.model.model_copy(update={"vision": vision, "llm": llm})}
-    )
-
-
-def _tiny_qwen() -> Qwen3VLForConditionalGeneration:
-    config = Qwen3VLConfig(
-        vision_config={
-            "depth": 3,
-            "hidden_size": 8,
-            "intermediate_size": 16,
-            "num_heads": 2,
-            "in_channels": 3,
-            "patch_size": 2,
-            "spatial_merge_size": 2,
-            "temporal_patch_size": 1,
-            "out_hidden_size": 8,
-            "num_position_embeddings": 16,
-            "deepstack_visual_indexes": [0, 1, 2],
-        },
-        text_config={
-            "vocab_size": 32,
-            "hidden_size": 8,
-            "intermediate_size": 16,
-            "num_hidden_layers": 3,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-            "head_dim": 4,
-            "max_position_embeddings": 128,
-            "use_cache": False,
-            "rope_scaling": {
-                "rope_type": "default",
-                "mrope_section": [1, 1, 0],
-                "mrope_interleaved": True,
-            },
-        },
-        image_token_id=28,
-        video_token_id=29,
-        vision_start_token_id=26,
-        vision_end_token_id=27,
-    )
-    torch.manual_seed(13)
-    return Qwen3VLForConditionalGeneration(config).eval()
-
-
 def test_tiny_composer_to_native_qwen_prefill_and_decode_contract() -> None:
-    qwen = _tiny_qwen()
+    qwen = make_tiny_hf_model(seed=13)
     owner = qwen.model
     tokenizer = SyntheticTokenizer()
     grid = torch.tensor([[1, 2, 2]], dtype=torch.int64)
@@ -195,7 +133,7 @@ def test_tiny_composer_to_native_qwen_prefill_and_decode_contract() -> None:
     adapter = CountingAdapter()
     wrapper = Qwen3VLAdapter(
         qwen,
-        _tiny_project_config(),
+        make_tiny_project_config(),
         adapter,
         adapter_enabled=True,
     )

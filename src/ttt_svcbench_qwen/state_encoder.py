@@ -21,7 +21,11 @@ from ttt_svcbench_qwen.config import (
     TemporalEncoderConfig,
 )
 from ttt_svcbench_qwen.qwen_adapter import MergedVideoMetadata
-from ttt_svcbench_qwen.tensor_contracts import timestamps_match
+from ttt_svcbench_qwen.tensor_contracts import (
+    assert_storage_disjoint,
+    assert_tensors_disjoint,
+    timestamps_match,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,8 +113,10 @@ class SpatialSlotRuntimeState:
             raise ValueError("runtime slot tensors must share dtype/device")
         if self.slots.device.type != "meta" and not bool(self.slot_valid_mask.any()):
             raise ValueError("spatial runtime requires at least one valid slot")
-        if _shares_storage(self.slots, self.slot_confidence):
-            raise ValueError("runtime slots and confidence must use distinct storage")
+        assert_tensors_disjoint(
+            (self.slots, self.slot_confidence),
+            "runtime slots and confidence must use distinct storage",
+        )
         if self.slots.device.type != "meta":
             if not bool(torch.isfinite(self.slots).all()):
                 raise ValueError("runtime slots must be finite")
@@ -382,13 +388,9 @@ class TemporalCache:
             raise ValueError("non-differentiable temporal cache tensors must be detached")
         if self.hidden.device.type == "meta":
             return
-        cache_tensors = self._storage_tensors()
-        for left_index, left in enumerate(cache_tensors):
-            if left.numel() == 0:
-                continue
-            for right in cache_tensors[left_index + 1 :]:
-                if right.numel() and _shares_storage(left, right):
-                    raise ValueError("temporal cache fields must use independent storage")
+        assert_tensors_disjoint(
+            self._storage_tensors(), "temporal cache fields must use independent storage"
+        )
         if not bool(torch.isfinite(self.query_signatures).all()):
             raise ValueError("temporal query signatures must be finite")
         if bool(torch.any(self.total_seen < 0)):
@@ -569,16 +571,10 @@ class TemporalCache:
             raise TypeError("TemporalCache.pack requires at least one TemporalCache")
         if any(state.batch_size != 1 for state in normalized):
             raise ValueError("TemporalCache.pack accepts singleton states only")
-        for left_index, left in enumerate(normalized):
-            for right in normalized[left_index + 1 :]:
-                for left_tensor in left._storage_tensors():
-                    if left_tensor.numel() == 0:
-                        continue
-                    for right_tensor in right._storage_tensors():
-                        if right_tensor.numel() and _shares_storage(left_tensor, right_tensor):
-                            raise ValueError(
-                                "packed temporal states must not share mutable storage"
-                            )
+        assert_storage_disjoint(
+            tuple(state._storage_tensors() for state in normalized),
+            "packed temporal states must not share mutable storage",
+        )
         reference = normalized[0]
         if any(
             state.hidden.dtype != reference.hidden.dtype
@@ -807,8 +803,10 @@ class TemporalEncoderOutput:
                     or bool(torch.any(positions[1:] != positions[:-1] + 1))
                 ):
                     raise ValueError("temporal output metadata must increase strictly")
-            if _shares_storage(self.hidden, self.cache.hidden):
-                raise ValueError("temporal output and next cache must not share mutable storage")
+            assert_tensors_disjoint(
+                (self.hidden, self.cache.hidden),
+                "temporal output and next cache must not share mutable storage",
+            )
 
 
 class QueryConditionedSpatialPool(nn.Module):  # type: ignore[misc]
@@ -2084,22 +2082,15 @@ def _normalize_required_slot_counts(
     return counts.to(dtype=torch.int64)
 
 
-def _shares_storage(left: Tensor, right: Tensor) -> bool:
-    if left.device.type == "meta" or right.device.type == "meta":
-        return left is right
-    return int(left.untyped_storage().data_ptr()) == int(right.untyped_storage().data_ptr())
-
-
 def _assert_runtime_state_storage_isolated(states: Sequence[SpatialSlotRuntimeState]) -> None:
-    tensors = tuple(
-        tensor
-        for state in states
-        for tensor in (state.slots, state.slot_valid_mask, state.slot_confidence)
+    assert_tensors_disjoint(
+        tuple(
+            tensor
+            for state in states
+            for tensor in (state.slots, state.slot_valid_mask, state.slot_confidence)
+        ),
+        "spatial runtime batch rows must not share mutable storage",
     )
-    for left_index, left in enumerate(tensors):
-        for right in tensors[left_index + 1 :]:
-            if _shares_storage(left, right):
-                raise ValueError("spatial runtime batch rows must not share mutable storage")
 
 
 def _assert_optional_runtime_state_storage_isolated(

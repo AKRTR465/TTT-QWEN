@@ -12,6 +12,12 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 import ttt_svcbench_qwen.meta_trainer as meta_trainer_module
+from tests.support.runtime_factories import (
+    make_e1_state,
+    make_e2_state,
+    make_stream_audit,
+    make_temporal_cache,
+)
 from ttt_svcbench_qwen.associative_ttt import (
     AssociativeTTTIntermediates,
     FastAssociativeContext,
@@ -62,7 +68,6 @@ from ttt_svcbench_qwen.observation_heads import (
     O1SoftOutput,
     O2SoftOutput,
     ObservationOutputs,
-    StreamReplayAudit,
 )
 from ttt_svcbench_qwen.query_encoder import Operator
 from ttt_svcbench_qwen.stage_a_runtime import StageASoftWriteOutput, StageAWriteAudit
@@ -405,12 +410,10 @@ class _ObservationStage:
                 timestamps=temporal.timestamps,
                 position_ids=temporal.position_ids,
                 next_states=tuple(
-                    _e1_state(request.owner, row, temporal.position_ids, temporal.timestamps)
+                    _e1_state(request.owner, row, temporal.position_ids)
                     for row in range(batch_size)
                 ),
-                audit=StreamReplayAudit(
-                    "e1", (width,) * batch_size, (0,) * batch_size, (width,) * batch_size
-                ),
+                audit=make_stream_audit("e1", batch_size, width),
             ),
             e2=E2SoftOutput(
                 event_logits=e2_event_logits,
@@ -421,12 +424,10 @@ class _ObservationStage:
                 timestamps=temporal.timestamps.clone(),
                 position_ids=temporal.position_ids.clone(),
                 next_states=tuple(
-                    _e2_state(request.owner, row, temporal.position_ids, temporal.timestamps)
+                    _e2_state(request.owner, row, temporal.position_ids)
                     for row in range(batch_size)
                 ),
-                audit=StreamReplayAudit(
-                    "e2", (width,) * batch_size, (0,) * batch_size, (width,) * batch_size
-                ),
+                audit=make_stream_audit("e2", batch_size, width),
             ),
         )
         self.outputs.append(output)
@@ -577,27 +578,6 @@ class _Reader:
             raise ValueError("tiny Reader ownership mismatch")
         results = tuple(_ReaderResult(int(state.version)) for state in states)
         self.calls.append(results)
-        return results
-
-    def audit_results(
-        self,
-        _retrieval: object,
-        results: Sequence[object],
-    ) -> Sequence[object]:
-        return results
-
-    def audit_bank_results(
-        self,
-        _state_bank: object,
-        _states: Sequence[object],
-        _query: object,
-        results: Sequence[object],
-        *,
-        video_ids: Sequence[str],
-        trajectory_ids: Sequence[str],
-    ) -> Sequence[object]:
-        if len(video_ids) != len(trajectory_ids):
-            raise ValueError("tiny Reader ownership mismatch")
         return results
 
     def audit_number_tokens(self, result: object) -> int | None:
@@ -963,75 +943,30 @@ def _cache(
     position_ids: Tensor,
     valid_mask: Tensor,
 ) -> TemporalCache:
-    batch_size = len(owner.video_ids)
-    width = reference.shape[1]
-    hidden = reference.detach().clone()
-    empty_kv = tuple(
-        torch.zeros((batch_size, 12, width, 64), dtype=reference.dtype) for _ in range(6)
-    )
-    replay_kv = tuple(torch.zeros((batch_size, 12, 0, 64), dtype=reference.dtype) for _ in range(6))
-    return TemporalCache(
-        hidden=hidden,
-        layer_keys=empty_kv,
-        layer_values=tuple(value.clone() for value in empty_kv),
-        replay_layer_keys=replay_kv,
-        replay_layer_values=tuple(value.clone() for value in replay_kv),
-        timestamps=timestamps.clone(),
-        replay_timestamps=torch.zeros((batch_size, 0), dtype=torch.float64),
-        position_ids=position_ids.clone(),
-        replay_position_ids=torch.zeros((batch_size, 0), dtype=torch.int64),
-        valid_mask=valid_mask.clone(),
-        replay_valid_mask=torch.zeros((batch_size, 0), dtype=torch.bool),
+    return make_temporal_cache(
+        hidden=reference,
         video_ids=owner.video_ids,
         trajectory_ids=owner.trajectory_ids,
-        query_signatures=torch.zeros((batch_size, 512), dtype=reference.dtype),
+        timestamps=timestamps,
+        position_ids=position_ids,
+        valid_mask=valid_mask,
         total_seen=position_ids[:, -1].clone() + 1,
     )
 
 
-def _e1_state(
-    owner: RuntimeOwner,
-    row: int,
-    positions: Tensor,
-    timestamps: Tensor,
-) -> E1RuntimeState:
-    total_seen = int(positions[row, -1].item()) + 1
-    length = min(total_seen, 66)
-    start = total_seen - length
-    state_positions = torch.arange(start, total_seen, dtype=torch.int64)
-    state_times = state_positions.to(torch.float64)
-    return E1RuntimeState(
+def _e1_state(owner: RuntimeOwner, row: int, positions: Tensor) -> E1RuntimeState:
+    return make_e1_state(
         video_id=owner.video_ids[row],
         trajectory_id=owner.trajectory_ids[row],
-        query_signature=torch.zeros(512),
-        projected_history=torch.zeros((length, 512)),
-        timestamps=state_times,
-        position_ids=state_positions,
-        total_seen=total_seen,
+        total_seen=int(positions[row, -1].item()) + 1,
     )
 
 
-def _e2_state(
-    owner: RuntimeOwner,
-    row: int,
-    positions: Tensor,
-    timestamps: Tensor,
-) -> E2RuntimeState:
-    del timestamps
-    total_seen = int(positions[row, -1].item()) + 1
-    length = min(total_seen, 5)
-    start = total_seen - length
-    state_positions = torch.arange(start, total_seen, dtype=torch.int64)
-    checkpoint = torch.zeros((length, 2, 768))
-    return E2RuntimeState(
+def _e2_state(owner: RuntimeOwner, row: int, positions: Tensor) -> E2RuntimeState:
+    return make_e2_state(
         video_id=owner.video_ids[row],
         trajectory_id=owner.trajectory_ids[row],
-        query_signature=torch.zeros(512),
-        hidden=checkpoint[-1].clone(),
-        checkpoint_hidden=checkpoint,
-        timestamps=state_positions.to(torch.float64),
-        position_ids=state_positions,
-        total_seen=total_seen,
+        total_seen=int(positions[row, -1].item()) + 1,
     )
 
 

@@ -549,7 +549,7 @@ class PerVideoRuntimeManager:
         self._lifecycle: PrefillLifecycle | None = None
         self._reset_audit: RuntimeResetAudit | None = None
         self._chunk_audits: list[ChunkAudit] = []
-        self._query_snapshots: dict[str, tuple[object, ...]] = {}
+        self._query_snapshots: dict[str, RuntimeBoundaryStamp] = {}
         self._lock = RLock()
 
     @property
@@ -805,8 +805,8 @@ class PerVideoRuntimeManager:
             causal_stamp = _causal_state_stamp(runtime)
             self._register_query_attempt(attempt, causal_stamp)
             lifecycle = self._query_lifecycle(owner)
-            before_guard = _runtime_guard_stamp(runtime)
-            before_snapshot = self._snapshot(runtime, content=True)
+            before_guard = runtime_boundary_stamp(runtime)
+            before_snapshot = self._snapshot(runtime, content=True, boundary=before_guard)
             with self.fast_adapter.use_fast_state(fast), torch.no_grad():
                 prepared = model.prepare_answer(
                     AnswerQueryRequest(
@@ -831,10 +831,10 @@ class PerVideoRuntimeManager:
             if len(generated.reader) != 1 or not isinstance(generated.reader[0], ReaderResult):
                 raise InferenceProtocolError("online inference requires one ReaderResult")
             reader_result = generated.reader[0]
-            after_guard = _runtime_guard_stamp(runtime)
+            after_guard = runtime_boundary_stamp(runtime)
             if after_guard != before_guard:
                 raise InferenceProtocolError("answer prefill/generation mutated runtime state")
-            after_snapshot = self._snapshot(runtime, content=True)
+            after_snapshot = self._snapshot(runtime, content=True, boundary=after_guard)
             state_attention = _state_attention(generated.resampler)
             self._runtime = replace(
                 runtime,
@@ -894,7 +894,7 @@ class PerVideoRuntimeManager:
             if causal is None:
                 raise InferenceProtocolError("Query observation contains no causal frame")
             owner = RuntimeOwner((runtime.video_id,), (runtime.trajectory_id,))
-            before_guard = _runtime_guard_stamp(runtime)
+            before_guard = runtime_boundary_stamp(runtime)
             lifecycle = PrefillLifecycle(owner)
             self.fast_adapter.last_audit = None
             with self.fast_adapter.use_fast_state(fast), torch.no_grad():
@@ -920,7 +920,7 @@ class PerVideoRuntimeManager:
                 fast.update_count,
             ):
                 raise InferenceProtocolError("Query observation used the wrong fast version")
-            if _runtime_guard_stamp(runtime) != before_guard:
+            if runtime_boundary_stamp(runtime) != before_guard:
                 raise InferenceProtocolError("read-only Query observation mutated runtime state")
             return replace(
                 observation,
@@ -982,12 +982,13 @@ class PerVideoRuntimeManager:
         state: TrajectoryRuntimeState,
         *,
         content: bool = False,
+        boundary: RuntimeBoundaryStamp | None = None,
     ) -> RuntimeAuditSnapshot:
         if self.audit_level is AuditLevel.OFF:
             return RuntimeAuditSnapshot(AuditLevel.OFF, None, None)
         return RuntimeAuditSnapshot(
             level=self.audit_level,
-            boundary=runtime_boundary_stamp(state),
+            boundary=runtime_boundary_stamp(state) if boundary is None else boundary,
             content_sha256=(
                 runtime_checksum(state) if content and self.audit_level is AuditLevel.FULL else None
             ),
@@ -996,7 +997,7 @@ class PerVideoRuntimeManager:
     def _register_query_attempt(
         self,
         attempt: QueryAttempt,
-        stamp: tuple[object, ...],
+        stamp: RuntimeBoundaryStamp,
     ) -> None:
         if attempt.query_id in self._query_snapshots:
             raise InferenceProtocolError("query_id has already been used in this runtime")
@@ -1349,25 +1350,8 @@ def _state_attention(resampler: object | None) -> Tensor | None:
     return value.detach().clone()
 
 
-def _runtime_guard_stamp(state: TrajectoryRuntimeState) -> tuple[object, ...]:
-    stamp = runtime_boundary_stamp(state)
-    return (
-        stamp.video_id,
-        stamp.trajectory_id,
-        stamp.next_chunk_index,
-        stamp.released,
-        stamp.fast_version,
-        stamp.update_count,
-        stamp.skip_count,
-        stamp.state_bank_version,
-        stamp.identity_bank_version,
-        stamp.component_ids,
-        stamp.tensor_versions,
-    )
-
-
-def _causal_state_stamp(state: TrajectoryRuntimeState) -> tuple[object, ...]:
-    return _runtime_guard_stamp(replace(state, reader_audit=()))
+def _causal_state_stamp(state: TrajectoryRuntimeState) -> RuntimeBoundaryStamp:
+    return runtime_boundary_stamp(replace(state, reader_audit=()))
 
 
 def _hard_state_stamp(state: TrajectoryRuntimeState) -> tuple[object, ...]:

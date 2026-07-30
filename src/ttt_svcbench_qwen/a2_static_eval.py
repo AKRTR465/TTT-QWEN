@@ -27,7 +27,6 @@ from ttt_svcbench_qwen.episode_data import (
 )
 from ttt_svcbench_qwen.llamafactory_trainer import ProductionTrainerRuntime
 from ttt_svcbench_qwen.model import (
-    AnswerQueryRequest,
     BatchRuntimeState,
     ObservationChunkOutput,
     PrefillLifecycle,
@@ -54,6 +53,8 @@ from ttt_svcbench_qwen.trainer import (
     StageAEpisodeAnswerInputs,
     StageAEpisodeInputs,
     StageATrainingBatch,
+    answer_query_request,
+    prepared_query_pair,
 )
 
 
@@ -136,11 +137,7 @@ def generate_a2_static(
     detached_query: PreparedQueryOutput | None = None
     if query_encoder_reuse:
         final_template = episode.observation_requests[-1]
-        prepared_query = PreparedQueryOutput.bind(
-            final_template.query_input,
-            model.components.query_encoder(final_template.query_input, inference=True),
-        )
-        detached_query = prepared_query.detached()
+        prepared_query, detached_query = prepared_query_pair(model, final_template, inference=True)
 
     for chunk_index, template in enumerate(episode.observation_requests):
         is_state_query = chunk_index + 1 == len(episode.observation_requests)
@@ -165,18 +162,7 @@ def generate_a2_static(
         episode.answer,
         batch.supervision.answer.base_labels,
     )
-    answer_request = AnswerQueryRequest(
-        owner=episode.owner,
-        observation=final_observation,
-        base_input_ids=answer.base_input_ids,
-        base_attention_mask=answer.base_attention_mask,
-        pixel_values_videos=answer.pixel_values_videos,
-        video_grid_thw=answer.video_grid_thw,
-        tokenizer=answer.tokenizer,
-        embedding_owner=answer.embedding_owner,
-        rope_indexer=answer.rope_indexer,
-        qwen_kwargs=answer.qwen_kwargs,
-    )
+    answer_request = answer_query_request(episode.owner, final_observation, answer)
     generated = model.generate_answer(
         model.prepare_answer(answer_request, lifecycle),
         lifecycle,

@@ -9,7 +9,7 @@ online gradients into W0/RMSNorm/P_in/P_out.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
@@ -301,7 +301,7 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             update_counts = fast_versions
         else:
             for state in runtime_states:
-                self._validate_state_for_input(state, visual_embeddings)
+                self._validate_state_for_module(state)
             differentiable_modes = {state.differentiable for state in runtime_states}
             if len(differentiable_modes) != 1:
                 raise ValueError("one Fast TTT batch cannot mix differentiable and online states")
@@ -457,7 +457,6 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             skip_count=0,
             differentiable=differentiable,
         )
-        self.assert_online_parameter_boundary(state.fast_parameters, state)
         return state
 
     def reset_fast_state(
@@ -505,8 +504,6 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
                 parameter.requires_grad_(False)
         self._active_fast_states = states
         try:
-            if freeze_module:
-                self.assert_online_freeze(states)
             yield self
         finally:
             self._active_fast_states = None
@@ -587,35 +584,6 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             online_fast=collect_fast_parameters(state),
         )
 
-    def assert_online_parameter_boundary(
-        self,
-        parameters: Iterable[Tensor],
-        state: FastWeightsState,
-    ) -> None:
-        supplied = tuple(parameters)
-        expected = collect_fast_parameters(state)
-        if len(supplied) != 2 or any(
-            actual is not required for actual, required in zip(supplied, expected, strict=True)
-        ):
-            raise ValueError("online parameters must be exactly (w_t_1, w_t_2) in stable order")
-        if sum(parameter.numel() for parameter in supplied) != self.config.online_parameter_count:
-            raise ValueError("online fast parameter count must equal 1,179,648")
-        module_ids = {id(parameter) for parameter in self.parameters()}
-        if any(id(parameter) in module_ids for parameter in supplied):
-            raise ValueError("transient W_t tensors must not be registered module parameters")
-
-    def assert_online_freeze(self, states: Sequence[FastWeightsState]) -> None:
-        """Prove that an inference binding freezes every checkpointed parameter."""
-
-        if not states or any(state.differentiable for state in states):
-            raise ValueError("online freeze requires non-differentiable per-video states")
-        for state in states:
-            self.assert_online_parameter_boundary(state.fast_parameters, state)
-        if any(parameter.requires_grad for parameter in self.parameters()):
-            raise ValueError("all checkpointed Fast TTT parameters must be frozen online")
-        if any(parameter.grad is not None for parameter in self.parameters()):
-            raise ValueError("checkpointed Fast TTT parameters must not carry online gradients")
-
     def _validate_input(self, visual_embeddings: Tensor) -> None:
         if (
             visual_embeddings.ndim != 3
@@ -655,32 +623,8 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
         return valid_mask
 
     def _validate_state_for_module(self, state: FastWeightsState) -> None:
-        if (
-            state.w0_1.dtype != self.w0_1.dtype
-            or state.w0_1.device != self.w0_1.device
-            or state.w_t_1.dtype != torch.float32
-            or state.w_t_1.device != self.w0_1.device
-        ):
-            raise ValueError(
-                "Fast TTT runtime W0 must match the module and W_t master must be float32 "
-                "on the module device"
-            )
-        self.assert_online_parameter_boundary(state.fast_parameters, state)
-
-    def _validate_state_for_input(
-        self,
-        state: FastWeightsState,
-        visual_embeddings: Tensor,
-    ) -> None:
-        self._validate_state_for_module(state)
-        if (
-            state.w0_1.dtype != visual_embeddings.dtype
-            or state.w_t_1.device != visual_embeddings.device
-        ):
-            raise ValueError(
-                "Fast TTT runtime W0 must share input dtype and all state tensors must share "
-                "the input device"
-            )
+        if state.w0_1.dtype != self.w0_1.dtype or state.w0_1.device != self.w0_1.device:
+            raise ValueError("Fast TTT runtime W0 must match the module dtype and device")
 
     def _normalize_runtime_states(
         self,

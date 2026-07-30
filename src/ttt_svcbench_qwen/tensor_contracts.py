@@ -21,6 +21,23 @@ def tensor_storage_key(tensor: Tensor) -> tuple[str, int | None, int]:
     )
 
 
+def assert_storage_disjoint(groups: Sequence[Sequence[Tensor]], message: str) -> None:
+    """Reject storage aliasing across independently mutable tensor groups."""
+
+    seen: set[tuple[str, int | None, int]] = set()
+    for group in groups:
+        keys = {tensor_storage_key(tensor) for tensor in group if tensor.numel() != 0}
+        if seen & keys:
+            raise ValueError(message)
+        seen |= keys
+
+
+def assert_tensors_disjoint(tensors: Sequence[Tensor], message: str) -> None:
+    """Reject storage aliasing among individually mutable tensors."""
+
+    assert_storage_disjoint([(tensor,) for tensor in tensors], message)
+
+
 def timestamps_match(left: Tensor, right: Tensor) -> bool:
     """Compare source-identical timestamps across legal FP32/FP64 handoffs."""
 

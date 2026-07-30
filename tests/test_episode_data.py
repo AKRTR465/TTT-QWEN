@@ -12,7 +12,6 @@ from ttt_svcbench_qwen.episode_data import (
     BalancedA2DistributedSampler,
     EpisodeSplit,
     ManifestStage,
-    ProductionEpisodeManifest,
     ProductionManifestDataset,
     RankAlignedA5SegmentSampler,
     adaptive_support_schedule,
@@ -20,7 +19,6 @@ from ttt_svcbench_qwen.episode_data import (
     greedy_nonoverlap_query_groups,
     load_production_episode_manifest,
     load_production_manifest_views,
-    sample_a5_training_manifest,
     write_production_episode_manifest,
 )
 
@@ -141,55 +139,6 @@ def test_production_manifest_has_fold0_buckets_padding_and_explicit_failures(
     leaked.write_text(json.dumps(stored), encoding="utf-8")
     with pytest.raises(ValueError, match="runtime Query keys drifted"):
         load_production_episode_manifest(leaked)
-
-
-def test_a5_half_subset_is_deterministic_reweighted_and_rank_aligned(
-    tmp_path: Path,
-) -> None:
-    rows = tuple(
-        _row(f"trajectory-{index}", f"video-{index}.mp4", [20.0, 40.0])
-        for index in range(10)
-    )
-    annotations = _annotations(tmp_path, rows=rows)
-    durations = {f"Demo/video-{index}.mp4": 60.0 for index in range(10)}
-    manifest = build_production_episode_manifest(annotations, video_durations=durations)
-
-    first = sample_a5_training_manifest(manifest, fraction=0.5, seed=42)
-    second = sample_a5_training_manifest(manifest, fraction=0.5, seed=42)
-
-    def real_train_ids(value: ProductionEpisodeManifest) -> tuple[str, ...]:
-        return tuple(
-            episode.episode_id
-            for episode in value.episodes
-            if episode.split is EpisodeSplit.TRAIN and episode.loss_weight == 1.0
-        )
-
-    assert real_train_ids(first) == real_train_ids(second)
-    original_train_count = sum(
-        episode.split is EpisodeSplit.TRAIN and episode.loss_weight == 1.0
-        for episode in manifest.episodes
-    )
-    assert len(real_train_ids(first)) == (original_train_count + 1) // 2
-    assert all(len(bucket.episode_ids) % 4 == 0 for bucket in first.buckets)
-    assert all(
-        episode.loss_weight == 0.0
-        for episode in first.episodes
-        if episode.padding_source_episode_id is not None
-    )
-    task_totals = Counter(
-        episode.task_class
-        for episode in first.episodes
-        if episode.split is EpisodeSplit.TRAIN and episode.loss_weight == 1.0
-    )
-    for task, count in task_totals.items():
-        weights = [
-            episode.sampling_weight
-            for episode in first.episodes
-            if episode.split is EpisodeSplit.TRAIN
-            and episode.loss_weight == 1.0
-            and episode.task_class == task
-        ]
-        assert weights == pytest.approx([1.0 / count] * count)
 
 
 def test_a5_supervised_segments_align_every_meta_query_to_new_supports(

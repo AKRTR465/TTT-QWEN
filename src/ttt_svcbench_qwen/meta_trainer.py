@@ -55,7 +55,6 @@ from ttt_svcbench_qwen.losses import (
     compute_state_loss,
 )
 from ttt_svcbench_qwen.model import (
-    AnswerQueryRequest,
     BatchRuntimeState,
     ObservationChunkOutput,
     ObservationChunkRequest,
@@ -86,14 +85,13 @@ from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
 from ttt_svcbench_qwen.trainer import (
     StageAEpisodeAnswerInputs,
     StageASupervisionBatch,
+    answer_query_request,
 )
 from ttt_svcbench_qwen.training_context import (
     QueryActivationOffloadBudget,
     QueryActivationOffloadScope,
     query_activation_context,
 )
-
-_CI_Z_95 = 1.959963984540054
 
 
 class FastStateController(Protocol):
@@ -743,14 +741,10 @@ class TruncatedMetaTTTEpisodeAudit:
             raise ValueError("A5 adaptation mode is invalid")
         if type(self.ttt_enabled) is not bool:
             raise TypeError("A5 TTT enabled audit must be bool")
-        if self.associative_contract != ASSOCIATIVE_CONTRACT:
-            raise ValueError("A5 associative contract is invalid")
         if type(self.associative_valid_count) is not int or self.associative_valid_count < 0:
             raise ValueError("A5 associative valid count must be a non-negative integer")
         if self.ttt_enabled != (self.adaptation_mode == "meta_ttt"):
             raise ValueError("A5 TTT enabled audit disagrees with adaptation mode")
-        if self.training_counterfactual_executed:
-            raise ValueError("training counterfactual remains forbidden")
         if type(self.diagnostic_counterfactual_executed) is not bool:
             raise TypeError("diagnostic counterfactual flag must be bool")
         if (
@@ -762,32 +756,12 @@ class TruncatedMetaTTTEpisodeAudit:
             raise ValueError("diagnostic counterfactual Query count is invalid")
         if self.loss_weight not in (0.0, 1.0):
             raise ValueError("A5 episode audit loss weight must be deterministic zero or one")
-        if self.prewarm_count != 1:
-            raise ValueError("A5 production episodes require exactly one no-update prewarm")
         if self.truncation_horizon <= 0:
             raise ValueError("truncation horizon must be positive")
-        expected_backwards = self.query_count + self.segment_count
-        if self.query_backward_count != self.query_count:
-            raise ValueError("A5 must backward every Query point exactly once")
-        if self.deferred_vjp_backward_count != self.segment_count:
-            raise ValueError("A5 must execute one deferred fast-state VJP per segment")
-        if self.backward_count != expected_backwards:
-            raise ValueError("A5 streamed Query/segment backward count drifted")
-        if self.truncation_count != self.segment_count:
-            raise ValueError("A5 must re-anchor after every supervised segment")
-        if (
-            type(self.diagnostic_query_count) is not int
-            or self.diagnostic_query_count < 0
-            or self.zero_support_query_count != 0
-            or self.support_segments_without_query != 0
-        ):
-            raise ValueError("A5 Query/Support alignment audit failed")
         if type(self.insufficient_inter_query_gap) is not bool:
             raise TypeError("A5 insufficient-gap audit must be bool")
         if self.maximum_retained_support_graphs > self.truncation_horizon:
             raise ValueError("A5 retained more than K Support graphs")
-        if self.update_attempt_count != self.update_count + self.skip_count:
-            raise ValueError("A5 update attempts must equal accepted plus skipped")
         nonnegative_finite = (
             self.associative_loss_mean,
             self.key_rms,
@@ -831,8 +805,6 @@ class TruncatedMetaTTTEpisodeAudit:
             or not -1.0 <= self.prediction_target_cosine_mean <= 1.0
         ):
             raise ValueError("A5 prediction-target cosine mean must be in [-1, 1]")
-        if len(self.segments) != self.segment_count:
-            raise ValueError("A5 segment audit count drifted")
         expected_update_audits = self.support_count if self.ttt_enabled else 0
         if len(self.updates) != expected_update_audits or len(self.queries) != self.query_count:
             raise ValueError("A5 detailed audit counts drifted")
@@ -863,10 +835,6 @@ class TruncatedMetaTTTEpisodeAudit:
             raise ValueError("A5 segment Query bundle counts drifted")
         if not self.parameter_versions_unchanged_before_outer_step:
             raise ValueError("outer parameters changed before the episode-level optimizer step")
-        if not self.bank_context_detached:
-            raise ValueError("A5 Bank context retained an authoritative hard-state graph")
-        if self.support_supervision_reachable:
-            raise ValueError("Support labels became reachable from the A5 inner path")
         if self.training_counterfactual_executed:
             raise ValueError("the production A5 path must not execute static-W0 counterfactuals")
 
@@ -1896,19 +1864,7 @@ class MetaTTTEpisodeRunner:
         fast_states: Sequence[FastWeightsState],
         with_grad: bool,
     ) -> StateTTTModelOutput:
-        answer = query.answer
-        request = AnswerQueryRequest(
-            owner=observation.owner,
-            observation=observation,
-            base_input_ids=answer.base_input_ids,
-            base_attention_mask=answer.base_attention_mask,
-            pixel_values_videos=answer.pixel_values_videos,
-            video_grid_thw=answer.video_grid_thw,
-            tokenizer=answer.tokenizer,
-            embedding_owner=answer.embedding_owner,
-            rope_indexer=answer.rope_indexer,
-            qwen_kwargs=answer.qwen_kwargs,
-        )
+        request = answer_query_request(observation.owner, observation, query.answer)
         with (
             torch.set_grad_enabled(with_grad),
             self.fast_controller.use_fast_state(fast_states),

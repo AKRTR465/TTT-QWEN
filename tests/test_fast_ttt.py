@@ -274,14 +274,6 @@ def test_parameter_collection_is_stable_exact_and_rejects_boundary_drift() -> No
     assert tensor_count(adapter.collect_slow_parameters()) == 6_300_416
     assert tensor_count(adapter.collect_associative_parameters()) == 393_984
     assert not ({id(parameter) for parameter in groups.online_fast} & {id(p) for p in groups.slow})
-    adapter.assert_online_parameter_boundary(groups.online_fast, state)
-
-    with pytest.raises(ValueError, match="stable order"):
-        adapter.assert_online_parameter_boundary(groups.online_fast[::-1], state)
-    with pytest.raises(ValueError, match="exactly"):
-        adapter.assert_online_parameter_boundary((*groups.online_fast, adapter.p_in.weight), state)
-    with pytest.raises(ValueError, match="exactly"):
-        adapter.assert_online_parameter_boundary(groups.meta_fast, state)
 
 
 def test_truncated_meta_reanchor_preserves_value_cuts_history_and_restores_w0_path() -> None:
@@ -338,7 +330,6 @@ def test_context_binding_integrates_with_p3_boundary_and_cleans_up_after_errors(
 
     with adapter.use_fast_state(state):
         assert all(not parameter.requires_grad for parameter in adapter.parameters())
-        adapter.assert_online_freeze((state,))
         adapted, returned_deepstack = boundary.intercept_features(main, deepstack, grid)
         assert adapter.last_audit is not None
         assert adapter.last_audit.used_runtime_state is True

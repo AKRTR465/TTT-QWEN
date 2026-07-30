@@ -1,12 +1,6 @@
 spec_version: state_ttt_qwen3vl8b_state_write_associative_v3
 config_schema_version: 12
 
-paths:
-  model_root_env: QWEN_MODEL_ROOT
-  svcbench_root_env: SVCBENCH_ROOT
-  hf_home_env: HF_HOME
-  output_root_env: OUTPUT_ROOT
-
 data:
   grouped_annotation_file: data/vcbench_data.jsonl
   flat_annotation_file: data/vcbench_eval.jsonl

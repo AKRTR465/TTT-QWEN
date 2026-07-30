@@ -19,7 +19,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from ttt_svcbench_qwen.config import ProjectConfig
-from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
+from ttt_svcbench_qwen.tensor_contracts import assert_tensors_disjoint
 
 if TYPE_CHECKING:
     from ttt_svcbench_qwen.observation_heads import O2SoftOutput
@@ -384,10 +384,6 @@ class IdentityBankRuntimeState:
         return len(self.candidates)
 
     @property
-    def confirmed_count(self) -> int:
-        return self.unique_count
-
-    @property
     def unique_count(self) -> int:
         return sum(chunk.size for chunk in self.confirmed_chunks)
 
@@ -484,17 +480,6 @@ class ExactMatchResult:
     def __post_init__(self) -> None:
         if self.search_mode != "exact" or self.ann_enabled:
             raise ValueError("P10 only permits full exact identity search")
-
-
-@dataclass(frozen=True, slots=True)
-class IdentityRuntimeMetrics:
-    candidate_count: int
-    confirmed_count: int
-    candidate_overflow_count: int
-    candidate_expired_count: int
-    candidate_low_confidence_pruned_count: int
-    match_conflict_count: int
-    signal_conflict_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -614,18 +599,6 @@ class IdentityBank:
         if len(matches) != 1:
             raise KeyError(f"Confirmed identity not found: {identity_id}")
         return _clone_confirmed(matches[0])
-
-    def metrics(self, state: IdentityBankRuntimeState) -> IdentityRuntimeMetrics:
-        _require_live_state(state)
-        return IdentityRuntimeMetrics(
-            candidate_count=len(state.candidates),
-            confirmed_count=state.unique_count,
-            candidate_overflow_count=state.candidate_overflow_count,
-            candidate_expired_count=state.candidate_expired_count,
-            candidate_low_confidence_pruned_count=state.candidate_low_confidence_pruned_count,
-            match_conflict_count=state.match_conflict_count,
-            signal_conflict_count=state.signal_conflict_count,
-        )
 
     def exact_match(
         self,
@@ -1919,6 +1892,4 @@ def _assert_runtime_storage_isolated(state: IdentityBankRuntimeState) -> None:
             )
         )
     tensors.extend(entry.identity_prototype for entry in state.hot_cache)
-    keys = [tensor_storage_key(tensor) for tensor in tensors if tensor.device.type != "meta"]
-    if len(keys) != len(set(keys)):
-        raise ValueError("Identity Bank runtime tensors must not share storage")
+    assert_tensors_disjoint(tensors, "Identity Bank runtime tensors must not share storage")

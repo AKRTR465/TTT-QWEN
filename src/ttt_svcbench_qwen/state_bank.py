@@ -24,7 +24,7 @@ from ttt_svcbench_qwen.config import (
 )
 from ttt_svcbench_qwen.identity_bank import CandidateIdentity, ConfirmedIdentity
 from ttt_svcbench_qwen.observation_heads import E1SoftOutput, E2SoftOutput, O1SoftOutput
-from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
+from ttt_svcbench_qwen.tensor_contracts import assert_storage_disjoint, tensor_storage_key
 
 if TYPE_CHECKING:
     from ttt_svcbench_qwen.query_encoder import Operator
@@ -2488,16 +2488,7 @@ def _validate_state_bank_view_records(view: StateBankView) -> None:
 
 
 def _assert_tensor_groups_isolated(groups: Sequence[tuple[Tensor, ...]], name: str) -> None:
-    seen: set[tuple[str, int | None, int]] = set()
-    for group in groups:
-        group_keys: set[tuple[str, int | None, int]] = set()
-        for tensor in group:
-            if tensor.numel() == 0:
-                continue
-            group_keys.add(tensor_storage_key(tensor))
-        if seen.intersection(group_keys):
-            raise ValueError(f"{name} must not share mutable tensor storage")
-        seen.update(group_keys)
+    assert_storage_disjoint(groups, f"{name} must not share mutable tensor storage")
 
 
 def _normalize_head_types(

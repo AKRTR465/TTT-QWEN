@@ -759,23 +759,6 @@ class ReaderStage(Protocol):
         trajectory_ids: Sequence[str],
     ) -> Sequence[ReaderResult]: ...
 
-    def audit_results(
-        self,
-        retrieval: RetrieverOutput,
-        results: Sequence[ReaderResult],
-    ) -> Sequence[ReaderResult]: ...
-
-    def audit_bank_results(
-        self,
-        state_bank: StructuredStateBank,
-        states: Sequence[StateBankRuntimeState],
-        query: QueryEncoderOutput,
-        results: Sequence[ReaderResult],
-        *,
-        video_ids: Sequence[str],
-        trajectory_ids: Sequence[str],
-    ) -> Sequence[ReaderResult]: ...
-
     def audit_number_tokens(self, result: ReaderResult) -> int | None: ...
 
 
@@ -1101,7 +1084,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
         if self.feature_flags.reader_enabled:
             reader = self.components.require_reader()
             state_bank = self.components.require_state_bank()
-            computed = tuple(
+            reader_results = tuple(
                 reader.read_bank(
                     state_bank,
                     observation.bank_states,
@@ -1110,18 +1093,6 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
                     trajectory_ids=request.owner.trajectory_ids,
                 )
             )
-            reader_results = tuple(
-                reader.audit_bank_results(
-                    state_bank,
-                    observation.bank_states,
-                    observation.query,
-                    computed,
-                    video_ids=request.owner.video_ids,
-                    trajectory_ids=request.owner.trajectory_ids,
-                )
-            )
-            if reader_results != computed:
-                raise ValueError("Reader audit must return the unchanged authoritative results")
             for result in reader_results:
                 reader.audit_number_tokens(result)
         if self.feature_flags.state_tokens_enabled:

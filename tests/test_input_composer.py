@@ -7,9 +7,9 @@ import pytest
 import torch
 from torch import Tensor, nn
 
+from tests.support.tokenizers import StubTokenizer, make_composer_tokenizer
 from ttt_svcbench_qwen.input_composer import (
     COMPOSER_SPECIAL_TOKENS,
-    EXACT_NUMBER_INSTRUCTION,
     NUMBER_END_TOKEN,
     NUMBER_START_TOKEN,
     STATE_END_TOKEN,
@@ -21,62 +21,6 @@ from ttt_svcbench_qwen.input_composer import (
     register_input_composer_tokens_with_audit,
 )
 from ttt_svcbench_qwen.state_reader import ReaderStatus
-
-
-class FakeTokenizer:
-    def __init__(self) -> None:
-        self.tokens = {
-            "<|endoftext|>": 0,
-            "<|im_end|>": 1,
-            "<|video_pad|>": 2,
-            "<|im_start|>": 3,
-            "user": 4,
-            "question": 5,
-            "assistant": 6,
-            "\n": 7,
-            "12": 8,
-            "0": 9,
-            "-3": 10,
-            "<|existing|>": 11,
-            "<|vision_start|>": 12,
-            "<|vision_end|>": 13,
-            "instruction-a": 14,
-            "instruction-b": 15,
-        }
-        self.pad_token_id = 0
-        self.additional_special_tokens = ["<|existing|>"]
-        self.registration_calls: list[tuple[tuple[str, ...], bool]] = []
-
-    def __len__(self) -> int:
-        return len(self.tokens)
-
-    def add_special_tokens(
-        self,
-        special_tokens_dict: dict[str, object],
-        replace_additional_special_tokens: bool = True,
-    ) -> int:
-        raw = special_tokens_dict["additional_special_tokens"]
-        assert isinstance(raw, list)
-        values = tuple(str(value) for value in raw)
-        self.registration_calls.append((values, replace_additional_special_tokens))
-        if replace_additional_special_tokens:
-            self.additional_special_tokens = []
-        added = 0
-        for token in values:
-            if token not in self.tokens:
-                self.tokens[token] = len(self.tokens)
-                added += 1
-            if token not in self.additional_special_tokens:
-                self.additional_special_tokens.append(token)
-        return added
-
-    def convert_tokens_to_ids(self, token: str) -> int | None:
-        return self.tokens.get(token)
-
-    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
-        assert text == EXACT_NUMBER_INSTRUCTION
-        assert add_special_tokens is False
-        return [self.tokens["instruction-a"], self.tokens["instruction-b"]]
 
 
 class TinyEmbeddingOwner(nn.Module):
@@ -196,8 +140,8 @@ def _compose(
     state_valid: Tensor | None = None,
     include_state: bool = True,
     include_number: bool = True,
-) -> tuple[ComposedInput, FakeTokenizer, TinyEmbeddingOwner, FakeRopeIndexer, Tensor]:
-    tokenizer = FakeTokenizer()
+) -> tuple[ComposedInput, StubTokenizer, TinyEmbeddingOwner, FakeRopeIndexer, Tensor]:
+    tokenizer = make_composer_tokenizer()
     owner = TinyEmbeddingOwner(vocab_size=len(tokenizer), hidden_size=8)
     rope = FakeRopeIndexer(malformed=malformed_rope)
     input_ids, attention_mask = _base_batch(len(statuses))
@@ -235,7 +179,7 @@ def _compose(
 
 
 def test_special_token_registration_initializes_independent_input_and_output_once() -> None:
-    tokenizer = FakeTokenizer()
+    tokenizer = make_composer_tokenizer()
     owner = TinyEmbeddingOwner(
         vocab_size=len(tokenizer),
         hidden_size=8,
@@ -289,7 +233,7 @@ def test_special_token_registration_initializes_independent_input_and_output_onc
 
 
 def test_tied_output_is_initialized_once_and_registration_never_shrinks() -> None:
-    tokenizer = FakeTokenizer()
+    tokenizer = make_composer_tokenizer()
     owner = TinyEmbeddingOwner(len(tokenizer), 8, output_mode="tied")
     before = owner.embedding.weight.detach().clone()
     expected = before[[12, 2, 13]].float().mean(dim=0)
@@ -306,7 +250,7 @@ def test_tied_output_is_initialized_once_and_registration_never_shrinks() -> Non
 
 def test_oversized_151936_embedding_is_not_resized_but_new_token_rows_are_initialized() -> None:
     oversized = TinyEmbeddingOwner(vocab_size=151_936, hidden_size=4)
-    other_tokenizer = FakeTokenizer()
+    other_tokenizer = make_composer_tokenizer()
     base_rows = oversized.embedding.weight[: len(other_tokenizer)].detach().clone()
     last_row = oversized.embedding.weight[-1].detach().clone()
     expected = base_rows[[12, 2, 13]].float().mean(dim=0)
@@ -322,7 +266,7 @@ def test_oversized_151936_embedding_is_not_resized_but_new_token_rows_are_initia
 
 
 def test_checkpoint_and_extended_tokenizer_reload_never_resets_trained_rows() -> None:
-    tokenizer = FakeTokenizer()
+    tokenizer = make_composer_tokenizer()
     seed_owner = TinyEmbeddingOwner(len(tokenizer), 8, output_mode="independent")
     token_ids = register_input_composer_tokens(tokenizer, seed_owner)
     reloaded = TinyEmbeddingOwner(len(tokenizer), 8, output_mode="independent")
@@ -436,7 +380,7 @@ def test_state_and_number_ablation_payloads_are_independent() -> None:
     assert state_only.row_audits[0].number_included is False
     assert state_only.row_audits[0].instruction_token_ids == ()
 
-    tokenizer = FakeTokenizer()
+    tokenizer = make_composer_tokenizer()
     owner = TinyEmbeddingOwner(len(tokenizer), 8)
     input_ids, attention_mask = _base_batch()
     number_only = compose_inputs(
@@ -498,7 +442,7 @@ def test_status_and_state_validity_mismatch_fails_closed(
 
 
 def test_missing_user_end_recomposition_and_wrong_state_shape_fail_closed() -> None:
-    tokenizer = FakeTokenizer()
+    tokenizer = make_composer_tokenizer()
     owner = TinyEmbeddingOwner(vocab_size=len(tokenizer), hidden_size=8)
     rope = FakeRopeIndexer()
     input_ids, attention_mask = _base_batch()
@@ -543,7 +487,7 @@ def test_hidden_size_and_native_mrope_shapes_are_strict() -> None:
 
 
 def test_binary_attention_and_original_reader_number_ids_are_strict() -> None:
-    tokenizer = FakeTokenizer()
+    tokenizer = make_composer_tokenizer()
     owner = TinyEmbeddingOwner(vocab_size=len(tokenizer), hidden_size=8)
     input_ids, attention = _base_batch()
     attention[0, 0] = 2
@@ -563,7 +507,7 @@ def test_binary_attention_and_original_reader_number_ids_are_strict() -> None:
             video_grid_thw=torch.tensor([[1, 2, 2], [1, 2, 2]]),
         )
 
-    control_token_number = FakeTokenizer().convert_tokens_to_ids("<|video_pad|>")
+    control_token_number = make_composer_tokenizer().convert_tokens_to_ids("<|video_pad|>")
     assert control_token_number is not None
     with pytest.raises(ValueError, match="control tokens"):
         compose_inputs(
@@ -575,7 +519,7 @@ def test_binary_attention_and_original_reader_number_ids_are_strict() -> None:
                 FakeReaderResult(ReaderStatus.OK, 12, (control_token_number,)),
                 FakeReaderResult(ReaderStatus.INVALID, None, ()),
             ),
-            tokenizer=FakeTokenizer(),
+            tokenizer=make_composer_tokenizer(),
             embedding_owner=TinyEmbeddingOwner(12, 8),
             rope_indexer=FakeRopeIndexer(),
             video_grid_thw=torch.tensor([[1, 2, 2], [1, 2, 2]]),

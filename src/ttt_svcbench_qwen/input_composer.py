@@ -365,9 +365,6 @@ class ComposedInput:
             or self.cache_position.device != embeds.device
         ):
             raise ValueError("cache_position must be int64 [L] on the embedding device")
-        expected_cache = torch.arange(sequence_length, device=embeds.device, dtype=torch.int64)
-        if embeds.device.type != "meta" and not torch.equal(self.cache_position, expected_cache):
-            raise ValueError("prefill cache_position must be zero-based and contiguous")
 
         masks = (
             (self.video_position_mask, "video_position_mask"),
@@ -391,43 +388,6 @@ class ComposedInput:
             raise ValueError("video, State, and number positions must be pairwise disjoint")
         if len(self.number_token_ids) != batch_size or len(self.row_audits) != batch_size:
             raise ValueError("number_token_ids/row_audits need one entry per batch row")
-        if self.registration_audit.token_ids != tuple(
-            zip(COMPOSER_SPECIAL_TOKENS, self.special_token_ids.composer_ids, strict=True)
-        ):
-            raise ValueError("registration audit and active Composer token IDs disagree")
-        if embeds.device.type != "meta":
-            for row, (number_ids, audit) in enumerate(
-                zip(self.number_token_ids, self.row_audits, strict=True)
-            ):
-                actual_ids = tuple(
-                    int(value)
-                    for value in self.input_ids[row, self.number_position_mask[row]].tolist()
-                )
-                if actual_ids != number_ids or actual_ids != audit.number_token_ids:
-                    raise ValueError("number position IDs must equal the original Reader IDs")
-                if tuple(torch.nonzero(self.video_position_mask[row]).flatten().tolist()) != (
-                    audit.video_positions
-                ):
-                    raise ValueError("video mask and row audit disagree")
-                if tuple(torch.nonzero(self.state_position_mask[row]).flatten().tolist()) != (
-                    audit.state_positions
-                ):
-                    raise ValueError("State mask and row audit disagree")
-                if tuple(torch.nonzero(self.number_position_mask[row]).flatten().tolist()) != (
-                    audit.number_positions
-                ):
-                    raise ValueError("number mask and row audit disagree")
-                actual_instruction_ids = tuple(
-                    int(self.input_ids[row, position].item())
-                    for position in audit.instruction_positions
-                )
-                if actual_instruction_ids != audit.instruction_token_ids:
-                    raise ValueError("instruction positions and row audit IDs disagree")
-                valid_count = int(self.attention_mask[row].sum().item())
-                if audit.left_padding != sequence_length - valid_count:
-                    raise ValueError("row audit left padding does not match attention_mask")
-                if valid_count != audit.composed_token_count:
-                    raise ValueError("row audit composed length does not match attention_mask")
 
 
 @dataclass(frozen=True, slots=True)

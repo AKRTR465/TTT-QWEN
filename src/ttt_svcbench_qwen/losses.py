@@ -15,7 +15,6 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
-_FP32_EPS = 1.0e-8
 _NORM_ATOL = 5.0e-4
 _TASK_WEIGHT = 1.0
 _OPERATOR_WEIGHT = 1.0
@@ -978,83 +977,6 @@ def _validate_row_indices(indices: Tensor, rows: int, name: str) -> None:
         raise ValueError(f"{name} row_indices must be int64 [R]")
     if indices.device.type != "meta" and len(set(indices.tolist())) != rows:
         raise ValueError(f"{name} row_indices must be unique")
-
-
-def _validate_overlap_probabilities(
-    current: Tensor,
-    previous: Tensor,
-    pair_mask: Tensor,
-    alignment_mask: Tensor,
-    current_positions: Tensor,
-    previous_positions: Tensor,
-    current_timestamps: Tensor,
-    previous_timestamps: Tensor,
-    *,
-    width: int,
-    name: str,
-    phase: bool,
-) -> None:
-    if current.ndim != 3 or current.shape[-1] != width or not torch.is_floating_point(current):
-        raise ValueError(f"{name} current probabilities must be floating [B, M, {width}]")
-    if previous.shape != current.shape or not torch.is_floating_point(previous):
-        raise ValueError(f"{name} previous target probabilities must match current")
-    shape = current.shape[:2]
-    if (
-        pair_mask.shape != shape
-        or alignment_mask.shape != shape
-        or pair_mask.dtype != torch.bool
-        or alignment_mask.dtype != torch.bool
-    ):
-        raise ValueError(f"{name} pair/alignment masks must be bool [B, M]")
-    if current_positions.shape != shape or previous_positions.shape != shape:
-        raise ValueError(f"{name} overlap positions must be [B, M]")
-    if current_positions.dtype != torch.int64 or previous_positions.dtype != torch.int64:
-        raise TypeError(f"{name} overlap positions must use int64 dtype")
-    if current_timestamps.shape != shape or previous_timestamps.shape != shape:
-        raise ValueError(f"{name} overlap timestamps must be [B, M]")
-    if not torch.is_floating_point(current_timestamps) or not torch.is_floating_point(
-        previous_timestamps
-    ):
-        raise TypeError(f"{name} overlap timestamps must be floating")
-    tensors = (
-        current,
-        previous,
-        pair_mask,
-        alignment_mask,
-        current_positions,
-        previous_positions,
-        current_timestamps,
-        previous_timestamps,
-    )
-    _require_same_device(tensors, f"{name} consistency input")
-    _require_probability_targets(current, f"{name} current probabilities")
-    _require_probability_targets(previous, f"{name} target probabilities")
-    if current.device.type == "meta":
-        return
-    if bool(torch.any(alignment_mask & ~pair_mask)):
-        raise ValueError(f"{name} alignment_mask must be a subset of pair_mask")
-    if bool(torch.any(alignment_mask & (current_positions != previous_positions))):
-        raise ValueError(f"{name} aligned positions must be identical")
-    aligned_time_difference = (current_timestamps - previous_timestamps).abs()
-    if bool(torch.any(alignment_mask & (aligned_time_difference > 1.0e-6))):
-        raise ValueError(f"{name} aligned timestamps must be equal")
-    for row in range(current.shape[0]):
-        current_aligned = current_positions[row, alignment_mask[row]].tolist()
-        previous_aligned = previous_positions[row, alignment_mask[row]].tolist()
-        if len(set(current_aligned)) != len(current_aligned) or len(set(previous_aligned)) != len(
-            previous_aligned
-        ):
-            raise ValueError(f"{name} aligned positions must be unique per row")
-    if phase:
-        for tensor, label in ((current, "current"), (previous, "target")):
-            selected = tensor[alignment_mask]
-            if selected.numel() and not torch.allclose(
-                selected.float().sum(dim=-1),
-                torch.ones(selected.shape[0], device=selected.device),
-                atol=_NORM_ATOL,
-                rtol=_NORM_ATOL,
-            ):
-                raise ValueError(f"{name} {label} distributions must sum to one")
 
 
 def _require_unit_norm(values: Tensor, mask: Tensor, name: str) -> None:

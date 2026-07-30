@@ -9,6 +9,14 @@ import pytest
 import torch
 from torch import Tensor
 
+from tests.support.runtime_factories import (
+    make_e1_state,
+    make_e2_state,
+    make_query_output,
+    make_spatial_output,
+    make_stream_audit,
+    make_temporal_cache,
+)
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.identity_bank import IdentityDecisionStatus, build_identity_bank
 from ttt_svcbench_qwen.model import BatchRuntimeState, ObservationChunkRequest, RuntimeOwner
@@ -20,20 +28,10 @@ from ttt_svcbench_qwen.observation_heads import (
     O1SoftOutput,
     O2SoftOutput,
     ObservationOutputs,
-    StreamReplayAudit,
 )
 from ttt_svcbench_qwen.query_encoder import (
-    OPERATOR_TO_HEAD_TYPE,
     Operator,
-    OperatorRouterOutput,
-    QueryEmbeddingOutput,
     QueryEncoderOutput,
-    TimeResolution,
-    TimeResolutionStatus,
-    TimeResolverLogits,
-    TimeResolverOutput,
-    TimeWindow,
-    TimeWindowMode,
 )
 from ttt_svcbench_qwen.stage_a_runtime import (
     StageABankWriter,
@@ -48,7 +46,6 @@ from ttt_svcbench_qwen.state_bank import (
 )
 from ttt_svcbench_qwen.state_encoder import (
     SpatialEncoderOutput,
-    SpatialSlotRuntimeState,
     TemporalCache,
     TemporalEncoderOutput,
 )
@@ -77,87 +74,42 @@ class _NumberTokenizer:
 
 
 def _cache(owner: RuntimeOwner, hidden: Tensor, query: Tensor) -> TemporalCache:
-    batch_size, width = hidden.shape[:2]
-    kv_shape = (batch_size, 12, width, 64)
-    replay_shape = (batch_size, 12, 0, 64)
-    timestamps = torch.arange(width, dtype=torch.float64).expand(batch_size, -1).clone()
-    positions = torch.arange(width, dtype=torch.int64).expand(batch_size, -1).clone()
-    return TemporalCache(
-        hidden=hidden.detach().clone(),
-        layer_keys=tuple(torch.zeros(kv_shape) for _ in range(6)),
-        layer_values=tuple(torch.zeros(kv_shape) for _ in range(6)),
-        replay_layer_keys=tuple(torch.zeros(replay_shape) for _ in range(6)),
-        replay_layer_values=tuple(torch.zeros(replay_shape) for _ in range(6)),
-        timestamps=timestamps,
-        replay_timestamps=torch.empty((batch_size, 0), dtype=torch.float64),
-        position_ids=positions,
-        replay_position_ids=torch.empty((batch_size, 0), dtype=torch.int64),
-        valid_mask=torch.ones((batch_size, width), dtype=torch.bool),
-        replay_valid_mask=torch.empty((batch_size, 0), dtype=torch.bool),
+    return make_temporal_cache(
+        hidden=hidden,
         video_ids=owner.video_ids,
         trajectory_ids=owner.trajectory_ids,
-        query_signatures=query.detach().clone(),
-        total_seen=torch.full((batch_size,), width, dtype=torch.int64),
+        query_signatures=query,
     )
 
 
 def _spatial(owner: RuntimeOwner, slots: Tensor) -> SpatialEncoderOutput:
-    batch_size, width = slots.shape[:2]
-    mask = torch.ones((batch_size, width), dtype=torch.bool)
-    next_states = tuple(
-        SpatialSlotRuntimeState(
-            video_id=owner.video_ids[row],
-            slots=slots[row].detach().clone(),
-            slot_valid_mask=mask[row].clone(),
-            slot_confidence=torch.ones(width),
-            active_slot_overflow_count=0,
-            overflow_event_count=0,
-            processed_tubelets=3,
-        )
-        for row in range(batch_size)
-    )
-    return SpatialEncoderOutput(
-        slots=slots,
-        slot_valid_mask=mask,
-        active_slot_overflow_count=torch.zeros(batch_size, dtype=torch.int64),
-        slot_confidence=torch.ones((batch_size, width)),
-        next_states=next_states,
-    )
+    return make_spatial_output(slots, video_ids=owner.video_ids)
 
 
 def _stream_states(
     owner: RuntimeOwner, query: Tensor, width: int
 ) -> tuple[tuple[E1RuntimeState, ...], tuple[E2RuntimeState, ...]]:
-    timestamps = torch.arange(width, dtype=torch.float64)
-    positions = torch.arange(width, dtype=torch.int64)
-    e1 = tuple(
-        E1RuntimeState(
-            video_id=owner.video_ids[row],
-            trajectory_id=owner.trajectory_ids[row],
-            query_signature=query[row].detach().clone(),
-            projected_history=torch.zeros((width, 512)),
-            timestamps=timestamps.clone(),
-            position_ids=positions.clone(),
-            total_seen=width,
-        )
-        for row in range(len(owner.video_ids))
-    )
-    e2_items: list[E2RuntimeState] = []
-    for row in range(len(owner.video_ids)):
-        checkpoints = torch.zeros((width, 2, 768))
-        e2_items.append(
-            E2RuntimeState(
+    rows = range(len(owner.video_ids))
+    return (
+        tuple(
+            make_e1_state(
                 video_id=owner.video_ids[row],
                 trajectory_id=owner.trajectory_ids[row],
                 query_signature=query[row].detach().clone(),
-                hidden=checkpoints[-1].clone(),
-                checkpoint_hidden=checkpoints,
-                timestamps=timestamps.clone(),
-                position_ids=positions.clone(),
                 total_seen=width,
             )
-        )
-    return e1, tuple(e2_items)
+            for row in rows
+        ),
+        tuple(
+            make_e2_state(
+                video_id=owner.video_ids[row],
+                trajectory_id=owner.trajectory_ids[row],
+                query_signature=query[row].detach().clone(),
+                total_seen=width,
+            )
+            for row in rows
+        ),
+    )
 
 
 def _observations(
@@ -206,12 +158,7 @@ def _observations(
         timestamps=timestamps,
         position_ids=positions,
         next_states=e1_states,
-        audit=StreamReplayAudit(
-            "e1",
-            (width,) * batch_size,
-            (0,) * batch_size,
-            (width,) * batch_size,
-        ),
+        audit=make_stream_audit("e1", batch_size, width),
     )
     event_logits = torch.full((batch_size, width, 4), 5.0, requires_grad=True)
     phase_logits = torch.zeros((batch_size, width, 4), requires_grad=True)
@@ -224,70 +171,21 @@ def _observations(
         timestamps=timestamps.clone(),
         position_ids=positions.clone(),
         next_states=e2_states,
-        audit=StreamReplayAudit(
-            "e2",
-            (width,) * batch_size,
-            (0,) * batch_size,
-            (width,) * batch_size,
-        ),
+        audit=make_stream_audit("e2", batch_size, width),
     )
     return ObservationOutputs(o1=o1, o2=o2, e1=e1, e2=e2)
 
 
 def _query(owner: RuntimeOwner) -> QueryEncoderOutput:
     batch_size = len(owner.video_ids)
-    operators = (
-        Operator.O1_SNAP,
-        Operator.O2_UNIQUE,
-        Operator.E1_ACTION,
-        Operator.E2_PERIODIC,
-    )
-    query = torch.nn.functional.normalize(torch.randn((batch_size, 512)), dim=-1)
-    embeddings = QueryEmbeddingOutput(
-        token_states=torch.zeros((batch_size, 1, 768)),
-        pooling_weights=torch.ones((batch_size, 1)),
-        q_target=query,
-        q_operator=query.clone(),
-        q_time=query.clone(),
-        padding_mask=torch.zeros((batch_size, 1), dtype=torch.bool),
-    )
-    raw = torch.tensor([tuple(Operator).index(value) for value in operators])
-    logits = torch.full((batch_size, 9), -5.0)
-    logits[torch.arange(batch_size), raw] = 5.0
-    route = OperatorRouterOutput(
-        logits=logits,
-        confidence=torch.ones(batch_size),
-        raw_indices=raw,
-        hard_operators=operators,
-        head_types=tuple(OPERATOR_TO_HEAD_TYPE[value] for value in operators),
-        confidence_gate_applied=False,
-    )
-    time_logits = TimeResolverLogits(
-        mode_logits=torch.zeros((batch_size, 4)),
-        mode_confidence=torch.ones(batch_size),
-        mode_indices=torch.ones(batch_size, dtype=torch.int64),
-        span_start_logits=torch.zeros((batch_size, 1)),
-        span_end_logits=torch.zeros((batch_size, 1)),
-        padding_mask=torch.zeros((batch_size, 1), dtype=torch.bool),
-    )
-    resolutions = tuple(
-        TimeResolution(
-            window=TimeWindow(TimeWindowMode.HISTORY, 2.0, 0.0, 2.0, True),
-            status=TimeResolutionStatus.OK,
-            reason="synthetic_explicit",
-            mode_confidence=1.0,
-            numeric_span=None,
-            parsed_values_seconds=(),
-            used_operator_default=True,
-        )
-        for _ in range(batch_size)
-    )
-    return QueryEncoderOutput(
-        embeddings=embeddings,
-        route=route,
-        time=TimeResolverOutput(time_logits, resolutions),
-        hard_operators=operators,
-        head_types=route.head_types,
+    return make_query_output(
+        (
+            Operator.O1_SNAP,
+            Operator.O2_UNIQUE,
+            Operator.E1_ACTION,
+            Operator.E2_PERIODIC,
+        ),
+        q_target=torch.nn.functional.normalize(torch.randn((batch_size, 512)), dim=-1),
     )
 
 
