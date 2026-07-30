@@ -16,7 +16,7 @@ Starts four-GPU A5 Meta-TTT with this Qwen Outer policy:
 
 The A2 checkpoint must contain the complete Outer model. The v3 manifest must be the same
 Support-aligned manifest used to prewarm the strict A5 cache. The warmup bundle must be produced
-by the matching 128-step Fast/State warmup. Environment overrides accepted by
+by the matching 256-step Memory/State warmup. Environment overrides accepted by
 scripts/h200/train_a2_a5.sh remain available, including TTT_PROJECT_ROOT,
 TTT_PREPROCESS_CACHE_ROOT, TTT_RESUME_CHECKPOINT, RUN_ID, SESSION, and DRY_RUN.
 EOF

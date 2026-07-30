@@ -10,8 +10,8 @@ usage:
 If dataset_manifest.json is omitted, the script builds the fixed fold0/K=8 manifest from the
 existing H200 SVCBench conversion. Environment overrides: TTT_PROJECT_ROOT,
 SVCBENCH_DATASET_ROOT, SVCBENCH_DATASET_MANIFEST, RUN_ID, SESSION,
-CUDA_VISIBLE_DEVICES, TTT_RESUME_CHECKPOINT, TTT_H200_VENV, TTT_PREPROCESS_CACHE_ROOT,
-TTT_DATALOADER_TRACE. The outer invocation starts a detached tmux;
+CUDA_VISIBLE_DEVICES, TTT_WORLD_SIZE, TTT_LAUNCHER, TTT_RESUME_CHECKPOINT, TTT_H200_VENV,
+TTT_PREPROCESS_CACHE_ROOT, TTT_DATALOADER_TRACE. The outer invocation starts a detached tmux;
 set RUN_IN_TMUX=1 only when already running inside the intended tmux pane. One-step validation may
 set TTT_SMOKE_MAX_STEPS=1 and TTT_SKIP_FINAL_CHECKPOINT=1. Shortest-first sampling is disabled by
 default; set TTT_SMOKE_SHORTEST_FIRST=1 explicitly only for a deliberately lightweight smoke test.
@@ -37,6 +37,20 @@ CONVERTED_DATASET="$DATASET_ROOT/$DATASET_NAME.json"
 BOOTSTRAP_PYTHON="${TTT_BOOTSTRAP_PYTHON:-/mnt/shared-storage-user/mineru2-shared/niujunbo/miniconda3/envs/openclaw-rl/bin/python3.12}"
 VENV="${TTT_H200_VENV:-$PROJECT_ROOT/.venv-h200-py312-torch28}"
 PYTHON="$VENV/bin/python"
+LAUNCHER="${TTT_LAUNCHER:-$PROJECT_ROOT/scripts/h200/launch_4gpu.sh}"
+TTT_WORLD_SIZE="${TTT_WORLD_SIZE:-4}"
+case "$TTT_WORLD_SIZE" in
+  4)
+    DEFAULT_CUDA_VISIBLE_DEVICES="0,1,2,3"
+    ;;
+  8)
+    DEFAULT_CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+    ;;
+  *)
+    echo "TTT_WORLD_SIZE must be 4 or 8, got: $TTT_WORLD_SIZE" >&2
+    exit 2
+    ;;
+esac
 H200_TORCH_VERSION="2.8.0+cu128"
 H200_TORCHVISION_VERSION="0.23.0+cu128"
 H200_TORCHAUDIO_VERSION="2.8.0+cu128"
@@ -48,6 +62,7 @@ if [[ "$TTT_SMOKE_SHORTEST_FIRST" != "0" && "$TTT_SMOKE_SHORTEST_FIRST" != "1" ]
   exit 2
 fi
 export TTT_SMOKE_SHORTEST_FIRST
+export TTT_WORLD_SIZE
 
 if [[ "$(id -un)" != "$EXPECTED_USER" ]]; then
   echo "refusing to train as $(id -un); expected $EXPECTED_USER" >&2
@@ -55,6 +70,10 @@ if [[ "$(id -un)" != "$EXPECTED_USER" ]]; then
 fi
 if [[ ! -e "$PROJECT_ROOT/.git" ]]; then
   echo "project checkout not found: $PROJECT_ROOT" >&2
+  exit 1
+fi
+if [[ ! -f "$LAUNCHER" ]]; then
+  echo "H200 distributed launcher not found: $LAUNCHER" >&2
   exit 1
 fi
 for path in "$ANNOTATION" "$CONVERTED_DATASET"; do
@@ -99,10 +118,10 @@ else
 fi
 
 if [[ "$STAGE" == "a2" ]]; then
-  TASK_NAME="qwen3vl8b_ttt_a2_fullprefix256_4h200"
+  TASK_NAME="qwen3vl8b_ttt_a2_fullprefix256_${TTT_WORLD_SIZE}h200"
   YAML="${YAML:-$PROJECT_ROOT/configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml}"
 else
-  TASK_NAME="qwen3vl8b_ttt_a5_k8_fullprefix256_4h200"
+  TASK_NAME="qwen3vl8b_ttt_a5_k8_fullprefix256_${TTT_WORLD_SIZE}h200"
   YAML="${YAML:-$PROJECT_ROOT/configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml}"
 fi
 RUN_ID="${RUN_ID:-$(date +%y%m%d_%H%M%S)_${TASK_NAME}}"
@@ -134,7 +153,9 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
     "YAML=$YAML"
     "TTT_H200_VENV=$VENV"
     "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
-    "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+    "TTT_WORLD_SIZE=$TTT_WORLD_SIZE"
+    "TTT_LAUNCHER=$LAUNCHER"
+    "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$DEFAULT_CUDA_VISIBLE_DEVICES}"
   )
   if [[ -n "$MANIFEST" ]]; then
     inner_env+=("SVCBENCH_DATASET_MANIFEST=$MANIFEST")
@@ -281,6 +302,7 @@ if [[ -z "$MANIFEST" ]]; then
     --video-root "$SOURCE_VIDEO_ROOT" \
     --dataset-name svcbench-part \
     --dataset-revision h200-20260710 \
+    --world-size "$TTT_WORLD_SIZE" \
     --output-root "$PROJECT_ROOT/runs")"
   PREP_DIR="$(printf '%s\n' "$PREP_OUTPUT" | tail -n 1)"
   MANIFEST="$PREP_DIR/dataset_manifest.json"
@@ -295,7 +317,7 @@ export TTT_H200_PLAY_ROOT="$PLAY_ROOT"
 export MODEL DATASET_DIR DATASET_NAME YAML RUN_ID SESSION RUN_ROOT LOG_DIR LOG_FILE
 export SVCBENCH_DATASET_MANIFEST="$(cd "$(dirname "$MANIFEST")" && pwd)/$(basename "$MANIFEST")"
 export SVCBENCH_VIDEO_ROOT="$SOURCE_VIDEO_ROOT"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$DEFAULT_CUDA_VISIBLE_DEVICES}"
 
 echo "stage=$STAGE"
 echo "manifest=$SVCBENCH_DATASET_MANIFEST"
@@ -305,4 +327,4 @@ if [[ "$STAGE" == "a5" ]]; then
   echo "a2_checkpoint=$A2_CHECKPOINT"
 fi
 
-exec bash scripts/h200/launch_4gpu.sh "$STAGE"
+exec bash "$LAUNCHER" "$STAGE"

@@ -46,9 +46,13 @@ def test_schema13_slot_memory_and_robust_query_contract_roundtrips() -> None:
     assert config.associative_ttt.key_dim == 768
     assert config.associative_ttt.bank_empty_policy == "zero"
     assert config.fast_ttt.online_parameter_count == 589_824
-    assert config.a5.warmup.max_steps == 128
+    assert config.a5.warmup.max_steps == 256
     assert config.a5.warmup.linear_warmup_steps == 4
+    assert config.a5.warmup.fast_slow_learning_rate == 0.0
     assert config.a5.warmup.state_learning_rate == 1.0e-5
+    assert config.a5.warmup.w0_learning_rate == 0.0
+    assert config.a5.warmup.associative_learning_rate == 5.0e-5
+    assert config.a5.warmup.bundle_schema_version == 2
     assert ProjectConfig.model_validate(config.model_dump()) == config
 
 

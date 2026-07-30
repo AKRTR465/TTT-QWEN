@@ -488,13 +488,13 @@ a5:
     w0_learning_rate: 5.0e-5
     associative_learning_rate: 5.0e-5
   warmup:
-    max_steps: 128
+    max_steps: 256
     linear_warmup_steps: 4
-    fast_slow_learning_rate: 5.0e-5
+    fast_slow_learning_rate: 0.0
     state_learning_rate: 1.0e-5
-    w0_learning_rate: 5.0e-5
+    w0_learning_rate: 0.0
     associative_learning_rate: 5.0e-5
-    bundle_schema_version: 1
+    bundle_schema_version: 2
   query_meta_gradient:
     mode: per_query_global_norm_clip_sum
     max_norm: 10.0

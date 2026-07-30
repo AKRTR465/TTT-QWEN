@@ -30,7 +30,9 @@ from ttt_svcbench_qwen.episode_data import (
 def main() -> int:
     args = _parse_args()
     started = time.monotonic()
-    run_id = args.run_id or datetime.now().strftime("%m%d_%H%M%S_prepare_svcbench_k8")
+    run_id = args.run_id or datetime.now().strftime(
+        f"%m%d_%H%M%S_prepare_svcbench_k8_w{args.world_size}"
+    )
     output_dir = args.output_root / run_id
     if output_dir.exists():
         raise FileExistsError(f"refusing to overwrite an existing run: {output_dir}")
@@ -51,7 +53,7 @@ def main() -> int:
         "fold_index": 0,
         "seed": 42,
         "truncation_horizon": 8,
-        "world_size": 4,
+        "world_size": args.world_size,
         "video_duration_tolerance_seconds": 1.0,
     }
     _write_json(output_dir / "run_config.json", run_config)
@@ -91,7 +93,7 @@ def main() -> int:
         seed=42,
         n_splits=5,
         truncation_horizon=8,
-        world_size=4,
+        world_size=args.world_size,
     )
     write_production_episode_manifest(
         manifest,
@@ -159,6 +161,7 @@ def main() -> int:
             episode.insufficient_inter_query_gap for episode in real_episodes
         ),
         "padding_episode_count": len(manifest.episodes) - len(real_episodes),
+        "world_size": args.world_size,
         "failed_query_count": len(manifest.failures),
         "task_query_counts": dict(manifest.task_query_counts),
         "elapsed_seconds": elapsed,
@@ -188,6 +191,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-revision", required=True)
     parser.add_argument("--output-root", type=Path, default=Path("runs"))
     parser.add_argument("--run-id")
+    parser.add_argument("--world-size", type=int, choices=(4, 8), default=4)
     return parser.parse_args()
 
 

@@ -13,6 +13,19 @@ PLAY_ROOT="/mnt/shared-storage-user/mineru2-shared/niujunbo/play"
 export TTT_H200_PLAY_ROOT="${TTT_H200_PLAY_ROOT:-$PLAY_ROOT}"
 VENV="${TTT_H200_VENV:-$PROJECT_ROOT/.venv-h200-py312-torch28}"
 PYTHON="$VENV/bin/python"
+WORLD_SIZE="${TTT_WORLD_SIZE:-4}"
+case "$WORLD_SIZE" in
+  4)
+    DEFAULT_CUDA_VISIBLE_DEVICES="0,1,2,3"
+    ;;
+  8)
+    DEFAULT_CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+    ;;
+  *)
+    echo "TTT_WORLD_SIZE must be 4 or 8, got: $WORLD_SIZE" >&2
+    exit 2
+    ;;
+esac
 
 if [[ "$(id -un)" != "$EXPECTED_USER" ]]; then
   echo "refusing to train as $(id -un); expected $EXPECTED_USER" >&2
@@ -69,8 +82,8 @@ if [[ "$STAGE" == "a5" ]]; then
 fi
 
 GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
-if (( GPU_COUNT < 4 )); then
-  echo "four GPUs are required; nvidia-smi reported $GPU_COUNT" >&2
+if (( GPU_COUNT < WORLD_SIZE )); then
+  echo "$WORLD_SIZE GPUs are required; nvidia-smi reported $GPU_COUNT" >&2
   exit 1
 fi
 FREE_KB="$(df -Pk /mnt/shared-storage-user/mineru2-shared | awk 'NR==2 {print $4}')"
@@ -81,7 +94,12 @@ fi
 
 cd "$PROJECT_ROOT"
 export PYTHONPATH="$PROJECT_ROOT/src:$PLAY_ROOT/LLaMA-Factory/src${PYTHONPATH:+:$PYTHONPATH}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$DEFAULT_CUDA_VISIBLE_DEVICES}"
+VISIBLE_GPU_COUNT="$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")"
+if (( VISIBLE_GPU_COUNT != WORLD_SIZE )); then
+  echo "TTT_WORLD_SIZE=$WORLD_SIZE requires exactly $WORLD_SIZE CUDA_VISIBLE_DEVICES entries, got: $CUDA_VISIBLE_DEVICES" >&2
+  exit 2
+fi
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -108,7 +126,7 @@ export PYTHONUNBUFFERED=1
 export FORCE_TORCHRUN=1
 export NNODES=1
 export NODE_RANK=0
-export NPROC_PER_NODE=4
+export NPROC_PER_NODE="$WORLD_SIZE"
 
 "$PYTHON" - <<'PY'
 import importlib.metadata as metadata
@@ -149,10 +167,10 @@ if not torch.cuda.is_available():
 PY
 
 if [[ "$STAGE" == "a2" ]]; then
-  TASK_NAME="a2_fullprefix256_8b_4h200"
+  TASK_NAME="a2_fullprefix256_8b_${WORLD_SIZE}h200"
   CONFIG="${YAML:-configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml}"
 else
-  TASK_NAME="a5_k8_fullprefix256_8b_4h200"
+  TASK_NAME="a5_k8_fullprefix256_8b_${WORLD_SIZE}h200"
   CONFIG="${YAML:-configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml}"
 fi
 if [[ "${TTT_PREFLIGHT_ONLY:-0}" == "1" ]]; then
@@ -186,10 +204,12 @@ from pathlib import Path
 path, stage, config = sys.argv[1:]
 adaptation_mode = None
 from ttt_svcbench_qwen.config import load_config
+from ttt_svcbench_qwen.episode_data import EpisodeSplit, load_production_episode_manifest
 from ttt_svcbench_qwen.production_factory import load_training_yaml
 
 native, extension = load_training_yaml(config)
 project = load_config(extension.project_config)
+world_size = int(os.environ["NPROC_PER_NODE"])
 if stage == "a5":
     adaptation_mode = extension.a5_adaptation_mode
     requested_mode = os.environ.get("TTT_A5_ADAPTATION_MODE")
@@ -197,41 +217,55 @@ if stage == "a5":
         raise ValueError(
             "TTT_A5_ADAPTATION_MODE disagrees with ttt_qwen.a5_adaptation_mode"
         )
+    manifest = load_production_episode_manifest(os.environ["SVCBENCH_DATASET_MANIFEST"])
+    active_bucket_world_sizes = {
+        bucket.world_size for bucket in manifest.buckets if bucket.split is EpisodeSplit.TRAIN
+    }
+    if active_bucket_world_sizes != {world_size}:
+        raise ValueError(
+            "A5 dataset manifest bucket world_size does not match the active launcher: "
+            f"manifest={sorted(active_bucket_world_sizes)}, active={world_size}; "
+            f"regenerate it with scripts/prepare_svcbench_episodes.py --world-size {world_size}"
+        )
 caps = project.outer_gradient_control.max_grad_norm
 if stage == "a2":
     qwen_lr = float(project.a2.optimizer.qwen_learning_rate)
     state_lr = float(project.a2.optimizer.state_learning_rate)
     w0_lr = float(project.a2.optimizer.w0_learning_rate)
     independent_budgets = {"w0": w0_lr * float(caps.w0)}
+    reference_budget = qwen_lr * float(caps.qwen)
 else:
-    qwen_lr = float(native["learning_rate"])
+    is_warmup = extension.a5_phase == "fast_state_warmup"
+    qwen_lr = 0.0 if is_warmup else float(native["learning_rate"])
     optimizer = (
         project.a5.warmup
-        if extension.a5_phase == "fast_state_warmup"
+        if is_warmup
         else project.a5.optimizer
     )
     fast_slow_lr = float(optimizer.fast_slow_learning_rate)
     state_lr = float(optimizer.state_learning_rate)
     w0_lr = float(optimizer.w0_learning_rate)
-    independent_budgets = {
-        "fast_slow": fast_slow_lr * float(caps.fast_slow),
-        "w0": w0_lr * float(caps.w0),
-    }
-    if adaptation_mode == "meta_ttt":
-        independent_budgets["associative"] = (
-            float(optimizer.associative_learning_rate) * float(caps.associative)
-        )
+    associative_budget = (
+        float(optimizer.associative_learning_rate) * float(caps.associative)
+    )
+    if is_warmup:
+        independent_budgets = {"associative": associative_budget}
+        reference_budget = associative_budget
+    else:
+        independent_budgets = {
+            "fast_slow": fast_slow_lr * float(caps.fast_slow),
+            "w0": w0_lr * float(caps.w0),
+        }
+        if adaptation_mode == "meta_ttt":
+            independent_budgets["associative"] = associative_budget
+        reference_budget = qwen_lr * float(caps.qwen)
 state_names = ("state_shared", "state_task", "state_router_time", "state_retrieval")
 budget_audit = {
     "policy": project.outer_gradient_control.mode.value,
     "memory_eta_max_per_slot": float(project.fast_memory.eta_max_per_slot),
     "memory_eta_chunk_budget": float(project.fast_memory.eta_chunk_budget),
     "memory_forget_beta_max": float(project.fast_memory.forget_beta_max),
-    "reference": (
-        fast_slow_lr * float(caps.fast_slow)
-        if stage == "a5" and extension.a5_phase == "fast_state_warmup"
-        else qwen_lr * float(caps.qwen)
-    ),
+    "reference": reference_budget,
     "independent": independent_budgets,
     "state_rss": math.sqrt(
         sum((state_lr * float(getattr(caps, name))) ** 2 for name in state_names)
@@ -259,7 +293,7 @@ payload = {
     "pid": int(os.environ["LAUNCHER_PID"]),
     "started_at": datetime.now(timezone.utc).isoformat(),
     "model": os.environ["MODEL"],
-    "world_size": 4,
+    "world_size": world_size,
     "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
     "dataset_manifest": os.environ["SVCBENCH_DATASET_MANIFEST"],
     "runtime_factory": "ttt_svcbench_qwen.production_runtime:build_runtime",
@@ -274,7 +308,7 @@ payload = {
         if not os.environ.get("TTT_RUN_TIMEOUT_SECONDS")
         else int(os.environ["TTT_RUN_TIMEOUT_SECONDS"])
     ),
-    "launch_command": f"python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=4 -m ttt_svcbench_qwen.llamafactory_trainer {config}",
+    "launch_command": f"python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node={world_size} -m ttt_svcbench_qwen.llamafactory_trainer {config}",
 }
 Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 PY
@@ -342,7 +376,7 @@ START_EPOCH="$(date +%s)"
     echo "a5_adaptation_mode=${TTT_A5_ADAPTATION_MODE:-from_yaml}"
     echo "a5_warmup_bundle=${A5_WARMUP_BUNDLE:-none}"
   fi
-  echo "launch world_size=4 config=$CONFIG"
+  echo "launch world_size=$WORLD_SIZE config=$CONFIG"
 } > "$RUN_ROOT/experiment.log"
 
 if [[ "${TTT_PREFLIGHT_ONLY:-0}" == "1" ]]; then
@@ -428,7 +462,7 @@ trap cleanup_gpu_monitor EXIT INT TERM
 
 set +e
 TRAIN_COMMAND=(
-  "$PYTHON" -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=4
+  "$PYTHON" -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node="$WORLD_SIZE"
   -m ttt_svcbench_qwen.llamafactory_trainer "$CONFIG"
 )
 if [[ -n "${TTT_RUN_TIMEOUT_SECONDS:-}" ]]; then

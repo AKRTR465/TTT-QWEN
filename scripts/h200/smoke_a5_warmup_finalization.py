@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the A5 warmup handoff ordering on four CUDA/NCCL ranks."""
+"""Exercise the A5 warmup handoff ordering on four or eight CUDA/NCCL ranks."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def _worker(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--world-size", type=int, default=4)
+    parser.add_argument("--world-size", type=int, choices=(4, 8), default=4)
     return parser.parse_args()
 
 
@@ -86,10 +86,10 @@ def main() -> int:
     args = _parse_args()
     if os.environ.get("USER") != "niujunbo":
         raise RuntimeError("H200 finalization smoke must run as niujunbo")
-    if args.world_size != 4:
-        raise ValueError("the release regression requires exactly four ranks")
+    if args.world_size not in {4, 8}:
+        raise ValueError("the release regression requires four or eight ranks")
     if not torch.cuda.is_available() or torch.cuda.device_count() < args.world_size:
-        raise RuntimeError("four visible CUDA devices are required")
+        raise RuntimeError(f"{args.world_size} visible CUDA devices are required")
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
     init_path = output_dir / "nccl-init"

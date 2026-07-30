@@ -198,15 +198,15 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             raise ValueError("A2 requires full Qwen outer trainability")
         if self.stage == "a5" and self.a5_adaptation_mode == "no_write":
             if self.a5_phase != "main" or self.warmup_bundle is not None:
-                raise ValueError("no-write A5 cannot use the Fast/State warmup handoff")
+                raise ValueError("no-write A5 cannot use the Memory/State warmup handoff")
             if self.qwen_outer_trainability.mode == "frozen":
                 raise ValueError("no-write A5 requires a trainable Qwen policy")
         if self.stage == "a5" and self.a5_adaptation_mode == "meta_ttt":
             if self.a5_phase == "fast_state_warmup":
                 if self.qwen_outer_trainability.mode != "frozen":
-                    raise ValueError("Fast/State warmup requires fully frozen Qwen")
+                    raise ValueError("Memory/State warmup requires fully frozen Qwen")
                 if self.warmup_bundle is not None:
-                    raise ValueError("Fast/State warmup cannot consume a warmup bundle")
+                    raise ValueError("Memory/State warmup cannot consume a warmup bundle")
             else:
                 if self.qwen_outer_trainability.mode == "frozen":
                     raise ValueError("A5 main requires the configured partial Qwen policy")
