@@ -409,8 +409,6 @@ class CurrentChunkVisualTokenAudit:
     batch_size: int
     raw_patch_counts: tuple[int, ...]
     merged_token_counts: tuple[int, ...]
-    history_feature_set_count: int
-    dynamic_token_count_allowed: bool
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -422,10 +420,6 @@ class CurrentChunkVisualTokenAudit:
             raise ValueError("current-chunk visual audit counts must align to the batch")
         if any(value <= 0 for value in (*self.raw_patch_counts, *self.merged_token_counts)):
             raise ValueError("current-chunk visual token counts must be positive")
-        if self.history_feature_set_count != 0:
-            raise ValueError("historical chunk visual features may not enter a Qwen prefill")
-        if not self.dynamic_token_count_allowed:
-            raise ValueError("production current-chunk visual counts are intentionally dynamic")
 
 
 def audit_current_chunk_visual_tokens(
@@ -453,8 +447,6 @@ def audit_current_chunk_visual_tokens(
         batch_size=len(prepared.metadata.token_counts),
         raw_patch_counts=raw_patch_counts,
         merged_token_counts=prepared.metadata.token_counts,
-        history_feature_set_count=0,
-        dynamic_token_count_allowed=True,
     )
 
 

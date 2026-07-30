@@ -323,12 +323,6 @@ class A5EpisodeRecord:
         )
 
     @property
-    def query_count(self) -> int:
-        """Compatibility alias: only gradient-bearing Meta Queries count at runtime."""
-
-        return self.meta_query_count
-
-    @property
     def segment_lengths(self) -> tuple[int, ...]:
         return tuple(len(segment.supports) for segment in self.supervised_segments)
 
@@ -876,7 +870,7 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
                 raise ValueError("A5 visual cost Support count disagrees with manifest")
             if sidecar.segment_lengths != _a5_segment_lengths(record):
                 raise ValueError("A5 visual cost segment lengths disagree with manifest")
-            if sidecar.query_count != record.query_count:
+            if sidecar.query_count != record.meta_query_count:
                 raise ValueError("A5 visual cost Query count disagrees with manifest")
             return (
                 self.runtime_cost_ema.value(

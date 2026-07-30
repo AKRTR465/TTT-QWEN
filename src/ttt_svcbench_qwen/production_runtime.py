@@ -197,7 +197,6 @@ class SupportChunkSpec:
     maximum_frames: int
     query_time: float
     reset_soft_state: bool = False
-    history_chunk_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.chunk_id or not self.video_path.is_file():
@@ -212,9 +211,6 @@ class SupportChunkSpec:
             raise ValueError("Support chunk must satisfy 0 <= start < end <= query_time")
         if self.maximum_frames < 2 or self.maximum_frames > 16:
             raise ValueError("production Support chunks permit 2..16 frames")
-        if self.history_chunk_ids:
-            raise ValueError("a Support chunk specification cannot carry historical chunks")
-
     @property
     def observation_role(self) -> str:
         return "support"
@@ -239,7 +235,6 @@ class QueryObservationSpec:
     maximum_frames: int
     query_time: float
     reset_soft_state: bool = False
-    history_chunk_ids: tuple[str, ...] = ()
     sampling_fps: float = 2.0
     sampling_policy: str = "llamafactory_uniform_cap"
     decode_max_groups: int = 16
@@ -265,8 +260,6 @@ class QueryObservationSpec:
             raise ValueError("unsupported Query frame sampling policy")
         if self.decode_max_groups < 1 or self.decode_max_groups > 16:
             raise ValueError("Query decode_max_groups must be within [1, 16]")
-        if self.history_chunk_ids:
-            raise ValueError("a Query observation cannot carry historical feature sets")
         if self.query_role not in {"query", "state_query", "answer_query"}:
             raise ValueError("unsupported Query observation role")
 
@@ -555,15 +548,6 @@ class PreparedA5Record:
 class ProductionVisualAudit:
     chunk: CurrentChunkMaterialization | PreparedVisualCPU
     token: CurrentChunkVisualTokenAudit
-    current_chunk_only: bool = True
-
-    def __post_init__(self) -> None:
-        if not self.current_chunk_only or self.chunk.spec.history_chunk_ids:
-            raise ValueError("production visual input must contain only the current chunk")
-
-    @property
-    def history_feature_set_count(self) -> int:
-        return self.token.history_feature_set_count
 
     @property
     def observation_role(self) -> str:
@@ -2415,7 +2399,7 @@ def _build_runtime_preprocess_cache(
     processor_name = (
         type(backbone.processor).__qualname__ if backbone.processor is not None else "none"
     )
-    raw_cache_dtype = str(getattr(config, "preprocess_cache_dtype", "float32"))
+    raw_cache_dtype = str(config.preprocess_cache_dtype)
     if raw_cache_dtype not in {"float32", "float16"}:
         raise ValueError(f"unsupported preprocess cache dtype: {raw_cache_dtype}")
     cache_dtype = cast(PreprocessCacheStorageDtype, raw_cache_dtype)
@@ -2636,10 +2620,11 @@ def build_inference_runtime_bundle(
     if not root.is_dir():
         raise FileNotFoundError(f"Qwen model root does not exist: {root}")
     config = load_config(config_path)
-    processor = transformers.AutoProcessor.from_pretrained(root, local_files_only=True)
-    tokenizer = getattr(processor, "tokenizer", None)
-    if tokenizer is None:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(root, local_files_only=True)
+    processor = _require_latest_qwen_processor(
+        transformers.AutoProcessor.from_pretrained(root, local_files_only=True),
+        context="inference runtime",
+    )
+    tokenizer = processor.tokenizer
     model_type = getattr(transformers, "Qwen3VLForConditionalGeneration", None)
     if model_type is None:
         raise RuntimeError("installed transformers has no Qwen3VLForConditionalGeneration")

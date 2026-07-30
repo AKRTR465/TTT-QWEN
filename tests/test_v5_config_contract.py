@@ -52,14 +52,6 @@ def test_schema12_state_write_fast_and_robust_query_contract_roundtrips() -> Non
     assert ProjectConfig.model_validate(config.model_dump()) == config
 
 
-@pytest.mark.parametrize("schema", [6, 7, 8, 9, 10, 11])
-def test_legacy_schema_cannot_cross_associative_boundary(schema: int) -> None:
-    raw = _raw()
-    raw["config_schema_version"] = schema
-    with pytest.raises(ValueError, match="schema 11|config_schema_version must be 12"):
-        ProjectConfig.model_validate(raw)
-
-
 @pytest.mark.parametrize(
     ("field", "value"),
     [

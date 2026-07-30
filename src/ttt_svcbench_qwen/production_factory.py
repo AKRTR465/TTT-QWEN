@@ -45,6 +45,26 @@ _FORBIDDEN_CHECKPOINT_TOKENS = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _LegacyA2ToA5Profile:
+    """The sole tolerated historical checkpoint shape at the A2-to-A5 boundary."""
+
+    missing_fragments: tuple[str, ...] = (".p_context.", "associative_contract_version")
+    unexpected_modules: tuple[str, ...] = ("predictor.", "p_value.")
+
+    def allows_missing(self, key: str) -> bool:
+        return any(fragment in key for fragment in self.missing_fragments)
+
+    def allows_unexpected(self, key: str) -> bool:
+        return any(
+            key.startswith(module) or f".{module}" in key
+            for module in self.unexpected_modules
+        )
+
+
+_LEGACY_A2_TO_A5 = _LegacyA2ToA5Profile()
+
+
 class QwenOuterTrainabilityConfig(BaseModel):  # type: ignore[misc]
     """Stage-local Qwen parameter policy applied after LLaMA-Factory model loading."""
 
@@ -751,55 +771,19 @@ def load_outer_checkpoint(
 def initialize_outer_model_from_a2(
     model: nn.Module,
     checkpoint: str | Path,
-    *,
-    allowed_missing_prefixes: tuple[str, ...] = (),
-    allowed_missing_fragments: tuple[str, ...] = (),
-    allowed_unexpected_prefixes: tuple[str, ...] = (),
 ) -> OuterCheckpointAudit:
-    """Load A2 weights only, leaving A5 optimizer/scheduler/RNG freshly initialized."""
+    """Load exact-current or narrowly profiled legacy A2 weights for A5 initialization."""
 
     root = Path(checkpoint).resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"A2 checkpoint directory does not exist: {root}")
     expected_all = set(audit_outer_checkpoint_boundary(model))
-    if any(
-        not value
-        for value in (
-            *allowed_missing_prefixes,
-            *allowed_missing_fragments,
-            *allowed_unexpected_prefixes,
-        )
-    ):
-        raise ValueError("allowed A2 initialization prefixes must be non-empty")
-
-    def allowed_prefix(key: str, prefixes: tuple[str, ...]) -> bool:
-        return any(
-            key.startswith(prefix) or f".{prefix}" in key for prefix in prefixes
-        )
-
-    allowed_missing = {
-        key
-        for key in expected_all
-        if any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
-        or any(fragment in key for fragment in allowed_missing_fragments)
-    }
-    if (allowed_missing_prefixes or allowed_missing_fragments) and not allowed_missing:
-        raise ValueError("allowed A2 initialization prefix matched no model parameters")
-    expected_keys = expected_all - allowed_missing
     safe_index = root / "model.safetensors.index.json"
     torch_index = root / "pytorch_model.bin.index.json"
     safe_weights = root / "model.safetensors"
     torch_weights = root / "pytorch_model.bin"
-    missing: tuple[str, ...]
-    unexpected: tuple[str, ...]
     if safe_index.is_file() or torch_index.is_file():
-        result = load_sharded_checkpoint(model, str(root), strict=False, prefer_safe=True)
-        missing = tuple(key for key in result.missing_keys if key not in allowed_missing)
-        unexpected = tuple(
-            key
-            for key in result.unexpected_keys
-            if not allowed_prefix(key, allowed_unexpected_prefixes)
-        )
+        load_sharded_checkpoint(model, str(root), strict=False, prefer_safe=True)
         index_path = safe_index if safe_index.is_file() else torch_index
         index = json.loads(index_path.read_text(encoding="utf-8"))
         weight_map = index.get("weight_map")
@@ -809,13 +793,7 @@ def initialize_outer_model_from_a2(
         checkpoint_format = "sharded_safetensors" if safe_index.is_file() else "sharded_torch"
     elif safe_weights.is_file():
         state = load_file(str(safe_weights), device="cpu")
-        result = model.load_state_dict(state, strict=False)
-        missing = tuple(key for key in result.missing_keys if key not in allowed_missing)
-        unexpected = tuple(
-            key
-            for key in result.unexpected_keys
-            if not allowed_prefix(key, allowed_unexpected_prefixes)
-        )
+        model.load_state_dict(state, strict=False)
         loaded_keys = set(state)
         checkpoint_format = "safetensors"
     elif torch_weights.is_file():
@@ -823,13 +801,7 @@ def initialize_outer_model_from_a2(
         if not isinstance(raw, dict) or not all(isinstance(key, str) for key in raw):
             raise ValueError("A2 torch checkpoint must contain a string-keyed state dict")
         state = cast(dict[str, torch.Tensor], raw)
-        result = model.load_state_dict(state, strict=False)
-        missing = tuple(key for key in result.missing_keys if key not in allowed_missing)
-        unexpected = tuple(
-            key
-            for key in result.unexpected_keys
-            if not any(key.startswith(prefix) for prefix in allowed_unexpected_prefixes)
-        )
+        model.load_state_dict(state, strict=False)
         loaded_keys = set(state)
         checkpoint_format = "torch"
     else:
@@ -841,15 +813,20 @@ def initialize_outer_model_from_a2(
         for name in loaded_keys
         if any(token in name.casefold() for token in _FORBIDDEN_CHECKPOINT_TOKENS)
     )
-    if loaded_keys != expected_keys:
-        missing = tuple(sorted(expected_keys - loaded_keys))
-        unexpected = tuple(
-            sorted(
-                key
-                for key in loaded_keys - expected_keys
-                if not allowed_prefix(key, allowed_unexpected_prefixes)
-            )
+    missing = tuple(
+        sorted(
+            key
+            for key in expected_all - loaded_keys
+            if not _LEGACY_A2_TO_A5.allows_missing(key)
         )
+    )
+    unexpected = tuple(
+        sorted(
+            key
+            for key in loaded_keys - expected_all
+            if not _LEGACY_A2_TO_A5.allows_unexpected(key)
+        )
+    )
     return OuterCheckpointAudit(
         checkpoint=root,
         format=checkpoint_format,

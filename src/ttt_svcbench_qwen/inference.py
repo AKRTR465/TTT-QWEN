@@ -1771,8 +1771,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "chunk_count": len(result.chunk_audit),
             "state_query_visual_mode": "recent_chunk",
             "answer_query_visual_mode": "causal_prefix",
-            "prepared_video_feature_count": 0,
-            "history_feature_set_count": 0,
             "state_query_frame_count": int(state_materialized.frames.shape[0]),
             "answer_query_frame_count": int(answer_materialized.frames.shape[0]),
             "state_query_visual_token_count": int(state_materialized.pixel_values_videos.shape[0]),

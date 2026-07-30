@@ -83,7 +83,7 @@ def test_production_manifest_has_fold0_buckets_padding_and_explicit_failures(
     padding = tuple(episode for episode in manifest.episodes if episode.loss_weight == 0.0)
     assert len(manifest.a2_query_ids) == 10
     assert len(real) == 5
-    assert sum(episode.query_count for episode in real) == 10
+    assert sum(episode.meta_query_count for episode in real) == 10
     assert len(padding) == 3
     assert all(episode.padding_source_episode_id for episode in padding)
     assert all(len(bucket.episode_ids) % 4 == 0 for bucket in manifest.buckets)

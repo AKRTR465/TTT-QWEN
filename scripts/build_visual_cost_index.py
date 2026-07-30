@@ -404,7 +404,7 @@ def _cost_record(
         record_id = record.episode_id
         support_count = record.support_count
         segment_lengths = _segment_lengths(record)
-        query_count = record.query_count
+        query_count = record.meta_query_count
     else:
         raise TypeError("visual cost builder received an unknown manifest record")
     visual_tokens = tuple(

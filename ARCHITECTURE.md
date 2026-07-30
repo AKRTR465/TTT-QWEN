@@ -158,6 +158,11 @@ load checkpoint
 并绑定 A2/config/data/code hash；禁止保存 Wt、optimizer runtime、Bank、cache、FSM 和
 Associative 临时 context。
 
+唯一历史权重兼容是私有 `legacy_a2_to_a5` profile：只允许旧 A2 缺少新增的 `p_context`、
+`associative_contract_version`，以及包含已删除的 `predictor`、`p_value`；其余 missing/unexpected
+key 一律拒绝。加载后立即重置 Associative 状态，且该 profile 不得用于 same-stage resume。
+旧 A5 checkpoint 仍必须按 schema-12/current contract 严格恢复，不推断、不迁移。
+
 A2/A5 sampler 必须保持四卡任务或 segment parity。非有限 loss/gradient 必须 warning/skip，不能产生部分参数更新。ZeRO、BF16、显存和性能是否可接受只由真实 H200 记录决定。
 
 ## 7. 验证边界

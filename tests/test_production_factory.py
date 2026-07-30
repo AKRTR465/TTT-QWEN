@@ -31,6 +31,7 @@ from ttt_svcbench_qwen.llamafactory_trainer import (
     _ControlledDeepSpeedEngineWrapper,
     _disable_smoke_checkpoints,
     _publish_epoch_two_four_checkpoints,
+    _reset_a2_to_a5_associative,
     _reset_a2_to_a5_balance,
     _validate_checkpoint_tree,
     _validate_resume_balance_schema,
@@ -70,6 +71,7 @@ from ttt_svcbench_qwen.production_runtime import (
     _TargetSeekUnavailable,
     _uniform_target_times,
     _video_pixel_bounds,
+    build_inference_runtime_bundle,
 )
 from ttt_svcbench_qwen.stage_a_targets import (
     OfficialWeakLossAudit,
@@ -231,12 +233,45 @@ def test_runtime_preprocess_cache_honors_explicit_namespace(
         preprocess_cache_miss_policy="error",
         preprocess_cache_root_env="TEST_PREPROCESS_CACHE_ROOT",
         preprocess_cache_max_gb=1,
+        preprocess_cache_dtype="float32",
     )
 
     cache = _build_runtime_preprocess_cache(backbone, config)
 
     assert cache is not None
     assert cache.namespace == "statequery-v1"
+
+
+def test_inference_bundle_rejects_processor_without_qwen_tokenizer_before_model_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root = tmp_path / "qwen"
+    model_root.mkdir()
+    processor = SimpleNamespace(
+        apply_chat_template=lambda *_args, **_kwargs: "",
+        video_processor=lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.production_runtime.transformers.AutoProcessor.from_pretrained",
+        lambda *_args, **_kwargs: processor,
+    )
+
+    def reject_tokenizer_fallback(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("AutoTokenizer fallback must not be used")
+
+    monkeypatch.setattr(
+        "ttt_svcbench_qwen.production_runtime.transformers.AutoTokenizer.from_pretrained",
+        reject_tokenizer_fallback,
+    )
+
+    with pytest.raises(TypeError, match="requires the Qwen3-VL tokenizer"):
+        build_inference_runtime_bundle(
+            model_root=model_root,
+            checkpoint=tmp_path / "unused-checkpoint",
+            device="cpu",
+            dtype=torch.float32,
+        )
 
 
 class _GroupedOuterToy(nn.Module):
@@ -828,7 +863,6 @@ def test_split_query_specs_bound_state_to_16_and_answer_to_256(tmp_path: Path) -
     assert state.observation_role == "state_query"
     assert (answer.start_time, answer.end_time, answer.maximum_frames) == (0.0, 20.0, 256)
     assert answer.observation_role == "answer_query"
-    assert not state.history_chunk_ids and not answer.history_chunk_ids
 
 
 def test_fullprefix256_trace_override_requires_run_root(
@@ -1699,30 +1733,79 @@ def test_a2_weight_initialization_is_strict_and_excludes_runtime_state(tmp_path:
         audit_outer_checkpoint_boundary(_BadOuter())
 
 
-def test_a2_migration_allows_removed_p_value_and_new_associative_state(
+@pytest.mark.parametrize("checkpoint_format", ("single", "sharded"))
+def test_legacy_a2_to_a5_profile_allows_removed_modules_and_new_associative_state(
     tmp_path: Path,
+    checkpoint_format: str,
 ) -> None:
     target = _GroupedOuterToy(nn.Linear(4, 4), associative_trainable=True)
+    with torch.no_grad():
+        target.fast_adapter.p_context.weight.fill_(1.0)
+        if target.fast_adapter.p_context.bias is not None:
+            target.fast_adapter.p_context.bias.fill_(1.0)
     state = {
         name: value.detach().clone()
         for name, value in target.state_dict().items()
         if ".p_context." not in name and "associative_contract_version" not in name
     }
-    state["fast_adapter.p_value.weight"] = torch.zeros((768, 768))
-    state["fast_adapter.p_value.bias"] = torch.zeros(768)
+    state["fast_adapter.p_value.weight"] = torch.zeros(1)
+    state["fast_adapter.p_value.bias"] = torch.zeros(1)
+    state["fast_adapter.predictor.weight"] = torch.zeros(1)
+    state["fast_adapter.predictor.bias"] = torch.zeros(1)
+    checkpoint = tmp_path / "a2-final"
+    checkpoint.mkdir()
+    if checkpoint_format == "single":
+        save_file(state, checkpoint / "model.safetensors")
+    else:
+        items = tuple(sorted(state.items()))
+        split = len(items) // 2
+        shards = (items[:split], items[split:])
+        weight_map: dict[str, str] = {}
+        for index, shard in enumerate(shards, start=1):
+            filename = f"model-{index:05d}-of-00002.safetensors"
+            save_file(dict(shard), checkpoint / filename)
+            weight_map.update({name: filename for name, _value in shard})
+        (checkpoint / "model.safetensors.index.json").write_text(
+            json.dumps({"metadata": {}, "weight_map": weight_map}),
+            encoding="utf-8",
+        )
+
+    audit = initialize_outer_model_from_a2(target, checkpoint)
+
+    assert audit.format == (
+        "safetensors" if checkpoint_format == "single" else "sharded_safetensors"
+    )
+    assert not audit.missing_keys
+    assert not audit.unexpected_keys
+    assert torch.count_nonzero(target.fast_adapter.p_context.weight) > 0
+    _reset_a2_to_a5_associative(target)
+    assert torch.count_nonzero(target.fast_adapter.p_context.weight) == 0
+    if target.fast_adapter.p_context.bias is not None:
+        assert torch.count_nonzero(target.fast_adapter.p_context.bias) == 0
+
+
+@pytest.mark.parametrize("invalid_boundary", ("missing", "unexpected"))
+def test_legacy_a2_to_a5_profile_rejects_unlisted_boundary_drift(
+    tmp_path: Path,
+    invalid_boundary: str,
+) -> None:
+    target = _GroupedOuterToy(nn.Linear(4, 4), associative_trainable=True)
+    state = {name: value.detach().clone() for name, value in target.state_dict().items()}
+    if invalid_boundary == "missing":
+        key = next(
+            name
+            for name in state
+            if ".p_context." not in name and "associative_contract_version" not in name
+        )
+        del state[key]
+    else:
+        state["fast_adapter.unlisted_legacy.weight"] = torch.zeros(1)
     checkpoint = tmp_path / "a2-final"
     checkpoint.mkdir()
     save_file(state, checkpoint / "model.safetensors")
 
-    audit = initialize_outer_model_from_a2(
-        target,
-        checkpoint,
-        allowed_missing_fragments=(".p_context.", "associative_contract_version"),
-        allowed_unexpected_prefixes=("p_value.",),
-    )
-
-    assert not audit.missing_keys
-    assert not audit.unexpected_keys
+    with pytest.raises(ValueError, match="does not exactly match"):
+        initialize_outer_model_from_a2(target, checkpoint)
 
 
 def test_production_runtime_defers_optimizer_and_sampler_to_central_bridge() -> None:
@@ -1874,6 +1957,10 @@ def test_deepspeed_segment_backward_steps_only_after_all_segments() -> None:
             self.boundaries: list[bool] = []
             self.step_calls = 0
 
+        @staticmethod
+        def zero_optimization_partition_gradients() -> bool:
+            return True
+
         def set_gradient_accumulation_boundary(self, *, is_boundary: bool) -> None:
             self.boundaries.append(is_boundary)
 
@@ -1908,6 +1995,28 @@ def test_deepspeed_segment_backward_steps_only_after_all_segments() -> None:
         controller.finalize()
 
 
+def test_deepspeed_segment_controller_requires_partition_query() -> None:
+    class _Engine:
+        @staticmethod
+        def set_gradient_accumulation_boundary(*, is_boundary: bool) -> None:
+            del is_boundary
+
+        @staticmethod
+        def backward(loss: torch.Tensor) -> None:
+            del loss
+
+        @staticmethod
+        def step() -> None:
+            return None
+
+    accelerator = SimpleNamespace(
+        distributed_type="DistributedType.DEEPSPEED",
+        deepspeed_engine_wrapped=SimpleNamespace(engine=_Engine()),
+    )
+    with pytest.raises(TypeError, match="partition"):
+        SegmentBackwardController(accelerator, nn.Linear(1, 1), expected_count=1)
+
+
 def test_a5_segment_backward_anchors_every_trainable_parameter_on_every_call() -> None:
     class _ConditionalModel(nn.Module):
         def __init__(self) -> None:
@@ -1922,6 +2031,10 @@ def test_a5_segment_backward_anchors_every_trainable_parameter_on_every_call() -
         def __init__(self) -> None:
             self.boundaries: list[bool] = []
             self.backward_gradients: list[tuple[float, float, None]] = []
+
+        @staticmethod
+        def zero_optimization_partition_gradients() -> bool:
+            return True
 
         def set_gradient_accumulation_boundary(self, *, is_boundary: bool) -> None:
             self.boundaries.append(is_boundary)
@@ -1984,6 +2097,10 @@ def test_a5_rank_stable_optimizer_anchor_excludes_always_used_qwen_group() -> No
             self.optimizer = object()
 
         @staticmethod
+        def zero_optimization_partition_gradients() -> bool:
+            return True
+
+        @staticmethod
         def set_gradient_accumulation_boundary(*, is_boundary: bool) -> None:
             assert is_boundary
 
@@ -2032,6 +2149,10 @@ def test_a5_rank_stable_hook_order_audit_is_fail_closed(
 
     class _Engine:
         optimizer = object()
+
+        @staticmethod
+        def zero_optimization_partition_gradients() -> bool:
+            return True
 
         @staticmethod
         def set_gradient_accumulation_boundary(*, is_boundary: bool) -> None:
@@ -2220,6 +2341,10 @@ def test_a5_segment_controller_clips_after_all_backward_calls_before_step() -> N
         optimizer = object()
 
         @staticmethod
+        def zero_optimization_partition_gradients() -> bool:
+            return True
+
+        @staticmethod
         def set_gradient_accumulation_boundary(*, is_boundary: bool) -> None:
             events.append(f"boundary:{is_boundary}")
 
@@ -2298,6 +2423,10 @@ def test_a5_nonfinite_segment_preserves_backward_parity_and_skips_episode_update
             self.backward_calls = 0
             self.step_calls = 0
             self.scheduler_steps = 0
+
+        @staticmethod
+        def zero_optimization_partition_gradients() -> bool:
+            return True
 
         def set_gradient_accumulation_boundary(self, *, is_boundary: bool) -> None:
             self.boundaries.append(is_boundary)
