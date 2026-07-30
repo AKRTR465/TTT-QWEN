@@ -218,10 +218,15 @@ class SegmentBackwardController:
         if self.is_deepspeed:
             if self.engine is None:
                 self.engine = model
-            required = ("set_gradient_accumulation_boundary", "backward", "step")
+            required = (
+                "set_gradient_accumulation_boundary",
+                "zero_optimization_partition_gradients",
+                "backward",
+                "step",
+            )
             if any(not callable(getattr(self.engine, name, None)) for name in required):
                 raise TypeError(
-                    "DeepSpeed segment controller requires boundary/backward/step methods"
+                    "DeepSpeed segment controller requires boundary/partition/backward/step methods"
                 )
         elif not callable(getattr(accelerator, "backward", None)):
             raise TypeError("segment controller requires accelerator.backward")
@@ -421,12 +426,7 @@ def _deepspeed_partitions_gradients(engine: object) -> bool:
     rank-stable anchor only needs to guarantee identical hook coverage.
     """
 
-    partitions_gradients = getattr(engine, "zero_optimization_partition_gradients", None)
-    if not callable(partitions_gradients):
-        # Existing tests and third-party wrappers historically omitted this query.  Preserve
-        # the fail-closed ZeRO-2 behavior unless the engine explicitly identifies ZeRO-1.
-        return True
-    result = partitions_gradients()
+    result = cast(Any, engine).zero_optimization_partition_gradients()
     if type(result) is not bool:
         raise TypeError("DeepSpeed zero_optimization_partition_gradients() must return bool")
     return result
@@ -2197,15 +2197,7 @@ def _run_main(argv: list[str] | None = None) -> int:
         if checkpoint is None:
             raise RuntimeError("validated A5 config lost initialize_from_a2_checkpoint")
         _validate_resume_balance_schema(Path(checkpoint).expanduser().resolve())
-        checkpoint_audit = initialize_outer_model_from_a2(
-            runtime_raw.model,
-            checkpoint,
-            allowed_missing_fragments=(
-                ".p_context.",
-                "associative_contract_version",
-            ),
-            allowed_unexpected_prefixes=("predictor.", "p_value."),
-        )
+        checkpoint_audit = initialize_outer_model_from_a2(runtime_raw.model, checkpoint)
         _reset_a2_to_a5_associative(runtime_raw.model)
         if backbone.ttt_config.a5_phase == "main":
             warmup_bundle_audit = _load_warmup_bundle(

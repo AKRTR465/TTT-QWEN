@@ -568,13 +568,6 @@ class TeacherForcedComposedInput:
                 "inserted payload, boundary, instruction, and context labels must be -100"
             )
 
-    @property
-    def composed(self) -> ComposedInput:
-        """Compatibility alias for callers that name the wrapped input ``composed``."""
-
-        return self.composed_input
-
-
 def register_input_composer_tokens(
     tokenizer: ComposerTokenizer,
     embedding_owner: EmbeddingOwner,

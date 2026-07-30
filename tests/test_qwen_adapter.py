@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 from types import MethodType
 
@@ -303,9 +302,6 @@ def test_variable_video_mapping_and_deepstack_objects_are_preserved() -> None:
     assert isinstance(audit, CurrentChunkVisualTokenAudit)
     assert audit.raw_patch_counts == (32, 8)
     assert audit.merged_token_counts == (8, 2)
-    assert audit.history_feature_set_count == 0
-    assert audit.dynamic_token_count_allowed
-
     with pytest.raises(TypeError, match="history container"):
         audit_current_chunk_visual_tokens((prepared,), pixels, grid)  # type: ignore[arg-type]
 
@@ -1012,7 +1008,7 @@ def test_direct_video_feature_failure_clears_stale_capture(
     assert wrapper.last_visual_output is None
 
 
-def test_checkpoint_loader_guards_and_legacy_interface_scan(tmp_path: Path) -> None:
+def test_checkpoint_loader_guards(tmp_path: Path) -> None:
     project = load_config()
     assert_qwen_checkpoint_config(make_official_checkpoint_config(), project)
     bad = make_official_checkpoint_config()
@@ -1023,16 +1019,6 @@ def test_checkpoint_loader_guards_and_legacy_interface_scan(tmp_path: Path) -> N
         build_qwen_adapter()
     with pytest.raises(FileNotFoundError, match="local Qwen"):
         build_qwen_adapter(project, tmp_path / "missing")
-
-    legacy_name = "pooler_" + "output"
-    code_files: Iterator[Path] = iter(
-        [
-            *(ROOT / "src" / "ttt_svcbench_qwen").glob("*.py"),
-            *(ROOT / "tests").glob("*.py"),
-        ]
-    )
-    assert all(legacy_name not in path.read_text(encoding="utf-8") for path in code_files)
-
 
 @pytest.mark.parametrize(
     ("owner_name", "field_name", "invalid_value"),

@@ -694,7 +694,7 @@ class ProjectConfig(FrozenModel):
     """Schema-12 production configuration with cross-component contract validation."""
 
     spec_version: str
-    config_schema_version: int
+    config_schema_version: Literal[12]
     paths: PathsConfig
     data: DataConfig
     video_preprocessing: VideoPreprocessingConfig
@@ -717,11 +717,6 @@ class ProjectConfig(FrozenModel):
     a2: A2TrainingConfig
     a5: A5TrainingConfig
     inference: InferenceRuntimeConfig
-
-    @model_validator(mode="before")  # type: ignore[untyped-decorator]
-    @classmethod
-    def normalize_schema_six(cls, value: object) -> object:
-        return _normalize_project_schema(value)
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
     def validate_production_contract(self) -> Self:
@@ -2132,24 +2127,6 @@ class ProjectConfig(FrozenModel):
             raise ValueError("spatial_encoder.active_slots cannot exceed max_active_slots")
 
 
-def _normalize_project_schema(value: object) -> object:
-    """Reject every legacy inner-target contract at the state-write boundary."""
-
-    if not isinstance(value, dict):
-        return value
-    schema = value.get("config_schema_version")
-    if schema == CONFIG_SCHEMA_VERSION:
-        return value
-    if schema == 11:
-        raise ValueError(
-            "schema 11 uses the removed raw-Main-Merger/P_value reconstruction target; "
-            "rebuild a schema-12 state-write associative configuration"
-        )
-    raise ValueError(
-        "config_schema_version must be 12; legacy schema 6-11 configurations "
-        "cannot be migrated across the state-write inner-target boundary"
-    )
-
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:
     """Read one UTF-8 YAML file and reject missing, unknown, or invalid values."""
 
@@ -2175,7 +2152,7 @@ def environment_summary() -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Validate and print the schema-9 configuration")
+    parser = argparse.ArgumentParser(description="Validate and print the schema-12 configuration")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     args = parser.parse_args(argv)
     print(load_config(args.config).model_dump_json(indent=2))
