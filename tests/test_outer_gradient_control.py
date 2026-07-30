@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ from torch import nn
 
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.outer_gradient_control import (
+    GradientProbe,
     OuterGradientController,
     sanitize_scalar_loss,
 )
@@ -272,3 +274,133 @@ def test_gradient_nonfinite_remains_owned_by_zero_overflow(
     assert audit.skipped_nonfinite
     assert not audit.skipped_nonfinite_loss
     assert audit.nonfinite_loss_sources == ()
+
+
+def _probe_optimizer(
+    associative: tuple[nn.Parameter, ...],
+    w0: nn.Parameter,
+) -> torch.optim.Optimizer:
+    return torch.optim.SGD(
+        [
+            {"params": list(associative), "lr": 5.0e-5, "group_name": "associative"},
+            {"params": [w0], "lr": 5.0e-5, "group_name": "w0"},
+        ]
+    )
+
+
+def test_probe_isolates_a_subset_of_one_pooled_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("ttt_svcbench_qwen.outer_gradient_control.version", lambda _name: "0.18.8")
+    write = _parameter(1.0, (0.3, 0.4))
+    read_and_context = _parameter(1.0, (30.0, 40.0))
+    w0 = _parameter(1.0, (3.0, 4.0))
+    controller = OuterGradientController(
+        load_config().outer_gradient_control,
+        expected_groups=("associative", "w0"),
+        probes=(
+            GradientProbe(
+                name="memory_write",
+                group_name="associative",
+                parameters=(write,),
+                reference_group="w0",
+            ),
+        ),
+    )
+
+    audit = controller.apply_deepspeed(_FakeZero(_probe_optimizer((write, read_and_context), w0)))
+
+    probe = audit.probe("memory_write")
+    # The pooled group norm is ~50; the write subset alone is 0.5.  Only the
+    # probe can tell that the write path is two orders below its own group.
+    assert audit.group("associative").pre_clip_norm == pytest.approx(50.0025, rel=1.0e-4)
+    assert probe.norm == pytest.approx(0.5)
+    assert probe.element_count == 2
+    assert probe.parameter_count == 1
+    metrics = dict(audit.metrics())
+    assert metrics["outer_grad/probe/memory_write/norm"] == pytest.approx(0.5)
+    assert metrics["outer_grad/probe/memory_write/norm_over_w0"] == pytest.approx(0.1)
+
+
+def test_probe_norm_is_measured_before_group_clipping(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("ttt_svcbench_qwen.outer_gradient_control.version", lambda _name: "0.18.8")
+    write = _parameter(1.0, (30.0, 40.0))
+    w0 = _parameter(1.0, (0.0, 0.0))
+    controller = OuterGradientController(
+        load_config().outer_gradient_control,
+        expected_groups=("associative", "w0"),
+        probes=(
+            GradientProbe(name="memory_write", group_name="associative", parameters=(write,)),
+        ),
+    )
+
+    audit = controller.apply_deepspeed(_FakeZero(_probe_optimizer((write,), w0)))
+
+    # The group is clipped hard, but probe and group pre-clip norms stay on one
+    # scale so their ratio remains interpretable across steps.
+    assert audit.group("associative").clipped
+    assert audit.probe("memory_write").norm == pytest.approx(50.0)
+    assert audit.group("associative").pre_clip_norm == pytest.approx(50.0)
+
+
+def test_probe_keys_survive_a_nonfinite_skip(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("ttt_svcbench_qwen.outer_gradient_control.version", lambda _name: "0.18.8")
+    write = _parameter(1.0, (float("nan"), 1.0))
+    w0 = _parameter(1.0, (1.0, 1.0))
+    controller = OuterGradientController(
+        load_config().outer_gradient_control,
+        expected_groups=("associative", "w0"),
+        probes=(
+            GradientProbe(
+                name="memory_write",
+                group_name="associative",
+                parameters=(write,),
+                reference_group="w0",
+            ),
+        ),
+    )
+
+    audit = controller.apply_deepspeed(_FakeZero(_probe_optimizer((write,), w0)))
+
+    assert audit.skipped_nonfinite
+    metrics = dict(audit.metrics())
+    # A dashboard gap must mean "not measured", never "measured as zero".
+    assert math.isnan(metrics["outer_grad/probe/memory_write/norm"])
+    assert math.isnan(metrics["outer_grad/probe/memory_write/norm_over_w0"])
+
+
+def test_probe_topology_drift_fails_closed() -> None:
+    config = load_config().outer_gradient_control
+    parameter = _parameter(1.0, (1.0,))
+    with pytest.raises(ValueError, match="unknown group"):
+        OuterGradientController(
+            config,
+            expected_groups=("w0",),
+            probes=(
+                GradientProbe(
+                    name="memory_write",
+                    group_name="associative",
+                    parameters=(parameter,),
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="unknown group"):
+        OuterGradientController(
+            config,
+            expected_groups=("associative",),
+            probes=(
+                GradientProbe(
+                    name="memory_write",
+                    group_name="associative",
+                    parameters=(parameter,),
+                    reference_group="w0",
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="unique"):
+        OuterGradientController(
+            config,
+            expected_groups=("associative",),
+            probes=(
+                GradientProbe(name="dup", group_name="associative", parameters=(parameter,)),
+                GradientProbe(name="dup", group_name="associative", parameters=(parameter,)),
+            ),
+        )

@@ -701,6 +701,8 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
         )
 
     def collect_associative_parameters(self) -> tuple[nn.Parameter, ...]:
+        # Order is part of the optimizer-group contract: torch/DeepSpeed optimizer
+        # state_dicts are keyed by position, so resume breaks if this is reordered.
         context_bias = self.p_context.bias
         if context_bias is None:
             raise RuntimeError("associative projection biases disappeared")
@@ -718,6 +720,34 @@ class FastTTTAdapter(nn.Module):  # type: ignore[misc]
             self.memory_alpha,
             self.memory_beta_raw,
         )
+
+    def collect_memory_write_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return the parameters reachable *only* through the delta-rule write.
+
+        These tensors appear nowhere outside :meth:`prepare_write`, so the Query
+        deferred VJP is their sole gradient source.  Their joint gradient norm is
+        therefore the one clean witness that the write mechanism is being trained
+        rather than merely executed.  ``memory_alpha`` is deliberately excluded:
+        it gates the read path and would keep looking healthy across a dead write
+        path.  ``p_context`` is excluded for the same reason.
+        """
+
+        return (
+            self.memory_key_probe.weight,
+            self.memory_key_probe.bias,
+            self.memory_value_projection.weight,
+            self.memory_value_projection.bias,
+            self.memory_eta_gate_hidden.weight,
+            self.memory_eta_gate_hidden.bias,
+            self.memory_eta_gate_output.weight,
+            self.memory_eta_gate_output.bias,
+            self.memory_beta_raw,
+        )
+
+    def collect_memory_read_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return the read-side gate, whose gradient arrives via ``alpha (K Mᵀ)``."""
+
+        return (self.memory_alpha,)
 
     def parameter_groups(self, state: FastMemoryState) -> FastParameterGroups:
         return FastParameterGroups(

@@ -52,6 +52,7 @@ from ttt_svcbench_qwen.meta_trainer import (
     TruncatedMetaTTTEpisodeOutput,
 )
 from ttt_svcbench_qwen.outer_gradient_control import (
+    GradientProbe,
     OuterGradientAudit,
     OuterGradientController,
     sanitize_scalar_loss,
@@ -2200,6 +2201,7 @@ def _run_main(argv: list[str] | None = None) -> int:
         gradient_controller=OuterGradientController(
             backbone.project_config.outer_gradient_control,
             expected_groups=expected_gradient_groups,
+            probes=_memory_gradient_probes(runtime_raw.model, expected_gradient_groups),
         ),
         semantic_projector_delta_audit_steps=(
             backbone.ttt_config.semantic_projector_delta_audit_steps
@@ -3127,6 +3129,45 @@ def _reset_a2_to_a5_associative(model: nn.Module) -> None:
     if len(adapters) != 1:
         raise RuntimeError("A2→A5 initialization requires exactly one FastTTTAdapter")
     adapters[0].reset_associative_projections()
+
+
+def _memory_gradient_probes(
+    model: nn.Module,
+    expected_groups: tuple[str, ...],
+) -> tuple[GradientProbe, ...]:
+    """Split the pooled ``associative`` group into read-path and write-path witnesses.
+
+    The write-path parameters reach the loss only through the Query deferred VJP,
+    so their gradient norm is the sole direct evidence that the delta-rule write
+    is being trained.  Pooled with ``p_context`` and ``memory_alpha`` — both of
+    which are also fed by the read path — that signal is unrecoverable from the
+    group norm alone.  ``w0`` is the reference denominator because the failure
+    mode this exists to catch is W0's static-adapter gradient dominating the
+    write path by orders of magnitude rather than the write path being exactly
+    zero.
+    """
+
+    if "associative" not in expected_groups:
+        return ()
+    adapters = tuple(module for module in model.modules() if isinstance(module, FastTTTAdapter))
+    if len(adapters) != 1:
+        raise RuntimeError("memory gradient probes require exactly one FastTTTAdapter")
+    adapter = adapters[0]
+    reference = "w0" if "w0" in expected_groups else None
+    return (
+        GradientProbe(
+            name="memory_write",
+            group_name="associative",
+            parameters=tuple(adapter.collect_memory_write_parameters()),
+            reference_group=reference,
+        ),
+        GradientProbe(
+            name="memory_read",
+            group_name="associative",
+            parameters=tuple(adapter.collect_memory_read_parameters()),
+            reference_group=reference,
+        ),
+    )
 
 
 def _reset_a2_to_a5_balance(model: nn.Module) -> None:

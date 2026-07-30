@@ -145,6 +145,15 @@ Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由�
   Query 对 Qwen、State 和其他 Outer 参数的直接梯度不参与此裁剪；
 - memory 接口参数并入既有 `associative` optimizer 组（Outer LR 当前 `5e-5`），组预算与
   Qwen/W0 严格对齐；eta gate 本身就是合法的可学习写入强度控制器；
+- 该组是混合来源的，因此组级梯度范数无法证明写入机制在被训练：`p_context` 与
+  `memory_alpha` 同时从读取路径拿梯度，而 `W_k/W_v/eta gate/β` 只能经 Query deferred VJP
+  拿梯度。`OuterGradientController` 因此对该组挂两个 `GradientProbe`——`memory_write`
+  （9 个只写张量）与 `memory_read`（`memory_alpha`），各自报裁剪前的跨 rank 范数及其
+  与 `w0` 组的比值（`outer_grad/probe/*`）。判据是比值而非绝对值：schema-12 的失效是
+  写入梯度比 W0 低四个数量级而非恰为零。probe 集合必须精确划分 `associative` 组，
+  新增参数漏挂 probe 会在测试期失败；
+
+
 - `no_write` 保留为 NoWrite 对照（memory 恒为零、memory 接口参数冻结；旧名 `static_w0`
   已删除并在入口报错指明新名）；counterfactual 仅作为 Meta-TTT 的无梯度因果诊断
   （参照 `episode_zero` 即精确 `M=0` 与 `segment_start`，每 rank 可审计多条 Query），

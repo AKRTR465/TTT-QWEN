@@ -636,3 +636,22 @@ def test_query_proxy_deferred_vjp_matches_one_shot_gradient(
 def test_builder_requires_validated_project_config() -> None:
     with pytest.raises(ValueError, match="validated ProjectConfig"):
         build_fast_ttt_adapter()
+
+
+def test_memory_probe_parameters_partition_the_associative_group() -> None:
+    adapter = build_fast_ttt_adapter(load_config())
+    associative = {id(value) for value in adapter.collect_associative_parameters()}
+    write = {id(value) for value in adapter.collect_memory_write_parameters()}
+    read = {id(value) for value in adapter.collect_memory_read_parameters()}
+    context = {id(adapter.p_context.weight), id(adapter.p_context.bias)}
+
+    # The probes must exactly partition the pooled optimizer group, or a future
+    # parameter would silently escape gradient observability.
+    assert write | read | context == associative
+    assert not write & read
+    assert not (write | read) & context
+    # memory_alpha gates the read path (alpha * K M^T) and would keep looking
+    # healthy across a dead write path; memory_beta_raw is write-only.
+    assert id(adapter.memory_alpha) in read
+    assert id(adapter.memory_beta_raw) in write
+    assert len(adapter.collect_memory_write_parameters()) == 9

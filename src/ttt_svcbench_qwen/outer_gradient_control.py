@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, cast
@@ -35,6 +36,45 @@ class GroupGradientAudit:
 
 
 @dataclass(frozen=True, slots=True)
+class GradientProbe:
+    """One named parameter subset measured separately inside its owning group.
+
+    A whole-group norm cannot answer "is this specific mechanism receiving
+    gradient", because one group pools parameters fed by different paths.  A
+    probe isolates the subset whose gradient source is the mechanism itself.
+    """
+
+    name: str
+    group_name: str
+    parameters: tuple[Tensor, ...]
+    reference_group: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name or not self.group_name:
+            raise ValueError("gradient probes require a non-empty name and group_name")
+        if not self.parameters:
+            raise ValueError(f"gradient probe {self.name!r} requires at least one parameter")
+        if len(self.member_ids) != len(self.parameters):
+            raise ValueError(f"gradient probe {self.name!r} lists one parameter twice")
+
+    @property
+    def member_ids(self) -> frozenset[int]:
+        return frozenset(id(parameter) for parameter in self.parameters)
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeGradientAudit:
+    """Pre-clip gradient norm for one probe, summed across data-parallel ranks."""
+
+    name: str
+    group_name: str
+    reference_group: str | None
+    norm: float
+    parameter_count: int
+    element_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class OuterGradientAudit:
     attempted_update_count: int
     successful_update_count: int
@@ -44,6 +84,17 @@ class OuterGradientAudit:
     skipped_nonfinite_loss: bool
     nonfinite_loss_sources: tuple[str, ...]
     groups: tuple[GroupGradientAudit, ...]
+    probes: tuple[ProbeGradientAudit, ...] = ()
+
+    def probe(self, name: str) -> ProbeGradientAudit:
+        """Return one named probe audit or fail closed on probe-topology drift."""
+
+        matches = tuple(probe for probe in self.probes if probe.name == name)
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Outer gradient audit requires exactly one {name!r} probe; found {len(matches)}"
+            )
+        return matches[0]
 
     def group(self, name: str) -> GroupGradientAudit:
         """Return one named optimizer-group audit or fail closed on topology drift."""
@@ -81,6 +132,27 @@ class OuterGradientAudit:
                     (f"{prefix}/nonfinite_elements", float(group.nonfinite_elements)),
                 )
             )
+        for probe in self.probes:
+            prefix = f"outer_grad/probe/{probe.name}"
+            values.extend(
+                (
+                    (f"{prefix}/norm", probe.norm),
+                    (f"{prefix}/element_count", float(probe.element_count)),
+                )
+            )
+            if probe.reference_group is None:
+                continue
+            reference = self.group(probe.reference_group).pre_clip_norm
+            # A bare norm cannot distinguish "small" from "small relative to the
+            # competing group"; the schema-12 neutralization was four orders below
+            # W0 while still being nonzero.  nan marks an unusable denominator
+            # rather than silently reporting a ratio against zero.
+            values.append(
+                (
+                    f"{prefix}/norm_over_{probe.reference_group}",
+                    probe.norm / reference if reference > 0.0 else math.nan,
+                )
+            )
         return tuple(values)
 
 
@@ -88,10 +160,24 @@ class OuterGradientController:
     """Clip named optimizer groups without allowing one group to scale another."""
 
     def __init__(
-        self, config: OuterGradientControlConfig, *, expected_groups: tuple[str, ...]
+        self,
+        config: OuterGradientControlConfig,
+        *,
+        expected_groups: tuple[str, ...],
+        probes: Sequence[GradientProbe] = (),
     ) -> None:
         if not expected_groups or len(set(expected_groups)) != len(expected_groups):
             raise ValueError("Outer gradient groups must be unique and non-empty")
+        self.probes = tuple(probes)
+        names = tuple(probe.name for probe in self.probes)
+        if len(set(names)) != len(names):
+            raise ValueError("Outer gradient probe names must be unique")
+        for probe in self.probes:
+            for group_name in (probe.group_name, probe.reference_group):
+                if group_name is not None and group_name not in expected_groups:
+                    raise ValueError(
+                        f"gradient probe {probe.name!r} references unknown group {group_name!r}"
+                    )
         self.config = config
         self.expected_groups = expected_groups
         self.attempted_update_count = 0
@@ -189,12 +275,16 @@ class OuterGradientController:
                 skipped_nonfinite=True,
                 skipped_nonfinite_loss=loss_nonfinite,
                 nonfinite_loss_sources=sources,
+                # Keep every probe metric key present across skipped steps so a
+                # dashboard gap means "not measured", never "measured as zero".
+                probes=tuple(self._nonfinite_probe_audit(probe) for probe in self.probes),
             )
 
         loss_scale = float(zero.loss_scale)
         if not math.isfinite(loss_scale) or loss_scale <= 0.0:
             raise RuntimeError("DeepSpeed exposed an invalid loss scale")
         group_audits: list[GroupGradientAudit] = []
+        probe_audits: list[ProbeGradientAudit] = []
         for index, (name, group) in enumerate(groups):
             gradients = cast(list[Tensor], averaged[index])
             params = zero.params_in_partition[index]
@@ -204,6 +294,16 @@ class OuterGradientController:
             coefficient = self._clip_coefficient(pre_norm, max_norm)
             active_elements, max_abs = self._distributed_shape_and_max(
                 gradients, self._process_group(zero, index), loss_scale
+            )
+            # Measure before clipping so probe and group norms share one scale.
+            probe_audits.extend(
+                self._probe_audits(
+                    group_name=name,
+                    gradients=gradients,
+                    params=params,
+                    process_group=self._process_group(zero, index),
+                    loss_scale=loss_scale,
+                )
             )
             for gradient in gradients:
                 gradient.mul_(coefficient)
@@ -222,11 +322,19 @@ class OuterGradientController:
                 )
             )
         self.successful_update_count += 1
+        # Probe audits come out in group order, so compare membership rather than
+        # sequence; each probe must be measured by exactly one owning group.
+        measured = sorted(audit.name for audit in probe_audits)
+        if measured != sorted(probe.name for probe in self.probes):
+            raise RuntimeError(
+                "Outer gradient probes did not resolve to exactly one owning optimizer group"
+            )
         return self._record(
             tuple(group_audits),
             skipped_nonfinite=False,
             skipped_nonfinite_loss=False,
             nonfinite_loss_sources=(),
+            probes=tuple(probe_audits),
         )
 
     def _validate_param_groups(
@@ -254,6 +362,62 @@ class OuterGradientController:
             return 1.0
         return max_norm / max(pre_norm, float(torch.finfo(torch.float32).tiny))
 
+    def _probe_audits(
+        self,
+        *,
+        group_name: str,
+        gradients: list[Tensor],
+        params: Sequence[object],
+        process_group: object | None,
+        loss_scale: float,
+    ) -> tuple[ProbeGradientAudit, ...]:
+        """Measure each probe owned by one group as a cross-rank pre-clip norm."""
+
+        probes = tuple(probe for probe in self.probes if probe.group_name == group_name)
+        if not probes:
+            return ()
+        if len(gradients) != len(params):
+            raise RuntimeError(
+                "DeepSpeed partition gradients and parameters must align to measure probes"
+            )
+        device = gradients[0].device if gradients else torch.device("cpu")
+        # [probe, (sum of squares, element count)] — one collective per group keeps
+        # the all-reduce schedule identical on ranks that hold no probe parameter.
+        statistics = torch.zeros((len(probes), 2), dtype=torch.float64, device=device)
+        for row, probe in enumerate(probes):
+            members = probe.member_ids
+            for gradient, parameter in zip(gradients, params, strict=True):
+                if id(parameter) not in members:
+                    continue
+                statistics[row, 0] += gradient.detach().double().square().sum()
+                statistics[row, 1] += gradient.numel()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                statistics, op=torch.distributed.ReduceOp.SUM, group=process_group
+            )
+        return tuple(
+            ProbeGradientAudit(
+                name=probe.name,
+                group_name=group_name,
+                reference_group=probe.reference_group,
+                norm=float(statistics[row, 0].sqrt().item()) / loss_scale,
+                parameter_count=len(probe.parameters),
+                element_count=int(statistics[row, 1].item()),
+            )
+            for row, probe in enumerate(probes)
+        )
+
+    @staticmethod
+    def _nonfinite_probe_audit(probe: GradientProbe) -> ProbeGradientAudit:
+        return ProbeGradientAudit(
+            name=probe.name,
+            group_name=probe.group_name,
+            reference_group=probe.reference_group,
+            norm=math.nan,
+            parameter_count=len(probe.parameters),
+            element_count=0,
+        )
+
     def _record(
         self,
         groups: tuple[GroupGradientAudit, ...],
@@ -261,6 +425,7 @@ class OuterGradientController:
         skipped_nonfinite: bool,
         skipped_nonfinite_loss: bool,
         nonfinite_loss_sources: tuple[str, ...],
+        probes: tuple[ProbeGradientAudit, ...] = (),
     ) -> OuterGradientAudit:
         audit = OuterGradientAudit(
             attempted_update_count=self.attempted_update_count,
@@ -271,6 +436,7 @@ class OuterGradientController:
             skipped_nonfinite_loss=skipped_nonfinite_loss,
             nonfinite_loss_sources=nonfinite_loss_sources,
             groups=groups,
+            probes=probes,
         )
         self.last_audit = audit
         self._loss_nonfinite = None
@@ -394,8 +560,10 @@ def sanitize_scalar_loss(
 
 
 __all__ = [
+    "GradientProbe",
     "GroupGradientAudit",
     "OuterGradientAudit",
     "OuterGradientController",
+    "ProbeGradientAudit",
     "sanitize_scalar_loss",
 ]
