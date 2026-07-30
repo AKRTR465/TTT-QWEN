@@ -26,7 +26,7 @@
 
 ## 训练
 
-- 正式流程为 A2→128-step Fast/State Warmup→A5 Main。
+- 正式流程为 A2→256-step Memory/State Warmup→A5 Main。
 - A2 全量解冻 Qwen、状态路径和 W0，冻结 `P_C`，memory 写入不可达。
 - A5 Support 写入直接归档本 chunk 的 slot (key, value) 对，无 inner loss；K=8 截断
   meta 图（detach 保值，无 W0 重锚）；Query Answer/State loss 是唯一 Outer 目标。
@@ -34,8 +34,9 @@
   10.0），不再是冻结常量；counterfactual 参照为 `episode_zero`（精确 M=0）与
   `segment_start`，每 rank 可审计多条 Query。
 - NoWrite 对照改名 `no_write`（旧名 `static_w0` 报错拒绝）。
-- Warmup 完全冻结 Qwen，仅保存带来源 hash 的非 Qwen handoff bundle；A5 Main 重新加载 A2
-  后叠加 bundle，恢复部分 Qwen 解冻，4 epoch 只保存 final checkpoint。
+- Warmup 完全冻结 Qwen、W0 与 RMSNorm/P_in/P_out；只训练 P_C、memory 接口和四个 state
+  组，并仅保存带来源 hash 的非 Qwen handoff bundle；A5 Main 重新加载 A2 后叠加 bundle，
+  恢复部分 Qwen 解冻，4 epoch 只保存 final checkpoint。
 - A1/A3/A4 与 full-graph Meta-TTT 已从生产实现和配置中删除。
 - graph anchor 只服务真实多卡动态分支，单卡不启用。
 - Outer checkpoint 完整保存模型/optimizer/scheduler/RNG，排除所有临时 runtime state。

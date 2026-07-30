@@ -771,8 +771,8 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
             raise ValueError("rank-aligned A5 sampling requires the A5 train dataset")
         if world_size <= 0 or rank < 0 or rank >= world_size:
             raise ValueError("A5 sampler rank/world_size is invalid")
-        if world_size != 4:
-            raise ValueError("production A5 manifest is frozen to four ranks")
+        if world_size not in {4, 8}:
+            raise ValueError("production A5 manifest supports only four or eight ranks")
         self.dataset = dataset
         self.rank = rank
         self.world_size = world_size
@@ -795,6 +795,13 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
         )
         if not self._buckets:
             raise ValueError("A5 train manifest contains no segment buckets")
+        bucket_world_sizes = {bucket.world_size for bucket in self._buckets}
+        if bucket_world_sizes != {self.world_size}:
+            raise ValueError(
+                "A5 manifest bucket world_size does not match the active launcher: "
+                f"manifest={sorted(bucket_world_sizes)}, active={self.world_size}; "
+                f"regenerate the manifest with --world-size {self.world_size}"
+            )
         record_ids = {_manifest_record_id(record) for record in dataset.records}
         if self.visual_cost_index and record_ids - set(self.visual_cost_index):
             raise ValueError("A5 visual cost index does not cover every manifest record")
@@ -1188,8 +1195,8 @@ def build_production_episode_manifest(
 
     if fold_index != 0 or seed != 42 or n_splits != 5:
         raise ValueError("production split is frozen to fold0, seed=42, five folds (80/20)")
-    if truncation_horizon <= 0 or world_size <= 0:
-        raise ValueError("truncation horizon/world size must be positive")
+    if truncation_horizon <= 0 or world_size not in {4, 8}:
+        raise ValueError("truncation horizon must be positive and world size must be four or eight")
     if not math.isfinite(video_duration_tolerance) or video_duration_tolerance < 0.0:
         raise ValueError("video duration tolerance must be finite and non-negative")
     if runtime_video_paths is not None:

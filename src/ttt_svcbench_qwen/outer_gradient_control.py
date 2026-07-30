@@ -288,24 +288,25 @@ class OuterGradientController:
         for index, (name, group) in enumerate(groups):
             gradients = cast(list[Tensor], averaged[index])
             params = zero.params_in_partition[index]
-            scaled_norm = zero.get_grad_norm_direct(gradients, params)
+            parameter_gradients = self._parameter_partition_gradients(gradients, params)
+            scaled_norm = zero.get_grad_norm_direct(parameter_gradients, params)
             pre_norm = float(scaled_norm.detach().float().item()) / loss_scale
             max_norm = self._max_norm(name)
             coefficient = self._clip_coefficient(pre_norm, max_norm)
             active_elements, max_abs = self._distributed_shape_and_max(
-                gradients, self._process_group(zero, index), loss_scale
+                parameter_gradients, self._process_group(zero, index), loss_scale
             )
             # Measure before clipping so probe and group norms share one scale.
             probe_audits.extend(
                 self._probe_audits(
                     group_name=name,
-                    gradients=gradients,
+                    gradients=parameter_gradients,
                     params=params,
                     process_group=self._process_group(zero, index),
                     loss_scale=loss_scale,
                 )
             )
-            for gradient in gradients:
+            for gradient in parameter_gradients:
                 gradient.mul_(coefficient)
             group_audits.append(
                 GroupGradientAudit(
@@ -352,6 +353,33 @@ class OuterGradientController:
                 f"Outer optimizer groups must be {self.expected_groups}, found {actual}"
             )
         return tuple(groups)
+
+    @staticmethod
+    def _parameter_partition_gradients(
+        gradients: list[Tensor],
+        params: Sequence[object],
+    ) -> list[Tensor]:
+        """Drop only DeepSpeed's trailing ZeRO partition-alignment gradient.
+
+        DeepSpeed 0.18.8 ``get_flat_partition(..., return_tensor_list=True)``
+        appends one zero tensor when the final data-parallel partition ends
+        after its last owned parameter.  That tensor has no matching entry in
+        ``params_in_partition``.  Treating the pinned padding as a parameter
+        topology error makes the last rank leave the collective schedule while
+        every other rank enters the probe all-reduce.
+        """
+
+        parameter_count = len(params)
+        if len(gradients) < parameter_count:
+            raise RuntimeError(
+                "DeepSpeed partition exposed fewer gradients than owned parameters"
+            )
+        padding = gradients[parameter_count:]
+        if len(padding) > 1 or any(bool(torch.count_nonzero(value).item()) for value in padding):
+            raise RuntimeError(
+                "DeepSpeed partition gradients contain unexpected nonzero or repeated padding"
+            )
+        return gradients[:parameter_count]
 
     def _max_norm(self, name: str) -> float:
         return float(getattr(self.config.max_grad_norm, name))

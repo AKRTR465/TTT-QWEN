@@ -45,6 +45,9 @@ uv sync --frozen
 bash scripts/h200/train_fullprefix256.sh a2
 bash scripts/h200/train_a5_fast_state_warmup.sh \
   /absolute/path/a2/final-checkpoint /absolute/path/v4_manifest.json
+# 单个完整 8 卡 worker 可用时：
+bash scripts/h200/train_a5_fast_state_warmup_8gpu.sh \
+  /absolute/path/a2/final-checkpoint /absolute/path/v4_manifest.json
 bash scripts/h200/train_a5_associative_lttt_finalonly.sh \
   /absolute/path/a2/final-checkpoint \
   /absolute/path/warmup_run/a5_warmup_bundle \
@@ -54,8 +57,9 @@ bash scripts/h200/train_a5_associative_lttt_finalonly.sh \
 固定训练语义：
 
 - A2：Qwen、状态模块和 W0 全量解冻，Associative 投影冻结，memory 写入不可达；
-- A5 Warmup：从完整 A2 checkpoint 初始化，Qwen 全冻结且不进入 optimizer；训练 Fast/State
-  128 step，只保存不含 Qwen、optimizer 与瞬态状态的原子 handoff bundle；
+- A5 Warmup：从完整 A2 checkpoint 初始化，Qwen、W0、RMSNorm/P_in/P_out 全冻结且不进入
+  optimizer；只训练 P_C、memory 接口和四个 state 组共 256 step，并保存不含 Qwen、optimizer
+  与瞬态状态的原子 handoff bundle；
 - A5 Main：重新加载完整 A2 checkpoint并严格叠加 handoff bundle，恢复原部分解冻策略，训练
   4 epoch 且只保存 final checkpoint；
 - A5 Support 写入是纯归档：slot (key, value) 对以学习到的 eta 强度写入 `M`，无
@@ -69,7 +73,7 @@ bash scripts/h200/train_a5_associative_lttt_finalonly.sh \
   Query→Qwen/State 梯度不参与该逐 Query 裁剪；
 - W0 保持 checkpoint/model dtype，瞬态 `M` 和 fast/memory 核心固定为 FP32；写入路径不
   产生独立 Outer backward，关联中间量不跨调用保存。
-- 四卡 sampler 保持任务/segment parity，padding 样本 loss 权重为零；
+- 4/8 rank sampler 保持任务/segment parity，padding 样本 loss 权重为零；
 - checkpoint 保存模型、optimizer、scheduler、RNG，但排除 `M`、Bank、cache 和 FSM runtime。
 
 `ema_answer_ref` 是唯一 official-weak loss-balance 算法，不再提供 mode 或 experimental
@@ -97,4 +101,4 @@ updater、严格 checkpoint 和 per-video runtime 生命周期均由同一 bundl
 
 ## 验证边界
 
-本机 tiny/CPU 测试只证明接口、梯度、因果性和状态隔离。真实 Qwen3-VL-8B、BF16、四卡显存、吞吐、收敛和效果必须由独立 H200 运行记录证明。
+本机 tiny/CPU 测试只证明接口、梯度、因果性和状态隔离。真实 Qwen3-VL-8B、BF16、4/8 卡显存、吞吐、收敛和效果必须由独立 H200 运行记录证明。

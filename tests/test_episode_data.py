@@ -342,6 +342,32 @@ def test_distributed_manifest_samplers_balance_a2_and_align_a5_segments(tmp_path
         assert len(segment_counts) == 1
         assert len(shapes) == 1
 
+    manifest_8 = build_production_episode_manifest(
+        annotations,
+        video_durations=durations,
+        world_size=8,
+    )
+    a5_dataset_8 = ProductionManifestDataset(
+        manifest_8,
+        stage=ManifestStage.A5,
+        split=EpisodeSplit.TRAIN,
+    )
+    assert all(bucket.world_size == 8 for bucket in manifest_8.buckets)
+    global_a5_indices_8 = [
+        list(RankAlignedA5SegmentSampler(a5_dataset_8, rank=rank, world_size=8))
+        for rank in range(8)
+    ]
+    assert all(indices == global_a5_indices_8[0] for indices in global_a5_indices_8[1:])
+    local_indices_8 = [global_a5_indices_8[0][rank::8] for rank in range(8)]
+    assert len({len(values) for values in local_indices_8}) == 1
+    for step in range(len(local_indices_8[0])):
+        rows = [a5_dataset_8[local_indices_8[rank][step]] for rank in range(8)]
+        assert len({row.tbptt_segment_count for row in rows}) == 1
+        assert len({(row.segment_lengths, row.meta_query_count) for row in rows}) == 1
+
+    with pytest.raises(ValueError, match="regenerate the manifest with --world-size 8"):
+        RankAlignedA5SegmentSampler(a5_dataset, rank=0, world_size=8)
+
 
 def _annotations(
     tmp_path: Path,

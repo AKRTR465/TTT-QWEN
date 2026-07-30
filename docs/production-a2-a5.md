@@ -1,4 +1,4 @@
-# A2 → A5 四卡生产训练
+# A2 → A5 单节点 4/8 卡生产训练
 
 本页描述当前生产入口。正式路径只有 A2 和 A5；历史阶段 gate、standalone trainer 与
 synthetic ablation harness 已从主线删除。
@@ -45,11 +45,11 @@ $PWD/.venv-h200/bin/python scripts/prepare_svcbench_episodes.py \
   --output-root runs
 ```
 
-脚本创建独立的 `MMDD_HHMMSS_prepare_svcbench_k8/`，写出 `dataset_manifest.json`、
+脚本创建独立的 `MMDD_HHMMSS_prepare_svcbench_k8_w<world_size>/`，写出 `dataset_manifest.json`、
 `failed.jsonl`、`succeeded.jsonl`、`run_config.json`、`run_summary.json` 和
 `experiment.log`。manifest 固定 `fold0/seed=42`，按原始视频切分，使用 64 秒 greedy
-Query 分组、细粒度近历史加几何扩宽远历史、每区间最多 16 帧，并为四卡按
-`tbptt_segment_count` 生成零权重 padding。
+Query 分组、细粒度近历史加几何扩宽远历史、每区间最多 16 帧，并按 `--world-size`（4 或 8）
+为相同 `tbptt_segment_count` 生成零权重 padding；8 卡 warmup 不可复用四卡 manifest。
 
 监督在物理上分成 `runtime`、`answer`、`weak` 三个 sidecar。中央 loader 会拒绝 runtime
 中出现 `answer/count/occurrence/counting_type/counting_subtype` 等字段；loss builder 只能在
@@ -74,9 +74,9 @@ factory。中央 bridge 会覆盖 runtime 的 dataset 字段，强制使用 mani
 
 入口会在训练前审计以上关键参数边界，不会退回普通 SFT。
 
-## 四卡运行
+## 单节点 4/8 卡运行
 
-在四卡 worker 内直接运行。full-prefix 入口只使用现有
+在单节点 4/8 卡 worker 内直接运行。full-prefix 入口只使用现有
 `.venv-h200-py312-torch28`，不会在线安装依赖。省略 manifest 时会用远端 SVCBench 数据自动
 生成：
 
@@ -85,14 +85,26 @@ cd /mnt/shared-storage-user/mineru2-shared/niujunbo/play/projects/ttt_qwen
 bash scripts/h200/train_fullprefix256.sh a2
 ```
 
-A2 成功后，先运行独立 128-step Fast/State Warmup。Warmup 完全冻结 Qwen，只保存非 Qwen
-handoff bundle，不继承 A2 optimizer、scheduler 或 Trainer step：
+A2 成功后，先运行独立 256-step Memory/State Warmup。Warmup 完全冻结 Qwen、W0 和
+RMSNorm/P_in/P_out，只训练 P_C、memory 接口和四个 state 组；它只保存非 Qwen handoff
+bundle，不继承 A2 optimizer、scheduler 或 Trainer step：
 
 ```bash
 bash scripts/h200/train_a5_fast_state_warmup.sh \
   /absolute/path/a2_run/checkpoints/final-checkpoint \
   /absolute/path/dataset_manifest.json
 ```
+
+只有单个完整 8 卡 worker 可用时，使用独立的 8-rank 入口：
+
+```bash
+bash scripts/h200/train_a5_fast_state_warmup_8gpu.sh \
+  /absolute/path/a2_run/checkpoints/final-checkpoint \
+  /absolute/path/dataset_manifest.json
+```
+
+它保持 256 个全局 optimizer step、每卡 batch 1（因此 global episode batch 为 8），并把每 rank
+DataLoader worker/prefetch 降至 `1/1`，以控制八 rank 的启动期 CPU 与进程压力。
 
 门槛通过后，Main 重新加载同一个 A2 checkpoint，严格叠加 warmup bundle，恢复部分 Qwen
 解冻并训练 4 epoch：
@@ -104,8 +116,8 @@ bash scripts/h200/train_a5_associative_lttt_finalonly.sh \
   /absolute/path/dataset_manifest.json
 ```
 
-启动脚本要求当前用户为 `niujunbo`、至少 4 张可见 GPU、共享盘至少 200 GiB 空闲；它先做
-manifest 严格加载和共享盘 safetensors 往返 smoke，再创建唯一 run 目录并执行四进程训练。
+启动脚本要求当前用户为 `niujunbo`、至少 4 张可见 GPU（8 卡入口严格要求选中 8 张）、共享盘至少 200 GiB 空闲；它先做
+manifest 严格加载和共享盘 safetensors 往返 smoke，再创建唯一 run 目录并按选定拓扑执行 4 或 8 个 rank 的训练。
 它不会配置 Mac 的本地代理，也不会写入 dirty 的 LLaMA-Factory checkout。
 
 8-step 对照入口：
@@ -119,7 +131,7 @@ bash scripts/h200/benchmark_fullprefix256_8step.sh a5 /absolute/path/a2/checkpoi
 ## Checkpoint 与续训
 
 - A2 按既定阶段策略保存完整 Trainer checkpoint。A5 Warmup 不保存完整 checkpoint，只在
-  成功完成 128 step 后原子发布 `a5_warmup_bundle/`。A5 Main 禁用周期 checkpoint，结束后先在
+  成功完成 256 step 后原子发布 `a5_warmup_bundle/`。A5 Main 禁用周期 checkpoint，结束后先在
   `.final-checkpoint.incomplete` 写入并校验模型、optimizer/scheduler/RNG 和 Trainer state，
   再原子发布为 `final-checkpoint/`，完成态只保留一个 checkpoint。
 - 同阶段续训必须新建 run，并显式设置
@@ -128,10 +140,9 @@ bash scripts/h200/benchmark_fullprefix256_8step.sh a5 /absolute/path/a2/checkpoi
 - A2→Warmup 和 A2+handoff→Main 都创建全新的 optimizer/scheduler/RNG；handoff bundle
   绑定 A2 checkpoint、project config、dataset manifest、seed 与代码 commit hash。
   该绑定取 `project.model_dump()` 的 sha256，因此任何 **字段级** config schema 变更都会作废
-  已有 bundle。schema-13 的 slot-memory refactor（新增 `fast_memory` 块、删除
-  `fast_ttt.optimizer`）即属此类：schema-12 及更早生成的 `a5_warmup_bundle/` 全部需要
-  重跑 Warmup 重建（schema-12 移除 `paths` 块时已首次作废过一轮）。只删 validator
-  不改字段则不影响该哈希。
+  已有 bundle。当前 Memory/State Warmup 使用 bundle schema 2：256-step 合同以及冻结 W0/
+  slow-projection 的参数组边界使旧的 128-step bundle schema 1 全部失效，必须重跑 Warmup
+  重建。只删 validator 不改字段则不影响该哈希。
 - `final-checkpoint/` 保存最终模型，`resume_state/` 保存 Accelerator 完整分布式状态；运行中断
   时可从尚存的最后一个标准 `checkpoint-*` 新建 run 续训。
 - transient `M`、Bank、FSM、视觉/时序 cache 从所有 checkpoint 中排除。
@@ -143,9 +154,9 @@ export TTT_RESUME_CHECKPOINT=/absolute/path/old_run/checkpoints/checkpoint-20
 bash scripts/h200/launch_4gpu.sh a5
 ```
 
-## Warmup 释放门（schema-13）
+## Warmup 释放门（schema-13，bundle schema 2）
 
-128-step Fast/State Warmup 以下列五门判定（发射点：`a5_memory_numerical_audit` trace 与
+256-step Memory/State Warmup 以下列五门判定（发射点：`a5_memory_numerical_audit` trace 与
 `memory/*` 指标；空值列为机制未生效时的读数）：
 
 | 门 | 定义 | 阈值 | 空值 |
@@ -170,14 +181,14 @@ python -m pytest -q \
   tests/test_stage_a_targets.py \
   tests/test_production_factory.py
 
-bash -n scripts/h200/launch_4gpu.sh
+bash -n scripts/h200/launch_4gpu.sh scripts/h200/launch_8gpu.sh
 ```
 
 CPU 测试覆盖 `T=17/K=8`、两次历史截断、数值连续、旧图断开、`M=0` 前向 bitwise 等于
 静态前向（A2 保留回归）、单对写入精确召回、并行写入 slot 顺序不变、Ση 预算重归一、
 200 步写入收缩界、写入梯度边界（gate/probe/value/β/token-keys 可达、slot state 不可达）、
 256 帧 causal Query、LLaMA-Factory 索引一致性、顺序 Query 梯度等价、manifest 防泄漏、
-四 rank backward parity 和原子 checkpoint 边界。真实四卡 8B 验收证据写入各自 run 目录。
+4/8 rank backward parity 和原子 checkpoint 边界。真实 4/8 卡 8B 验收证据写入各自 run 目录。
 
 ## H200 观测工具
 

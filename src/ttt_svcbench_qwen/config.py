@@ -640,19 +640,19 @@ class A5QueryMetaGradientConfig(FrozenModel):
 
 
 class A5WarmupConfig(FrozenModel):
-    """Independent Fast/State handoff stage; values are part of schema-13."""
+    """Independent Memory/State handoff stage; values are part of schema-13."""
 
-    max_steps: Literal[128]
+    max_steps: Literal[256]
     linear_warmup_steps: Literal[4]
-    fast_slow_learning_rate: PositiveFloat
+    fast_slow_learning_rate: Literal[0.0]
     state_learning_rate: PositiveFloat
-    w0_learning_rate: PositiveFloat
+    w0_learning_rate: Literal[0.0]
     associative_learning_rate: PositiveFloat
-    bundle_schema_version: Literal[1]
+    bundle_schema_version: Literal[2]
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
     def validate_warmup_contract(self) -> Self:
-        expected = (5.0e-5, 1.0e-5, 5.0e-5, 5.0e-5)
+        expected = (0.0, 1.0e-5, 0.0, 5.0e-5)
         actual = (
             float(self.fast_slow_learning_rate),
             float(self.state_learning_rate),
@@ -660,7 +660,7 @@ class A5WarmupConfig(FrozenModel):
             float(self.associative_learning_rate),
         )
         if actual != expected:
-            raise ValueError("A5 Fast/State warmup learning rates drifted from schema-13")
+            raise ValueError("A5 Memory/State warmup learning rates drifted from schema-13")
         return self
 
 

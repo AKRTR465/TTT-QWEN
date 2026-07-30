@@ -1441,10 +1441,10 @@ def test_a5_fast_state_warmup_yaml_and_launcher_are_restart_only(
     monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/v4_manifest.json")
     monkeypatch.setenv("A2_CHECKPOINT", "/tmp/a2-final")
 
-    native, extension = load_training_yaml(ROOT / "configs/h200/a5_fast_state_warmup_128_4gpu.yaml")
+    native, extension = load_training_yaml(ROOT / "configs/h200/a5_fast_state_warmup_256_4gpu.yaml")
     launcher = (ROOT / "scripts/h200/train_a5_fast_state_warmup.sh").read_text(encoding="utf-8")
 
-    assert native["max_steps"] == 128
+    assert native["max_steps"] == 256
     assert native["warmup_steps"] == 4
     assert native["lr_scheduler_type"] == "cosine"
     assert native["save_strategy"] == "no"
@@ -1455,6 +1455,39 @@ def test_a5_fast_state_warmup_yaml_and_launcher_are_restart_only(
     assert "[[ $# -eq 2 ]] || usage" in launcher
     assert "a5_warmup_bundle only" in launcher
     assert 'TTT_SKIP_ENV_SETUP="${TTT_SKIP_ENV_SETUP:-1}"' in launcher
+
+
+def test_a5_fast_state_warmup_8gpu_entry_isolated_and_eight_rank(
+    h200_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/v4_manifest.json")
+    monkeypatch.setenv("A2_CHECKPOINT", "/tmp/a2-final")
+
+    native, extension = load_training_yaml(ROOT / "configs/h200/a5_fast_state_warmup_256_8gpu.yaml")
+    launcher = (ROOT / "scripts/h200/train_a5_fast_state_warmup_8gpu.sh").read_text(
+        encoding="utf-8"
+    )
+    eight_gpu = (ROOT / "scripts/h200/launch_8gpu.sh").read_text(encoding="utf-8")
+    shared_launcher = (ROOT / "scripts/h200/launch_4gpu.sh").read_text(encoding="utf-8")
+    train_entry = (ROOT / "scripts/h200/train_a2_a5.sh").read_text(encoding="utf-8")
+
+    assert native["max_steps"] == 256
+    assert native["per_device_train_batch_size"] == 1
+    assert native["gradient_accumulation_steps"] == 1
+    assert native["dataloader_num_workers"] == 1
+    assert native["dataloader_prefetch_factor"] == 1
+    assert extension.a5_phase == "fast_state_warmup"
+    assert extension.warmup_bundle is None
+    assert "export TTT_WORLD_SIZE=8" in launcher
+    assert 'CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"' in launcher
+    assert 'TTT_LAUNCHER="$PROJECT_ROOT/scripts/h200/launch_8gpu.sh"' in launcher
+    assert "export TTT_WORLD_SIZE=8" in eight_gpu
+    assert 'export NPROC_PER_NODE="$WORLD_SIZE"' in shared_launcher
+    assert '--nproc-per-node="$WORLD_SIZE"' in shared_launcher
+    assert '"TTT_LAUNCHER=$LAUNCHER"' in train_entry
+    assert '--world-size "$TTT_WORLD_SIZE"' in train_entry
+    assert 'exec bash "$LAUNCHER" "$STAGE"' in train_entry
 
 
 def test_a5_no_write_yaml_and_launcher_match_meta_ttt_data_contract(
@@ -1856,11 +1889,18 @@ def test_a5_global_sample_sequence_hash_is_mode_independent(
             return iter((0, 1) if self.epoch == 0 else (1, 0))
 
     records = (_Record("episode-a"), _Record("episode-b"))
+    observed_world_sizes: list[int] = []
+
+    def sampler_factory(_dataset: object, _rank: int, world_size: int) -> _Sampler:
+        observed_world_sizes.append(world_size)
+        return _Sampler()
+
     monkeypatch.setattr(trainer_module, "A5EpisodeRecord", _Record)
     digest, count = trainer_module._a5_global_sample_sequence_sha256(
         records,
-        lambda _dataset, _rank, _world_size: _Sampler(),
+        sampler_factory,
         epoch_count=2.0,
+        world_size=8,
     )
     expected = hashlib.sha256(
         b"0\tepisode-a\n0\tepisode-b\n1\tepisode-b\n1\tepisode-a\n"
@@ -1868,6 +1908,7 @@ def test_a5_global_sample_sequence_hash_is_mode_independent(
 
     assert digest == expected
     assert count == 4
+    assert observed_world_sizes == [8]
 
 
 def test_deepspeed_segment_backward_steps_only_after_all_segments() -> None:
@@ -2566,44 +2607,61 @@ def test_canonical_a5_builds_equal_budget_production_optimizer(
     assert float(groups["associative"]["lr"]) * float(caps.associative) == pytest.approx(5.0e-6)
 
 
-def test_warmup_optimizer_excludes_qwen_and_updates_fast_state_groups(
+def test_warmup_optimizer_trains_only_memory_interface_and_state_groups(
     tmp_path: Path,
 ) -> None:
     project = load_config()
     bundle, model = _grouped_bundle(tmp_path, project)
     bundle.model.requires_grad_(False)
+    with pytest.raises(ValueError, match="frozen optimizer groups"):
+        make_production_outer_optimizer_factory(
+            bundle,
+            ProductionStage.A5,
+            a5_phase="fast_state_warmup",
+        )(model)
+
+    trainability = trainer_module._configure_fast_state_warmup_trainability(
+        model,
+        bundle.model,
+    )
     optimizer = make_production_outer_optimizer_factory(
         bundle,
         ProductionStage.A5,
         a5_phase="fast_state_warmup",
     )(model)
     groups = {str(group["group_name"]): group for group in optimizer.param_groups}
-    delta_auditor = trainer_module._A5ParameterGroupStepAuditor(
-        model,
-        delta_audit_steps=3,
-        group_names=("fast_slow",),
-    )
-
+    assert trainability.qwen_trainable_count == 0
+    assert trainability.fast_slow_trainable_count == 0
+    assert trainability.w0_trainable_count == 0
+    assert trainability.state_trainable_count == trainability.state_parameter_count
+    assert trainability.associative_trainable_count == trainability.associative_parameter_count
     assert "qwen" not in groups
-    assert {id(parameter) for parameter in delta_auditor.parameters["fast_slow"]} == {
-        id(parameter) for parameter in model.fast_adapter.collect_slow_parameters()
-    }
     assert {name: float(group["lr"]) for name, group in groups.items()} == {
-        "fast_slow": 5.0e-5,
         "state_shared": 1.0e-5,
         "state_task": 1.0e-5,
         "state_router_time": 1.0e-5,
         "state_retrieval": 1.0e-5,
-        "w0": 5.0e-5,
         "associative": 5.0e-5,
     }
     qwen_before = {
         name: value.detach().clone() for name, value in bundle.model.state_dict().items()
     }
+    frozen_fast_parameters = (
+        *model.fast_adapter.collect_slow_parameters(),
+        *model.fast_adapter.collect_meta_fast_parameters(),
+    )
+    assert all(not parameter.requires_grad for parameter in frozen_fast_parameters)
     representatives = {name: group["params"][0] for name, group in groups.items()}
     representative_before = {
         name: parameter.detach().clone() for name, parameter in representatives.items()
     }
+    frozen_before = tuple(
+        (parameter, parameter.detach().clone()) for parameter in frozen_fast_parameters
+    )
+    owned = {
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+    }
+    assert not {id(parameter) for parameter in frozen_fast_parameters} & owned
     for _ in range(3):
         optimizer.zero_grad(set_to_none=True)
         loss = sum(parameter.float().mean() for parameter in representatives.values())
@@ -2613,6 +2671,7 @@ def test_warmup_optimizer_excludes_qwen_and_updates_fast_state_groups(
     assert all(
         torch.equal(qwen_before[name], value) for name, value in bundle.model.state_dict().items()
     )
+    assert all(torch.equal(before, parameter) for parameter, before in frozen_before)
     assert all(
         not torch.equal(representative_before[name], parameter)
         for name, parameter in representatives.items()
@@ -2729,7 +2788,7 @@ def test_warmup_bundle_is_non_qwen_atomic_and_fail_closed(
         qwen_model=bundle.model,
         backbone=bundle,
         artifact_root=artifact_root,
-        global_step=128,
+        global_step=project.a5.warmup.max_steps,
         qwen_sha256=qwen_sha256,
     )
 
@@ -2800,7 +2859,7 @@ def test_warmup_bundle_can_publish_prepared_cpu_tensors(
         qwen_model=bundle.model,
         backbone=bundle,
         artifact_root=artifact_root,
-        global_step=128,
+        global_step=project.a5.warmup.max_steps,
         qwen_sha256=trainer_module._module_bitwise_sha256(bundle.model),
         prepared_bundle=prepared,
     )
@@ -2813,7 +2872,7 @@ def test_warmup_bundle_can_publish_prepared_cpu_tensors(
             qwen_model=bundle.model,
             backbone=bundle,
             artifact_root=tmp_path / "other-artifacts",
-            global_step=128,
+            global_step=project.a5.warmup.max_steps,
             qwen_sha256="qwen-hash",
             prepared_bundle=(allowlist, {**tensors, "unexpected": torch.ones(1)}),
         )

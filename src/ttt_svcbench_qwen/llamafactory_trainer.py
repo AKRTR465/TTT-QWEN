@@ -94,7 +94,7 @@ class CheckpointPolicy(StrEnum):
     EPOCH_2_AND_EPOCH_4 = "epoch_2_and_epoch_4"
 
 
-_WARMUP_BUNDLE_SCHEMA_VERSION = 1
+_WARMUP_BUNDLE_SCHEMA_VERSION = 2
 _WARMUP_BUNDLE_ASSOCIATIVE_CONTRACT_VERSION = 3
 _WARMUP_BUNDLE_EXCLUDED_TOKENS = (
     "official_weak_balancer",
@@ -108,6 +108,15 @@ _WARMUP_BUNDLE_EXCLUDED_TOKENS = (
     "cache",
 )
 _A5_ADAPTATION_MODES = ("meta_ttt", "no_write")
+_A5_WARMUP_TRAINABLE_GROUPS = frozenset(
+    {
+        "state_shared",
+        "state_task",
+        "state_router_time",
+        "state_retrieval",
+        "associative",
+    }
+)
 
 
 def _is_transient_memory_name(lowered: str) -> bool:
@@ -818,10 +827,13 @@ class OuterParameterAudit:
         elif self.a5_adaptation_mode == "meta_ttt":
             if self.a5_phase == "fast_state_warmup":
                 if self.qwen_trainable_count:
-                    raise ValueError("Fast/State warmup must freeze every Qwen parameter")
+                    raise ValueError("Memory/State warmup must freeze every Qwen parameter")
             elif self.qwen_trainable_count <= 0:
                 raise ValueError("A5 main must train configured Qwen parameters")
-            if self.non_qwen_trainable_count != self.non_qwen_parameter_count:
+            if (
+                self.a5_phase != "fast_state_warmup"
+                and self.non_qwen_trainable_count != self.non_qwen_parameter_count
+            ):
                 raise ValueError("A5 must train every state, W0, and Associative parameter")
             if self.associative_trainable_count != self.associative_parameter_count:
                 raise ValueError("A5 Associative must be fully trainable")
@@ -2083,7 +2095,7 @@ def _run_main(argv: list[str] | None = None) -> int:
         a5_adaptation_mode=backbone.ttt_config.a5_adaptation_mode,
     )
     if backbone.ttt_config.a5_phase == "fast_state_warmup" and same_stage_resume is not None:
-        raise ValueError("Fast/State warmup is restart-only and cannot resume")
+        raise ValueError("Memory/State warmup is restart-only and cannot resume")
     if same_stage_resume is not None:
         _validate_resume_balance_schema(same_stage_resume)
     from ttt_svcbench_qwen.production_runtime import _video_pixel_bounds, build_runtime
@@ -2150,6 +2162,7 @@ def _run_main(argv: list[str] | None = None) -> int:
         )
     checkpoint_audit: OuterCheckpointAudit | None = None
     warmup_bundle_audit: dict[str, object] | None = None
+    warmup_trainability_audit: WarmupOuterTrainabilityAudit | None = None
     if configured_stage is ProductionStage.A5 and same_stage_resume is None:
         checkpoint = backbone.ttt_config.initialize_from_a2_checkpoint
         if checkpoint is None:
@@ -2164,6 +2177,14 @@ def _run_main(argv: list[str] | None = None) -> int:
                 backbone=backbone,
             )
         _reset_a2_to_a5_balance(runtime_raw.model)
+    if (
+        configured_stage is ProductionStage.A5
+        and backbone.ttt_config.a5_phase == "fast_state_warmup"
+    ):
+        warmup_trainability_audit = _configure_fast_state_warmup_trainability(
+            runtime_raw.model,
+            backbone.model,
+        )
     expected_gradient_groups = (
         (
             "qwen",
@@ -2175,13 +2196,12 @@ def _run_main(argv: list[str] | None = None) -> int:
         )
         if configured_stage is ProductionStage.A2
         else (
-            *(("qwen",) if backbone.ttt_config.a5_phase == "main" else ()),
-            "fast_slow",
+            *(("qwen", "fast_slow") if backbone.ttt_config.a5_phase == "main" else ()),
             "state_shared",
             "state_task",
             "state_router_time",
             "state_retrieval",
-            "w0",
+            *(("w0",) if backbone.ttt_config.a5_phase == "main" else ()),
             *(("associative",) if backbone.ttt_config.a5_adaptation_mode == "meta_ttt" else ()),
         )
     )
@@ -2246,7 +2266,11 @@ def _run_main(argv: list[str] | None = None) -> int:
             else project.a5.optimizer
         )
         budget_lrs = (
-            float(training_args.learning_rate),
+            (
+                0.0
+                if backbone.ttt_config.a5_phase == "fast_state_warmup"
+                else float(training_args.learning_rate)
+            ),
             float(phase_optimizer.fast_slow_learning_rate),
             float(phase_optimizer.state_learning_rate),
             float(phase_optimizer.w0_learning_rate),
@@ -2292,6 +2316,7 @@ def _run_main(argv: list[str] | None = None) -> int:
     output_dir = Path(str(training_args.output_dir))
     artifact_root = Path(os.environ.get("RUN_ROOT", str(output_dir)))
     sequence_audit: tuple[str, int] | None = None
+    sequence_world_size: int | None = None
     qwen_source_sha256: str | None = None
     if backbone.ttt_config.a5_phase == "fast_state_warmup":
         # This pre-prepare digest is provenance only.  The actual frozen-Qwen baseline
@@ -2302,10 +2327,12 @@ def _run_main(argv: list[str] | None = None) -> int:
         # The sampler synchronizes its runtime-cost EMA when advancing epochs. Every rank
         # must therefore execute this preflight in the same collective order; running it
         # only on world rank zero races DeepSpeed's process-group construction on peers.
+        sequence_world_size = int(os.environ.get("WORLD_SIZE", "4"))
         sequence_audit = _a5_global_sample_sequence_sha256(
             train_dataset,
             runtime_raw.train_sampler_factory,
             epoch_count=float(training_args.num_train_epochs),
+            world_size=sequence_world_size,
         )
     if trainer.is_world_process_zero():
         environment = environment_manifest(backbone)
@@ -2315,8 +2342,14 @@ def _run_main(argv: list[str] | None = None) -> int:
             sequence_sha256, sequence_count = sequence_audit
             environment["a5_global_sample_sequence_sha256"] = sequence_sha256
             environment["a5_global_sample_sequence_count"] = sequence_count
+            environment["a5_global_sample_sequence_world_size"] = sequence_world_size
         environment["qwen_trainability_audit"] = asdict(trainability_audit)
         environment["a5_phase"] = backbone.ttt_config.a5_phase
+        environment["warmup_trainability_audit"] = (
+            asdict(warmup_trainability_audit)
+            if warmup_trainability_audit is not None
+            else None
+        )
         if full_unfreeze_audit is not None:
             environment["full_unfreeze_audit"] = asdict(full_unfreeze_audit)
         environment["outer_parameter_audit"] = asdict(parameter_audit)
@@ -2574,13 +2607,13 @@ def _validate_fast_state_warmup_training_arguments(
     scheduler_raw = arguments.lr_scheduler_type
     scheduler = getattr(scheduler_raw, "value", str(scheduler_raw))
     if int(arguments.max_steps) != project.a5.warmup.max_steps:
-        raise ValueError("Fast/State warmup requires exactly 128 optimizer steps")
+        raise ValueError("Memory/State warmup requires exactly 256 optimizer steps")
     if int(arguments.warmup_steps) != project.a5.warmup.linear_warmup_steps:
-        raise ValueError("Fast/State warmup requires exactly four linear warmup steps")
+        raise ValueError("Memory/State warmup requires exactly four linear warmup steps")
     if scheduler != "cosine":
-        raise ValueError("Fast/State warmup requires the cosine scheduler")
+        raise ValueError("Memory/State warmup requires the cosine scheduler")
     if int(arguments.gradient_accumulation_steps) != 1:
-        raise ValueError("Fast/State warmup requires one optimizer step per episode batch")
+        raise ValueError("Memory/State warmup requires one optimizer step per episode batch")
 
 
 def _standard_checkpoint_progress(checkpoint: Path) -> tuple[int, int, float]:
@@ -2865,23 +2898,32 @@ def _outer_update_norm_budget_audit(
     if a5_adaptation_mode not in _A5_ADAPTATION_MODES:
         raise ValueError("A5 adaptation mode must be meta_ttt or no_write")
     caps = project.outer_gradient_control.max_grad_norm
-    if stage is ProductionStage.A5:
+    if stage is ProductionStage.A5 and a5_phase == "fast_state_warmup":
+        reference_budget = associative_lr * float(caps.associative)
+    elif stage is ProductionStage.A5:
         reference_budget = fast_slow_lr * float(caps.fast_slow)
     else:
         reference_budget = qwen_lr * float(caps.qwen)
-    independent_budgets = {
-        "w0": w0_lr * float(caps.w0),
-        **(
-            {"fast_slow": fast_slow_lr * float(caps.fast_slow)}
-            if stage is ProductionStage.A5
-            else {}
-        ),
-        **(
+    if stage is ProductionStage.A5 and a5_phase == "fast_state_warmup":
+        independent_budgets = (
             {"associative": associative_lr * float(caps.associative)}
-            if stage is ProductionStage.A5 and a5_adaptation_mode == "meta_ttt"
+            if a5_adaptation_mode == "meta_ttt"
             else {}
-        ),
-    }
+        )
+    else:
+        independent_budgets = {
+            "w0": w0_lr * float(caps.w0),
+            **(
+                {"fast_slow": fast_slow_lr * float(caps.fast_slow)}
+                if stage is ProductionStage.A5
+                else {}
+            ),
+            **(
+                {"associative": associative_lr * float(caps.associative)}
+                if stage is ProductionStage.A5 and a5_adaptation_mode == "meta_ttt"
+                else {}
+            ),
+        }
     mode = project.outer_gradient_control.mode
     if mode is not OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP:
         raise ValueError("production training requires the canonical equal-update budget policy")
@@ -2891,7 +2933,7 @@ def _outer_update_norm_budget_audit(
         or not math.isclose(value, expected_budgets[name], rel_tol=1.0e-6)
         for name, value in independent_budgets.items()
     ):
-        raise ValueError("Qwen/W0/Associative update-norm budgets must remain aligned")
+        raise ValueError("active optimizer update-norm budgets must remain aligned")
     state_names = (
         "state_shared",
         "state_task",
@@ -2949,7 +2991,9 @@ def make_production_outer_optimizer_factory(
         associative_lr = state_lr
         fast_slow_lr = state_lr
     else:
-        qwen_lr = float(training_args.learning_rate)
+        qwen_lr = (
+            0.0 if a5_phase == "fast_state_warmup" else float(training_args.learning_rate)
+        )
         if a5_phase == "fast_state_warmup":
             optimizer = backbone.project_config.a5.warmup
         else:
@@ -2998,13 +3042,33 @@ def make_production_outer_optimizer_factory(
             ownership[parameter_id] = group
             groups[group].append(parameter)
         required = (
-            *(("qwen",) if stage is ProductionStage.A2 or a5_phase == "main" else ()),
-            *(("fast_slow",) if stage is ProductionStage.A5 else ()),
-            "state_shared",
-            "state_task",
-            "state_router_time",
-            "state_retrieval",
-            "w0",
+            (
+                "qwen",
+                "state_shared",
+                "state_task",
+                "state_router_time",
+                "state_retrieval",
+                "w0",
+            )
+            if stage is ProductionStage.A2
+            else (
+                (
+                    "state_shared",
+                    "state_task",
+                    "state_router_time",
+                    "state_retrieval",
+                )
+                if a5_phase == "fast_state_warmup"
+                else (
+                    "qwen",
+                    "fast_slow",
+                    "state_shared",
+                    "state_task",
+                    "state_router_time",
+                    "state_retrieval",
+                    "w0",
+                )
+            )
         )
         empty = tuple(name for name in required if not groups[name])
         if empty:
@@ -3012,8 +3076,15 @@ def make_production_outer_optimizer_factory(
         if stage is ProductionStage.A2 and groups["associative"]:
             raise ValueError("A2 Outer AdamW cannot own Associative")
         if stage is ProductionStage.A5:
-            if a5_phase == "fast_state_warmup" and groups["qwen"]:
-                raise ValueError("Fast/State warmup cannot own a Qwen optimizer group")
+            if a5_phase == "fast_state_warmup":
+                frozen_groups = tuple(
+                    name for name in ("qwen", "fast_slow", "w0") if groups[name]
+                )
+                if frozen_groups:
+                    raise ValueError(
+                        "Memory/State warmup cannot own frozen optimizer groups: "
+                        f"{frozen_groups}"
+                    )
             if a5_adaptation_mode == "meta_ttt" and not groups["associative"]:
                 raise ValueError("Meta-TTT A5 Outer AdamW must own Associative")
             if a5_adaptation_mode == "no_write" and groups["associative"]:
@@ -3124,6 +3195,121 @@ def _state_group_for_name(lowered: str) -> str:
     return "state_shared"
 
 
+@dataclass(frozen=True, slots=True)
+class WarmupOuterTrainabilityAudit:
+    qwen_parameter_count: int
+    qwen_trainable_count: int
+    fast_slow_parameter_count: int
+    fast_slow_trainable_count: int
+    w0_parameter_count: int
+    w0_trainable_count: int
+    state_parameter_count: int
+    state_trainable_count: int
+    associative_parameter_count: int
+    associative_trainable_count: int
+
+    def __post_init__(self) -> None:
+        if any(
+            count <= 0
+            for count in (
+                self.qwen_parameter_count,
+                self.fast_slow_parameter_count,
+                self.w0_parameter_count,
+                self.state_parameter_count,
+                self.associative_parameter_count,
+            )
+        ):
+            raise ValueError("Memory/State warmup trainability audit found an empty group")
+        if any(
+            count != 0
+            for count in (
+                self.qwen_trainable_count,
+                self.fast_slow_trainable_count,
+                self.w0_trainable_count,
+            )
+        ):
+            raise ValueError("Memory/State warmup left a frozen group trainable")
+        if self.state_trainable_count != self.state_parameter_count:
+            raise ValueError("Memory/State warmup must train every state parameter")
+        if self.associative_trainable_count != self.associative_parameter_count:
+            raise ValueError("Memory/State warmup must train every Associative parameter")
+
+
+def _configure_fast_state_warmup_trainability(
+    model: nn.Module,
+    qwen_model: nn.Module,
+) -> WarmupOuterTrainabilityAudit:
+    """Freeze Qwen/W0/slow projections and train only memory interface plus state modules."""
+
+    qwen_ids = {id(parameter) for parameter in qwen_model.parameters()}
+    adapters = tuple(module for module in model.modules() if isinstance(module, FastTTTAdapter))
+    if len(adapters) != 1:
+        raise RuntimeError("Memory/State warmup requires exactly one FastTTTAdapter")
+    fast_slow_ids = {id(parameter) for parameter in adapters[0].collect_slow_parameters()}
+    grouped: dict[int, tuple[str, nn.Parameter]] = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        parameter_id = id(parameter)
+        lowered = name.casefold()
+        if parameter_id in qwen_ids:
+            group = "qwen"
+        elif parameter_id in fast_slow_ids:
+            group = "fast_slow"
+        else:
+            group = _state_group_for_name(lowered)
+        previous = grouped.get(parameter_id)
+        if previous is not None:
+            if previous[0] != group:
+                raise ValueError(
+                    "aliased warmup parameter crossed trainability groups: "
+                    f"{previous[0]}/{group}"
+                )
+            continue
+        grouped[parameter_id] = (group, parameter)
+    if not qwen_ids <= set(grouped):
+        raise RuntimeError("Memory/State warmup lost Qwen parameters from the outer model")
+    allowed_groups = _A5_WARMUP_TRAINABLE_GROUPS
+    for group, parameter in grouped.values():
+        parameter.requires_grad_(group in allowed_groups)
+
+    def parameter_count(groups: frozenset[str]) -> tuple[int, int]:
+        values = tuple(
+            parameter
+            for group, parameter in grouped.values()
+            if group in groups
+        )
+        return (
+            sum(parameter.numel() for parameter in values),
+            sum(parameter.numel() for parameter in values if parameter.requires_grad),
+        )
+
+    qwen_count, qwen_trainable = parameter_count(frozenset({"qwen"}))
+    fast_slow_count, fast_slow_trainable = parameter_count(frozenset({"fast_slow"}))
+    w0_count, w0_trainable = parameter_count(frozenset({"w0"}))
+    state_count, state_trainable = parameter_count(
+        frozenset(
+            {
+                "state_shared",
+                "state_task",
+                "state_router_time",
+                "state_retrieval",
+            }
+        )
+    )
+    associative_count, associative_trainable = parameter_count(frozenset({"associative"}))
+    return WarmupOuterTrainabilityAudit(
+        qwen_parameter_count=qwen_count,
+        qwen_trainable_count=qwen_trainable,
+        fast_slow_parameter_count=fast_slow_count,
+        fast_slow_trainable_count=fast_slow_trainable,
+        w0_parameter_count=w0_count,
+        w0_trainable_count=w0_trainable,
+        state_parameter_count=state_count,
+        state_trainable_count=state_trainable,
+        associative_parameter_count=associative_count,
+        associative_trainable_count=associative_trainable,
+    )
+
+
 def _reset_a2_to_a5_associative(model: nn.Module) -> None:
     adapters = tuple(module for module in model.modules() if isinstance(module, FastTTTAdapter))
     if len(adapters) != 1:
@@ -3182,14 +3368,17 @@ def _a5_global_sample_sequence_sha256(
     sampler_factory: TrainSamplerFactory | None,
     *,
     epoch_count: float,
+    world_size: int = 4,
 ) -> tuple[str, int]:
-    """Hash the exact four-rank global A5 record sequence before training starts."""
+    """Hash the exact active-world-size global A5 record sequence before training starts."""
 
     if sampler_factory is None:
         raise RuntimeError("A5 sample-sequence audit requires the production sampler")
     if not math.isfinite(epoch_count) or epoch_count <= 0.0 or not epoch_count.is_integer():
         raise ValueError("A5 sample-sequence audit requires an integer epoch count")
-    sampler = sampler_factory(dataset, 0, 4)
+    if world_size not in {4, 8}:
+        raise ValueError("A5 sample-sequence audit supports only four or eight ranks")
+    sampler = sampler_factory(dataset, 0, world_size)
     set_epoch = getattr(sampler, "set_epoch", None)
     if not callable(set_epoch):
         raise TypeError("A5 sample-sequence audit requires an epoch-aware sampler")
@@ -3710,7 +3899,7 @@ def _publish_warmup_bundle(
     prepared_bundle: tuple[tuple[str, ...], dict[str, Tensor]] | None = None,
     qwen_warmup_audit: WarmupQwenBitwiseAudit | None = None,
 ) -> tuple[Path, dict[str, object]]:
-    """Atomically publish the non-Qwen handoff only after a successful 128-step run."""
+    """Atomically publish the non-Qwen handoff only after a successful 256-step run."""
 
     expected_steps = int(backbone.project_config.a5.warmup.max_steps)
     if global_step != expected_steps:

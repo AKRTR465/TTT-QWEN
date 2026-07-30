@@ -126,9 +126,9 @@ Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由�
 
 ### A5
 
-- 先独立执行 128-step Fast/State Warmup：重新加载完整 A2 checkpoint，Qwen bitwise 冻结且
-  不进入 optimizer，Fast persistent 参数（含 memory 接口）与全部状态模块训练；只使用现有
-  Query Outer objective；
+- 先独立执行 256-step Memory/State Warmup：重新加载完整 A2 checkpoint，Qwen、W0 和
+  RMSNorm/P_in/P_out bitwise 冻结且不进入 optimizer；只训练 P_C、memory 接口与全部状态
+  模块，并只使用现有 Query Outer objective；
 - Warmup 成功后仅原子保存小型 handoff bundle。Main 再加载原 A2 checkpoint，严格校验并叠加
   bundle，重置 loss-balancer EMA，创建全新 optimizer/scheduler，恢复部分 Qwen 解冻；
 - Support 写入不含任何 inner loss：memory 直接归档本 chunk 的 (key, value) 对，K=8 截断的
@@ -204,7 +204,7 @@ memory 接口参数（`memory_key_probe`、`memory_value_projection`、eta gate�
 Associative 状态，且该 profile 不得用于 same-stage resume。旧 A5 checkpoint 仍必须按
 schema-13/current contract 严格恢复，不推断、不迁移。
 
-A2/A5 sampler 必须保持四卡任务或 segment parity；每 rank 每 episode 的 backward 数固定为
+A2/A5 sampler 必须保持配置的 4/8 rank 任务或 segment parity；每 rank 每 episode 的 backward 数固定为
 `query_count + segment_count`，写入本身是本地张量运算、不含 collective。非有限
 loss/gradient 必须 warning/skip，不能产生部分参数更新。Warmup 的 Qwen bitwise 审计只
 覆盖 parameter 与 persistent buffer；被排除的 non-persistent buffer 名单随审计 JSON 一并
@@ -214,7 +214,7 @@ schema-13 的冻结常量分两层强制：`ProjectConfig._FROZEN_CONTRACT` 在 
 其覆盖的路径漂移；observation head、State Bank、Spatial/Temporal Encoder 与 fast memory 的
 字段由各模块 `_validate_*_config`/构造器在 build 时拒绝。后者是唯一能拦住
 `model_copy(update=...)` 绕过 pydantic validator 的路径，因此这些字段只在模块构建期报错——
-四卡上意味着在 distributed init 之后。schema-13 不含 `paths` 配置块，四个环境变量名直接从
+多卡启动时意味着在 distributed init 之后。schema-13 不含 `paths` 配置块，四个环境变量名直接从
 `os.environ` 读取。
 
 ## 7. 验证边界

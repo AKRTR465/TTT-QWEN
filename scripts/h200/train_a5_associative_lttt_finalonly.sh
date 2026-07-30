@@ -9,7 +9,7 @@ usage:
 
 Runs four-GPU A5 main training with the state-write Associative LTTT design:
   - initialize the complete Outer model from the supplied A2 final checkpoint
-  - strictly overlay the verified 128-step Fast/State warmup bundle
+  - strictly overlay the verified 256-step Memory/State warmup bundle
   - use Meta-TTT with normalized FP32 active-head state-write targets
   - use the partial Qwen policy (ViT upper half and Decoder last eight layers)
   - train for exactly four epochs with seed/data_seed 42
@@ -47,7 +47,7 @@ export TTT_CHECKPOINT_POLICY="atomic_final_only"
 if [[ -n "${TTT_SMOKE_MAX_STEPS:-}" ]]; then
   export TTT_DATALOADER_TRACE="${TTT_DATALOADER_TRACE:-1}"
 fi
-export RUN_ID="${RUN_ID:-$(date +%y%m%d_%H%M%S)_a5_statewrite_lttt_warmup128_v4_4epoch_finalonly}"
+export RUN_ID="${RUN_ID:-$(date +%y%m%d_%H%M%S)_a5_statewrite_lttt_warmup256_v4_4epoch_finalonly}"
 export SESSION="${SESSION:-a5_associative_lttt_${RUN_ID}}"
 
 exec bash "$PROJECT_ROOT/scripts/h200/train_a2_a5.sh" a5 "$1" "$3"
