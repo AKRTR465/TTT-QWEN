@@ -58,10 +58,3 @@ derived index through `VISUAL_COST_INDEX`; schema-2, missing, estimated-only, or
 records fail closed. For an explicit calibration smoke run, set `TTT_VISUAL_COST_PREFLIGHT=1` and
 `TTT_SMOKE_MAX_STEPS`; then rebuild the index from the emitted trace before formal training.
 Task/support buckets, rank alignment, and epoch-boundary rank-0 EMA broadcast remain unchanged.
-
-Use `scripts/select_dataloader_profile.py` to choose between 2 workers/prefetch 2 and 4/1 from
-measured trials. Use `scripts/select_visual_batch_size.py` for Support visual batches 1, 2, 4, 8;
-it enforces no OOM, at least 12 GiB free memory, state/loss parity, and at least 5% adjacent P50
-improvement. The checked-in batch remains 1 until a four-H200 run selects a larger value. The GPU
-utilization, GA-wait, step-time, and memory targets are therefore hardware acceptance gates, not
-claims established by local tests.

@@ -7,6 +7,12 @@ import torch
 from torch import Tensor, nn
 
 from tests.support import parameter_count
+from tests.support.runtime_factories import (
+    make_e1_state,
+    make_e2_state,
+    make_state_record,
+    make_stream_audit,
+)
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.identity_bank import CandidateIdentity, ConfirmedIdentity
 from ttt_svcbench_qwen.observation_heads import (
@@ -15,7 +21,6 @@ from ttt_svcbench_qwen.observation_heads import (
     E2RuntimeState,
     E2SoftOutput,
     O1SoftOutput,
-    StreamReplayAudit,
 )
 from ttt_svcbench_qwen.state_bank import (
     E1EventKind,
@@ -54,28 +59,11 @@ def _unit_semantic(index: int = 0, *, requires_grad: bool = False) -> Tensor:
 
 
 def _empty_e1_state() -> E1RuntimeState:
-    return E1RuntimeState(
-        video_id="observation-video",
-        trajectory_id="observation-trajectory",
-        query_signature=torch.zeros(SEMANTIC_DIM),
-        projected_history=torch.zeros(0, 512),
-        timestamps=torch.zeros(0, dtype=torch.float64),
-        position_ids=torch.zeros(0, dtype=torch.int64),
-        total_seen=0,
-    )
+    return make_e1_state(video_id="observation-video", trajectory_id="observation-trajectory")
 
 
 def _empty_e2_state() -> E2RuntimeState:
-    return E2RuntimeState(
-        video_id="observation-video",
-        trajectory_id="observation-trajectory",
-        query_signature=torch.zeros(SEMANTIC_DIM),
-        hidden=torch.zeros(2, HIDDEN_DIM),
-        checkpoint_hidden=torch.zeros(0, 2, HIDDEN_DIM),
-        timestamps=torch.zeros(0, dtype=torch.float64),
-        position_ids=torch.zeros(0, dtype=torch.int64),
-        total_seen=0,
-    )
+    return make_e2_state(video_id="observation-video", trajectory_id="observation-trajectory")
 
 
 def _o1_output(
@@ -142,11 +130,8 @@ def _e1_output(
         timestamps=timestamps.to(dtype=torch.float64),
         position_ids=position_ids.to(dtype=torch.int64),
         next_states=tuple(_empty_e1_state() for _ in range(probabilities.shape[0])),
-        audit=StreamReplayAudit(
-            "e1",
-            tuple(probabilities.shape[1] for _ in range(probabilities.shape[0])),
-            tuple(0 for _ in range(probabilities.shape[0])),
-            tuple(0 for _ in range(probabilities.shape[0])),
+        audit=make_stream_audit(
+            "e1", probabilities.shape[0], probabilities.shape[1], state_length=0
         ),
     )
 
@@ -188,11 +173,8 @@ def _e2_output(
         timestamps=timestamps.to(dtype=torch.float64),
         position_ids=position_ids.to(dtype=torch.int64),
         next_states=tuple(_empty_e2_state() for _ in range(event_probabilities.shape[0])),
-        audit=StreamReplayAudit(
-            "e2",
-            tuple(event_probabilities.shape[1] for _ in range(event_probabilities.shape[0])),
-            tuple(0 for _ in range(event_probabilities.shape[0])),
-            tuple(0 for _ in range(event_probabilities.shape[0])),
+        audit=make_stream_audit(
+            "e2", event_probabilities.shape[0], event_probabilities.shape[1], state_length=0
         ),
     )
 
@@ -341,17 +323,14 @@ def test_all_five_payloads_record_xor_head_and_detach_contracts() -> None:
     records = []
     for index, (head_type, payload) in enumerate(payloads):
         records.append(
-            StateRecord(
-                record_id=f"record-{index}",
+            make_state_record(
+                f"record-{index}",
+                head_type,
+                payload,
+                semantic_embedding=_unit_semantic(index),
                 video_id="video-a",
                 trajectory_id="trajectory-a",
-                head_type=head_type,
-                semantic_embedding=_unit_semantic(index),
                 timestamp=float(index),
-                time_range=None,
-                valid=True,
-                confidence=0.9,
-                payload=payload,
             )
         )
     assert tuple(record.head_type for record in records) == tuple(item[0] for item in payloads)
@@ -423,17 +402,14 @@ def test_state_record_time_contract_blocks_future_payload_evidence() -> None:
     def aggregate_record(
         head_type: HeadType, payload: O1Payload | E1Payload | E2Payload
     ) -> StateRecord:
-        return StateRecord(
-            record_id=f"record-{head_type.value}",
+        return make_state_record(
+            f"record-{head_type.value}",
+            head_type,
+            payload,
+            semantic_embedding=_unit_semantic(),
             video_id="video-time-contract",
             trajectory_id="trajectory-time-contract",
-            head_type=head_type,
-            semantic_embedding=_unit_semantic(),
             timestamp=5.0,
-            time_range=None,
-            valid=True,
-            confidence=0.9,
-            payload=payload,
         )
 
     o1_record = aggregate_record(HeadType.O1, o1_payload)
@@ -478,29 +454,24 @@ def test_state_record_time_contract_blocks_future_payload_evidence() -> None:
 def test_o2_record_time_contract_preserves_first_seen_and_allows_later_last_seen() -> None:
     point_candidate = _candidate("candidate-time", first_seen=2.0, last_seen=5.0)
     point_confirmed = _confirmed("identity-time", first_seen=2.0, last_seen=5.0)
-    point_record = StateRecord(
-        record_id="record-point",
-        video_id="video-o2-time",
-        trajectory_id="trajectory-o2-time",
-        head_type=HeadType.O2,
+    point_record = make_state_record(
+        "record-point",
+        HeadType.O2,
+        point_confirmed,
         semantic_embedding=_unit_semantic(),
-        timestamp=2.0,
-        time_range=None,
-        valid=True,
-        confidence=0.9,
-        payload=point_confirmed,
-    )
-    StateRecord(
-        record_id="record-candidate-point",
         video_id="video-o2-time",
         trajectory_id="trajectory-o2-time",
-        head_type=HeadType.O2,
-        semantic_embedding=_unit_semantic(1),
         timestamp=2.0,
-        time_range=None,
-        valid=True,
+    )
+    make_state_record(
+        "record-candidate-point",
+        HeadType.O2,
+        point_candidate,
+        semantic_embedding=_unit_semantic(1),
+        video_id="video-o2-time",
+        trajectory_id="trajectory-o2-time",
+        timestamp=2.0,
         confidence=0.8,
-        payload=point_candidate,
     )
     range_record = replace(
         point_record,

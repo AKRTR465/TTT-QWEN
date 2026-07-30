@@ -11,6 +11,14 @@ import torch
 from torch import Tensor
 
 from tests.support import make_test_model as build_model
+from tests.support.runtime_factories import (
+    make_e1_state,
+    make_e2_state,
+    make_query_output,
+    make_spatial_output,
+    make_stream_audit,
+    make_temporal_cache,
+)
 from ttt_svcbench_qwen.associative_ttt import (
     AssociativeTTTIntermediates,
     FastAssociativeContext,
@@ -47,25 +55,15 @@ from ttt_svcbench_qwen.model import (
     VisualStageOutput,
 )
 from ttt_svcbench_qwen.observation_heads import (
-    E1RuntimeState,
     E1SoftOutput,
-    E2RuntimeState,
     E2SoftOutput,
     O1SoftOutput,
     O2SoftOutput,
     ObservationOutputs,
-    StreamReplayAudit,
 )
 from ttt_svcbench_qwen.query_encoder import (
-    OPERATOR_TO_HEAD_TYPE,
     Operator,
-    OperatorRouterOutput,
-    QueryEmbeddingOutput,
     QueryEncoderOutput,
-    TimeResolution,
-    TimeResolutionStatus,
-    TimeResolverLogits,
-    TimeResolverOutput,
     TimeWindow,
     TimeWindowMode,
 )
@@ -73,7 +71,6 @@ from ttt_svcbench_qwen.stage_a_runtime import StageABankWriter
 from ttt_svcbench_qwen.state_bank import HeadType, StructuredStateBank, build_state_bank
 from ttt_svcbench_qwen.state_encoder import (
     SpatialEncoderOutput,
-    SpatialSlotRuntimeState,
     TemporalCache,
     TemporalEncoderOutput,
 )
@@ -286,27 +283,6 @@ class _FakeSuite:
         return (_reader_result(self.status),)
 
     @staticmethod
-    def audit_results(
-        _retrieval: object,
-        results: tuple[ReaderResult, ...],
-    ) -> tuple[ReaderResult, ...]:
-        return results
-
-    @staticmethod
-    def audit_bank_results(
-        _state_bank: object,
-        _states: object,
-        _query: object,
-        results: tuple[ReaderResult, ...],
-        *,
-        video_ids: object,
-        trajectory_ids: object,
-    ) -> tuple[ReaderResult, ...]:
-        assert tuple(cast(Sequence[str], video_ids)) == ("video-a",)
-        assert tuple(cast(Sequence[str], trajectory_ids)) == ("trajectory-a",)
-        return results
-
-    @staticmethod
     def audit_number_tokens(result: ReaderResult) -> int | None:
         return result.exact_count
 
@@ -365,93 +341,21 @@ class _FakeSuite:
 
 
 def _typed_query() -> QueryEncoderOutput:
-    q_target = torch.zeros((1, 512))
-    embeddings = QueryEmbeddingOutput(
-        token_states=torch.zeros((1, 1, 768)),
-        pooling_weights=torch.ones((1, 1)),
-        q_target=q_target,
-        q_operator=q_target.clone(),
-        q_time=q_target.clone(),
-        padding_mask=torch.zeros((1, 1), dtype=torch.bool),
-    )
-    operator = Operator.O1_SNAP
-    raw_index = tuple(Operator).index(operator)
-    logits = torch.full((1, len(tuple(Operator))), -5.0)
-    logits[0, raw_index] = 5.0
-    route = OperatorRouterOutput(
-        logits=logits,
-        confidence=torch.ones(1),
-        raw_indices=torch.tensor((raw_index,), dtype=torch.int64),
-        hard_operators=(operator,),
-        head_types=(OPERATOR_TO_HEAD_TYPE[operator],),
-        confidence_gate_applied=False,
-    )
-    time_logits = TimeResolverLogits(
-        mode_logits=torch.zeros((1, 4)),
-        mode_confidence=torch.ones(1),
-        mode_indices=torch.ones(1, dtype=torch.int64),
-        span_start_logits=torch.zeros((1, 1)),
-        span_end_logits=torch.zeros((1, 1)),
-        padding_mask=torch.zeros((1, 1), dtype=torch.bool),
-    )
-    resolution = TimeResolution(
-        window=TimeWindow(TimeWindowMode.HISTORY, 2.0, 0.0, 2.0, True),
-        status=TimeResolutionStatus.OK,
-        reason="synthetic_explicit",
-        mode_confidence=1.0,
-        numeric_span=None,
-        parsed_values_seconds=(),
-        used_operator_default=True,
-    )
-    return QueryEncoderOutput(
-        embeddings=embeddings,
-        route=route,
-        time=TimeResolverOutput(time_logits, (resolution,)),
-        hard_operators=(operator,),
-        head_types=(HeadType.O1,),
-    )
+    return make_query_output((Operator.O1_SNAP,), q_target=torch.zeros((1, 512)))
 
 
 def _typed_cache(hidden: Tensor, query: Tensor) -> TemporalCache:
-    width = hidden.shape[1]
-    kv = tuple(torch.zeros((1, 12, width, 64)) for _ in range(6))
-    replay = tuple(torch.zeros((1, 12, 0, 64)) for _ in range(6))
-    return TemporalCache(
-        hidden=hidden.detach().clone(),
-        layer_keys=kv,
-        layer_values=tuple(value.clone() for value in kv),
-        replay_layer_keys=replay,
-        replay_layer_values=tuple(value.clone() for value in replay),
-        timestamps=torch.arange(width, dtype=torch.float64).reshape(1, width),
-        replay_timestamps=torch.empty((1, 0), dtype=torch.float64),
-        position_ids=torch.arange(width, dtype=torch.int64).reshape(1, width),
-        replay_position_ids=torch.empty((1, 0), dtype=torch.int64),
-        valid_mask=torch.ones((1, width), dtype=torch.bool),
-        replay_valid_mask=torch.empty((1, 0), dtype=torch.bool),
+    return make_temporal_cache(
+        hidden=hidden,
         video_ids=("video-a",),
         trajectory_ids=("trajectory-a",),
-        query_signatures=query.detach().clone(),
-        total_seen=torch.tensor((width,), dtype=torch.int64),
+        query_signatures=query,
     )
 
 
 def _typed_spatial() -> SpatialEncoderOutput:
-    slots = torch.randn((1, 1, 768))
-    state = SpatialSlotRuntimeState(
-        video_id="video-a",
-        slots=slots[0].detach().clone(),
-        slot_valid_mask=torch.ones(1, dtype=torch.bool),
-        slot_confidence=torch.ones(1),
-        active_slot_overflow_count=0,
-        overflow_event_count=0,
-        processed_tubelets=2,
-    )
-    return SpatialEncoderOutput(
-        slots=slots,
-        slot_valid_mask=torch.ones((1, 1), dtype=torch.bool),
-        active_slot_overflow_count=torch.zeros(1, dtype=torch.int64),
-        slot_confidence=torch.ones((1, 1)),
-        next_states=(state,),
+    return make_spatial_output(
+        torch.randn((1, 1, 768)), video_ids=("video-a",), processed_tubelets=2
     )
 
 
@@ -493,24 +397,17 @@ def _typed_observations(
         timestamps=slot_times.clone(),
         position_ids=slot_positions.clone(),
     )
-    e1_state = E1RuntimeState(
-        video_id="video-a",
-        trajectory_id="trajectory-a",
+    e1_state = make_e1_state(
         query_signature=query.q_target[0].detach().clone(),
-        projected_history=torch.zeros((2, 512)),
+        total_seen=2,
         timestamps=temporal.timestamps[0].clone(),
         position_ids=temporal.position_ids[0].clone(),
-        total_seen=2,
     )
-    e2_state = E2RuntimeState(
-        video_id="video-a",
-        trajectory_id="trajectory-a",
+    e2_state = make_e2_state(
         query_signature=query.q_target[0].detach().clone(),
-        hidden=torch.zeros((2, 768)),
-        checkpoint_hidden=torch.zeros((2, 2, 768)),
+        total_seen=2,
         timestamps=temporal.timestamps[0].clone(),
         position_ids=temporal.position_ids[0].clone(),
-        total_seen=2,
     )
     e1_logits = torch.full((1, 2, 3), 5.0)
     e1 = E1SoftOutput(
@@ -520,7 +417,7 @@ def _typed_observations(
         timestamps=temporal.timestamps.clone(),
         position_ids=temporal.position_ids.clone(),
         next_states=(e1_state,),
-        audit=StreamReplayAudit("e1", (2,), (0,), (2,)),
+        audit=make_stream_audit("e1", 1, 2),
     )
     event_logits = torch.full((1, 2, 4), 5.0)
     phase_logits = torch.zeros((1, 2, 4))
@@ -533,7 +430,7 @@ def _typed_observations(
         timestamps=temporal.timestamps.clone(),
         position_ids=temporal.position_ids.clone(),
         next_states=(e2_state,),
-        audit=StreamReplayAudit("e2", (2,), (0,), (2,)),
+        audit=make_stream_audit("e2", 1, 2),
     )
     return ObservationOutputs(o1=o1, o2=o2, e1=e1, e2=e2)
 

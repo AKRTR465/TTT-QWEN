@@ -8,6 +8,12 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+from tests.support.runtime_factories import (
+    make_e1_state,
+    make_e2_state,
+    make_state_record,
+    make_stream_audit,
+)
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.losses import compute_state_loss
 from ttt_svcbench_qwen.observation_heads import (
@@ -18,7 +24,6 @@ from ttt_svcbench_qwen.observation_heads import (
     O1SoftOutput,
     O2SoftOutput,
     ObservationOutputs,
-    StreamReplayAudit,
 )
 from ttt_svcbench_qwen.query_encoder import (
     OPERATOR_TO_HEAD_TYPE,
@@ -95,28 +100,11 @@ def test_official_weak_term_always_keeps_the_shared_zero_anchor(valid: bool) -> 
 
 
 def _fresh_e1(row: int) -> E1RuntimeState:
-    return E1RuntimeState(
-        video_id=f"video-{row}",
-        trajectory_id=f"trajectory-{row}",
-        query_signature=torch.zeros(512),
-        projected_history=torch.zeros(0, 512),
-        timestamps=torch.zeros(0, dtype=torch.float64),
-        position_ids=torch.zeros(0, dtype=torch.int64),
-        total_seen=0,
-    )
+    return make_e1_state(video_id=f"video-{row}", trajectory_id=f"trajectory-{row}")
 
 
 def _fresh_e2(row: int) -> E2RuntimeState:
-    return E2RuntimeState(
-        video_id=f"video-{row}",
-        trajectory_id=f"trajectory-{row}",
-        query_signature=torch.zeros(512),
-        hidden=torch.zeros(2, 768),
-        checkpoint_hidden=torch.zeros(0, 2, 768),
-        timestamps=torch.zeros(0, dtype=torch.float64),
-        position_ids=torch.zeros(0, dtype=torch.int64),
-        total_seen=0,
-    )
+    return make_e2_state(video_id=f"video-{row}", trajectory_id=f"trajectory-{row}")
 
 
 def _resolution(row: int) -> TimeResolution:
@@ -141,17 +129,14 @@ def _resolution(row: int) -> TimeResolution:
 def _record(row: int, column: int) -> StateRecord:
     semantic = torch.zeros(512)
     semantic[(row * 3 + column) % 512] = 1.0
-    return StateRecord(
-        record_id=f"record-{row}-{column}",
+    return make_state_record(
+        f"record-{row}-{column}",
+        HeadType.O1,
+        O1Payload(0, 0, ()),
+        semantic_embedding=semantic,
         video_id=f"video-{row}",
         trajectory_id=f"trajectory-{row}",
-        head_type=HeadType.O1,
-        semantic_embedding=semantic,
         timestamp=float(column + 1),
-        time_range=None,
-        valid=True,
-        confidence=0.9,
-        payload=O1Payload(0, 0, ()),
     )
 
 
@@ -224,12 +209,7 @@ def _typed_predictions(
         timestamps=temporal_times,
         position_ids=temporal_positions,
         next_states=tuple(_fresh_e1(row) for row in range(batch_size)),
-        audit=StreamReplayAudit(
-            "e1",
-            (temporal_width,) * batch_size,
-            (0,) * batch_size,
-            (0,) * batch_size,
-        ),
+        audit=make_stream_audit("e1", batch_size, temporal_width, state_length=0),
     )
     e2_events = _leaf((batch_size, temporal_width, 4))
     e2_phases = _leaf((batch_size, temporal_width, 4))
@@ -242,12 +222,7 @@ def _typed_predictions(
         timestamps=temporal_times,
         position_ids=temporal_positions,
         next_states=tuple(_fresh_e2(row) for row in range(batch_size)),
-        audit=StreamReplayAudit(
-            "e2",
-            (temporal_width,) * batch_size,
-            (0,) * batch_size,
-            (0,) * batch_size,
-        ),
+        audit=make_stream_audit("e2", batch_size, temporal_width, state_length=0),
     )
     observations = ObservationOutputs(o1=o1, o2=o2, e1=e1, e2=e2)
 
@@ -809,7 +784,6 @@ def test_official_retrieval_requires_aligned_mixed_bag_and_ignores_selection_mas
         "retrieval/all_positive_rows": 0.0,
         "retrieval/valid_bag_rows": 1.0,
         "retrieval/rescued_from_wrong_route_rows": 0.0,
-        "retrieval/legacy_valid_bag_rows": 1.0,
         "retrieval/invalid_excluded_count": 0.0,
         "retrieval/ineligible_excluded_count": 0.0,
         "retrieval/causal_excluded_count": 0.0,
@@ -890,7 +864,6 @@ def test_official_retrieval_rescues_valid_target_bag_from_wrong_hard_route() -> 
     assert output.retrieval.valid_rows == 1
     assert output.audit.retrieval_wrong_operator_rows == 1
     assert output.audit.retrieval_rescued_from_wrong_route_rows == 1
-    assert output.audit.retrieval_legacy_valid_bag_rows == 0
     output.retrieval.value.backward()
     assert retrieval.scores.grad is not None
     assert float(retrieval.scores.grad.abs().sum()) > 0.0
@@ -996,7 +969,7 @@ def test_e1_dense_targets_follow_the_two_position_hard_fsm_contract() -> None:
         timestamps=timestamps.unsqueeze(0),
         position_ids=torch.arange(3, dtype=torch.int64).unsqueeze(0),
         next_states=(_fresh_e1(0),),
-        audit=StreamReplayAudit("e1", (3,), (0,), (0,)),
+        audit=make_stream_audit("e1", 1, 3, state_length=0),
     )
     bank = build_state_bank(load_config())
     state = bank.reset("video-e1", "trajectory-e1")

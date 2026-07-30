@@ -125,6 +125,9 @@ bash scripts/h200/benchmark_fullprefix256_8step.sh a5 /absolute/path/a2/checkpoi
   `run_config.json` 一致。
 - A2→Warmup 和 A2+handoff→Main 都创建全新的 optimizer/scheduler/RNG；handoff bundle
   绑定 A2 checkpoint、project config、dataset manifest、seed 与代码 commit hash。
+  该绑定取 `project.model_dump()` 的 sha256，因此任何 **字段级** config schema 变更都会作废
+  已有 bundle。schema-12 移除 `paths` 块即属此类：此前生成的 `a5_warmup_bundle/` 全部需要
+  重跑 Warmup 重建。只删 validator 不改字段则不影响该哈希。
 - `final-checkpoint/` 保存最终模型，`resume_state/` 保存 Accelerator 完整分布式状态；运行中断
   时可从尚存的最后一个标准 `checkpoint-*` 新建 run 续训。
 - transient `W_t`、Bank、FSM、视觉/时序 cache 从所有 checkpoint 中排除。
@@ -176,3 +179,48 @@ python scripts/benchmark_retrieval_history.py \
 GPU 遥测在完成后写同名 `.done` 哨兵。TensorBoard bridge 需要安装项目的 `tracking` extra；
 Retrieval benchmark 比较逐行写入与生产 `append_many()` 批量写入当前 tensor ring 的耗时，
 不再依赖已删除的 legacy tuple backend。
+
+## Preprocess cache 预热
+
+`scripts/h200/prewarm_preprocess_cache.sh` 是唯一的预热入口，16 路分片写 `runs/<run_id>/`
+下的 `command.txt`、`git_state.txt`、`environment.txt`、`shards/` 与 `run_summary.json`。
+三条历史配置对应以下调用：
+
+```bash
+bash scripts/h200/prewarm_preprocess_cache.sh \
+  --stage a2 --roles state_query \
+  --cache-root "$PWD/.cache/preprocess/260720_ttt8_benchmark" \
+  --cache-namespace 544334e7d7bbf4c2f651 \
+  --training-config "$PWD/configs/h200/a2_qwen3vl8b_trainsplit_costbalanced_4epoch_4gpu.yaml" \
+  --lock-name .state_query_train_prewarm.lock \
+  --run-tag svcbench_a2_state_query_cache_train \
+  --inspect 1 \
+  runs/0719_215434_prepare_svcbench_k8/dataset_manifest.json
+
+bash scripts/h200/prewarm_preprocess_cache.sh \
+  --stage a2 --roles "support state_query" \
+  --cache-root "$PWD/.cache/preprocess/260723_a2_original_trainsplit_support_statequery" \
+  --cache-namespace a2_original_trainsplit_support_statequery_v1 \
+  --training-config "$PWD/configs/h200/a2_qwen3vl8b_trainsplit_costbalanced_4epoch_4gpu.yaml" \
+  --lock-name .support_state_query_train_prewarm.lock \
+  --run-tag a2_original_trainsplit_support_state_cache \
+  --verify inputs \
+  runs/0719_215434_prepare_svcbench_k8/dataset_manifest.json
+
+TTT_H200_VENV=/mnt/shared-storage-user/mineru2-shared/niujunbo/play/projects/ttt_qwen/.venv-h200-uv-py312-torch28 \
+bash scripts/h200/prewarm_preprocess_cache.sh \
+  --stage a5 --roles "support state_query" --storage-dtype float16 \
+  --cache-root /mnt/shared-storage-user/mineru2-shared/niujunbo/play/projects/ttt_qwen/.cache/preprocess/260726_a5_support_aligned_v3_fp16 \
+  --cache-namespace a5_support_aligned_train_support_statequery_fp16_v3 \
+  --training-config "$PWD/configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml" \
+  --lock-name .a5_support_state_query_train_prewarm.lock \
+  --run-tag a5_train_support_state_cache \
+  --verify inputs --inspect 1 \
+  runs/0719_215434_prepare_svcbench_k8/dataset_manifest.json
+```
+
+`run_summary.json` 为三者的并集 schema：`status`、`stage`、`split`、`roles`、`shard_count`、
+`failed_shards`、`shard_exit_codes`、`candidate_chunk_count`、`unique_chunk_count`、
+`selected_chunk_count`、`written_bytes` 恒定写出，`verification` 只在 `--verify inputs` 时出现，
+`cache` 只在 `--inspect 1` 时出现。任一分片失败、分片 summary 缺失或 verify 非零时
+`status=failed` 且脚本退出 1。

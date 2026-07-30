@@ -57,7 +57,6 @@ class SpySuite:
     prefill_output: object
     composer_request: dict[str, object] | None = None
     prefill_request: QwenPrefillRequest | None = None
-    audit_replacement: tuple[object, ...] | None = None
 
     def visual(self, request: ObservationChunkRequest) -> VisualStageOutput:
         self.events.append("visual")
@@ -163,34 +162,6 @@ class SpySuite:
         assert tuple(video_ids) == ("video-a",)
         assert tuple(trajectory_ids) == ("trajectory-a",)
         return self.reader_results
-
-    def audit_results(
-        self,
-        retrieval: object,
-        results: Any,
-    ) -> tuple[object, ...]:
-        self.events.append("reader.audit")
-        assert retrieval is self.retrieval
-        assert tuple(results) == self.reader_results
-        return self.reader_results if self.audit_replacement is None else self.audit_replacement
-
-    def audit_bank_results(
-        self,
-        state_bank: object,
-        states: Any,
-        query: object,
-        results: Any,
-        *,
-        video_ids: Any,
-        trajectory_ids: Any,
-    ) -> tuple[object, ...]:
-        self.events.append("reader.audit")
-        assert isinstance(state_bank, _StateBankComponent)
-        assert tuple(states) == ("bank-1",)
-        assert tuple(video_ids) == ("video-a",)
-        assert tuple(trajectory_ids) == ("trajectory-a",)
-        assert tuple(results) == self.reader_results
-        return self.reader_results if self.audit_replacement is None else self.audit_replacement
 
     def audit_number_tokens(self, result: object) -> int:
         self.events.append("reader.number")
@@ -474,7 +445,6 @@ def test_answer_query_audits_same_retrieval_before_resampler_and_native_prefill(
     assert suite.events == [
         "retriever.history",
         "reader.bank",
-        "reader.audit",
         "reader.number",
         "resampler",
         "composer",
@@ -540,33 +510,6 @@ def test_cross_owner_observation_fails_closed(
     with pytest.raises(LifecycleError, match="owner"):
         model.observe_chunk(make_observation_request(other), lifecycle)
     assert suite.events == []
-
-
-def test_reader_rewrite_blocks_resampler_composer_and_marks_lifecycle_failed(
-    config: ProjectConfig,
-) -> None:
-    suite = make_suite()
-    replacement = SimpleNamespace(
-        selected_record_ids=("record-1",),
-        exact_count=999,
-        number_token_ids=(999,),
-    )
-    suite.audit_replacement = (replacement,)
-    model = build_model(config, components=make_components(suite))
-    owner = make_owner()
-    lifecycle = PrefillLifecycle(owner)
-    observation = run_observation(model, owner, lifecycle)
-    suite.events.clear()
-
-    with pytest.raises(ValueError, match="unchanged authoritative"):
-        model.prepare_answer(make_answer_request(owner, observation), lifecycle)
-
-    assert suite.events == [
-        "retriever.history",
-        "reader.bank",
-        "reader.audit",
-    ]
-    assert lifecycle.audit().phase is LifecyclePhase.READY
 
 
 def test_resampler_provenance_mismatch_blocks_composer_and_prefill(

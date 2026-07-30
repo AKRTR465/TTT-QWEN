@@ -7,6 +7,7 @@ import torch
 from torch import Tensor, nn
 
 from tests.support import parameter_count
+from tests.support.runtime_factories import make_temporal_cache
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.observation_heads import (
     E1PointEventDecoder,
@@ -48,29 +49,17 @@ def _empty_temporal_cache(
     video_ids: tuple[str, ...],
     trajectory_ids: tuple[str, ...],
 ) -> TemporalCache:
-    batch_size = query_signatures.shape[0]
-    device = query_signatures.device
-    dtype = query_signatures.dtype
-
-    def empty_kv() -> Tensor:
-        return torch.empty(batch_size, 12, 0, 64, dtype=dtype, device=device)
-
-    return TemporalCache(
-        hidden=torch.empty(batch_size, 0, HIDDEN_DIM, dtype=dtype, device=device),
-        layer_keys=tuple(empty_kv() for _ in range(6)),
-        layer_values=tuple(empty_kv() for _ in range(6)),
-        replay_layer_keys=tuple(empty_kv() for _ in range(6)),
-        replay_layer_values=tuple(empty_kv() for _ in range(6)),
-        timestamps=torch.empty(batch_size, 0, dtype=torch.float64, device=device),
-        replay_timestamps=torch.empty(batch_size, 0, dtype=torch.float64, device=device),
-        position_ids=torch.empty(batch_size, 0, dtype=torch.int64, device=device),
-        replay_position_ids=torch.empty(batch_size, 0, dtype=torch.int64, device=device),
-        valid_mask=torch.empty(batch_size, 0, dtype=torch.bool, device=device),
-        replay_valid_mask=torch.empty(batch_size, 0, dtype=torch.bool, device=device),
+    return make_temporal_cache(
+        hidden=torch.empty(
+            query_signatures.shape[0],
+            0,
+            HIDDEN_DIM,
+            dtype=query_signatures.dtype,
+            device=query_signatures.device,
+        ),
         video_ids=video_ids,
         trajectory_ids=trajectory_ids,
-        query_signatures=query_signatures.detach().clone(),
-        total_seen=torch.zeros(batch_size, dtype=torch.int64, device=device),
+        query_signatures=query_signatures,
     )
 
 

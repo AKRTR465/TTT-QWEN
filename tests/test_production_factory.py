@@ -80,6 +80,26 @@ from ttt_svcbench_qwen.stage_a_targets import (
 
 ROOT = Path(__file__).resolve().parents[1]
 
+_A2_EXTENSION_FIELDS: dict[str, object] = {
+    "stage": "a2",
+    "project_config": "configs/model_state_ttt_8b.yaml",
+    "dataset_manifest": "manifest.json",
+    "support_prefetch_depth": 2,
+    "support_decode_coalesce": True,
+    "support_materialization": "dataloader_episode",
+    "state_query_visual_mode": "recent_chunk",
+    "state_query_max_frames": 16,
+    "answer_query_visual_mode": "causal_prefix",
+    "answer_query_max_frames": 256,
+    "state_query_cache_mode": "inherit",
+    "answer_query_cache_mode": "disabled",
+    "preprocess_cache_mode": "read_write",
+    "preprocess_cache_miss_policy": "decode",
+    "preprocess_cache_root_env": "TTT_PREPROCESS_CACHE_ROOT",
+    "preprocess_cache_max_gb": 200.0,
+    "preprocess_cache_dtype": "float32",
+}
+
 
 class _OuterToy(nn.Module):
     def __init__(self) -> None:
@@ -311,6 +331,7 @@ def _grouped_bundle(
     project: ProjectConfig,
     *,
     adaptation_mode: str = "meta_ttt",
+    associative_trainable: bool | None = None,
 ) -> tuple[LlamaFactoryBackboneBundle, nn.Module]:
     qwen = nn.Linear(4, 4)
     checkout = tmp_path / "lf"
@@ -365,7 +386,9 @@ def _grouped_bundle(
         ),
         symbols=symbols,
     )
-    return bundle, _GroupedOuterToy(qwen, associative_trainable=adaptation_mode == "meta_ttt")
+    if associative_trainable is None:
+        associative_trainable = adaptation_mode == "meta_ttt"
+    return bundle, _GroupedOuterToy(qwen, associative_trainable=associative_trainable)
 
 
 class _QwenOwnerToy(nn.Module):
@@ -631,18 +654,13 @@ def test_operator_diagnostics_aggregate_confusion_before_macro_recall() -> None:
 
 
 def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
+    h200_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = Path(__file__).parents[1]
-    monkeypatch.setenv("OUTPUT_DIR", "/tmp/output")
     monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/dataset_manifest.json")
-    monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
-    monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
-    monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
-    monkeypatch.setenv("VISUAL_COST_INDEX", "/tmp/visual_cost_index.json")
 
     native, extension = load_training_yaml(
-        root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml"
+        ROOT / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml"
     )
 
     assert native["num_train_epochs"] == 4.0
@@ -691,18 +709,13 @@ def test_a2_yaml_runs_four_epochs_and_keeps_only_the_final_checkpoint(
 
 
 def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
+    h200_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = Path(__file__).parents[1]
-    monkeypatch.setenv("OUTPUT_DIR", "/tmp/output")
     monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/dataset_manifest.json")
-    monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
-    monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
-    monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
-    monkeypatch.setenv("VISUAL_COST_INDEX", "/tmp/visual_cost_index.json")
 
     native, extension = load_training_yaml(
-        root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml"
+        ROOT / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml"
     )
 
     assert native["video_fps"] == 2.0
@@ -729,22 +742,18 @@ def test_fullprefix256_yaml_matches_qwen_visual_budget_and_dynamic_graph_zero1(
 
 
 def test_semantic_repair_train_split_recipe_saves_only_epochs_two_and_four(
+    h200_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = Path(__file__).parents[1]
     for key, value in {
-        "OUTPUT_DIR": "/tmp/output",
         "RUN_ROOT": "/tmp/run",
         "SVCBENCH_DATASET_MANIFEST": "/tmp/dataset_manifest.json",
-        "MODEL": "/tmp/qwen3vl8b",
-        "DATASET_DIR": "/tmp/svcbench",
-        "DATASET_NAME": "svcbench_qwen3vl_sft",
         "VISUAL_COST_INDEX": "/tmp/state16_answer256_schema4.json",
     }.items():
         monkeypatch.setenv(key, value)
 
     native, extension = load_training_yaml(
-        root / "configs/h200/a2_qwen3vl8b_trainsplit_costbalanced_4epoch_4gpu.yaml"
+        ROOT / "configs/h200/a2_qwen3vl8b_trainsplit_costbalanced_4epoch_4gpu.yaml"
     )
 
     assert native["num_train_epochs"] == 4.0
@@ -765,47 +774,30 @@ def test_semantic_repair_train_split_recipe_saves_only_epochs_two_and_four(
 
 
 def test_dual_query_visual_config_is_required_and_legacy_is_rejected() -> None:
-    fields = {
-        "stage": "a2",
-        "project_config": "configs/model_state_ttt_8b.yaml",
-        "dataset_manifest": "manifest.json",
-        "support_prefetch_depth": 2,
-        "support_decode_coalesce": True,
-        "support_materialization": "dataloader_episode",
-        "state_query_visual_mode": "recent_chunk",
-        "state_query_max_frames": 16,
-        "answer_query_visual_mode": "causal_prefix",
-        "answer_query_max_frames": 256,
-        "state_query_cache_mode": "inherit",
-        "answer_query_cache_mode": "disabled",
-        "preprocess_cache_mode": "read_write",
-        "preprocess_cache_miss_policy": "decode",
-        "preprocess_cache_root_env": "TTT_PREPROCESS_CACHE_ROOT",
-        "preprocess_cache_max_gb": 200.0,
-        "preprocess_cache_dtype": "float32",
-    }
     legacy_fields = {
         key: value
-        for key, value in fields.items()
+        for key, value in _A2_EXTENSION_FIELDS.items()
         if not key.startswith(("state_query_", "answer_query_"))
     }
     with pytest.raises(ValueError, match="Field required"):
         ProductionTTTConfig(**legacy_fields)
     with pytest.raises(ValueError, match="Extra inputs are not permitted"):
         ProductionTTTConfig(
-            **fields,
+            **_A2_EXTENSION_FIELDS,
             query_visual_mode="causal_prefix",
             query_max_frames=256,
         )
     with pytest.raises(ValueError, match="Extra inputs are not permitted"):
-        ProductionTTTConfig(**fields, query_cache_mode="inherit")
+        ProductionTTTConfig(**_A2_EXTENSION_FIELDS, query_cache_mode="inherit")
     with pytest.raises(ValueError, match="Extra inputs are not permitted"):
-        ProductionTTTConfig(**fields, query_decode_strategy="legacy_seek")
+        ProductionTTTConfig(**_A2_EXTENSION_FIELDS, query_decode_strategy="legacy_seek")
     with pytest.raises(ValueError, match="support_materialization"):
-        ProductionTTTConfig(**{**fields, "support_materialization": "trainer_prefetch"})
+        ProductionTTTConfig(
+            **{**_A2_EXTENSION_FIELDS, "support_materialization": "trainer_prefetch"}
+        )
     with pytest.raises(ValueError, match="A2 requires full"):
         ProductionTTTConfig(
-            **fields,
+            **_A2_EXTENSION_FIELDS,
             qwen_outer_trainability={
                 "mode": "partial",
                 "vision_freeze_first_blocks": 13,
@@ -866,36 +858,23 @@ def test_split_query_specs_bound_state_to_16_and_answer_to_256(tmp_path: Path) -
 
 
 def test_fullprefix256_trace_override_requires_run_root(
+    h200_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = Path(__file__).parents[1]
-    for key, value in {
-        "OUTPUT_DIR": "/tmp/output",
-        "SVCBENCH_DATASET_MANIFEST": "/tmp/dataset_manifest.json",
-        "MODEL": "/tmp/qwen3vl8b",
-        "DATASET_DIR": "/tmp/svcbench",
-        "DATASET_NAME": "svcbench_qwen3vl_sft",
-        "VISUAL_COST_INDEX": "/tmp/visual_cost_index.json",
-        "TTT_DATALOADER_TRACE": "1",
-    }.items():
-        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/dataset_manifest.json")
+    monkeypatch.setenv("TTT_DATALOADER_TRACE", "1")
     monkeypatch.delenv("RUN_ROOT", raising=False)
 
     with pytest.raises(ValueError, match="requires RUN_ROOT"):
-        load_training_yaml(root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml")
+        load_training_yaml(ROOT / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml")
 
 
 def test_fullprefix256_trace_and_cost_preflight_overrides(
+    h200_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = Path(__file__).parents[1]
     for key, value in {
-        "OUTPUT_DIR": "/tmp/output",
         "SVCBENCH_DATASET_MANIFEST": "/tmp/dataset_manifest.json",
-        "MODEL": "/tmp/qwen3vl8b",
-        "DATASET_DIR": "/tmp/svcbench",
-        "DATASET_NAME": "svcbench_qwen3vl_sft",
-        "VISUAL_COST_INDEX": "/tmp/visual_cost_index.json",
         "TTT_DATALOADER_TRACE": "1",
         "RUN_ROOT": "/tmp/run",
         "TTT_VISUAL_COST_PREFLIGHT": "1",
@@ -903,7 +882,7 @@ def test_fullprefix256_trace_and_cost_preflight_overrides(
     }.items():
         monkeypatch.setenv(key, value)
 
-    _, extension = load_training_yaml(root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml")
+    _, extension = load_training_yaml(ROOT / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml")
 
     assert extension.runtime_trace_mode == "cuda"
     assert Path(extension.runtime_trace_dir or "") == Path("/tmp/run/runtime_trace")
@@ -912,23 +891,15 @@ def test_fullprefix256_trace_and_cost_preflight_overrides(
 
 
 def test_fullprefix256_cost_preflight_requires_explicit_smoke(
+    h200_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = Path(__file__).parents[1]
-    for key, value in {
-        "OUTPUT_DIR": "/tmp/output",
-        "SVCBENCH_DATASET_MANIFEST": "/tmp/dataset_manifest.json",
-        "MODEL": "/tmp/qwen3vl8b",
-        "DATASET_DIR": "/tmp/svcbench",
-        "DATASET_NAME": "svcbench_qwen3vl_sft",
-        "VISUAL_COST_INDEX": "/tmp/visual_cost_index.json",
-        "TTT_VISUAL_COST_PREFLIGHT": "1",
-    }.items():
-        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/dataset_manifest.json")
+    monkeypatch.setenv("TTT_VISUAL_COST_PREFLIGHT", "1")
     monkeypatch.delenv("TTT_SMOKE_MAX_STEPS", raising=False)
 
     with pytest.raises(ValueError, match="explicit smoke run"):
-        load_training_yaml(root / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml")
+        load_training_yaml(ROOT / "configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml")
 
 
 def test_a2_lazy_ga_fetch_pulls_each_microbatch_only_when_consumed(
@@ -1366,19 +1337,15 @@ def test_outer_model_forces_non_reentrant_gradient_checkpointing() -> None:
 
 
 def test_training_yaml_expands_required_environment_and_keeps_a5_fresh(
+    h200_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = Path(__file__).parents[1]
-    monkeypatch.setenv("OUTPUT_DIR", "/tmp/output")
     monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/dataset_manifest.json")
     monkeypatch.setenv("A2_CHECKPOINT", "/tmp/a2-final")
     monkeypatch.setenv("A5_WARMUP_BUNDLE", "/tmp/a5-warmup")
-    monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
-    monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
-    monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
 
     native, extension = load_training_yaml(
-        root / "configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml"
+        ROOT / "configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml"
     )
 
     assert native["resume_from_checkpoint"] is None
@@ -1390,23 +1357,19 @@ def test_training_yaml_expands_required_environment_and_keeps_a5_fresh(
 
     monkeypatch.delenv("A2_CHECKPOINT")
     with pytest.raises(ValueError, match="unresolved environment variables"):
-        load_training_yaml(root / "configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml")
+        load_training_yaml(ROOT / "configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml")
 
 
 def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
+    h200_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = Path(__file__).parents[1]
-    monkeypatch.setenv("OUTPUT_DIR", "/tmp/output")
     monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/dataset_manifest.json")
     monkeypatch.setenv("A2_CHECKPOINT", "/tmp/a2-final")
     monkeypatch.setenv("A5_WARMUP_BUNDLE", "/tmp/a5-warmup")
-    monkeypatch.setenv("MODEL", "/tmp/qwen3vl8b")
-    monkeypatch.setenv("DATASET_DIR", "/tmp/svcbench")
-    monkeypatch.setenv("DATASET_NAME", "svcbench_qwen3vl_sft")
 
     native, extension = load_training_yaml(
-        root / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
+        ROOT / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
     )
     policy = extension.qwen_outer_trainability
 
@@ -1429,7 +1392,7 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
     assert not policy.train_input_embeddings
     assert not policy.train_lm_head
 
-    launcher = (root / "scripts/h200/train_a5_vithalf_decoder8.sh").read_text(encoding="utf-8")
+    launcher = (ROOT / "scripts/h200/train_a5_vithalf_decoder8.sh").read_text(encoding="utf-8")
     assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
     assert 'TTT_DATALOADER_TRACE="${TTT_DATALOADER_TRACE:-1}"' in launcher
     assert 'TTT_SKIP_ENV_SETUP="${TTT_SKIP_ENV_SETUP:-1}"' in launcher
@@ -1439,24 +1402,20 @@ def test_a5_partial_qwen_yaml_selects_vit_half_and_decoder_last_eight(
 
 
 def test_a5_associative_lttt_finalonly_launcher_contract(
+    h200_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = Path(__file__).parents[1]
     for key, value in {
-        "OUTPUT_DIR": "/tmp/output",
         "SVCBENCH_DATASET_MANIFEST": "/tmp/v4_manifest.json",
         "A2_CHECKPOINT": "/tmp/a2-final",
         "A5_WARMUP_BUNDLE": "/tmp/a5-warmup",
-        "MODEL": "/tmp/qwen3vl8b",
-        "DATASET_DIR": "/tmp/svcbench",
-        "DATASET_NAME": "svcbench_qwen3vl_sft",
     }.items():
         monkeypatch.setenv(key, value)
 
     native, extension = load_training_yaml(
-        root / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
+        ROOT / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
     )
-    launcher = (root / "scripts/h200/train_a5_associative_lttt_finalonly.sh").read_text(
+    launcher = (ROOT / "scripts/h200/train_a5_associative_lttt_finalonly.sh").read_text(
         encoding="utf-8"
     )
 
@@ -1476,21 +1435,14 @@ def test_a5_associative_lttt_finalonly_launcher_contract(
 
 
 def test_a5_fast_state_warmup_yaml_and_launcher_are_restart_only(
+    h200_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = Path(__file__).parents[1]
-    for key, value in {
-        "OUTPUT_DIR": "/tmp/output",
-        "SVCBENCH_DATASET_MANIFEST": "/tmp/v4_manifest.json",
-        "A2_CHECKPOINT": "/tmp/a2-final",
-        "MODEL": "/tmp/qwen3vl8b",
-        "DATASET_DIR": "/tmp/svcbench",
-        "DATASET_NAME": "svcbench_qwen3vl_sft",
-    }.items():
-        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("SVCBENCH_DATASET_MANIFEST", "/tmp/v4_manifest.json")
+    monkeypatch.setenv("A2_CHECKPOINT", "/tmp/a2-final")
 
-    native, extension = load_training_yaml(root / "configs/h200/a5_fast_state_warmup_128_4gpu.yaml")
-    launcher = (root / "scripts/h200/train_a5_fast_state_warmup.sh").read_text(encoding="utf-8")
+    native, extension = load_training_yaml(ROOT / "configs/h200/a5_fast_state_warmup_128_4gpu.yaml")
+    launcher = (ROOT / "scripts/h200/train_a5_fast_state_warmup.sh").read_text(encoding="utf-8")
 
     assert native["max_steps"] == 128
     assert native["warmup_steps"] == 4
@@ -1506,25 +1458,21 @@ def test_a5_fast_state_warmup_yaml_and_launcher_are_restart_only(
 
 
 def test_a5_static_w0_yaml_and_launcher_match_meta_ttt_data_contract(
+    h200_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = Path(__file__).parents[1]
     for key, value in {
-        "OUTPUT_DIR": "/tmp/output",
         "SVCBENCH_DATASET_MANIFEST": "/tmp/v4_manifest.json",
         "A2_CHECKPOINT": "/tmp/a2-final",
         "A5_WARMUP_BUNDLE": "/tmp/a5-warmup",
-        "MODEL": "/tmp/qwen3vl8b",
-        "DATASET_DIR": "/tmp/svcbench",
-        "DATASET_NAME": "svcbench_qwen3vl_sft",
     }.items():
         monkeypatch.setenv(key, value)
 
     meta_native, meta = load_training_yaml(
-        root / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
+        ROOT / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
     )
     static_native, static = load_training_yaml(
-        root / "configs/h200/a5_static_w0_k8_vithalf_decoder8_4gpu.yaml"
+        ROOT / "configs/h200/a5_static_w0_k8_vithalf_decoder8_4gpu.yaml"
     )
 
     assert meta.a5_adaptation_mode == "meta_ttt"
@@ -1544,7 +1492,7 @@ def test_a5_static_w0_yaml_and_launcher_match_meta_ttt_data_contract(
     ):
         assert static_native[key] == meta_native[key]
 
-    launcher = (root / "scripts/h200/train_a5_static_w0_ablation.sh").read_text(encoding="utf-8")
+    launcher = (ROOT / "scripts/h200/train_a5_static_w0_ablation.sh").read_text(encoding="utf-8")
     assert 'TTT_A5_ADAPTATION_MODE="static_w0"' in launcher
     assert "a5_dense_querybundle_train_support_statequery_fp16_v4" in launcher
     assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
@@ -1555,26 +1503,6 @@ def test_a5_static_w0_yaml_and_launcher_match_meta_ttt_data_contract(
 def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoint(
     tmp_path: Path,
 ) -> None:
-    base = {
-        "stage": "a2",
-        "project_config": "configs/model_state_ttt_8b.yaml",
-        "dataset_manifest": "manifest.json",
-        "support_prefetch_depth": 2,
-        "support_decode_coalesce": True,
-        "support_materialization": "dataloader_episode",
-        "state_query_visual_mode": "recent_chunk",
-        "state_query_max_frames": 16,
-        "answer_query_visual_mode": "causal_prefix",
-        "answer_query_max_frames": 256,
-        "state_query_cache_mode": "inherit",
-        "answer_query_cache_mode": "disabled",
-        "preprocess_cache_mode": "read_write",
-        "preprocess_cache_miss_policy": "decode",
-        "preprocess_cache_root_env": "TTT_PREPROCESS_CACHE_ROOT",
-        "preprocess_cache_max_gb": 200.0,
-        "preprocess_cache_dtype": "float32",
-    }
-
     def write(extension: dict[str, object]) -> Path:
         path = tmp_path / "training.yaml"
         lines = ["model_name_or_path: model", "ttt_qwen:"]
@@ -1583,11 +1511,13 @@ def test_training_yaml_rejects_unknown_extension_keys_and_invalid_stage_checkpoi
         return path
 
     with pytest.raises(ValueError, match="Extra inputs are not permitted"):
-        load_training_yaml(write({**base, "inner_learning_rate": 1.0e-4}))
+        load_training_yaml(write({**_A2_EXTENSION_FIELDS, "inner_learning_rate": 1.0e-4}))
     with pytest.raises(ValueError, match="A2 must not initialize"):
-        load_training_yaml(write({**base, "initialize_from_a2_checkpoint": "checkpoint"}))
+        load_training_yaml(
+            write({**_A2_EXTENSION_FIELDS, "initialize_from_a2_checkpoint": "checkpoint"})
+        )
     with pytest.raises(ValueError, match="A5 requires initialize"):
-        load_training_yaml(write({**base, "stage": "a5"}))
+        load_training_yaml(write({**_A2_EXTENSION_FIELDS, "stage": "a5"}))
 
 
 def test_full_unfreeze_accepts_qwen_module_list(
@@ -1824,22 +1754,32 @@ def test_production_runtime_defers_optimizer_and_sampler_to_central_bridge() -> 
     assert runtime.train_sampler_factory is None
 
 
-def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Path) -> None:
-    run = tmp_path / "runs" / "0715_010203_a5"
+def _resume_run(
+    tmp_path: Path,
+    name: str,
+    *,
+    run_config: dict[str, object] | None,
+) -> Path:
+    run = tmp_path / "runs" / name
     checkpoint = run / "checkpoints" / "checkpoint-20"
     checkpoint.mkdir(parents=True)
     (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
     (checkpoint / "scheduler.pt").write_bytes(b"scheduler")
     (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
-    (run / "run_config.json").write_text(
-        json.dumps(
-            {
-                "stage": "a5",
-                "config_schema_version": 12,
-                "associative_ttt_contract": "bank_conditioned_state_write_v2",
-            }
-        ),
-        encoding="utf-8",
+    if run_config is not None:
+        (run / "run_config.json").write_text(json.dumps(run_config), encoding="utf-8")
+    return checkpoint
+
+
+def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Path) -> None:
+    checkpoint = _resume_run(
+        tmp_path,
+        "0715_010203_a5",
+        run_config={
+            "stage": "a5",
+            "config_schema_version": 12,
+            "associative_ttt_contract": "bank_conditioned_state_write_v2",
+        },
     )
 
     assert resolve_same_stage_resume(str(checkpoint), ProductionStage.A5) == checkpoint
@@ -1852,32 +1792,21 @@ def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Pa
             a5_adaptation_mode="static_w0",
         )
 
-    orphan = tmp_path / "checkpoint-orphan"
-    orphan.mkdir()
-    (orphan / "trainer_state.json").write_text("{}", encoding="utf-8")
-    (orphan / "scheduler.pt").write_bytes(b"scheduler")
-    (orphan / "optimizer.pt").write_bytes(b"optimizer")
+    orphan = _resume_run(tmp_path, "orphan", run_config=None)
     with pytest.raises(FileNotFoundError, match="run_config"):
         resolve_same_stage_resume(str(orphan), ProductionStage.A5)
 
 
 def test_same_stage_resume_accepts_only_matching_static_w0_mode(tmp_path: Path) -> None:
-    run = tmp_path / "runs" / "static-w0"
-    checkpoint = run / "checkpoints" / "checkpoint-20"
-    checkpoint.mkdir(parents=True)
-    (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
-    (checkpoint / "scheduler.pt").write_bytes(b"scheduler")
-    (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
-    (run / "run_config.json").write_text(
-        json.dumps(
-            {
-                "stage": "a5",
-                "a5_adaptation_mode": "static_w0",
-                "config_schema_version": 12,
-                "associative_ttt_contract": "bank_conditioned_state_write_v2",
-            }
-        ),
-        encoding="utf-8",
+    checkpoint = _resume_run(
+        tmp_path,
+        "static-w0",
+        run_config={
+            "stage": "a5",
+            "a5_adaptation_mode": "static_w0",
+            "config_schema_version": 12,
+            "associative_ttt_contract": "bank_conditioned_state_write_v2",
+        },
     )
 
     assert (
@@ -1895,21 +1824,14 @@ def test_same_stage_resume_accepts_only_matching_static_w0_mode(tmp_path: Path) 
 def test_same_stage_resume_rejects_legacy_associative_contract(
     tmp_path: Path,
 ) -> None:
-    run = tmp_path / "runs" / "learned-step"
-    checkpoint = run / "checkpoints" / "checkpoint-20"
-    checkpoint.mkdir(parents=True)
-    (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
-    (checkpoint / "scheduler.pt").write_bytes(b"scheduler")
-    (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
-    (run / "run_config.json").write_text(
-        json.dumps(
-            {
-                "stage": "a5",
-                "a5_adaptation_mode": "meta_ttt",
-                "config_schema_version": 9,
-            }
-        ),
-        encoding="utf-8",
+    checkpoint = _resume_run(
+        tmp_path,
+        "learned-step",
+        run_config={
+            "stage": "a5",
+            "a5_adaptation_mode": "meta_ttt",
+            "config_schema_version": 9,
+        },
     )
 
     with pytest.raises(ValueError, match="schema-12 state-write associative"):
@@ -2606,58 +2528,12 @@ def test_central_outer_optimizer_has_exact_stage_groups(
     associative_trainable: bool,
     expected_lrs: dict[str, float],
 ) -> None:
-    qwen = nn.Linear(4, 4)
-    checkout = tmp_path / "lf"
-    checkout.mkdir()
-    symbols = LlamaFactorySymbols(
-        get_train_args=lambda *_args, **_kwargs: (),
-        load_tokenizer=lambda *_args, **_kwargs: {},
-        load_model=lambda *_args, **_kwargs: qwen,
-        trainer_base=object,
-        checkout=LlamaFactoryCheckoutAudit(checkout, "523f801", False, True),
+    bundle, model = _grouped_bundle(
+        tmp_path,
+        load_config(),
+        adaptation_mode=adaptation_mode,
+        associative_trainable=associative_trainable,
     )
-    bundle = LlamaFactoryBackboneBundle(
-        model=qwen,
-        tokenizer=object(),
-        processor=None,
-        model_args=object(),
-        data_args=object(),
-        training_args=SimpleNamespace(
-            learning_rate=5.0e-6,
-            adam_beta1=0.9,
-            adam_beta2=0.999,
-            adam_epsilon=1.0e-8,
-            weight_decay=0.01,
-        ),
-        finetuning_args=object(),
-        generating_args=object(),
-        project_config=load_config(),
-        ttt_config=ProductionTTTConfig(
-            stage="a5",
-            a5_adaptation_mode=adaptation_mode,
-            warmup_bundle="warmup" if adaptation_mode == "meta_ttt" else None,
-            project_config="configs/model_state_ttt_8b.yaml",
-            dataset_manifest="manifest.json",
-            initialize_from_a2_checkpoint="a2-final",
-            support_prefetch_depth=2,
-            support_decode_coalesce=True,
-            support_materialization="segment_double_buffer",
-            segment_prefetch_depth=1,
-            state_query_visual_mode="recent_chunk",
-            state_query_max_frames=16,
-            answer_query_visual_mode="causal_prefix",
-            answer_query_max_frames=256,
-            state_query_cache_mode="inherit",
-            answer_query_cache_mode="disabled",
-            preprocess_cache_mode="read_write",
-            preprocess_cache_miss_policy="decode",
-            preprocess_cache_root_env="TTT_PREPROCESS_CACHE_ROOT",
-            preprocess_cache_max_gb=200.0,
-            preprocess_cache_dtype="float32",
-        ),
-        symbols=symbols,
-    )
-    model = _GroupedOuterToy(qwen, associative_trainable=associative_trainable)
 
     optimizer = make_production_outer_optimizer_factory(
         bundle,
@@ -2968,59 +2844,7 @@ def test_optimizer_rejects_noncanonical_budget_drift(tmp_path: Path) -> None:
 def test_outer_optimizer_rejects_removed_step_controller_parameters(
     tmp_path: Path,
 ) -> None:
-    qwen = nn.Linear(4, 4)
-    checkout = tmp_path / "lf"
-    checkout.mkdir()
-    symbols = LlamaFactorySymbols(
-        get_train_args=lambda *_args, **_kwargs: (),
-        load_tokenizer=lambda *_args, **_kwargs: {},
-        load_model=lambda *_args, **_kwargs: qwen,
-        trainer_base=object,
-        checkout=LlamaFactoryCheckoutAudit(checkout, "523f801", False, True),
-    )
-    project = load_config()
-    bundle = LlamaFactoryBackboneBundle(
-        model=qwen,
-        tokenizer=object(),
-        processor=None,
-        model_args=object(),
-        data_args=object(),
-        training_args=SimpleNamespace(
-            learning_rate=5.0e-6,
-            adam_beta1=0.9,
-            adam_beta2=0.999,
-            adam_epsilon=1.0e-8,
-            weight_decay=0.01,
-        ),
-        finetuning_args=object(),
-        generating_args=object(),
-        project_config=project,
-        ttt_config=ProductionTTTConfig(
-            stage="a5",
-            a5_adaptation_mode="meta_ttt",
-            warmup_bundle="warmup",
-            project_config="configs/model_state_ttt_8b.yaml",
-            dataset_manifest="manifest.json",
-            initialize_from_a2_checkpoint="a2-final",
-            support_prefetch_depth=2,
-            support_decode_coalesce=True,
-            support_materialization="segment_double_buffer",
-            segment_prefetch_depth=1,
-            state_query_visual_mode="recent_chunk",
-            state_query_max_frames=16,
-            answer_query_visual_mode="causal_prefix",
-            answer_query_max_frames=256,
-            state_query_cache_mode="inherit",
-            answer_query_cache_mode="disabled",
-            preprocess_cache_mode="read_write",
-            preprocess_cache_miss_policy="decode",
-            preprocess_cache_root_env="TTT_PREPROCESS_CACHE_ROOT",
-            preprocess_cache_max_gb=200.0,
-            preprocess_cache_dtype="float32",
-        ),
-        symbols=symbols,
-    )
-    model = _GroupedOuterToy(qwen, associative_trainable=True)
+    bundle, model = _grouped_bundle(tmp_path, load_config())
     model.step_controller = nn.Linear(7, 1)
 
     with pytest.raises(ValueError, match="step-controller parameters were removed"):

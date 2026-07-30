@@ -42,7 +42,7 @@ from ttt_svcbench_qwen.episode_data import (
     adaptive_support_schedule,
 )
 from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter, build_fast_ttt_adapter
-from ttt_svcbench_qwen.identity_bank import build_identity_bank
+from ttt_svcbench_qwen.identity_bank import IdentityBank, build_identity_bank
 from ttt_svcbench_qwen.input_composer import (
     ComposedInput,
     compose_inputs,
@@ -62,6 +62,7 @@ from ttt_svcbench_qwen.meta_trainer import (
 )
 from ttt_svcbench_qwen.model import (
     BatchRuntimeState,
+    ComposerStage,
     ModelComponents,
     ModelFeatureFlags,
     ObservationChunkRequest,
@@ -338,35 +339,6 @@ class PreparedVisualCPU:
     tubelet_position_ids: Tensor
     pixel_values_videos: Tensor
     video_grid_thw: Tensor
-
-    def __post_init__(self) -> None:
-        if self.frame_timestamps.ndim != 1:
-            raise ValueError("prepared frame timestamps must be rank 1")
-        frame_count = int(self.frame_timestamps.shape[0])
-        if frame_count < 2 or frame_count > self.spec.maximum_frames or frame_count % 2:
-            raise ValueError("prepared frame count must be even within [2, max]")
-        if bool(
-            torch.any(self.frame_timestamps < self.spec.start_time - 1.0e-6)
-            or torch.any(self.frame_timestamps > self.spec.query_time + 1.0e-6)
-        ):
-            raise ValueError("prepared observation contains a frame outside its causal range")
-        tubelets = frame_count // 2
-        if (
-            self.tubelet_timestamps.shape != (1, tubelets)
-            or self.tubelet_valid_mask.shape != (1, tubelets)
-            or self.tubelet_position_ids.shape != (1, tubelets)
-        ):
-            raise ValueError("prepared tubelet metadata must be [1, F/2]")
-        if self.tubelet_valid_mask.dtype != torch.bool:
-            raise TypeError("prepared tubelet validity must use bool dtype")
-        if self.pixel_values_videos.ndim != 2 or not torch.is_floating_point(
-            self.pixel_values_videos
-        ):
-            raise ValueError("prepared Qwen pixels must be packed floating [N_patch, D]")
-        if self.video_grid_thw.shape != (1, 3):
-            raise ValueError("prepared Qwen video grid must be [1, 3]")
-        if int(self.video_grid_thw[0, 0].item()) != tubelets:
-            raise ValueError("prepared temporal grid must equal the tubelet count")
 
     @property
     def frame_count(self) -> int:
@@ -1503,63 +1475,8 @@ class ProductionReaderRuntime:
             trajectory_ids=trajectory_ids,
         )
 
-    def audit_results(
-        self,
-        retrieval: RetrieverOutput,
-        results: Sequence[ReaderResult],
-    ) -> Sequence[ReaderResult]:
-        return self.reader.audit_results(retrieval, results)
-
-    def audit_bank_results(
-        self,
-        state_bank: StructuredStateBank,
-        states: Sequence[StateBankRuntimeState],
-        query: QueryEncoderOutput,
-        results: Sequence[ReaderResult],
-        *,
-        video_ids: Sequence[str],
-        trajectory_ids: Sequence[str],
-    ) -> Sequence[ReaderResult]:
-        return self.reader.audit_bank_results(
-            state_bank,
-            states,
-            query,
-            results,
-            video_ids=video_ids,
-            trajectory_ids=trajectory_ids,
-        )
-
     def audit_number_tokens(self, result: ReaderResult) -> int | None:
         return self.reader.audit_number_tokens(result)
-
-
-def _compose_production_inputs(
-    *,
-    base_input_ids: Tensor,
-    base_attention_mask: Tensor,
-    state_tokens: Tensor | None,
-    state_token_valid_mask: Tensor | None,
-    reader_results: Sequence[ReaderResult],
-    tokenizer: object,
-    embedding_owner: object,
-    rope_indexer: object,
-    video_grid_thw: Tensor | None,
-    include_state: bool,
-    include_number: bool,
-) -> ComposedInput:
-    return compose_inputs(
-        base_input_ids=base_input_ids,
-        base_attention_mask=base_attention_mask,
-        state_tokens=state_tokens,
-        state_token_valid_mask=state_token_valid_mask,
-        reader_results=reader_results,
-        tokenizer=cast(Any, tokenizer),
-        embedding_owner=cast(Any, embedding_owner),
-        rope_indexer=cast(Any, rope_indexer),
-        video_grid_thw=video_grid_thw,
-        include_state=include_state,
-        include_number=include_number,
-    )
 
 
 class ProductionOuterModel(nn.Module):  # type: ignore[misc]
@@ -1615,7 +1532,83 @@ class ProductionOuterModel(nn.Module):  # type: ignore[misc]
         raise RuntimeError("ProductionOuterModel must be driven by the typed A2/A5 trainer hook")
 
 
-class A2PrefetchCollator:
+class _PrefetchCollatorBase:
+    def __init__(
+        self,
+        *,
+        processor: object,
+        tokenizer: object,
+        config: ProjectConfig,
+        ttt_config: ProductionTTTConfig,
+        minimum_pixels: int,
+        maximum_pixels: int,
+        preprocess_cache: PreprocessCache | None,
+        context: str,
+    ) -> None:
+        _require_latest_qwen_processor(processor, context=context)
+        self.processor = processor
+        self.tokenizer = tokenizer
+        self.config = config
+        self.ttt_config = ttt_config
+        self.minimum_pixels = minimum_pixels
+        self.maximum_pixels = maximum_pixels
+        self.preprocess_cache = preprocess_cache
+        self.video = VideoChunkMaterializer(
+            config,
+            minimum_pixels=minimum_pixels,
+            maximum_pixels=maximum_pixels,
+            preprocess_cache=preprocess_cache,
+            cache_query_roles=ttt_config.cached_query_roles,
+            prefetch_depth=1,
+            decode_coalesce=False,
+        )
+
+
+def _prepare_query_pair(
+    collator: _PrefetchCollatorBase,
+    query: ProductionQueryRecord,
+    *,
+    chunk_prefix: str,
+    video_path: Path,
+    reset_soft_state: bool,
+    source_dataset: str,
+) -> tuple[PreparedVisualCPU, PreparedAnswerCPU]:
+    state_spec = _query_chunk_spec(
+        f"{chunk_prefix}:state_query",
+        video_path,
+        query.runtime.query_time,
+        reset_soft_state=reset_soft_state,
+        config=collator.ttt_config,
+        role="state_query",
+    )
+    answer_spec = _query_chunk_spec(
+        f"{chunk_prefix}:answer_query",
+        video_path,
+        query.runtime.query_time,
+        reset_soft_state=reset_soft_state,
+        config=collator.ttt_config,
+        role="answer_query",
+    )
+    state_query = _compact_materialized_chunk(collator.video(state_spec))
+    answer = _prepare_answer_cpu(
+        query,
+        answer_spec,
+        processor=collator.processor,
+        tokenizer=collator.tokenizer,
+        config=collator.config,
+        minimum_pixels=collator.minimum_pixels,
+        maximum_pixels=collator.maximum_pixels,
+        preprocess_cache=(
+            collator.preprocess_cache
+            if collator.ttt_config.query_cache_enabled("answer_query")
+            else None
+        ),
+        source_dataset=source_dataset,
+    )
+    return state_query, answer
+
+
+class A2PrefetchCollator(_PrefetchCollatorBase):
     """Materialize the next Query in a persistent DataLoader worker.
 
     The collator deliberately owns only CPU processor/tokenizer objects.  It never receives the
@@ -1635,26 +1628,19 @@ class A2PrefetchCollator:
         preprocess_cache: PreprocessCache | None = None,
         prepared_episode_max_bytes: int = 2_147_483_648,
     ) -> None:
-        _require_latest_qwen_processor(processor, context="A2 prefetch")
-        self.processor = processor
-        self.tokenizer = tokenizer
-        self.config = config
-        self.ttt_config = ttt_config
-        self.minimum_pixels = minimum_pixels
-        self.maximum_pixels = maximum_pixels
-        self.preprocess_cache = preprocess_cache
-        if prepared_episode_max_bytes <= 0:
-            raise ValueError("prepared episode byte limit must be positive")
-        self.prepared_episode_max_bytes = prepared_episode_max_bytes
-        self.video = VideoChunkMaterializer(
-            config,
+        super().__init__(
+            processor=processor,
+            tokenizer=tokenizer,
+            config=config,
+            ttt_config=ttt_config,
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
-            cache_query_roles=ttt_config.cached_query_roles,
-            prefetch_depth=1,
-            decode_coalesce=False,
+            context="A2 prefetch",
         )
+        if prepared_episode_max_bytes <= 0:
+            raise ValueError("prepared episode byte limit must be positive")
+        self.prepared_episode_max_bytes = prepared_episode_max_bytes
 
     def __call__(self, records: Sequence[object]) -> dict[str, object]:
         if len(records) != 1 or not isinstance(records[0], A2QueryRecord):
@@ -1663,36 +1649,12 @@ class A2PrefetchCollator:
         record = records[0]
         video_path = _resolve_video_path(record.source_dataset, record.relative_video_path)
         self.video.set_source_dataset(record.source_dataset)
-        state_spec = _query_chunk_spec(
-            f"{record.query.runtime.query_id}:state_query",
-            video_path,
-            record.query.runtime.query_time,
-            reset_soft_state=False,
-            config=self.ttt_config,
-            role="state_query",
-        )
-        answer_spec = _query_chunk_spec(
-            f"{record.query.runtime.query_id}:answer_query",
-            video_path,
-            record.query.runtime.query_time,
-            reset_soft_state=False,
-            config=self.ttt_config,
-            role="answer_query",
-        )
-        state_query = _compact_materialized_chunk(self.video(state_spec))
-        answer = _prepare_answer_cpu(
+        state_query, answer = _prepare_query_pair(
+            self,
             record.query,
-            answer_spec,
-            processor=self.processor,
-            tokenizer=self.tokenizer,
-            config=self.config,
-            minimum_pixels=self.minimum_pixels,
-            maximum_pixels=self.maximum_pixels,
-            preprocess_cache=(
-                self.preprocess_cache
-                if self.ttt_config.query_cache_enabled("answer_query")
-                else None
-            ),
+            chunk_prefix=record.query.runtime.query_id,
+            video_path=video_path,
+            reset_soft_state=False,
             source_dataset=record.source_dataset,
         )
         support_started = time.perf_counter()
@@ -1745,7 +1707,7 @@ class A2PrefetchCollator:
         }
 
 
-class A5PrefetchCollator:
+class A5PrefetchCollator(_PrefetchCollatorBase):
     """Prepare only CPU Query tensors; runtime/State-TTT objects stay in the trainer process."""
 
     def __init__(
@@ -1759,22 +1721,15 @@ class A5PrefetchCollator:
         maximum_pixels: int,
         preprocess_cache: PreprocessCache | None = None,
     ) -> None:
-        _require_latest_qwen_processor(processor, context="A5 prefetch")
-        self.processor = processor
-        self.tokenizer = tokenizer
-        self.config = config
-        self.ttt_config = ttt_config
-        self.minimum_pixels = minimum_pixels
-        self.maximum_pixels = maximum_pixels
-        self.preprocess_cache = preprocess_cache
-        self.video = VideoChunkMaterializer(
-            config,
+        super().__init__(
+            processor=processor,
+            tokenizer=tokenizer,
+            config=config,
+            ttt_config=ttt_config,
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
-            cache_query_roles=ttt_config.cached_query_roles,
-            prefetch_depth=1,
-            decode_coalesce=False,
+            context="A5 prefetch",
         )
 
     def __call__(self, records: Sequence[object]) -> dict[str, object]:
@@ -1788,40 +1743,16 @@ class A5PrefetchCollator:
         self.video.set_source_dataset(record.source_dataset)
         primary = record.queries[0].runtime
         for index, query in enumerate(record.queries):
-            state_spec = _query_chunk_spec(
-                f"{record.episode_id}:q{index}:state_query",
-                video_path,
-                query.runtime.query_time,
+            state_query, answer = _prepare_query_pair(
+                self,
+                query,
+                chunk_prefix=f"{record.episode_id}:q{index}",
+                video_path=video_path,
                 reset_soft_state=index > 0 and query.runtime.question != primary.question,
-                config=self.ttt_config,
-                role="state_query",
+                source_dataset=record.source_dataset,
             )
-            answer_spec = _query_chunk_spec(
-                f"{record.episode_id}:q{index}:answer_query",
-                video_path,
-                query.runtime.query_time,
-                reset_soft_state=index > 0 and query.runtime.question != primary.question,
-                config=self.ttt_config,
-                role="answer_query",
-            )
-            state_queries.append(_compact_materialized_chunk(self.video(state_spec)))
-            answers.append(
-                _prepare_answer_cpu(
-                    query,
-                    answer_spec,
-                    processor=self.processor,
-                    tokenizer=self.tokenizer,
-                    config=self.config,
-                    minimum_pixels=self.minimum_pixels,
-                    maximum_pixels=self.maximum_pixels,
-                    preprocess_cache=(
-                        self.preprocess_cache
-                        if self.ttt_config.query_cache_enabled("answer_query")
-                        else None
-                    ),
-                    source_dataset=record.source_dataset,
-                )
-            )
+            state_queries.append(state_query)
+            answers.append(answer)
         _loader_trace(
             "a5_collate_done",
             episode_id=record.episode_id,
@@ -2430,6 +2361,70 @@ def _build_runtime_preprocess_cache(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _StateStack:
+    fast: FastTTTAdapter
+    qwen_adapter: Qwen3VLAdapter
+    qwen_runtime: ProductionQwenRuntime
+    state_bank: StructuredStateBank
+    identity_bank: IdentityBank
+    writer: StageABankWriter
+    state_model: StateTTTModel
+
+
+def _assemble_state_stack(
+    config: ProjectConfig,
+    qwen_model: nn.Module,
+    tokenizer: object,
+    materializer: VideoChunkMaterializer,
+) -> _StateStack:
+    fast = build_fast_ttt_adapter(config)
+    qwen = Qwen3VLAdapter(
+        qwen_model,
+        config,
+        adapter=fast,
+        adapter_enabled=True,
+        freeze_base=False,
+    )
+    qwen_runtime = ProductionQwenRuntime(qwen, materializer, tokenizer)
+    query_runtime = ProductionQueryRuntime(build_query_encoder(config), tokenizer, qwen_model)
+    query_runtime.bind_project_config(config)
+    state_bank: StructuredStateBank = build_state_bank(config)
+    identity_bank = build_identity_bank(config)
+    writer = StageABankWriter(state_bank, identity_bank)
+    reader = ProductionReaderRuntime(build_state_reader(config, cast(Any, tokenizer)))
+    register_input_composer_tokens_with_audit(cast(Any, tokenizer), qwen_model)
+    state_model = StateTTTModel(
+        config,
+        ModelComponents(
+            visual_stage=qwen_runtime,
+            query_encoder=query_runtime,
+            composer=cast(ComposerStage, compose_inputs),
+            qwen_prefill=qwen_runtime,
+            qwen_generate=qwen_runtime,
+            fast_adapter=FastVisualPassThrough(fast),
+            spatial_encoder=ProductionSpatialRuntime(build_spatial_encoder(config)),
+            temporal_encoder=ProductionTemporalRuntime(build_temporal_encoder(config)),
+            observation_heads=ProductionObservationRuntime(build_observation_heads(config)),
+            state_bank=state_bank,
+            bank_writer=writer,
+            retriever=build_state_retriever(config),
+            reader=reader,
+            resampler=build_state_resampler(config),
+        ),
+        ModelFeatureFlags(),
+    )
+    return _StateStack(
+        fast=fast,
+        qwen_adapter=qwen,
+        qwen_runtime=qwen_runtime,
+        state_bank=state_bank,
+        identity_bank=identity_bank,
+        writer=writer,
+        state_model=state_model,
+    )
+
+
 def build_runtime(
     backbone: LlamaFactoryBackboneBundle,
     config: ProductionTTTConfig,
@@ -2450,19 +2445,6 @@ def build_runtime(
     if stage is ProductionStage.A5 and config.support_materialization == "segment_double_buffer":
         support_prefetch_depth = (1 + config.segment_prefetch_depth) * project.a5.truncation_horizon
     support_decode_coalesce = config.support_decode_coalesce
-    fast = build_fast_ttt_adapter(project)
-    associative_trainable = (
-        stage is ProductionStage.A5 and config.a5_adaptation_mode == "meta_ttt"
-    )
-    for parameter in fast.collect_associative_parameters():
-        parameter.requires_grad_(associative_trainable)
-    qwen = Qwen3VLAdapter(
-        backbone.model,
-        project,
-        adapter=fast,
-        adapter_enabled=True,
-        freeze_base=False,
-    )
     chunk_materializer = VideoChunkMaterializer(
         project,
         minimum_pixels=minimum_pixels,
@@ -2472,39 +2454,16 @@ def build_runtime(
         prefetch_depth=support_prefetch_depth,
         decode_coalesce=support_decode_coalesce,
     )
-    qwen_runtime = ProductionQwenRuntime(qwen, chunk_materializer, backbone.tokenizer)
-    query_runtime = ProductionQueryRuntime(
-        build_query_encoder(project), backbone.tokenizer, backbone.model
+    stack = _assemble_state_stack(project, backbone.model, backbone.tokenizer, chunk_materializer)
+    fast = stack.fast
+    qwen_runtime = stack.qwen_runtime
+    writer = stack.writer
+    state_model = stack.state_model
+    associative_trainable = (
+        stage is ProductionStage.A5 and config.a5_adaptation_mode == "meta_ttt"
     )
-    query_runtime.bind_project_config(project)
-    spatial = ProductionSpatialRuntime(build_spatial_encoder(project))
-    temporal = ProductionTemporalRuntime(build_temporal_encoder(project))
-    observations = ProductionObservationRuntime(build_observation_heads(project))
-    state_bank: StructuredStateBank = build_state_bank(project)
-    identity_bank = build_identity_bank(project)
-    writer = StageABankWriter(state_bank, identity_bank)
-    reader = ProductionReaderRuntime(build_state_reader(project, cast(Any, backbone.tokenizer)))
-    register_input_composer_tokens_with_audit(cast(Any, backbone.tokenizer), backbone.model)
-    state_model = StateTTTModel(
-        project,
-        ModelComponents(
-            visual_stage=qwen_runtime,
-            query_encoder=query_runtime,
-            composer=_compose_production_inputs,
-            qwen_prefill=qwen_runtime,
-            qwen_generate=qwen_runtime,
-            fast_adapter=FastVisualPassThrough(fast),
-            spatial_encoder=spatial,
-            temporal_encoder=temporal,
-            observation_heads=observations,
-            state_bank=state_bank,
-            bank_writer=writer,
-            retriever=build_state_retriever(project),
-            reader=reader,
-            resampler=build_state_resampler(project),
-        ),
-        ModelFeatureFlags(),
-    )
+    for parameter in fast.collect_associative_parameters():
+        parameter.requires_grad_(associative_trainable)
     official_weak_balancer = OfficialWeakOuterLossComposer(project.loss.official_weak_balance)
     outer = ProductionOuterModel(
         state_model,
@@ -2637,47 +2596,14 @@ def build_inference_runtime_bundle(
         raise TypeError("Qwen loader returned a non-module")
     qwen_model.to(device=torch.device(device))
     qwen_model.eval()
-    fast = build_fast_ttt_adapter(config)
-    qwen = Qwen3VLAdapter(
-        qwen_model,
-        config,
-        adapter=fast,
-        adapter_enabled=True,
-        freeze_base=False,
-    )
     materializer = VideoChunkMaterializer(
         config,
         minimum_pixels=minimum_pixels,
         maximum_pixels=maximum_pixels,
         cache_query_visuals=False,
     )
-    qwen_runtime = ProductionQwenRuntime(qwen, materializer, tokenizer)
-    query_runtime = ProductionQueryRuntime(build_query_encoder(config), tokenizer, qwen_model)
-    query_runtime.bind_project_config(config)
-    state_bank = build_state_bank(config)
-    identity_bank = build_identity_bank(config)
-    writer = StageABankWriter(state_bank, identity_bank)
-    register_input_composer_tokens_with_audit(cast(Any, tokenizer), qwen_model)
-    state_model = StateTTTModel(
-        config,
-        ModelComponents(
-            visual_stage=qwen_runtime,
-            query_encoder=query_runtime,
-            composer=_compose_production_inputs,
-            qwen_prefill=qwen_runtime,
-            qwen_generate=qwen_runtime,
-            fast_adapter=FastVisualPassThrough(fast),
-            spatial_encoder=ProductionSpatialRuntime(build_spatial_encoder(config)),
-            temporal_encoder=ProductionTemporalRuntime(build_temporal_encoder(config)),
-            observation_heads=ProductionObservationRuntime(build_observation_heads(config)),
-            state_bank=state_bank,
-            bank_writer=writer,
-            retriever=build_state_retriever(config),
-            reader=ProductionReaderRuntime(build_state_reader(config, cast(Any, tokenizer))),
-            resampler=build_state_resampler(config),
-        ),
-        ModelFeatureFlags(),
-    )
+    stack = _assemble_state_stack(config, qwen_model, tokenizer, materializer)
+    state_model = stack.state_model
     outer = ProductionOuterModel(
         state_model,
         qwen_model,
@@ -2690,15 +2616,15 @@ def build_inference_runtime_bundle(
     outer.to(device=torch.device(device), dtype=dtype)
     outer.eval()
     manager = PerVideoRuntimeManager(
-        fast_adapter=fast,
-        state_bank=state_bank,
-        identity_bank=identity_bank,
+        fast_adapter=stack.fast,
+        state_bank=stack.state_bank,
+        identity_bank=stack.identity_bank,
         optimizer_config=config.fast_ttt.optimizer,
         audit_level=config.inference.audit_level,
     )
     return StateTTTRuntimeBundle(
         config=config,
-        qwen_adapter=qwen,
+        qwen_adapter=stack.qwen_adapter,
         state_model=state_model,
         outer_model=outer,
         manager=manager,

@@ -6,68 +6,14 @@ import pytest
 import torch
 from torch import Tensor, nn
 
+from tests.support.tokenizers import make_stage_a_tokenizer
 from ttt_svcbench_qwen.input_composer import (
-    EXACT_NUMBER_INSTRUCTION,
     TeacherForcedComposedInput,
     compose_inputs,
     compose_teacher_forced_inputs,
     map_teacher_forced_targets,
 )
 from ttt_svcbench_qwen.state_reader import ReaderStatus
-
-
-class TinyTokenizer:
-    def __init__(self) -> None:
-        self.tokens = {
-            "<|endoftext|>": 0,
-            "<|im_end|>": 1,
-            "<|video_pad|>": 2,
-            "<|im_start|>": 3,
-            "user": 4,
-            "question": 5,
-            "assistant": 6,
-            "\n": 7,
-            "12": 8,
-            "0": 9,
-            "answer-a": 10,
-            "answer-b": 11,
-            "<|vision_start|>": 12,
-            "<|vision_end|>": 13,
-            "instruction-a": 14,
-            "instruction-b": 15,
-        }
-        self.pad_token_id = 0
-        self.additional_special_tokens: list[str] = []
-
-    def __len__(self) -> int:
-        return len(self.tokens)
-
-    def add_special_tokens(
-        self,
-        special_tokens_dict: dict[str, object],
-        replace_additional_special_tokens: bool = True,
-    ) -> int:
-        raw = special_tokens_dict["additional_special_tokens"]
-        assert isinstance(raw, list)
-        if replace_additional_special_tokens:
-            self.additional_special_tokens = []
-        added = 0
-        for raw_token in raw:
-            token = str(raw_token)
-            if token not in self.tokens:
-                self.tokens[token] = len(self.tokens)
-                added += 1
-            if token not in self.additional_special_tokens:
-                self.additional_special_tokens.append(token)
-        return added
-
-    def convert_tokens_to_ids(self, token: str) -> int | None:
-        return self.tokens.get(token)
-
-    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
-        assert text == EXACT_NUMBER_INSTRUCTION
-        assert add_special_tokens is False
-        return [14, 15]
 
 
 class TinyEmbeddingOwner(nn.Module):
@@ -139,7 +85,7 @@ def _teacher_forced_fixture() -> tuple[
 
 def _compose_teacher_fixture() -> TeacherForcedComposedInput:
     input_ids, attention_mask, labels, number_mask, readers = _teacher_forced_fixture()
-    tokenizer = TinyTokenizer()
+    tokenizer = make_stage_a_tokenizer()
     owner = TinyEmbeddingOwner(len(tokenizer))
     return compose_teacher_forced_inputs(
         base_input_ids=input_ids,
@@ -204,7 +150,7 @@ def test_low_level_mapper_rejects_source_token_provenance_drift() -> None:
 
 def test_teacher_forcing_rejects_malicious_source_labels_and_number_masks() -> None:
     input_ids, attention_mask, labels, number_mask, readers = _teacher_forced_fixture()
-    tokenizer = TinyTokenizer()
+    tokenizer = make_stage_a_tokenizer()
     owner = TinyEmbeddingOwner(len(tokenizer))
     common = {
         "base_input_ids": input_ids,
@@ -266,7 +212,7 @@ def test_plain_qwen_a1_accepts_empty_reader_without_payload_or_im_end() -> None:
     attention_mask = torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]], dtype=torch.int64)
     labels = torch.tensor([[-100, -100, -100, 10], [-100, -100, -100, 11]])
     number_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-    tokenizer = TinyTokenizer()
+    tokenizer = make_stage_a_tokenizer()
     owner = TinyEmbeddingOwner(len(tokenizer))
 
     output = compose_teacher_forced_inputs(
@@ -298,7 +244,7 @@ def test_plain_qwen_a1_accepts_empty_reader_without_payload_or_im_end() -> None:
 def test_reader_alignment_remains_strict_outside_empty_plain_qwen_mode() -> None:
     input_ids = torch.tensor([[3, 4, 5, 1], [3, 4, 5, 1]], dtype=torch.int64)
     attention_mask = torch.ones_like(input_ids)
-    tokenizer = TinyTokenizer()
+    tokenizer = make_stage_a_tokenizer()
     owner = TinyEmbeddingOwner(len(tokenizer))
     common = {
         "base_input_ids": input_ids,

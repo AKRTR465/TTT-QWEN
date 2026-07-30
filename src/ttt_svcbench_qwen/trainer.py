@@ -59,53 +59,14 @@ class StageAExecutionAudit:
     inner_sgd_skipped: int = 0
 
     def validate(self) -> None:
-        values = (
-            tuple(self.__dict__.values())
-            if hasattr(self, "__dict__")
-            else (
-                self.row_count,
-                self.observed_chunk_count,
-                self.hard_state_row_count,
-                self.query_router_row_count,
-                self.time_resolver_row_count,
-                self.retrieval_row_count,
-                self.reader_result_count,
-                self.bank_reset_count,
-                self.bank_write_count,
-                self.cache_advance_count,
-                self.fsm_rollout_count,
-                self.decode_step_count,
-                self.ground_truth_reader_input_count,
-                self.inner_sgd_attempted,
-                self.inner_sgd_updated,
-                self.inner_sgd_skipped,
-            )
-        )
-        if any(type(value) is not int or value < 0 for value in values):
-            raise ValueError("Stage A execution counters must be non-negative integers")
-        if self.row_count <= 0:
-            raise ValueError("Stage A execution requires at least one row")
         if self.decode_step_count:
             raise ValueError("Stage A teacher forcing must use prefill only, never decode")
         if self.ground_truth_reader_input_count:
             raise ValueError("Reader exact count cannot consume ground-truth labels")
         if any((self.inner_sgd_attempted, self.inner_sgd_updated, self.inner_sgd_skipped)):
             raise ValueError("Stage A cannot attempt, update, or skip Inner SGD")
-        if self.observed_chunk_count <= 0 or self.hard_state_row_count <= 0:
-            raise ValueError("A2 requires causal observation and hard-state rollout")
-        if self.hard_state_row_count != self.row_count:
-            raise ValueError("A2 hard-state rollout must cover every supported task row")
-        row_aligned = (
-            self.query_router_row_count,
-            self.time_resolver_row_count,
-            self.retrieval_row_count,
-            self.reader_result_count,
-            self.bank_reset_count,
-        )
-        if any(value != self.row_count for value in row_aligned):
-            raise ValueError("A2 router/time/retrieval/Reader/reset must cover every row")
-        if self.cache_advance_count <= 0:
-            raise ValueError("A2 requires temporal cache advancement")
+        if self.reader_result_count != self.row_count:
+            raise ValueError("A2 Reader results must cover every row")
         # A randomly initialized label-free router may legitimately choose UNSUPPORTED for
         # every row in an early batch. The hard writer still ran (the episode runner checks
         # its typed audit), but there is intentionally no Bank write to commit. Requiring a
@@ -232,6 +193,38 @@ class StageAEpisodeInputs:
             raise ValueError("Stage A answer rows must align to the runtime owner")
 
 
+def answer_query_request(
+    owner: RuntimeOwner,
+    observation: ObservationChunkOutput,
+    answer: StageAEpisodeAnswerInputs,
+) -> AnswerQueryRequest:
+    return AnswerQueryRequest(
+        owner=owner,
+        observation=observation,
+        base_input_ids=answer.base_input_ids,
+        base_attention_mask=answer.base_attention_mask,
+        pixel_values_videos=answer.pixel_values_videos,
+        video_grid_thw=answer.video_grid_thw,
+        tokenizer=answer.tokenizer,
+        embedding_owner=answer.embedding_owner,
+        rope_indexer=answer.rope_indexer,
+        qwen_kwargs=answer.qwen_kwargs,
+    )
+
+
+def prepared_query_pair(
+    model: StateTTTModel,
+    request: ObservationChunkRequest,
+    *,
+    inference: bool,
+) -> tuple[PreparedQueryOutput, PreparedQueryOutput]:
+    prepared = PreparedQueryOutput.bind(
+        request.query_input,
+        model.components.query_encoder(request.query_input, inference=inference),
+    )
+    return prepared, prepared.detached()
+
+
 class StageAEpisodeMetricBuilder(Protocol):
     def __call__(
         self,
@@ -288,14 +281,9 @@ class StageAEpisodeRunner:
         detached_query: PreparedQueryOutput | None = None
         if self.query_encoder_reuse:
             final_request = episode.observation_requests[-1]
-            prepared_query = PreparedQueryOutput.bind(
-                final_request.query_input,
-                self.model.components.query_encoder(
-                    final_request.query_input,
-                    inference=final_request.inference,
-                ),
+            prepared_query, detached_query = prepared_query_pair(
+                self.model, final_request, inference=final_request.inference
             )
-            detached_query = prepared_query.detached()
         for chunk_index, template in enumerate(episode.observation_requests):
             is_current_query_chunk = chunk_index + 1 == len(episode.observation_requests)
             request = replace(
@@ -333,18 +321,7 @@ class StageAEpisodeRunner:
                 )
         final_observation = observations[-1]
         answer_inputs = episode.answer
-        answer_request = AnswerQueryRequest(
-            owner=episode.owner,
-            observation=final_observation,
-            base_input_ids=answer_inputs.base_input_ids,
-            base_attention_mask=answer_inputs.base_attention_mask,
-            pixel_values_videos=answer_inputs.pixel_values_videos,
-            video_grid_thw=answer_inputs.video_grid_thw,
-            tokenizer=answer_inputs.tokenizer,
-            embedding_owner=answer_inputs.embedding_owner,
-            rope_indexer=answer_inputs.rope_indexer,
-            qwen_kwargs=answer_inputs.qwen_kwargs,
-        )
+        answer_request = answer_query_request(episode.owner, final_observation, answer_inputs)
         with query_activation_context(self.query_activation_offload):
             output = self.model.prefill_answer(
                 self.model.prepare_answer(answer_request, lifecycle),

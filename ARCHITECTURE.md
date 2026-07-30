@@ -2,7 +2,7 @@
 
 > 规范版本：state_ttt_qwen3vl8b_state_write_associative_v3
 > 配置 schema：12（schema 11 A5 不自动迁移）
-> 修订日期：2026-07-29
+> 修订日期：2026-07-30
 > 状态：A2/A5 TRAINING MAINLINE IMPLEMENTED；ONLINE INFERENCE WIRED
 
 ## 1. 固定目标
@@ -164,6 +164,12 @@ key 一律拒绝。加载后立即重置 Associative 状态，且该 profile 不
 旧 A5 checkpoint 仍必须按 schema-12/current contract 严格恢复，不推断、不迁移。
 
 A2/A5 sampler 必须保持四卡任务或 segment parity。非有限 loss/gradient 必须 warning/skip，不能产生部分参数更新。ZeRO、BF16、显存和性能是否可接受只由真实 H200 记录决定。
+
+schema-12 的冻结常量分两层强制：`ProjectConfig._FROZEN_CONTRACT` 在 `load_config()` 处拒绝
+其覆盖的路径漂移；observation head、State Bank、Spatial/Temporal Encoder 与 Inner SGD 的字段
+由各模块 `_validate_*_config` 在 build 时拒绝。后者是唯一能拦住 `model_copy(update=...)`
+绕过 pydantic validator 的路径，因此这些字段只在模块构建期报错——四卡上意味着在
+distributed init 之后。schema-12 不含 `paths` 配置块，四个环境变量名直接从 `os.environ` 读取。
 
 ## 7. 验证边界
 

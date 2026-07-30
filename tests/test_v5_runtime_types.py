@@ -3,6 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tests.support.runtime_factories import (
+    make_e1_state,
+    make_e2_state,
+    make_state_record,
+    make_temporal_cache,
+)
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.fast_ttt import FastWeightsState, OptimizerRuntimeState
 from ttt_svcbench_qwen.identity_bank import (
@@ -12,16 +18,6 @@ from ttt_svcbench_qwen.identity_bank import (
     build_identity_bank,
 )
 from ttt_svcbench_qwen.model import RuntimeOwner, TrajectoryRuntimeState
-from ttt_svcbench_qwen.observation_heads import (
-    E1RuntimeState,
-    E1SoftOutput,
-    E2RuntimeState,
-    E2SoftOutput,
-    O1SoftOutput,
-    O2SoftOutput,
-    ObservationOutputs,
-    StreamReplayAudit,
-)
 from ttt_svcbench_qwen.query_encoder import (
     Operator,
     OperatorRouterOutput,
@@ -43,12 +39,6 @@ from ttt_svcbench_qwen.state_bank import (
     HeadType,
     O1Payload,
     StateBankRuntimeState,
-    StateRecord,
-)
-from ttt_svcbench_qwen.state_encoder import (
-    SpatialEncoderOutput,
-    TemporalCache,
-    TemporalEncoderOutput,
 )
 from ttt_svcbench_qwen.state_reader import ReaderResult, ReaderStatus
 from ttt_svcbench_qwen.state_retriever import (
@@ -171,111 +161,6 @@ def test_query_output_and_time_window_contracts_reject_future_time() -> None:
         )
 
 
-def test_encoder_cache_and_observation_output_contracts() -> None:
-    spatial = SpatialEncoderOutput(
-        slots=torch.zeros(2, 32, 768),
-        slot_valid_mask=torch.ones(2, 32, dtype=torch.bool),
-        active_slot_overflow_count=torch.zeros(2, dtype=torch.int64),
-    )
-    cache = TemporalCache(
-        hidden=torch.zeros(2, 4, 768),
-        layer_keys=tuple(torch.zeros(2, 12, 4, 64) for _ in range(6)),
-        layer_values=tuple(torch.zeros(2, 12, 4, 64) for _ in range(6)),
-        replay_layer_keys=tuple(torch.zeros(2, 12, 0, 64) for _ in range(6)),
-        replay_layer_values=tuple(torch.zeros(2, 12, 0, 64) for _ in range(6)),
-        timestamps=torch.arange(4, dtype=torch.float64).repeat(2, 1),
-        replay_timestamps=torch.empty(2, 0, dtype=torch.float64),
-        position_ids=torch.arange(4, dtype=torch.int64).repeat(2, 1),
-        replay_position_ids=torch.empty(2, 0, dtype=torch.int64),
-        valid_mask=torch.ones(2, 4, dtype=torch.bool),
-        replay_valid_mask=torch.empty(2, 0, dtype=torch.bool),
-        video_ids=("video-a", "video-b"),
-        trajectory_ids=("trajectory-a", "trajectory-b"),
-        query_signatures=torch.zeros(2, 512),
-        total_seen=torch.full((2,), 4, dtype=torch.int64),
-    )
-    temporal = TemporalEncoderOutput(
-        hidden=torch.zeros(2, 4, 768),
-        timestamps=torch.arange(4, dtype=torch.float32).repeat(2, 1),
-        position_ids=torch.arange(4, dtype=torch.int64).repeat(2, 1),
-        valid_mask=torch.ones(2, 4, dtype=torch.bool),
-        cache=cache,
-    )
-    slot_mask = torch.zeros(2, 32, dtype=torch.bool)
-    temporal_mask = torch.zeros(2, 4, dtype=torch.bool)
-    slot_timestamps = torch.full((2, 32), -1.0)
-    temporal_timestamps = torch.full((2, 4), -1.0)
-    slot_positions = torch.full((2, 32), -1, dtype=torch.int64)
-    temporal_positions = torch.full((2, 4), -1, dtype=torch.int64)
-    e1_states = tuple(
-        E1RuntimeState(
-            video_id=f"video-{row}",
-            trajectory_id=f"trajectory-{row}",
-            query_signature=torch.zeros(512),
-            projected_history=torch.zeros(0, 512),
-            timestamps=torch.zeros(0, dtype=torch.float64),
-            position_ids=torch.zeros(0, dtype=torch.int64),
-            total_seen=0,
-        )
-        for row in range(2)
-    )
-    e2_states = tuple(
-        E2RuntimeState(
-            video_id=f"video-{row}",
-            trajectory_id=f"trajectory-{row}",
-            query_signature=torch.zeros(512),
-            hidden=torch.zeros(2, 768),
-            checkpoint_hidden=torch.zeros(0, 2, 768),
-            timestamps=torch.zeros(0, dtype=torch.float64),
-            position_ids=torch.zeros(0, dtype=torch.int64),
-            total_seen=0,
-        )
-        for row in range(2)
-    )
-    observations = ObservationOutputs(
-        o1=O1SoftOutput(
-            logits=torch.zeros(2, 32, 6),
-            probabilities=torch.zeros(2, 32, 6),
-            soft_count=torch.zeros(2),
-            valid_mask=slot_mask,
-            timestamps=slot_timestamps,
-            position_ids=slot_positions,
-        ),
-        o2=O2SoftOutput(
-            identity=torch.zeros(2, 32, 256),
-            score_logits=torch.zeros(2, 32, 2),
-            score_probabilities=torch.zeros(2, 32, 2),
-            valid_mask=slot_mask,
-            timestamps=slot_timestamps.clone(),
-            position_ids=slot_positions.clone(),
-        ),
-        e1=E1SoftOutput(
-            logits=torch.zeros(2, 4, 3),
-            probabilities=torch.zeros(2, 4, 3),
-            valid_mask=temporal_mask,
-            timestamps=temporal_timestamps,
-            position_ids=temporal_positions,
-            next_states=e1_states,
-            audit=StreamReplayAudit("e1", (0, 0), (0, 0), (0, 0)),
-        ),
-        e2=E2SoftOutput(
-            event_logits=torch.zeros(2, 4, 4),
-            phase_logits=torch.zeros(2, 4, 4),
-            event_probabilities=torch.zeros(2, 4, 4),
-            phase_probabilities=torch.zeros(2, 4, 4),
-            valid_mask=temporal_mask.clone(),
-            timestamps=temporal_timestamps.clone(),
-            position_ids=temporal_positions.clone(),
-            next_states=e2_states,
-            audit=StreamReplayAudit("e2", (0, 0), (0, 0), (0, 0)),
-        ),
-    )
-
-    assert spatial.slots.shape == (2, 32, 768)
-    assert temporal.cache.hidden.shape[1] == 4
-    assert observations.o2.identity.shape[-1] == 256
-
-
 def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
     prototype = torch.zeros(256)
     prototype[0] = 1.0
@@ -289,17 +174,14 @@ def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
         "trajectory-a",
         hot_cache_enabled=False,
     )
-    record = StateRecord(
-        record_id="record-1",
+    record = make_state_record(
+        "record-1",
+        HeadType.O1,
+        O1Payload(2, 1, (0, 1)),
+        semantic_embedding=semantic,
         video_id="video-a",
         trajectory_id="trajectory-a",
-        head_type=HeadType.O1,
-        semantic_embedding=semantic,
         timestamp=2.0,
-        time_range=None,
-        valid=True,
-        confidence=0.9,
-        payload=O1Payload(2, 1, (0, 1)),
     )
     bank = StateBankRuntimeState("video-a", "trajectory-a", (record,), ())
     window = TimeWindow(TimeWindowMode.HISTORY, 2.0, 0.0, 2.0, True)
@@ -400,22 +282,10 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
     w_t_2 = w0_2.clone().requires_grad_(True)
     fast = FastWeightsState(w0_1, w0_2, w_t_1, w_t_2, 0, 0, 0)
     optimizer = OptimizerRuntimeState("sgd", 1.0e-4, 0.0, 0.0, 1, 1.0, 0, None)
-    cache = TemporalCache(
+    cache = make_temporal_cache(
         hidden=torch.zeros(1, 0, 768),
-        layer_keys=tuple(torch.zeros(1, 12, 0, 64) for _ in range(6)),
-        layer_values=tuple(torch.zeros(1, 12, 0, 64) for _ in range(6)),
-        replay_layer_keys=tuple(torch.zeros(1, 12, 0, 64) for _ in range(6)),
-        replay_layer_values=tuple(torch.zeros(1, 12, 0, 64) for _ in range(6)),
-        timestamps=torch.zeros(1, 0, dtype=torch.float64),
-        replay_timestamps=torch.zeros(1, 0, dtype=torch.float64),
-        position_ids=torch.zeros(1, 0, dtype=torch.int64),
-        replay_position_ids=torch.zeros(1, 0, dtype=torch.int64),
-        valid_mask=torch.zeros(1, 0, dtype=torch.bool),
-        replay_valid_mask=torch.zeros(1, 0, dtype=torch.bool),
         video_ids=("video-a",),
         trajectory_ids=("trajectory-a",),
-        query_signatures=torch.zeros(1, 512),
-        total_seen=torch.zeros(1, dtype=torch.int64),
     )
     bank = StateBankRuntimeState("video-a", "trajectory-a", (), ())
     identity_operator = build_identity_bank(load_config())
@@ -424,25 +294,8 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
         "trajectory-a",
         hot_cache_enabled=False,
     )
-    e1_state = E1RuntimeState(
-        video_id="video-a",
-        trajectory_id="trajectory-a",
-        query_signature=torch.zeros(512),
-        projected_history=torch.zeros(0, 512),
-        timestamps=torch.zeros(0, dtype=torch.float64),
-        position_ids=torch.zeros(0, dtype=torch.int64),
-        total_seen=0,
-    )
-    e2_state = E2RuntimeState(
-        video_id="video-a",
-        trajectory_id="trajectory-a",
-        query_signature=torch.zeros(512),
-        hidden=torch.zeros(2, 768),
-        checkpoint_hidden=torch.zeros(0, 2, 768),
-        timestamps=torch.zeros(0, dtype=torch.float64),
-        position_ids=torch.zeros(0, dtype=torch.int64),
-        total_seen=0,
-    )
+    e1_state = make_e1_state()
+    e2_state = make_e2_state()
     owner = RuntimeOwner(("video-a",), ("trajectory-a",))
     values = {
         "owner": owner,
@@ -482,14 +335,6 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
     with pytest.raises(ValueError, match="Identity Bank release"):
         TrajectoryRuntimeState(**{**values, "identity_bank": identity_operator.release(identities)})
 
-    mismatched_e1 = E1RuntimeState(
-        video_id="video-a",
-        trajectory_id="trajectory-a",
-        query_signature=torch.ones(512),
-        projected_history=torch.zeros(0, 512),
-        timestamps=torch.zeros(0, dtype=torch.float64),
-        position_ids=torch.zeros(0, dtype=torch.int64),
-        total_seen=0,
-    )
+    mismatched_e1 = make_e1_state(query_signature=torch.ones(512))
     with pytest.raises(ValueError, match="E1 state query signature"):
         TrajectoryRuntimeState(**{**values, "e1_state": mismatched_e1})

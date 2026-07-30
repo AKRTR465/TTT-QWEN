@@ -653,22 +653,12 @@ class _A5ParameterGroupStepAuditor:
     @staticmethod
     def _classify_parameter(name: str) -> str:
         lowered = name.casefold()
-        if _is_associative_parameter_name(lowered):
-            return "associative"
-        if lowered.endswith(("w0_1", "w0_2")) or "meta_fast" in lowered:
-            return "w0"
         if (
             lowered.startswith(("qwen.", "module.qwen."))
             or ".visual_stage.qwen.qwen_model." in lowered
         ):
             return "qwen"
-        if "component_modules.observation_heads" in lowered:
-            return "state_task"
-        if "operator_router" in lowered or "time_resolver" in lowered:
-            return "state_router_time"
-        if "semantic_projector" in lowered or "component_modules.retriever" in lowered:
-            return "state_retrieval"
-        return "state_shared"
+        return _state_group_for_name(lowered)
 
     def before_step(
         self,
@@ -3033,18 +3023,8 @@ def make_production_outer_optimizer_factory(
                 group = "qwen"
             elif stage is ProductionStage.A5 and parameter_id in fast_slow_ids:
                 group = "fast_slow"
-            elif _is_associative_parameter_name(lowered):
-                group = "associative"
-            elif lowered.endswith(("w0_1", "w0_2")) or "meta_fast" in lowered:
-                group = "w0"
-            elif "component_modules.observation_heads" in lowered:
-                group = "state_task"
-            elif "operator_router" in lowered or "time_resolver" in lowered:
-                group = "state_router_time"
-            elif "semantic_projector" in lowered or "component_modules.retriever" in lowered:
-                group = "state_retrieval"
             else:
-                group = "state_shared"
+                group = _state_group_for_name(lowered)
             previous = ownership.get(parameter_id)
             if previous is not None:
                 if previous != group:
@@ -3150,6 +3130,20 @@ def make_production_outer_optimizer_factory(
 def _is_associative_parameter_name(name: str) -> bool:
     lowered = name.casefold()
     return lowered.startswith("p_context.") or ".p_context." in lowered
+
+
+def _state_group_for_name(lowered: str) -> str:
+    if _is_associative_parameter_name(lowered):
+        return "associative"
+    if lowered.endswith(("w0_1", "w0_2")) or "meta_fast" in lowered:
+        return "w0"
+    if "component_modules.observation_heads" in lowered:
+        return "state_task"
+    if "operator_router" in lowered or "time_resolver" in lowered:
+        return "state_router_time"
+    if "semantic_projector" in lowered or "component_modules.retriever" in lowered:
+        return "state_retrieval"
+    return "state_shared"
 
 
 def _reset_a2_to_a5_associative(model: nn.Module) -> None:

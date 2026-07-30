@@ -403,15 +403,12 @@ class StageATargetBuilder:
         batch_size: int,
         device: torch.device,
     ) -> O1StateTarget | None:
-        if labels is None:
+        joined = _select_joined_rows(
+            labels, observations.o1.valid_mask, "slot_mask", "O1", batch_size, device
+        )
+        if labels is None or joined is None:
             return None
-        selected = _select_explicit_rows(labels.row_indices, labels.provenance, batch_size, device)
-        if selected is None:
-            return None
-        label_positions, global_rows = selected
-        mask = labels.slot_mask.index_select(0, label_positions)
-        prediction_mask = observations.o1.valid_mask.index_select(0, global_rows)
-        _require_label_mask_within_prediction(mask, prediction_mask, "O1")
+        label_positions, global_rows, mask = joined
         return O1StateTarget(
             row_indices=global_rows,
             logits=observations.o1.logits.index_select(0, global_rows),
@@ -426,15 +423,12 @@ class StageATargetBuilder:
         batch_size: int,
         device: torch.device,
     ) -> O2StateTarget | None:
-        if labels is None:
+        joined = _select_joined_rows(
+            labels, observations.o2.valid_mask, "slot_mask", "O2", batch_size, device
+        )
+        if labels is None or joined is None:
             return None
-        selected = _select_explicit_rows(labels.row_indices, labels.provenance, batch_size, device)
-        if selected is None:
-            return None
-        label_positions, global_rows = selected
-        mask = labels.slot_mask.index_select(0, label_positions)
-        prediction_mask = observations.o2.valid_mask.index_select(0, global_rows)
-        _require_label_mask_within_prediction(mask, prediction_mask, "O2")
+        label_positions, global_rows, mask = joined
         return O2StateTarget(
             row_indices=global_rows,
             identity_predictions=observations.o2.identity.index_select(0, global_rows),
@@ -451,15 +445,12 @@ class StageATargetBuilder:
         batch_size: int,
         device: torch.device,
     ) -> E1StateTarget | None:
-        if labels is None:
+        joined = _select_joined_rows(
+            labels, observations.e1.valid_mask, "time_mask", "E1", batch_size, device
+        )
+        if labels is None or joined is None:
             return None
-        selected = _select_explicit_rows(labels.row_indices, labels.provenance, batch_size, device)
-        if selected is None:
-            return None
-        label_positions, global_rows = selected
-        mask = labels.time_mask.index_select(0, label_positions)
-        prediction_mask = observations.e1.valid_mask.index_select(0, global_rows)
-        _require_label_mask_within_prediction(mask, prediction_mask, "E1")
+        label_positions, global_rows, mask = joined
         return E1StateTarget(
             row_indices=global_rows,
             logits=observations.e1.logits.index_select(0, global_rows),
@@ -474,15 +465,12 @@ class StageATargetBuilder:
         batch_size: int,
         device: torch.device,
     ) -> E2StateTarget | None:
-        if labels is None:
+        joined = _select_joined_rows(
+            labels, observations.e2.valid_mask, "time_mask", "E2", batch_size, device
+        )
+        if labels is None or joined is None:
             return None
-        selected = _select_explicit_rows(labels.row_indices, labels.provenance, batch_size, device)
-        if selected is None:
-            return None
-        label_positions, global_rows = selected
-        mask = labels.time_mask.index_select(0, label_positions)
-        prediction_mask = observations.e2.valid_mask.index_select(0, global_rows)
-        _require_label_mask_within_prediction(mask, prediction_mask, "E2")
+        label_positions, global_rows, mask = joined
         return E2StateTarget(
             row_indices=global_rows,
             event_logits=observations.e2.event_logits.index_select(0, global_rows),
@@ -772,6 +760,26 @@ def _select_explicit_rows(
     return label_positions, global_rows
 
 
+def _select_joined_rows(
+    labels: O1TargetLabels | O2TargetLabels | E1TargetLabels | E2TargetLabels | None,
+    prediction_valid_mask: Tensor,
+    mask_attr: str,
+    name: str,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor, Tensor] | None:
+    if labels is None:
+        return None
+    selected = _select_explicit_rows(labels.row_indices, labels.provenance, batch_size, device)
+    if selected is None:
+        return None
+    label_positions, global_rows = selected
+    mask: Tensor = getattr(labels, mask_attr).index_select(0, label_positions)
+    prediction_mask = prediction_valid_mask.index_select(0, global_rows)
+    _require_label_mask_within_prediction(mask, prediction_mask, name)
+    return label_positions, global_rows, mask
+
+
 def _provenance_mask(
     provenance: tuple[TargetProvenance, ...],
     device: torch.device,
@@ -1019,7 +1027,6 @@ class OfficialWeakLossAudit:
     retrieval_all_positive_rows: int = 0
     retrieval_valid_bag_rows: int = 0
     retrieval_rescued_from_wrong_route_rows: int = 0
-    retrieval_legacy_valid_bag_rows: int = 0
     retrieval_invalid_excluded_count: int = 0
     retrieval_ineligible_excluded_count: int = 0
     retrieval_causal_excluded_count: int = 0
@@ -1058,7 +1065,6 @@ class OfficialWeakLossAudit:
             self.retrieval_all_positive_rows,
             self.retrieval_valid_bag_rows,
             self.retrieval_rescued_from_wrong_route_rows,
-            self.retrieval_legacy_valid_bag_rows,
             self.retrieval_invalid_excluded_count,
             self.retrieval_ineligible_excluded_count,
             self.retrieval_causal_excluded_count,
@@ -1106,10 +1112,6 @@ class OfficialWeakLossAudit:
             (
                 "retrieval/rescued_from_wrong_route_rows",
                 float(self.retrieval_rescued_from_wrong_route_rows),
-            ),
-            (
-                "retrieval/legacy_valid_bag_rows",
-                float(self.retrieval_legacy_valid_bag_rows),
             ),
             (
                 "retrieval/invalid_excluded_count",
@@ -1239,7 +1241,6 @@ class OfficialWeakTargetBuilder:
         retrieval_target_head_candidate_rows = 0
         retrieval_no_target_head_candidate_rows = 0
         retrieval_rescued_from_wrong_route_rows = 0
-        retrieval_legacy_valid_bag_rows = 0
         retrieval_invalid_excluded_count = 0
         retrieval_ineligible_excluded_count = 0
         retrieval_causal_excluded_count = 0
@@ -1378,7 +1379,6 @@ class OfficialWeakTargetBuilder:
                 retrieval_result.target_head_present_count == 0
             )
             retrieval_rescued_from_wrong_route_rows += int(retrieval_result.rescued_wrong_route)
-            retrieval_legacy_valid_bag_rows += int(retrieval_result.legacy_valid_bag)
             retrieval_invalid_excluded_count += retrieval_result.invalid_excluded_count
             retrieval_ineligible_excluded_count += retrieval_result.ineligible_excluded_count
             retrieval_causal_excluded_count += retrieval_result.causal_excluded_count
@@ -1479,7 +1479,6 @@ class OfficialWeakTargetBuilder:
                 retrieval_status_counts["all_positive"],
                 retrieval_status_counts["valid_bag"],
                 retrieval_rescued_from_wrong_route_rows,
-                retrieval_legacy_valid_bag_rows,
                 retrieval_invalid_excluded_count,
                 retrieval_ineligible_excluded_count,
                 retrieval_causal_excluded_count,
@@ -1499,7 +1498,6 @@ class OfficialWeakTargetBuilder:
             retrieval_status_counts["all_positive"],
             retrieval_status_counts["valid_bag"],
             retrieval_rescued_from_wrong_route_rows,
-            retrieval_legacy_valid_bag_rows,
             retrieval_invalid_excluded_count,
             retrieval_ineligible_excluded_count,
             retrieval_causal_excluded_count,
@@ -1538,7 +1536,6 @@ class OfficialWeakTargetBuilder:
                 retrieval_all_positive_rows=retrieval_status_counts["all_positive"],
                 retrieval_valid_bag_rows=retrieval_status_counts["valid_bag"],
                 retrieval_rescued_from_wrong_route_rows=(retrieval_rescued_from_wrong_route_rows),
-                retrieval_legacy_valid_bag_rows=retrieval_legacy_valid_bag_rows,
                 retrieval_invalid_excluded_count=retrieval_invalid_excluded_count,
                 retrieval_ineligible_excluded_count=retrieval_ineligible_excluded_count,
                 retrieval_causal_excluded_count=retrieval_causal_excluded_count,
@@ -1838,7 +1835,6 @@ class _RetrievalLossResult:
     status: str
     wrong_operator: bool
     rescued_wrong_route: bool
-    legacy_valid_bag: bool
     target_head_present_count: int
     invalid_excluded_count: int
     ineligible_excluded_count: int
@@ -1872,7 +1868,6 @@ def _official_weak_retrieval_loss(
     candidate_mask = eligible_head & official_causal
     present_columns = torch.nonzero(candidate_mask, as_tuple=False).flatten()
     candidate_count = int(present_columns.numel())
-    legacy_valid = _legacy_retrieval_bag_is_valid(retrieval, row, label)
     target_head_present_count = int(head_mask.sum().item())
     if not candidate_count:
         return _RetrievalLossResult(
@@ -1883,7 +1878,6 @@ def _official_weak_retrieval_loss(
             status="no_candidate",
             wrong_operator=wrong_operator,
             rescued_wrong_route=False,
-            legacy_valid_bag=legacy_valid,
             target_head_present_count=target_head_present_count,
             invalid_excluded_count=invalid_excluded,
             ineligible_excluded_count=ineligible_excluded,
@@ -1901,7 +1895,6 @@ def _official_weak_retrieval_loss(
             status="no_positive",
             wrong_operator=wrong_operator,
             rescued_wrong_route=False,
-            legacy_valid_bag=legacy_valid,
             target_head_present_count=target_head_present_count,
             invalid_excluded_count=invalid_excluded,
             ineligible_excluded_count=ineligible_excluded,
@@ -1917,7 +1910,6 @@ def _official_weak_retrieval_loss(
             status="all_positive",
             wrong_operator=wrong_operator,
             rescued_wrong_route=False,
-            legacy_valid_bag=legacy_valid,
             target_head_present_count=target_head_present_count,
             invalid_excluded_count=invalid_excluded,
             ineligible_excluded_count=ineligible_excluded,
@@ -1934,31 +1926,11 @@ def _official_weak_retrieval_loss(
         status="valid_bag",
         wrong_operator=wrong_operator,
         rescued_wrong_route=wrong_operator,
-        legacy_valid_bag=legacy_valid,
         target_head_present_count=target_head_present_count,
         invalid_excluded_count=invalid_excluded,
         ineligible_excluded_count=ineligible_excluded,
         causal_excluded_count=causal_excluded,
     )
-
-
-def _legacy_retrieval_bag_is_valid(
-    retrieval: RetrieverOutput,
-    row: int,
-    label: OfficialWeakSupervision,
-) -> bool:
-    if retrieval.hard_operators[row] is not label.operator:
-        return False
-    mask = (
-        retrieval.present_mask[row]
-        & retrieval.predicted_head_mask[row]
-        & retrieval.record_valid_mask[row]
-        & retrieval.retrieval_eligible_mask[row]
-        & retrieval.causal_mask[row]
-    )
-    positives = int((_retrieval_occurrence_mask(retrieval, row, label) & mask).sum().item())
-    count = int(mask.sum().item())
-    return bool(positives > 0 and positives < count)
 
 
 def _retrieval_occurrence_mask(

@@ -1,20 +1,17 @@
 """Load and validate the frozen retrieval-history project configuration.
 
-Inputs: UTF-8 YAML plus environment-variable *names* for model, data, cache, and outputs.
-Outputs: an immutable, fully validated :class:`ProjectConfig` and environment summaries.
+Inputs: one UTF-8 YAML file describing the frozen schema-12 contract.
+Outputs: an immutable, fully validated :class:`ProjectConfig`.
 Forbidden: model forward logic, training logic, secret values, or platform absolute paths.
 """
 
 from __future__ import annotations
 
 import argparse
-import platform
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, Self, cast
 
-import torch
-import transformers
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -53,13 +50,6 @@ class AuditLevel(StrEnum):
     OFF = "off"
     BOUNDARY = "boundary"
     FULL = "full"
-
-
-class PathsConfig(FrozenModel):
-    model_root_env: str
-    svcbench_root_env: str
-    hf_home_env: str
-    output_root_env: str
 
 
 class DataConfig(FrozenModel):
@@ -623,21 +613,11 @@ class A5CounterfactualAuditConfig(FrozenModel):
 
     enabled: bool = False
     interval_steps: PositiveInt = 8
-    queries_per_rank: PositiveInt = 1
-    references: tuple[Literal["episode_w0", "segment_start"], ...] = (
+    queries_per_rank: Literal[1] = 1
+    references: tuple[Literal["episode_w0"], Literal["segment_start"]] = (
         "episode_w0",
         "segment_start",
     )
-
-    @model_validator(mode="after")  # type: ignore[untyped-decorator]
-    def validate_audit_contract(self) -> Self:
-        if self.queries_per_rank != 1:
-            raise ValueError("counterfactual audit must select exactly one Query per rank")
-        if self.references != ("episode_w0", "segment_start"):
-            raise ValueError(
-                "counterfactual audit references must be episode_w0 and segment_start"
-            )
-        return self
 
 
 class A5QueryMetaGradientConfig(FrozenModel):
@@ -690,12 +670,396 @@ class InferenceRuntimeConfig(FrozenModel):
     audit_level: AuditLevel
 
 
+_FROZEN_CONTRACT: dict[str, object] = {
+    "spec_version": SPEC_VERSION,
+    "config_schema_version": CONFIG_SCHEMA_VERSION,
+    "data": {
+        "grouped_annotation_file": "data/vcbench_data.jsonl",
+        "flat_annotation_file": "data/vcbench_eval.jsonl",
+        "video_directory": "data/videos",
+        "group_key_fields": ("source_dataset", "video_path"),
+        "group_k_folds": 5,
+        "fold_seed": 42,
+        "runtime_allowlist": ("video", "question", "query_time", "explicit_time_values"),
+        "runtime_denylist": (
+            "answer",
+            "count",
+            "occurrence_times",
+            "counting_type",
+            "counting_subtype",
+        ),
+        "official_clean_selection_forbidden": True,
+    },
+    "video_preprocessing": {
+        "sample_fps": 2.0,
+        "frames_per_chunk": 16,
+        "stride_frames": 8,
+        "causal_boundary": "right_closed",
+        "processor_shortest_edge": 4096,
+        "processor_longest_edge": 25_165_824,
+        "patch_size": 16,
+        "temporal_patch_size": 2,
+        "spatial_merge_size": 2,
+        "pad_value": 0.0,
+        "full_tubelet_required_for_state": True,
+    },
+    "model": {
+        "base_model": BASE_MODEL_ID,
+        "revision": BASE_MODEL_REVISION,
+        "transformers_version": TRANSFORMERS_VERSION,
+        "vision": {
+            "depth": 27,
+            "hidden_size": 1152,
+            "num_heads": 16,
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+            "output_size": 4096,
+            "deepstack_visual_indexes": (8, 16, 24),
+        },
+        "llm": {
+            "num_layers": 36,
+            "hidden_size": 4096,
+        },
+        "online_freeze": {
+            "vision": True,
+            "merger": True,
+            "deepstack": True,
+            "llm": True,
+        },
+    },
+    "fast_ttt": {
+        "input_dim": 4096,
+        "bottleneck_dim": 768,
+        "output_dim": 4096,
+        "residual_scale": 0.1,
+        "rms_norm_eps": 1.0e-6,
+        "slow_projection_bias": True,
+        "fast_bias": False,
+        "fast_initialization": "xavier_uniform",
+        "fast_matrix_count": 2,
+        "online_parameter_count": 1_179_648,
+        "update_order": "observe_state_then_update_for_next_chunk",
+        "optimizer": {
+            "learning_rate": 1.0e-4,
+        },
+    },
+    "spatial_encoder": {
+        "input_dim": 4096,
+        "hidden_dim": 768,
+        "stages": 2,
+        "num_heads": 12,
+        "head_dim": 64,
+        "refinements_per_stage": 3,
+        "ffn_dim": 3072,
+        "active_slots": 32,
+        "max_active_slots": 64,
+        "query_dim": 512,
+        "layer_norm_eps": 1.0e-5,
+        "attention_epsilon": 1.0e-8,
+        "slot_valid_mask": True,
+        "log_overflow": True,
+    },
+    "state_bank": {
+        "confirmed_store": {
+            "initial_capacity": 256,
+            "growth_chunk": 256,
+            "hard_limit": None,
+            "storage_device": "cpu",
+            "storage_dtype": "float32",
+            "exact_search": True,
+            "ann_enabled": False,
+            "gpu_hot_capacity": 256,
+            "hot_cache_enabled": True,
+            "hot_cache_device": "cuda",
+            "hot_cache_dtype": "bfloat16",
+            "eviction_policy": "lru_position_then_identity_id",
+        },
+        "candidate_store": {
+            "initial_capacity": 64,
+            "growth_chunk": 64,
+            "hard_limit": 512,
+            "ttl_chunks": 8,
+            "match_threshold": 0.8,
+            "reliability_threshold": 0.5,
+            "low_confidence_threshold": 0.5,
+            "ttl_refresh_policy": "reset_to_full_on_reliable_match",
+            "ttl_aging_policy": (
+                "match_first_then_unmatched_decrement_once_per_new_committed_position_remove_at_zero_end"
+            ),
+            "promotion_policy": "two_reliable_distinct_consecutive_committed_positions",
+            "overflow_policy": "expire_then_low_confidence_then_reject",
+            "prune_order": (
+                "expired",
+                "low_confidence",
+                "confidence_asc",
+                "last_position_id_asc",
+                "candidate_id_asc",
+                "reject_new",
+            ),
+        },
+        "o2_lifecycle_owner": "identity_bank_p10",
+        "o2_candidate_retrieval_eligible": False,
+        "o2_confirmed_retrieval_eligible": True,
+        "event_kind_provenance": "hard_operator_frozen_per_aggregate",
+    },
+    "query_encoder": {
+        "input_dim": 4096,
+        "hidden_dim": 768,
+        "num_layers": 4,
+        "num_heads": 12,
+        "head_dim": 64,
+        "ffn_dim": 3072,
+        "dropout": 0.1,
+        "output_dim": 512,
+        "bidirectional": True,
+        "position_encoding": "sinusoidal",
+        "pooling": "learned_attention",
+    },
+    "operator_router": {
+        "output_dim": 512,
+        "temperature_initial": 1.0,
+        "temperature_trainable": True,
+        "confidence_threshold": None,
+        "threshold_status": CalibrationStatus.CALIBRATION_REQUIRED,
+    },
+    "time_resolver": {
+        "input_dim": 512,
+        "hidden_dim": 256,
+        "mode_count": 4,
+        "token_hidden_dim": 768,
+        "pointer_heads": 2,
+        "confidence_threshold": None,
+        "threshold_status": CalibrationStatus.CALIBRATION_REQUIRED,
+    },
+    "retriever": {
+        "semantic_dim": 512,
+        "record_similarity_threshold": 0.35,
+        "similarity_dtype": "float32",
+        "normalization_eps": 1.0e-8,
+        "zero_query_policy": "unsupported",
+        "threshold_comparison": "greater_than_or_equal",
+        "record_confidence_threshold": None,
+        "filter_order": (
+            "invalid",
+            "retrieval_ineligible",
+            "future",
+            "outside_window",
+            "below_similarity",
+        ),
+        "selection_order": ("score_desc", "record_id_asc"),
+        "owner_mismatch_status": "invalid",
+        "aggregate_time_policy": "causal_availability_only_window_in_reader",
+        "atomic_window_boundary": "closed",
+        "metrics_policy": "offline_ground_truth_runtime_label_free",
+        "top_k": None,
+        "ann_enabled": False,
+    },
+    "state_resampler": {
+        "num_queries": 16,
+        "num_layers": 3,
+        "num_heads": 8,
+        "head_dim": 64,
+        "ffn_dim": 2048,
+        "hidden_dim": 512,
+        "output_dim": 4096,
+        "layer_norm_eps": 1.0e-5,
+        "activation": "gelu",
+        "dropout": 0.0,
+        "attention_bias": True,
+        "output_projection_bias": True,
+        "attention_softmax_dtype": "float32",
+        "empty_record_embedding": True,
+        "empty_record_policy": "internal_trainable_kv_external_zero_width",
+        "attention_audit": "final_layer_mean_heads_selected_mass",
+        "parameter_count": 14_722_048,
+    },
+    "state_reader": {
+        "signed_exact_count": True,
+        "empty_exact_count": 0,
+        "status_propagation": "retriever_exact",
+        "o1_delta_policy": "fixed_baseline_v1",
+        "o2_identity_key": "identity_id",
+        "point_window_boundary": "closed",
+        "e1_history_policy": "cumulative_or_retained_completion_times",
+        "e1_truncated_window_status": "invalid",
+        "e2_window_anchor": "completion_end",
+        "event_kind_mismatch_status": "invalid",
+        "number_text_format": "canonical_ascii_signed_decimal",
+        "tokenizer_add_special_tokens": False,
+        "tokenizer_roundtrip_required": True,
+        "tokenizer_class": "Qwen2TokenizerFast",
+        "tokenizer_vocab_size": 151_643,
+        "tokenizer_required_files": (
+            "merges.txt",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+        ),
+        "tokenizer_manifest_sha256": (
+            "ccd18347b6d6714d91d4c55b37ff05e473a0f8e84fbcba2bda1401a9572f44c3"
+        ),
+        "ground_truth_input_forbidden": True,
+    },
+    "input_composer": {
+        "state_token_count": 16,
+        "special_tokens": (
+            "<|state_start|>",
+            "<|state_pad|>",
+            "<|state_end|>",
+            "<|number_start|>",
+            "<|number_end|>",
+        ),
+        "special_token_ids": (151_669, 151_670, 151_671, 151_672, 151_673),
+        "tokenizer_base_length": 151_669,
+        "tokenizer_extended_length": 151_674,
+        "tokenizer_revision": BASE_MODEL_REVISION,
+        "model_embedding_rows": 151_936,
+        "embedding_initialization": "fp32_mean_of_vision_start_video_pad_vision_end_then_cast",
+        "embedding_source_token_ids": (151_652, 151_656, 151_653),
+        "initialize_input_and_output_embeddings": True,
+        "padding_side": "left",
+        "state_payload_statuses": ("ok", "empty"),
+        "invalid_payload_policy": "omit_state_and_number",
+        "payload_order": (
+            "system_user_question_video",
+            "state",
+            "number",
+            "user_end",
+            "assistant_generation_prefix",
+        ),
+        "prefill_once": True,
+        "generation_num_beams": 1,
+    },
+    "associative_ttt": {
+        "contract": "bank_conditioned_state_write_v2",
+        "bank_embedding_dim": 512,
+        "key_dim": 768,
+        "target_dim": 768,
+        "bank_empty_policy": "zero",
+        "target_source": "predicted_active_head_soft_write_stopgrad",
+        "unsupported_target_policy": "skip",
+        "loss": "normalized_fp32_cosine",
+    },
+    "loss": {
+        "operator_weight": 1.0,
+        "retrieval_weight": 1.0,
+        "time_weight": 1.0,
+        "answer_causal_shift": True,
+        "answer_ignore_index": -100,
+        "official_weak_balance": {
+            "group_weight": 0.4,
+            "answer_reference_floor": 0.1,
+            "scale_min": 0.001,
+            "scale_max": 20.0,
+            "epsilon": 1.0e-8,
+            "ema_beta": 0.99,
+            "grad_ema_beta": 0.99,
+            "grad_scale_min": 0.1,
+            "grad_scale_max": 10.0,
+        },
+    },
+    "outer_gradient_control": {
+        "max_grad_norm": {
+            "qwen": 1.0,
+            "state_shared": 0.05,
+            "state_task": 0.05,
+            "state_router_time": 0.05,
+            "state_retrieval": 0.05,
+            "associative": 0.1,
+            "w0": 0.1,
+        },
+        "mode": OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP,
+        "nonfinite_policy": OuterNonfinitePolicy.SKIP_UPDATE,
+        "audit_steps": 32,
+    },
+    "a2": {
+        "optimizer": {
+            "qwen_learning_rate": 1.0e-5,
+            "state_learning_rate": 1.0e-4,
+            "w0_learning_rate": 1.0e-4,
+        },
+    },
+    "a5": {
+        "truncation_horizon": 8,
+        "seed": 42,
+        "optimizer": {
+            "state_learning_rate": 5.0e-5,
+            "w0_learning_rate": 5.0e-5,
+            "associative_learning_rate": 5.0e-5,
+        },
+    },
+    "inference": {
+        "audit_level": AuditLevel.BOUNDARY,
+    },
+    "observation_heads": {
+        "o1": {
+            "output_names": ("object", "target", "visible", "enter", "exit", "confidence"),
+            "object_threshold": 0.5,
+            "target_threshold": 0.5,
+            "visible_threshold": 0.5,
+            "enter_threshold": 0.5,
+            "exit_threshold": 0.5,
+            "confidence_threshold": 0.5,
+            "baseline_policy": "explicit_set_once_per_trajectory",
+            "count_update_policy": "recompute_from_full_slot_state",
+            "committed_position_policy": "idempotent_preserve_and_audit_drift",
+        },
+        "o2": {
+            "score_names": ("novelty", "match_confidence"),
+            "prototype_ema": 0.9,
+            "confirmation_observations": 2,
+            "match_threshold": 0.8,
+            "novelty_threshold": 0.5,
+            "match_confidence_threshold": 0.5,
+            "reliability_threshold": 0.5,
+            "candidate_low_confidence_threshold": 0.5,
+            "match_ambiguity_margin": 1.0e-6,
+            "threshold_status": CalibrationStatus.BOOTSTRAP_CALIBRATION_REQUIRED,
+        },
+        "e1": {
+            "output_names": ("eventness", "completion", "transition"),
+            "tau_on": 0.7,
+            "tau_off": 0.3,
+            "completion_threshold": 0.7,
+            "transition_threshold": 0.7,
+            "min_gap_seconds": 0.5,
+            "fsm_policy": "eventness_hysteresis_completion_transition",
+            "cooldown_nms_source": "min_gap_seconds",
+            "committed_position_policy": "idempotent_ignore_and_audit",
+        },
+        "e2": {
+            "event_names": ("start", "active", "end", "complete"),
+            "phase_names": ("inactive", "active", "end_candidate", "completed"),
+            "start_threshold": 0.6,
+            "end_threshold": 0.6,
+            "complete_threshold": 0.7,
+            "rearm_max_event_probability": 0.5,
+            "rearm_phase": "inactive",
+            "completed_hold_positions": 1,
+            "fsm_policy": "phase_gated_single_transition_per_position",
+            "active_evidence_policy": "diagnostic_and_phase_consistency_only",
+            "committed_position_policy": "idempotent_ignore_and_audit",
+        },
+    },
+}
+
+
+def _validate_frozen_contract(node: object, contract: dict[str, object], prefix: str) -> None:
+    for name, expected in contract.items():
+        path = f"{prefix}{name}"
+        actual = getattr(node, name)
+        if isinstance(expected, dict):
+            _validate_frozen_contract(actual, expected, f"{path}.")
+        elif actual != expected:
+            raise ValueError(f"{path} must be {expected!r}; got {actual!r}")
+
+
 class ProjectConfig(FrozenModel):
     """Schema-12 production configuration with cross-component contract validation."""
 
     spec_version: str
     config_schema_version: Literal[12]
-    paths: PathsConfig
     data: DataConfig
     video_preprocessing: VideoPreprocessingConfig
     model: ModelConfig
@@ -720,1037 +1084,7 @@ class ProjectConfig(FrozenModel):
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
     def validate_production_contract(self) -> Self:
-        checks: tuple[tuple[str, object, object], ...] = (
-            ("spec_version", self.spec_version, SPEC_VERSION),
-            ("config_schema_version", self.config_schema_version, CONFIG_SCHEMA_VERSION),
-            ("paths.model_root_env", self.paths.model_root_env, "QWEN_MODEL_ROOT"),
-            ("paths.svcbench_root_env", self.paths.svcbench_root_env, "SVCBENCH_ROOT"),
-            ("paths.hf_home_env", self.paths.hf_home_env, "HF_HOME"),
-            ("paths.output_root_env", self.paths.output_root_env, "OUTPUT_ROOT"),
-            (
-                "data.grouped_annotation_file",
-                self.data.grouped_annotation_file,
-                "data/vcbench_data.jsonl",
-            ),
-            (
-                "data.flat_annotation_file",
-                self.data.flat_annotation_file,
-                "data/vcbench_eval.jsonl",
-            ),
-            ("data.video_directory", self.data.video_directory, "data/videos"),
-            ("data.group_key_fields", self.data.group_key_fields, ("source_dataset", "video_path")),
-            ("data.group_k_folds", self.data.group_k_folds, 5),
-            ("data.fold_seed", self.data.fold_seed, 42),
-            (
-                "data.runtime_allowlist",
-                self.data.runtime_allowlist,
-                ("video", "question", "query_time", "explicit_time_values"),
-            ),
-            (
-                "data.runtime_denylist",
-                self.data.runtime_denylist,
-                ("answer", "count", "occurrence_times", "counting_type", "counting_subtype"),
-            ),
-            (
-                "data.official_clean_selection_forbidden",
-                self.data.official_clean_selection_forbidden,
-                True,
-            ),
-            ("video_preprocessing.sample_fps", self.video_preprocessing.sample_fps, 2.0),
-            ("video_preprocessing.frames_per_chunk", self.video_preprocessing.frames_per_chunk, 16),
-            ("video_preprocessing.stride_frames", self.video_preprocessing.stride_frames, 8),
-            (
-                "video_preprocessing.causal_boundary",
-                self.video_preprocessing.causal_boundary,
-                "right_closed",
-            ),
-            (
-                "video_preprocessing.processor_shortest_edge",
-                self.video_preprocessing.processor_shortest_edge,
-                4096,
-            ),
-            (
-                "video_preprocessing.processor_longest_edge",
-                self.video_preprocessing.processor_longest_edge,
-                25_165_824,
-            ),
-            ("video_preprocessing.patch_size", self.video_preprocessing.patch_size, 16),
-            (
-                "video_preprocessing.temporal_patch_size",
-                self.video_preprocessing.temporal_patch_size,
-                2,
-            ),
-            (
-                "video_preprocessing.spatial_merge_size",
-                self.video_preprocessing.spatial_merge_size,
-                2,
-            ),
-            ("video_preprocessing.pad_value", self.video_preprocessing.pad_value, 0.0),
-            (
-                "video_preprocessing.full_tubelet_required_for_state",
-                self.video_preprocessing.full_tubelet_required_for_state,
-                True,
-            ),
-            ("model.base_model", self.model.base_model, BASE_MODEL_ID),
-            ("model.revision", self.model.revision, BASE_MODEL_REVISION),
-            ("model.transformers_version", self.model.transformers_version, TRANSFORMERS_VERSION),
-            ("model.vision.depth", self.model.vision.depth, 27),
-            ("model.vision.hidden_size", self.model.vision.hidden_size, 1152),
-            ("model.vision.num_heads", self.model.vision.num_heads, 16),
-            ("model.vision.patch_size", self.model.vision.patch_size, 16),
-            ("model.vision.temporal_patch_size", self.model.vision.temporal_patch_size, 2),
-            ("model.vision.spatial_merge_size", self.model.vision.spatial_merge_size, 2),
-            ("model.vision.output_size", self.model.vision.output_size, 4096),
-            (
-                "model.vision.deepstack_visual_indexes",
-                self.model.vision.deepstack_visual_indexes,
-                (8, 16, 24),
-            ),
-            ("model.llm.num_layers", self.model.llm.num_layers, 36),
-            ("model.llm.hidden_size", self.model.llm.hidden_size, 4096),
-            ("model.online_freeze.vision", self.model.online_freeze.vision, True),
-            ("model.online_freeze.merger", self.model.online_freeze.merger, True),
-            ("model.online_freeze.deepstack", self.model.online_freeze.deepstack, True),
-            ("model.online_freeze.llm", self.model.online_freeze.llm, True),
-            ("fast_ttt.input_dim", self.fast_ttt.input_dim, 4096),
-            ("fast_ttt.bottleneck_dim", self.fast_ttt.bottleneck_dim, 768),
-            ("fast_ttt.output_dim", self.fast_ttt.output_dim, 4096),
-            ("fast_ttt.residual_scale", self.fast_ttt.residual_scale, 0.1),
-            ("fast_ttt.rms_norm_eps", self.fast_ttt.rms_norm_eps, 1.0e-6),
-            ("fast_ttt.slow_projection_bias", self.fast_ttt.slow_projection_bias, True),
-            ("fast_ttt.fast_bias", self.fast_ttt.fast_bias, False),
-            ("fast_ttt.fast_initialization", self.fast_ttt.fast_initialization, "xavier_uniform"),
-            ("fast_ttt.fast_matrix_count", self.fast_ttt.fast_matrix_count, 2),
-            ("fast_ttt.online_parameter_count", self.fast_ttt.online_parameter_count, 1_179_648),
-            (
-                "fast_ttt.update_order",
-                self.fast_ttt.update_order,
-                "observe_state_then_update_for_next_chunk",
-            ),
-            ("fast_ttt.optimizer.name", self.fast_ttt.optimizer.name, "sgd"),
-            ("fast_ttt.optimizer.momentum", self.fast_ttt.optimizer.momentum, 0.0),
-            ("fast_ttt.optimizer.weight_decay", self.fast_ttt.optimizer.weight_decay, 0.0),
-            ("fast_ttt.optimizer.steps_per_chunk", self.fast_ttt.optimizer.steps_per_chunk, 1),
-            ("fast_ttt.optimizer.grad_clip_norm", self.fast_ttt.optimizer.grad_clip_norm, 1.0),
-            ("fast_ttt.optimizer.reset_per_video", self.fast_ttt.optimizer.reset_per_video, True),
-            (
-                "fast_ttt.optimizer.meta_gradient_mode",
-                self.fast_ttt.optimizer.meta_gradient_mode,
-                "full_second_order",
-            ),
-            ("fast_ttt.optimizer.learning_rate", self.fast_ttt.optimizer.learning_rate, 1.0e-4),
-            (
-                "fast_ttt.optimizer.fast_weight_dtype",
-                self.fast_ttt.optimizer.fast_weight_dtype,
-                "float32",
-            ),
-            (
-                "fast_ttt.optimizer.fast_core_dtype",
-                self.fast_ttt.optimizer.fast_core_dtype,
-                "float32",
-            ),
-            ("spatial_encoder.input_dim", self.spatial_encoder.input_dim, 4096),
-            ("spatial_encoder.hidden_dim", self.spatial_encoder.hidden_dim, 768),
-            ("spatial_encoder.stages", self.spatial_encoder.stages, 2),
-            ("spatial_encoder.num_heads", self.spatial_encoder.num_heads, 12),
-            ("spatial_encoder.head_dim", self.spatial_encoder.head_dim, 64),
-            (
-                "spatial_encoder.refinements_per_stage",
-                self.spatial_encoder.refinements_per_stage,
-                3,
-            ),
-            ("spatial_encoder.ffn_dim", self.spatial_encoder.ffn_dim, 3072),
-            ("spatial_encoder.active_slots", self.spatial_encoder.active_slots, 32),
-            ("spatial_encoder.max_active_slots", self.spatial_encoder.max_active_slots, 64),
-            ("spatial_encoder.query_dim", self.spatial_encoder.query_dim, 512),
-            ("spatial_encoder.layer_norm_eps", self.spatial_encoder.layer_norm_eps, 1.0e-5),
-            (
-                "spatial_encoder.slot_initialization",
-                self.spatial_encoder.slot_initialization,
-                "shared_seed_plus_fixed_sinusoidal_codes",
-            ),
-            (
-                "spatial_encoder.attention_normalization",
-                self.spatial_encoder.attention_normalization,
-                "softmax_slots_then_normalize_tokens",
-            ),
-            (
-                "spatial_encoder.attention_epsilon",
-                self.spatial_encoder.attention_epsilon,
-                1.0e-8,
-            ),
-            (
-                "spatial_encoder.confidence_mode",
-                self.spatial_encoder.confidence_mode,
-                "attention_occupancy",
-            ),
-            (
-                "spatial_encoder.overflow_policy",
-                self.spatial_encoder.overflow_policy,
-                "preserve_existing_reject_excess",
-            ),
-            ("spatial_encoder.slot_valid_mask", self.spatial_encoder.slot_valid_mask, True),
-            ("spatial_encoder.log_overflow", self.spatial_encoder.log_overflow, True),
-            ("temporal_encoder.input_dim", self.temporal_encoder.input_dim, 4096),
-            ("temporal_encoder.hidden_dim", self.temporal_encoder.hidden_dim, 768),
-            ("temporal_encoder.num_layers", self.temporal_encoder.num_layers, 6),
-            ("temporal_encoder.num_heads", self.temporal_encoder.num_heads, 12),
-            ("temporal_encoder.head_dim", self.temporal_encoder.head_dim, 64),
-            ("temporal_encoder.ffn_dim", self.temporal_encoder.ffn_dim, 3072),
-            ("temporal_encoder.dropout", self.temporal_encoder.dropout, 0.1),
-            (
-                "temporal_encoder.position_encoding",
-                self.temporal_encoder.position_encoding,
-                "absolute_sinusoidal",
-            ),
-            (
-                "temporal_encoder.layer_norm_eps",
-                self.temporal_encoder.layer_norm_eps,
-                1.0e-5,
-            ),
-            ("temporal_encoder.activation", self.temporal_encoder.activation, "gelu"),
-            ("temporal_encoder.pre_norm", self.temporal_encoder.pre_norm, True),
-            (
-                "temporal_encoder.attention_projection_bias",
-                self.temporal_encoder.attention_projection_bias,
-                True,
-            ),
-            ("temporal_encoder.strict_causal", self.temporal_encoder.strict_causal, True),
-            (
-                "temporal_encoder.causal_includes_self",
-                self.temporal_encoder.causal_includes_self,
-                True,
-            ),
-            (
-                "temporal_encoder.causal_window_includes_current",
-                self.temporal_encoder.causal_window_includes_current,
-                True,
-            ),
-            ("temporal_encoder.cache_tubelets", self.temporal_encoder.cache_tubelets, 64),
-            (
-                "temporal_encoder.cache_mode",
-                self.temporal_encoder.cache_mode,
-                "layerwise_kv",
-            ),
-            (
-                "temporal_encoder.position_id_mode",
-                self.temporal_encoder.position_id_mode,
-                "explicit_global",
-            ),
-            (
-                "temporal_encoder.overlap_policy",
-                self.temporal_encoder.overlap_policy,
-                "replay_replace",
-            ),
-            (
-                "temporal_encoder.overlap_tubelets",
-                self.temporal_encoder.overlap_tubelets,
-                4,
-            ),
-            (
-                "temporal_encoder.replay_context_tubelets",
-                self.temporal_encoder.replay_context_tubelets,
-                3,
-            ),
-            (
-                "temporal_encoder.cache_owner_keys",
-                self.temporal_encoder.cache_owner_keys,
-                ("video_id", "trajectory_id", "query_signature"),
-            ),
-            (
-                "temporal_encoder.detach_cache_default",
-                self.temporal_encoder.detach_cache_default,
-                True,
-            ),
-            ("temporal_encoder.query_dim", self.temporal_encoder.query_dim, 512),
-            (
-                "temporal_encoder.parameter_count",
-                self.temporal_encoder.parameter_count,
-                48_438_272,
-            ),
-            ("state_bank.semantic_dim", self.state_bank.semantic_dim, 512),
-            ("state_bank.identity_dim", self.state_bank.identity_dim, 256),
-            (
-                "state_bank.semantic_projector.input_dim",
-                self.state_bank.semantic_projector.input_dim,
-                768,
-            ),
-            (
-                "state_bank.semantic_projector.hidden_dim",
-                self.state_bank.semantic_projector.hidden_dim,
-                1024,
-            ),
-            (
-                "state_bank.semantic_projector.output_dim",
-                self.state_bank.semantic_projector.output_dim,
-                512,
-            ),
-            (
-                "state_bank.semantic_projector.head_types",
-                self.state_bank.semantic_projector.head_types,
-                ("o1", "o2", "e1", "e2"),
-            ),
-            (
-                "state_bank.semantic_projector.head_type_count",
-                self.state_bank.semantic_projector.head_type_count,
-                4,
-            ),
-            (
-                "state_bank.semantic_projector.layer_norm_eps",
-                self.state_bank.semantic_projector.layer_norm_eps,
-                1.0e-5,
-            ),
-            (
-                "state_bank.semantic_projector.activation",
-                self.state_bank.semantic_projector.activation,
-                "silu",
-            ),
-            (
-                "state_bank.semantic_projector.dropout",
-                self.state_bank.semantic_projector.dropout,
-                0.0,
-            ),
-            (
-                "state_bank.semantic_projector.linear_bias",
-                self.state_bank.semantic_projector.linear_bias,
-                True,
-            ),
-            (
-                "state_bank.semantic_projector.normalization_dtype",
-                self.state_bank.semantic_projector.normalization_dtype,
-                "float32",
-            ),
-            (
-                "state_bank.semantic_projector.normalization_eps",
-                self.state_bank.semantic_projector.normalization_eps,
-                1.0e-8,
-            ),
-            (
-                "state_bank.semantic_projector.zero_norm_fallback",
-                self.state_bank.semantic_projector.zero_norm_fallback,
-                "first_unit_basis",
-            ),
-            (
-                "state_bank.semantic_projector.parameter_count",
-                self.state_bank.semantic_projector.parameter_count,
-                1_316_864,
-            ),
-            (
-                "state_bank.semantic_projector.included_in_model_state_dict",
-                self.state_bank.semantic_projector.included_in_model_state_dict,
-                True,
-            ),
-            (
-                "state_bank.semantic_projector.included_in_outer_optimizer",
-                self.state_bank.semantic_projector.included_in_outer_optimizer,
-                True,
-            ),
-            (
-                "state_bank.semantic_projector.included_in_inner_optimizer",
-                self.state_bank.semantic_projector.included_in_inner_optimizer,
-                False,
-            ),
-            (
-                "state_bank.semantic_projector.online_frozen",
-                self.state_bank.semantic_projector.online_frozen,
-                True,
-            ),
-            (
-                "state_bank.semantic_projector.online_forward_no_grad",
-                self.state_bank.semantic_projector.online_forward_no_grad,
-                False,
-            ),
-            (
-                "state_bank.semantic_projector.detach_inputs",
-                self.state_bank.semantic_projector.detach_inputs,
-                False,
-            ),
-            (
-                "state_bank.confirmed_store.initial_capacity",
-                self.state_bank.confirmed_store.initial_capacity,
-                256,
-            ),
-            (
-                "state_bank.confirmed_store.growth_chunk",
-                self.state_bank.confirmed_store.growth_chunk,
-                256,
-            ),
-            (
-                "state_bank.confirmed_store.hard_limit",
-                self.state_bank.confirmed_store.hard_limit,
-                None,
-            ),
-            (
-                "state_bank.confirmed_store.storage_device",
-                self.state_bank.confirmed_store.storage_device,
-                "cpu",
-            ),
-            (
-                "state_bank.confirmed_store.storage_dtype",
-                self.state_bank.confirmed_store.storage_dtype,
-                "float32",
-            ),
-            (
-                "state_bank.confirmed_store.exact_search",
-                self.state_bank.confirmed_store.exact_search,
-                True,
-            ),
-            (
-                "state_bank.confirmed_store.ann_enabled",
-                self.state_bank.confirmed_store.ann_enabled,
-                False,
-            ),
-            (
-                "state_bank.confirmed_store.gpu_hot_capacity",
-                self.state_bank.confirmed_store.gpu_hot_capacity,
-                256,
-            ),
-            (
-                "state_bank.confirmed_store.hot_cache_enabled",
-                self.state_bank.confirmed_store.hot_cache_enabled,
-                True,
-            ),
-            (
-                "state_bank.confirmed_store.hot_cache_device",
-                self.state_bank.confirmed_store.hot_cache_device,
-                "cuda",
-            ),
-            (
-                "state_bank.confirmed_store.hot_cache_dtype",
-                self.state_bank.confirmed_store.hot_cache_dtype,
-                "bfloat16",
-            ),
-            (
-                "state_bank.confirmed_store.eviction_policy",
-                self.state_bank.confirmed_store.eviction_policy,
-                "lru_position_then_identity_id",
-            ),
-            (
-                "state_bank.candidate_store.initial_capacity",
-                self.state_bank.candidate_store.initial_capacity,
-                64,
-            ),
-            (
-                "state_bank.candidate_store.growth_chunk",
-                self.state_bank.candidate_store.growth_chunk,
-                64,
-            ),
-            (
-                "state_bank.candidate_store.hard_limit",
-                self.state_bank.candidate_store.hard_limit,
-                512,
-            ),
-            (
-                "state_bank.candidate_store.ttl_chunks",
-                self.state_bank.candidate_store.ttl_chunks,
-                8,
-            ),
-            (
-                "state_bank.candidate_store.match_threshold",
-                self.state_bank.candidate_store.match_threshold,
-                0.8,
-            ),
-            (
-                "state_bank.candidate_store.reliability_threshold",
-                self.state_bank.candidate_store.reliability_threshold,
-                0.5,
-            ),
-            (
-                "state_bank.candidate_store.low_confidence_threshold",
-                self.state_bank.candidate_store.low_confidence_threshold,
-                0.5,
-            ),
-            (
-                "state_bank.candidate_store.ttl_refresh_policy",
-                self.state_bank.candidate_store.ttl_refresh_policy,
-                "reset_to_full_on_reliable_match",
-            ),
-            (
-                "state_bank.candidate_store.ttl_aging_policy",
-                self.state_bank.candidate_store.ttl_aging_policy,
-                "match_first_then_unmatched_decrement_once_per_new_committed_position_remove_at_zero_end",
-            ),
-            (
-                "state_bank.candidate_store.promotion_policy",
-                self.state_bank.candidate_store.promotion_policy,
-                "two_reliable_distinct_consecutive_committed_positions",
-            ),
-            (
-                "state_bank.candidate_store.overflow_policy",
-                self.state_bank.candidate_store.overflow_policy,
-                "expire_then_low_confidence_then_reject",
-            ),
-            (
-                "state_bank.candidate_store.prune_order",
-                self.state_bank.candidate_store.prune_order,
-                (
-                    "expired",
-                    "low_confidence",
-                    "confidence_asc",
-                    "last_position_id_asc",
-                    "candidate_id_asc",
-                    "reject_new",
-                ),
-            ),
-            ("state_bank.event_history_capacity", self.state_bank.event_history_capacity, 512),
-            (
-                "state_bank.retrieval_history_capacity_per_head",
-                self.state_bank.retrieval_history_capacity_per_head,
-                512,
-            ),
-            (
-                "state_bank.retrieval_history_source_dim",
-                self.state_bank.retrieval_history_source_dim,
-                768,
-            ),
-            ("state_bank.hard_updates_no_grad", self.state_bank.hard_updates_no_grad, True),
-            ("state_bank.detach_before_write", self.state_bank.detach_before_write, True),
-            (
-                "state_bank.runtime_in_model_state_dict",
-                self.state_bank.runtime_in_model_state_dict,
-                False,
-            ),
-            (
-                "state_bank.runtime_registered_parameters",
-                self.state_bank.runtime_registered_parameters,
-                False,
-            ),
-            (
-                "state_bank.runtime_registered_buffers",
-                self.state_bank.runtime_registered_buffers,
-                False,
-            ),
-            (
-                "state_bank.runtime_in_outer_optimizer",
-                self.state_bank.runtime_in_outer_optimizer,
-                False,
-            ),
-            (
-                "state_bank.runtime_in_inner_optimizer",
-                self.state_bank.runtime_in_inner_optimizer,
-                False,
-            ),
-            (
-                "state_bank.snapshot_separate_from_model_checkpoint",
-                self.state_bank.snapshot_separate_from_model_checkpoint,
-                True,
-            ),
-            (
-                "state_bank.record_time_metadata_policy",
-                self.state_bank.record_time_metadata_policy,
-                "exactly_one",
-            ),
-            (
-                "state_bank.record_id_policy",
-                self.state_bank.record_id_policy,
-                "trajectory_monotonic_never_reuse",
-            ),
-            (
-                "state_bank.aggregate_record_heads",
-                self.state_bank.aggregate_record_heads,
-                ("o1", "e1", "e2"),
-            ),
-            (
-                "state_bank.aggregate_update_mode",
-                self.state_bank.aggregate_update_mode,
-                "functional_replace",
-            ),
-            (
-                "state_bank.committed_position_policy",
-                self.state_bank.committed_position_policy,
-                "idempotent_ignore_and_audit",
-            ),
-            (
-                "state_bank.o2_p9_policy",
-                self.state_bank.o2_p9_policy,
-                "generic_crud_only_p10_owns_lifecycle",
-            ),
-            (
-                "state_bank.o2_lifecycle_owner",
-                self.state_bank.o2_lifecycle_owner,
-                "identity_bank_p10",
-            ),
-            (
-                "state_bank.o2_candidate_retrieval_eligible",
-                self.state_bank.o2_candidate_retrieval_eligible,
-                False,
-            ),
-            (
-                "state_bank.o2_confirmed_retrieval_eligible",
-                self.state_bank.o2_confirmed_retrieval_eligible,
-                True,
-            ),
-            (
-                "state_bank.dynamic_view_padding",
-                self.state_bank.dynamic_view_padding,
-                "batch_max",
-            ),
-            (
-                "state_bank.n_state_definition",
-                self.state_bank.n_state_definition,
-                "owner_head_present_records_before_filters",
-            ),
-            (
-                "state_bank.event_kind_provenance",
-                self.state_bank.event_kind_provenance,
-                "hard_operator_frozen_per_aggregate",
-            ),
-            ("query_encoder.input_dim", self.query_encoder.input_dim, 4096),
-            ("query_encoder.hidden_dim", self.query_encoder.hidden_dim, 768),
-            ("query_encoder.num_layers", self.query_encoder.num_layers, 4),
-            ("query_encoder.num_heads", self.query_encoder.num_heads, 12),
-            ("query_encoder.head_dim", self.query_encoder.head_dim, 64),
-            ("query_encoder.ffn_dim", self.query_encoder.ffn_dim, 3072),
-            ("query_encoder.dropout", self.query_encoder.dropout, 0.1),
-            ("query_encoder.output_dim", self.query_encoder.output_dim, 512),
-            ("query_encoder.bidirectional", self.query_encoder.bidirectional, True),
-            (
-                "query_encoder.position_encoding",
-                self.query_encoder.position_encoding,
-                "sinusoidal",
-            ),
-            ("query_encoder.pooling", self.query_encoder.pooling, "learned_attention"),
-            ("operator_router.output_dim", self.operator_router.output_dim, 512),
-            (
-                "operator_router.temperature_initial",
-                self.operator_router.temperature_initial,
-                1.0,
-            ),
-            (
-                "operator_router.temperature_trainable",
-                self.operator_router.temperature_trainable,
-                True,
-            ),
-            (
-                "operator_router.confidence_threshold",
-                self.operator_router.confidence_threshold,
-                None,
-            ),
-            (
-                "operator_router.threshold_status",
-                self.operator_router.threshold_status,
-                CalibrationStatus.CALIBRATION_REQUIRED,
-            ),
-            ("time_resolver.input_dim", self.time_resolver.input_dim, 512),
-            ("time_resolver.hidden_dim", self.time_resolver.hidden_dim, 256),
-            ("time_resolver.mode_count", self.time_resolver.mode_count, 4),
-            ("time_resolver.token_hidden_dim", self.time_resolver.token_hidden_dim, 768),
-            ("time_resolver.pointer_heads", self.time_resolver.pointer_heads, 2),
-            (
-                "time_resolver.confidence_threshold",
-                self.time_resolver.confidence_threshold,
-                None,
-            ),
-            (
-                "time_resolver.threshold_status",
-                self.time_resolver.threshold_status,
-                CalibrationStatus.CALIBRATION_REQUIRED,
-            ),
-            ("retriever.semantic_dim", self.retriever.semantic_dim, 512),
-            (
-                "retriever.record_similarity_threshold",
-                self.retriever.record_similarity_threshold,
-                0.35,
-            ),
-            ("retriever.similarity_dtype", self.retriever.similarity_dtype, "float32"),
-            ("retriever.normalization_eps", self.retriever.normalization_eps, 1.0e-8),
-            ("retriever.zero_query_policy", self.retriever.zero_query_policy, "unsupported"),
-            (
-                "retriever.threshold_comparison",
-                self.retriever.threshold_comparison,
-                "greater_than_or_equal",
-            ),
-            (
-                "retriever.record_confidence_threshold",
-                self.retriever.record_confidence_threshold,
-                None,
-            ),
-            (
-                "retriever.filter_order",
-                self.retriever.filter_order,
-                (
-                    "invalid",
-                    "retrieval_ineligible",
-                    "future",
-                    "outside_window",
-                    "below_similarity",
-                ),
-            ),
-            (
-                "retriever.selection_order",
-                self.retriever.selection_order,
-                ("score_desc", "record_id_asc"),
-            ),
-            (
-                "retriever.owner_mismatch_status",
-                self.retriever.owner_mismatch_status,
-                "invalid",
-            ),
-            (
-                "retriever.aggregate_time_policy",
-                self.retriever.aggregate_time_policy,
-                "causal_availability_only_window_in_reader",
-            ),
-            (
-                "retriever.atomic_window_boundary",
-                self.retriever.atomic_window_boundary,
-                "closed",
-            ),
-            (
-                "retriever.metrics_policy",
-                self.retriever.metrics_policy,
-                "offline_ground_truth_runtime_label_free",
-            ),
-            ("retriever.top_k", self.retriever.top_k, None),
-            ("retriever.ann_enabled", self.retriever.ann_enabled, False),
-            ("state_resampler.num_queries", self.state_resampler.num_queries, 16),
-            ("state_resampler.num_layers", self.state_resampler.num_layers, 3),
-            ("state_resampler.num_heads", self.state_resampler.num_heads, 8),
-            ("state_resampler.head_dim", self.state_resampler.head_dim, 64),
-            ("state_resampler.ffn_dim", self.state_resampler.ffn_dim, 2048),
-            ("state_resampler.hidden_dim", self.state_resampler.hidden_dim, 512),
-            ("state_resampler.output_dim", self.state_resampler.output_dim, 4096),
-            ("state_resampler.layer_norm_eps", self.state_resampler.layer_norm_eps, 1.0e-5),
-            ("state_resampler.activation", self.state_resampler.activation, "gelu"),
-            ("state_resampler.dropout", self.state_resampler.dropout, 0.0),
-            ("state_resampler.attention_bias", self.state_resampler.attention_bias, True),
-            (
-                "state_resampler.output_projection_bias",
-                self.state_resampler.output_projection_bias,
-                True,
-            ),
-            (
-                "state_resampler.attention_softmax_dtype",
-                self.state_resampler.attention_softmax_dtype,
-                "float32",
-            ),
-            (
-                "state_resampler.empty_record_embedding",
-                self.state_resampler.empty_record_embedding,
-                True,
-            ),
-            (
-                "state_resampler.empty_record_policy",
-                self.state_resampler.empty_record_policy,
-                "internal_trainable_kv_external_zero_width",
-            ),
-            (
-                "state_resampler.attention_audit",
-                self.state_resampler.attention_audit,
-                "final_layer_mean_heads_selected_mass",
-            ),
-            ("state_resampler.parameter_count", self.state_resampler.parameter_count, 14_722_048),
-            ("state_reader.signed_exact_count", self.state_reader.signed_exact_count, True),
-            ("state_reader.empty_exact_count", self.state_reader.empty_exact_count, 0),
-            (
-                "state_reader.status_propagation",
-                self.state_reader.status_propagation,
-                "retriever_exact",
-            ),
-            (
-                "state_reader.o1_delta_policy",
-                self.state_reader.o1_delta_policy,
-                "fixed_baseline_v1",
-            ),
-            ("state_reader.o2_identity_key", self.state_reader.o2_identity_key, "identity_id"),
-            (
-                "state_reader.point_window_boundary",
-                self.state_reader.point_window_boundary,
-                "closed",
-            ),
-            (
-                "state_reader.e1_history_policy",
-                self.state_reader.e1_history_policy,
-                "cumulative_or_retained_completion_times",
-            ),
-            (
-                "state_reader.e1_truncated_window_status",
-                self.state_reader.e1_truncated_window_status,
-                "invalid",
-            ),
-            (
-                "state_reader.e2_window_anchor",
-                self.state_reader.e2_window_anchor,
-                "completion_end",
-            ),
-            (
-                "state_reader.event_kind_mismatch_status",
-                self.state_reader.event_kind_mismatch_status,
-                "invalid",
-            ),
-            (
-                "state_reader.number_text_format",
-                self.state_reader.number_text_format,
-                "canonical_ascii_signed_decimal",
-            ),
-            (
-                "state_reader.tokenizer_add_special_tokens",
-                self.state_reader.tokenizer_add_special_tokens,
-                False,
-            ),
-            (
-                "state_reader.tokenizer_roundtrip_required",
-                self.state_reader.tokenizer_roundtrip_required,
-                True,
-            ),
-            (
-                "state_reader.tokenizer_class",
-                self.state_reader.tokenizer_class,
-                "Qwen2TokenizerFast",
-            ),
-            (
-                "state_reader.tokenizer_vocab_size",
-                self.state_reader.tokenizer_vocab_size,
-                151_643,
-            ),
-            (
-                "state_reader.tokenizer_required_files",
-                self.state_reader.tokenizer_required_files,
-                ("merges.txt", "tokenizer.json", "tokenizer_config.json", "vocab.json"),
-            ),
-            (
-                "state_reader.tokenizer_manifest_sha256",
-                self.state_reader.tokenizer_manifest_sha256,
-                "ccd18347b6d6714d91d4c55b37ff05e473a0f8e84fbcba2bda1401a9572f44c3",
-            ),
-            (
-                "state_reader.ground_truth_input_forbidden",
-                self.state_reader.ground_truth_input_forbidden,
-                True,
-            ),
-            ("input_composer.state_token_count", self.input_composer.state_token_count, 16),
-            (
-                "input_composer.special_tokens",
-                self.input_composer.special_tokens,
-                (
-                    "<|state_start|>",
-                    "<|state_pad|>",
-                    "<|state_end|>",
-                    "<|number_start|>",
-                    "<|number_end|>",
-                ),
-            ),
-            (
-                "input_composer.special_token_ids",
-                self.input_composer.special_token_ids,
-                (151_669, 151_670, 151_671, 151_672, 151_673),
-            ),
-            (
-                "input_composer.tokenizer_base_length",
-                self.input_composer.tokenizer_base_length,
-                151_669,
-            ),
-            (
-                "input_composer.tokenizer_extended_length",
-                self.input_composer.tokenizer_extended_length,
-                151_674,
-            ),
-            (
-                "input_composer.tokenizer_revision",
-                self.input_composer.tokenizer_revision,
-                BASE_MODEL_REVISION,
-            ),
-            (
-                "input_composer.model_embedding_rows",
-                self.input_composer.model_embedding_rows,
-                151_936,
-            ),
-            (
-                "input_composer.embedding_initialization",
-                self.input_composer.embedding_initialization,
-                "fp32_mean_of_vision_start_video_pad_vision_end_then_cast",
-            ),
-            (
-                "input_composer.embedding_source_token_ids",
-                self.input_composer.embedding_source_token_ids,
-                (151_652, 151_656, 151_653),
-            ),
-            (
-                "input_composer.initialize_input_and_output_embeddings",
-                self.input_composer.initialize_input_and_output_embeddings,
-                True,
-            ),
-            ("input_composer.padding_side", self.input_composer.padding_side, "left"),
-            (
-                "input_composer.state_payload_statuses",
-                self.input_composer.state_payload_statuses,
-                ("ok", "empty"),
-            ),
-            (
-                "input_composer.invalid_payload_policy",
-                self.input_composer.invalid_payload_policy,
-                "omit_state_and_number",
-            ),
-            (
-                "input_composer.payload_order",
-                self.input_composer.payload_order,
-                (
-                    "system_user_question_video",
-                    "state",
-                    "number",
-                    "user_end",
-                    "assistant_generation_prefix",
-                ),
-            ),
-            ("input_composer.prefill_once", self.input_composer.prefill_once, True),
-            (
-                "input_composer.generation_num_beams",
-                self.input_composer.generation_num_beams,
-                1,
-            ),
-            (
-                "associative_ttt.contract",
-                self.associative_ttt.contract,
-                "bank_conditioned_state_write_v2",
-            ),
-            ("associative_ttt.bank_embedding_dim", self.associative_ttt.bank_embedding_dim, 512),
-            ("associative_ttt.key_dim", self.associative_ttt.key_dim, 768),
-            ("associative_ttt.target_dim", self.associative_ttt.target_dim, 768),
-            ("associative_ttt.bank_empty_policy", self.associative_ttt.bank_empty_policy, "zero"),
-            (
-                "associative_ttt.target_source",
-                self.associative_ttt.target_source,
-                "predicted_active_head_soft_write_stopgrad",
-            ),
-            (
-                "associative_ttt.unsupported_target_policy",
-                self.associative_ttt.unsupported_target_policy,
-                "skip",
-            ),
-            ("associative_ttt.loss", self.associative_ttt.loss, "normalized_fp32_cosine"),
-            ("loss.operator_weight", self.loss.operator_weight, 1.0),
-            ("loss.retrieval_weight", self.loss.retrieval_weight, 1.0),
-            ("loss.time_weight", self.loss.time_weight, 1.0),
-            ("loss.answer_causal_shift", self.loss.answer_causal_shift, True),
-            ("loss.answer_ignore_index", self.loss.answer_ignore_index, -100),
-            (
-                "loss.official_weak_balance.group_weight",
-                self.loss.official_weak_balance.group_weight,
-                0.4,
-            ),
-            (
-                "loss.official_weak_balance.answer_reference_floor",
-                self.loss.official_weak_balance.answer_reference_floor,
-                0.1,
-            ),
-            (
-                "loss.official_weak_balance.scale_min",
-                self.loss.official_weak_balance.scale_min,
-                0.001,
-            ),
-            (
-                "loss.official_weak_balance.scale_max",
-                self.loss.official_weak_balance.scale_max,
-                20.0,
-            ),
-            (
-                "loss.official_weak_balance.epsilon",
-                self.loss.official_weak_balance.epsilon,
-                1.0e-8,
-            ),
-            (
-                "loss.official_weak_balance.ema_beta",
-                self.loss.official_weak_balance.ema_beta,
-                0.99,
-            ),
-            (
-                "loss.official_weak_balance.grad_ema_beta",
-                self.loss.official_weak_balance.grad_ema_beta,
-                0.99,
-            ),
-            (
-                "loss.official_weak_balance.grad_scale_min",
-                self.loss.official_weak_balance.grad_scale_min,
-                0.1,
-            ),
-            (
-                "loss.official_weak_balance.grad_scale_max",
-                self.loss.official_weak_balance.grad_scale_max,
-                10.0,
-            ),
-            (
-                "outer_gradient_control.max_grad_norm.qwen",
-                self.outer_gradient_control.max_grad_norm.qwen,
-                1.0,
-            ),
-            (
-                "outer_gradient_control.max_grad_norm.state_shared",
-                self.outer_gradient_control.max_grad_norm.state_shared,
-                0.05,
-            ),
-            (
-                "outer_gradient_control.max_grad_norm.state_task",
-                self.outer_gradient_control.max_grad_norm.state_task,
-                0.05,
-            ),
-            (
-                "outer_gradient_control.max_grad_norm.state_router_time",
-                self.outer_gradient_control.max_grad_norm.state_router_time,
-                0.05,
-            ),
-            (
-                "outer_gradient_control.max_grad_norm.state_retrieval",
-                self.outer_gradient_control.max_grad_norm.state_retrieval,
-                0.05,
-            ),
-            (
-                "outer_gradient_control.max_grad_norm.associative",
-                self.outer_gradient_control.max_grad_norm.associative,
-                0.1,
-            ),
-            (
-                "outer_gradient_control.max_grad_norm.w0",
-                self.outer_gradient_control.max_grad_norm.w0,
-                0.1,
-            ),
-            (
-                "outer_gradient_control.mode",
-                self.outer_gradient_control.mode,
-                OuterGradientControlMode.PER_GROUP_L2_EQUAL_UPDATE_CAP,
-            ),
-            (
-                "outer_gradient_control.nonfinite_policy",
-                self.outer_gradient_control.nonfinite_policy,
-                OuterNonfinitePolicy.SKIP_UPDATE,
-            ),
-            ("outer_gradient_control.audit_steps", self.outer_gradient_control.audit_steps, 32),
-            (
-                "a2.optimizer.qwen_learning_rate",
-                self.a2.optimizer.qwen_learning_rate,
-                1.0e-5,
-            ),
-            (
-                "a2.optimizer.state_learning_rate",
-                self.a2.optimizer.state_learning_rate,
-                1.0e-4,
-            ),
-            (
-                "a2.optimizer.w0_learning_rate",
-                self.a2.optimizer.w0_learning_rate,
-                1.0e-4,
-            ),
-            ("a5.truncation_horizon", self.a5.truncation_horizon, 8),
-            ("a5.seed", self.a5.seed, 42),
-            (
-                "a5.optimizer.state_learning_rate",
-                self.a5.optimizer.state_learning_rate,
-                5.0e-5,
-            ),
-            (
-                "a5.optimizer.w0_learning_rate",
-                self.a5.optimizer.w0_learning_rate,
-                5.0e-5,
-            ),
-            (
-                "a5.optimizer.associative_learning_rate",
-                self.a5.optimizer.associative_learning_rate,
-                5.0e-5,
-            ),
-            ("inference.audit_level", self.inference.audit_level, AuditLevel.BOUNDARY),
-        )
-        for path, actual, expected in checks:
-            if actual != expected:
-                raise ValueError(f"{path} must be {expected!r}; got {actual!r}")
+        _validate_frozen_contract(self, _FROZEN_CONTRACT, "")
         if self.a5.query_meta_gradient.mode != "per_query_global_norm_clip_sum":
             raise ValueError(
                 "a5.query_meta_gradient.mode must be 'per_query_global_norm_clip_sum'"
@@ -1819,209 +1153,6 @@ class ProjectConfig(FrozenModel):
 
     def _validate_head_contracts(self) -> None:
         heads = self.observation_heads
-        expected: tuple[tuple[str, object, object], ...] = (
-            (
-                "temporal_input_conditioning",
-                heads.temporal_input_conditioning,
-                "inherited_query_conditioned_h_t",
-            ),
-            ("raw_logits", heads.raw_logits, True),
-            ("debug_probabilities", heads.debug_probabilities, True),
-            ("output_valid_mask", heads.output_valid_mask, True),
-            ("output_timestamps", heads.output_timestamps, True),
-            ("output_position_ids", heads.output_position_ids, True),
-            (
-                "invalid_output_policy",
-                heads.invalid_output_policy,
-                "zero_tensors_negative_one_metadata",
-            ),
-            ("online_frozen", heads.online_frozen, True),
-            ("online_forward_no_grad", heads.online_forward_no_grad, False),
-            ("detach_inputs", heads.detach_inputs, False),
-            ("hard_state_mutation", heads.hard_state_mutation, False),
-            ("o1.input_dim", heads.o1.input_dim, 768),
-            ("o1.query_dim", heads.o1.query_dim, 512),
-            ("o1.film_dim", heads.o1.film_dim, 1536),
-            ("o1.hidden_dims", heads.o1.hidden_dims, (1024, 1024)),
-            ("o1.output_dim", heads.o1.output_dim, 6),
-            (
-                "o1.output_names",
-                heads.o1.output_names,
-                ("object", "target", "visible", "enter", "exit", "confidence"),
-            ),
-            ("o1.layer_norm_eps", heads.o1.layer_norm_eps, 1.0e-5),
-            ("o1.film_mode", heads.o1.film_mode, "one_plus_scale_and_shift"),
-            ("o1.activation", heads.o1.activation, "silu"),
-            ("o1.dropout", heads.o1.dropout, 0.0),
-            ("o1.linear_bias", heads.o1.linear_bias, True),
-            ("o1.parameter_count", heads.o1.parameter_count, 2_632_710),
-            ("o1.object_threshold", heads.o1.object_threshold, 0.5),
-            ("o1.target_threshold", heads.o1.target_threshold, 0.5),
-            ("o1.visible_threshold", heads.o1.visible_threshold, 0.5),
-            ("o1.enter_threshold", heads.o1.enter_threshold, 0.5),
-            ("o1.exit_threshold", heads.o1.exit_threshold, 0.5),
-            ("o1.confidence_threshold", heads.o1.confidence_threshold, 0.5),
-            (
-                "o1.baseline_policy",
-                heads.o1.baseline_policy,
-                "explicit_set_once_per_trajectory",
-            ),
-            (
-                "o1.count_update_policy",
-                heads.o1.count_update_policy,
-                "recompute_from_full_slot_state",
-            ),
-            (
-                "o1.committed_position_policy",
-                heads.o1.committed_position_policy,
-                "idempotent_preserve_and_audit_drift",
-            ),
-            ("o2.input_dim", heads.o2.input_dim, 768),
-            ("o2.hidden_dims", heads.o2.hidden_dims, (1024, 1024)),
-            ("o2.identity_dim", heads.o2.identity_dim, 256),
-            ("o2.score_dim", heads.o2.score_dim, 2),
-            ("o2.score_names", heads.o2.score_names, ("novelty", "match_confidence")),
-            ("o2.layer_norm_eps", heads.o2.layer_norm_eps, 1.0e-5),
-            ("o2.activation", heads.o2.activation, "silu"),
-            ("o2.dropout", heads.o2.dropout, 0.0),
-            ("o2.linear_bias", heads.o2.linear_bias, True),
-            (
-                "o2.identity_normalization",
-                heads.o2.identity_normalization,
-                "l2_fp32_unit_basis_fallback",
-            ),
-            ("o2.normalization_eps", heads.o2.normalization_eps, 1.0e-8),
-            ("o2.parameter_count", heads.o2.parameter_count, 2_499_843),
-            ("o2.prototype_ema", heads.o2.prototype_ema, 0.9),
-            ("o2.confirmation_observations", heads.o2.confirmation_observations, 2),
-            ("o2.match_threshold", heads.o2.match_threshold, 0.8),
-            ("o2.novelty_threshold", heads.o2.novelty_threshold, 0.5),
-            (
-                "o2.match_confidence_threshold",
-                heads.o2.match_confidence_threshold,
-                0.5,
-            ),
-            ("o2.reliability_threshold", heads.o2.reliability_threshold, 0.5),
-            (
-                "o2.candidate_low_confidence_threshold",
-                heads.o2.candidate_low_confidence_threshold,
-                0.5,
-            ),
-            (
-                "o2.match_ambiguity_margin",
-                heads.o2.match_ambiguity_margin,
-                1.0e-6,
-            ),
-            (
-                "o2.threshold_status",
-                heads.o2.threshold_status,
-                CalibrationStatus.BOOTSTRAP_CALIBRATION_REQUIRED,
-            ),
-            ("e1.input_dim", heads.e1.input_dim, 768),
-            ("e1.channels", heads.e1.channels, 512),
-            ("e1.num_layers", heads.e1.num_layers, 5),
-            ("e1.kernel_size", heads.e1.kernel_size, 3),
-            ("e1.dilations", heads.e1.dilations, (1, 2, 4, 8, 16)),
-            ("e1.output_dim", heads.e1.output_dim, 3),
-            (
-                "e1.output_names",
-                heads.e1.output_names,
-                ("eventness", "completion", "transition"),
-            ),
-            ("e1.layer_norm_eps", heads.e1.layer_norm_eps, 1.0e-5),
-            ("e1.activation", heads.e1.activation, "silu_filter_sigmoid_gate"),
-            ("e1.strict_causal", heads.e1.strict_causal, True),
-            ("e1.batch_norm", heads.e1.batch_norm, False),
-            ("e1.dropout", heads.e1.dropout, 0.0),
-            ("e1.convolution_bias", heads.e1.convolution_bias, True),
-            ("e1.causal_padding", heads.e1.causal_padding, "left"),
-            ("e1.receptive_field", heads.e1.receptive_field, 63),
-            ("e1.streaming_state_mode", heads.e1.streaming_state_mode, "projected_history"),
-            ("e1.overlap_tubelets", heads.e1.overlap_tubelets, 4),
-            ("e1.history_tubelets", heads.e1.history_tubelets, 66),
-            (
-                "e1.state_owner_keys",
-                heads.e1.state_owner_keys,
-                ("video_id", "trajectory_id", "query_signature"),
-            ),
-            ("e1.detach_runtime_default", heads.e1.detach_runtime_default, True),
-            ("e1.parameter_count", heads.e1.parameter_count, 9_717_252),
-            ("e1.tau_on", heads.e1.tau_on, 0.7),
-            ("e1.tau_off", heads.e1.tau_off, 0.3),
-            ("e1.completion_threshold", heads.e1.completion_threshold, 0.7),
-            ("e1.transition_threshold", heads.e1.transition_threshold, 0.7),
-            ("e1.min_gap_seconds", heads.e1.min_gap_seconds, 0.5),
-            (
-                "e1.fsm_policy",
-                heads.e1.fsm_policy,
-                "eventness_hysteresis_completion_transition",
-            ),
-            ("e1.cooldown_nms_source", heads.e1.cooldown_nms_source, "min_gap_seconds"),
-            (
-                "e1.committed_position_policy",
-                heads.e1.committed_position_policy,
-                "idempotent_ignore_and_audit",
-            ),
-            ("e2.input_dim", heads.e2.input_dim, 768),
-            ("e2.hidden_dim", heads.e2.hidden_dim, 768),
-            ("e2.num_layers", heads.e2.num_layers, 2),
-            ("e2.event_output_dim", heads.e2.event_output_dim, 4),
-            ("e2.phase_output_dim", heads.e2.phase_output_dim, 4),
-            ("e2.event_names", heads.e2.event_names, ("start", "active", "end", "complete")),
-            (
-                "e2.phase_names",
-                heads.e2.phase_names,
-                ("inactive", "active", "end_candidate", "completed"),
-            ),
-            ("e2.layer_norm_eps", heads.e2.layer_norm_eps, 1.0e-5),
-            ("e2.bidirectional", heads.e2.bidirectional, False),
-            ("e2.batch_first", heads.e2.batch_first, True),
-            ("e2.bias", heads.e2.bias, True),
-            ("e2.dropout", heads.e2.dropout, 0.0),
-            (
-                "e2.streaming_state_mode",
-                heads.e2.streaming_state_mode,
-                "hidden_with_rollback_checkpoints",
-            ),
-            ("e2.overlap_tubelets", heads.e2.overlap_tubelets, 4),
-            ("e2.checkpoint_tubelets", heads.e2.checkpoint_tubelets, 5),
-            (
-                "e2.state_owner_keys",
-                heads.e2.state_owner_keys,
-                ("video_id", "trajectory_id", "query_signature"),
-            ),
-            ("e2.detach_runtime_default", heads.e2.detach_runtime_default, True),
-            ("e2.parameter_count", heads.e2.parameter_count, 7_293_449),
-            ("e2.start_threshold", heads.e2.start_threshold, 0.6),
-            ("e2.end_threshold", heads.e2.end_threshold, 0.6),
-            ("e2.complete_threshold", heads.e2.complete_threshold, 0.7),
-            (
-                "e2.rearm_max_event_probability",
-                heads.e2.rearm_max_event_probability,
-                0.5,
-            ),
-            ("e2.rearm_phase", heads.e2.rearm_phase, "inactive"),
-            ("e2.completed_hold_positions", heads.e2.completed_hold_positions, 1),
-            (
-                "e2.fsm_policy",
-                heads.e2.fsm_policy,
-                "phase_gated_single_transition_per_position",
-            ),
-            (
-                "e2.active_evidence_policy",
-                heads.e2.active_evidence_policy,
-                "diagnostic_and_phase_consistency_only",
-            ),
-            (
-                "e2.committed_position_policy",
-                heads.e2.committed_position_policy,
-                "idempotent_ignore_and_audit",
-            ),
-        )
-        for path, actual, required in expected:
-            if actual != required:
-                raise ValueError(f"observation_heads.{path} must be {required!r}; got {actual!r}")
-
         e1_receptive_field = 1 + (heads.e1.kernel_size - 1) * sum(heads.e1.dilations)
         if heads.e1.receptive_field != e1_receptive_field:
             raise ValueError("observation_heads.e1 receptive field does not match its dilations")
@@ -2135,20 +1266,6 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"configuration root must be a mapping: {config_path}")
     return cast(ProjectConfig, ProjectConfig.model_validate(raw))
-
-
-def environment_summary() -> dict[str, object]:
-    """Return the local runtime identity without resolving data or model paths."""
-
-    return {
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-        "torch": torch.__version__,
-        "transformers": transformers.__version__,
-        "cuda_runtime": torch.version.cuda,
-        "cuda_available": torch.cuda.is_available(),
-        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-    }
 
 
 def main(argv: list[str] | None = None) -> None:
