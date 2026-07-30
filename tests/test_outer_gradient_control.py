@@ -341,6 +341,44 @@ def test_probe_norm_is_measured_before_group_clipping(monkeypatch: pytest.Monkey
     assert audit.group("associative").pre_clip_norm == pytest.approx(50.0)
 
 
+def test_probe_ignores_zero1_trailing_partition_padding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ttt_svcbench_qwen.outer_gradient_control.version", lambda _name: "0.18.8")
+    write = _parameter(1.0, (3.0, 4.0))
+    controller = OuterGradientController(
+        load_config().outer_gradient_control,
+        expected_groups=("associative",),
+        probes=(
+            GradientProbe(name="memory_write", group_name="associative", parameters=(write,)),
+        ),
+    )
+    zero = _FakeZero(_optimizer((("associative", 5.0e-5, write),)))
+    zero.averaged_gradients[0].append(torch.zeros(3))
+
+    audit = controller.apply_deepspeed(zero)
+
+    assert audit.probe("memory_write").norm == pytest.approx(5.0)
+    assert audit.probe("memory_write").element_count == 2
+    assert audit.group("associative").active_elements == 2
+
+
+def test_probe_rejects_nonzero_zero1_partition_padding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ttt_svcbench_qwen.outer_gradient_control.version", lambda _name: "0.18.8")
+    write = _parameter(1.0, (3.0, 4.0))
+    controller = OuterGradientController(
+        load_config().outer_gradient_control,
+        expected_groups=("associative",),
+    )
+    zero = _FakeZero(_optimizer((("associative", 5.0e-5, write),)))
+    zero.averaged_gradients[0].append(torch.ones(1))
+
+    with pytest.raises(RuntimeError, match="unexpected nonzero or repeated padding"):
+        controller.apply_deepspeed(zero)
+
+
 def test_probe_keys_survive_a_nonfinite_skip(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("ttt_svcbench_qwen.outer_gradient_control.version", lambda _name: "0.18.8")
     write = _parameter(1.0, (float("nan"), 1.0))
