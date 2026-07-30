@@ -1,7 +1,7 @@
 """Distributed A2-static generation over a fixed SVCBench train-set selection.
 
 ``A2-static`` means the learned slow state ``W0`` is used for every visual pass.  No
-``OnlineTTTUpdater`` is constructed, no transient fast matrices exist, and no Inner SGD can
+``OnlineTTTUpdater`` is constructed, no transient memory matrix exists, and no memory write can
 run.  Support and State Query chunks still update the hard Bank/FSM state, and the Answer
 Query still consumes Reader/State Tokens exactly as in A2.
 """
@@ -63,8 +63,8 @@ class A2StaticGenerationAudit:
     mode: str
     support_count: int
     observed_chunk_count: int
-    inner_sgd_attempted: int
-    inner_sgd_updated: int
+    memory_writes_attempted: int
+    memory_writes_applied: int
     fast_state_row_count: int
     reader_status: str
     reader_exact_count: int | None
@@ -79,12 +79,12 @@ class A2StaticGenerationAudit:
         if any(
             value != 0
             for value in (
-                self.inner_sgd_attempted,
-                self.inner_sgd_updated,
+                self.memory_writes_attempted,
+                self.memory_writes_applied,
                 self.fast_state_row_count,
             )
         ):
-            raise ValueError("A2-static cannot expose fast-state or Inner-SGD activity")
+            raise ValueError("A2-static cannot expose memory-state or memory-write activity")
 
 
 def prompt_only_answer_inputs(
@@ -181,8 +181,8 @@ def generate_a2_static(
         mode="a2_static",
         support_count=len(episode.observation_requests) - 1,
         observed_chunk_count=len(episode.observation_requests),
-        inner_sgd_attempted=0,
-        inner_sgd_updated=0,
+        memory_writes_attempted=0,
+        memory_writes_applied=0,
         fast_state_row_count=0,
         reader_status=(
             "disabled" if reader is None else str(getattr(reader.status, "value", reader.status))
@@ -199,8 +199,8 @@ def generate_a2_static(
 
 
 def _assert_no_fast_state(runtime: BatchRuntimeState) -> None:
-    if any(row.fast_weights is not None or row.optimizer is not None for row in runtime.rows):
-        raise ValueError("A2-static runtime unexpectedly contains transient fast state")
+    if any(row.fast_weights is not None for row in runtime.rows):
+        raise ValueError("A2-static runtime unexpectedly contains transient memory state")
 
 
 def _prepare_support_batch(
@@ -501,8 +501,8 @@ def main() -> int:
                 "succeeded": len(prediction_rows),
                 "failed": len(failure_rows),
                 "world_size": world_size,
-                "inner_sgd_attempted": 0,
-                "inner_sgd_updated": 0,
+                "memory_writes_attempted": 0,
+                "memory_writes_applied": 0,
                 "transient_fast_state": False,
                 "elapsed_seconds": time.monotonic() - started,
             },

@@ -1,11 +1,12 @@
-"""Causal Meta-TTT episode orchestration and associative inner-update audits.
+"""Causal Meta-TTT episode orchestration and slot-memory write audits.
 
 Inputs: resettable model/runtime factories, causal Support/Query chunks, typed query labels,
-and the frozen P14 loss/functional-SGD contracts.
-Outputs: a Query-only after-update objective, per-video next-only fast generations, before/after
-Query metrics, and bounded graph/lifecycle audits.
-Forbidden: Support labels, batch-scalar inner updates, in-place fast mutation, first-order training,
-cross-video runtime reuse, observe-after-prefill, or carrying differentiable runtime snapshots.
+and the frozen delta-rule memory-write contract.
+Outputs: a Query-only after-update objective, per-video next-only memory generations,
+before/after Query metrics, and bounded graph/lifecycle audits.
+Forbidden: Support labels, batch-scalar inner updates, in-place memory mutation, inner
+optimizer state, cross-video runtime reuse, observe-after-prefill, or carrying
+differentiable runtime snapshots.
 """
 
 from __future__ import annotations
@@ -22,24 +23,17 @@ from torch import Tensor, nn
 
 from ttt_svcbench_qwen.associative_ttt import (
     ASSOCIATIVE_CONTRACT,
-    AssociativeTTTLossOutput,
-    compute_associative_ttt_loss,
+    AssociativeTTTIntermediates,
 )
 from ttt_svcbench_qwen.config import ProjectConfig
 from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.fast_ttt import (
-    FastReanchorAudit,
+    FastMemoryState,
     FastTTTForwardAudit,
-    FastWeightsState,
-    OptimizerRuntimeState,
+    MemoryWriteBatch,
+    SlotStateView,
     deferred_fast_vjp_loss,
     make_query_proxy_fast_state,
-    reanchor_fast_state,
-)
-from ttt_svcbench_qwen.functional_sgd import (
-    FunctionalSGDResult,
-    functional_sgd_steps_from_associative,
-    reset_optimizer_state,
 )
 from ttt_svcbench_qwen.input_composer import ComposedInput, map_teacher_forced_targets
 from ttt_svcbench_qwen.losses import (
@@ -53,6 +47,12 @@ from ttt_svcbench_qwen.losses import (
     compute_answer_loss,
     compute_outer_loss,
     compute_state_loss,
+)
+from ttt_svcbench_qwen.memory_write import (
+    MemoryTruncateAudit,
+    MemoryWriteResult,
+    apply_memory_writes,
+    truncate_memory_state,
 )
 from ttt_svcbench_qwen.model import (
     BatchRuntimeState,
@@ -93,6 +93,9 @@ from ttt_svcbench_qwen.training_context import (
     query_activation_context,
 )
 
+_ADAPTATION_MODES = ("meta_ttt", "no_write")
+_LEGACY_STATIC_W0 = "static_w0"
+
 
 class FastStateController(Protocol):
     """Subset of :class:`FastTTTAdapter` needed by a managed meta episode."""
@@ -101,15 +104,21 @@ class FastStateController(Protocol):
 
     def reset_fast_state(
         self,
-        state: FastWeightsState | None = None,
+        state: FastMemoryState | None = None,
         *,
         differentiable: bool | None = None,
-    ) -> FastWeightsState: ...
+    ) -> FastMemoryState: ...
 
     def use_fast_state(
         self,
-        state: FastWeightsState | Sequence[FastWeightsState],
+        state: FastMemoryState | Sequence[FastMemoryState],
     ) -> AbstractContextManager[object]: ...
+
+    def prepare_write(
+        self,
+        intermediates: AssociativeTTTIntermediates,
+        spatial: SlotStateView,
+    ) -> MemoryWriteBatch: ...
 
     def collect_meta_fast_parameters(self) -> tuple[nn.Parameter, nn.Parameter]: ...
 
@@ -380,59 +389,72 @@ class MetaQueryObjective:
 
 
 @dataclass(frozen=True, slots=True)
-class InnerUpdateAudit:
+class MemoryWriteAudit:
+    """One Support chunk's per-video slot-memory write evidence."""
+
     support_index: int
     start_time: float
     end_time: float
-    fast_versions_before: tuple[int, ...]
-    fast_versions_observed: tuple[int, ...]
-    fast_versions_after: tuple[int, ...]
-    did_update: tuple[bool, ...]
+    write_versions_before: tuple[int, ...]
+    write_versions_observed: tuple[int, ...]
+    write_versions_after: tuple[int, ...]
+    did_write: tuple[bool, ...]
     skip_reasons: tuple[str | None, ...]
-    gradient_norms: tuple[float | None, ...]
-    update_norms: tuple[float, ...]
-    master_changed_fractions: tuple[float, ...]
-    bf16_shadow_changed_fractions: tuple[float, ...]
-    master_delta_norms: tuple[float, ...]
-    fast_core_prediction_delta_norms: tuple[float, ...]
+    slots_written: tuple[int, ...]
+    eta_sums: tuple[float, ...]
+    eta_renormalized: tuple[bool, ...]
+    pre_write_cosine_means: tuple[float, ...]
+    post_write_cosine_means: tuple[float, ...]
+    write_norms: tuple[float, ...]
+    memory_norms: tuple[float, ...]
+    readout_shares: tuple[float, ...]
     valid_token_counts: tuple[int, ...]
     bank_record_counts: tuple[int, ...]
     runtime_detached: bool
     next_only_verified: bool
 
     def __post_init__(self) -> None:
-        batch_size = len(self.fast_versions_before)
+        batch_size = len(self.write_versions_before)
         aligned = (
-            self.fast_versions_observed,
-            self.fast_versions_after,
-            self.did_update,
+            self.write_versions_observed,
+            self.write_versions_after,
+            self.did_write,
             self.skip_reasons,
-            self.gradient_norms,
-            self.update_norms,
-            self.master_changed_fractions,
-            self.bf16_shadow_changed_fractions,
-            self.master_delta_norms,
-            self.fast_core_prediction_delta_norms,
+            self.slots_written,
+            self.eta_sums,
+            self.eta_renormalized,
+            self.pre_write_cosine_means,
+            self.post_write_cosine_means,
+            self.write_norms,
+            self.memory_norms,
+            self.readout_shares,
             self.valid_token_counts,
             self.bank_record_counts,
         )
         if batch_size <= 0 or any(len(values) != batch_size for values in aligned):
-            raise ValueError("Inner update audit fields must align to the owner batch")
-        if self.fast_versions_observed != self.fast_versions_before:
-            raise ValueError("current Support was not observed with its before-update weights")
+            raise ValueError("memory write audit fields must align to the owner batch")
+        if self.write_versions_observed != self.write_versions_before:
+            raise ValueError("current Support was not observed with its before-write memory")
         if not self.next_only_verified:
-            raise ValueError("Meta-TTT update failed the next-chunk-only audit")
-        fractions = (*self.master_changed_fractions, *self.bf16_shadow_changed_fractions)
-        if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in fractions):
-            raise ValueError("Inner update changed fractions must be finite in [0, 1]")
-        precision_norms = (*self.master_delta_norms, *self.fast_core_prediction_delta_norms)
-        if any(not math.isfinite(value) or value < 0.0 for value in precision_norms):
-            raise ValueError("Inner update precision audit norms must be finite and non-negative")
+            raise ValueError("Meta-TTT write failed the next-chunk-only audit")
+        cosines = (*self.pre_write_cosine_means, *self.post_write_cosine_means)
+        if any(not math.isfinite(value) or not -1.0 <= value <= 1.0 for value in cosines):
+            raise ValueError("memory write cosine audits must be finite in [-1, 1]")
+        norms = (
+            *self.eta_sums,
+            *self.write_norms,
+            *self.memory_norms,
+            *self.readout_shares,
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in norms):
+            raise ValueError("memory write audit norms must be finite and non-negative")
+        if any(type(value) is not int or value < 0 for value in self.slots_written):
+            raise ValueError("memory write slots_written must be non-negative integers")
 
 
 @dataclass(frozen=True, slots=True)
 class TruncatedSegmentAudit:
-    """One bounded second-order graph segment and its local backward boundary."""
+    """One bounded truncated-graph segment and its local backward boundary."""
 
     training_mode: str
     segment_index: int
@@ -440,35 +462,38 @@ class TruncatedSegmentAudit:
     support_end_index: int
     support_count: int
     query_count: int
-    associative_loss: float
+    pre_write_cosine_mean: float
+    eta_sum: float
+    renormalized_count: int
     raw_query_cotangent_sum_norm: float
     clipped_query_cotangent_sum_norm: float
     deferred_vjp_norm: float
     query_roles: tuple[str, ...]
     query_weights: tuple[float, ...]
-    fast_version_before_segment: tuple[int, ...]
-    fast_version_at_query: tuple[int, ...]
-    update_attempt_count: int
-    update_count: int
+    write_version_before_segment: tuple[int, ...]
+    write_version_at_query: tuple[int, ...]
+    write_attempt_count: int
+    write_count: int
     skip_count: int
     skip_reason_counts: tuple[tuple[str, int], ...]
     backward_applied: bool
     includes_query_backward: bool
-    reanchored: bool
-    reanchor_audits: tuple[FastReanchorAudit, ...]
+    truncated: bool
+    truncate_audits: tuple[MemoryTruncateAudit, ...]
 
     def __post_init__(self) -> None:
-        if self.training_mode not in {"meta_ttt", "outer_only", "static_w0"}:
-            raise ValueError("A5 segment training mode must be meta_ttt, outer_only, or static_w0")
+        if self.training_mode not in {"meta_ttt", "outer_only", "no_write"}:
+            raise ValueError("A5 segment training mode must be meta_ttt, outer_only, or no_write")
         integers = (
             self.segment_index,
             self.support_start_index,
             self.support_end_index,
             self.support_count,
             self.query_count,
-            self.update_attempt_count,
-            self.update_count,
+            self.write_attempt_count,
+            self.write_count,
             self.skip_count,
+            self.renormalized_count,
         )
         if any(type(value) is not int or value < 0 for value in integers):
             raise ValueError("truncated segment indices/counts must be non-negative integers")
@@ -478,8 +503,12 @@ class TruncatedSegmentAudit:
             raise ValueError("a truncated segment must contain at least one Meta Query")
         if self.support_end_index - self.support_start_index + 1 != self.support_count:
             raise ValueError("truncated segment Support range does not match its count")
-        if not math.isfinite(self.associative_loss) or self.associative_loss < 0.0:
-            raise ValueError("truncated segment associative loss must be finite and non-negative")
+        if not math.isfinite(self.pre_write_cosine_mean) or not (
+            -1.0 <= self.pre_write_cosine_mean <= 1.0
+        ):
+            raise ValueError("truncated segment pre-write cosine must be finite in [-1, 1]")
+        if not math.isfinite(self.eta_sum) or self.eta_sum < 0.0:
+            raise ValueError("truncated segment eta sum must be finite and non-negative")
         cotangent_norms = (
             self.raw_query_cotangent_sum_norm,
             self.clipped_query_cotangent_sum_norm,
@@ -496,36 +525,36 @@ class TruncatedSegmentAudit:
             or self.query_weights != (1.0,) * self.query_count
         ):
             raise ValueError("truncated segment must carry unit-weight Meta Queries")
-        if self.update_attempt_count != self.update_count + self.skip_count:
-            raise ValueError("segment update attempts must equal updates plus skips")
+        if self.write_attempt_count != self.write_count + self.skip_count:
+            raise ValueError("segment write attempts must equal writes plus skips")
         if sum(count for _, count in self.skip_reason_counts) != self.skip_count:
             raise ValueError("segment skip-reason counts must equal skip count")
-        if self.training_mode == "static_w0":
-            if self.update_attempt_count or self.update_count or self.skip_count:
-                raise ValueError("static-W0 segments cannot attempt fast-weight updates")
-            if self.associative_loss != 0.0:
-                raise ValueError("static-W0 segments cannot include associative updates")
+        if self.training_mode == "no_write":
+            if self.write_attempt_count or self.write_count or self.skip_count:
+                raise ValueError("no-write segments cannot attempt memory writes")
+            if self.pre_write_cosine_mean != 0.0 or self.eta_sum != 0.0:
+                raise ValueError("no-write segments cannot report write statistics")
         else:
-            expected_mode = "meta_ttt" if self.update_count > 0 else "outer_only"
+            expected_mode = "meta_ttt" if self.write_count > 0 else "outer_only"
             if self.training_mode != expected_mode:
-                raise ValueError("A5 segment training mode disagrees with its fast updates")
-        if not self.fast_version_before_segment or len(self.fast_version_before_segment) != len(
-            self.fast_version_at_query
+                raise ValueError("A5 segment training mode disagrees with its memory writes")
+        if not self.write_version_before_segment or len(self.write_version_before_segment) != len(
+            self.write_version_at_query
         ):
-            raise ValueError("segment fast-version boundaries must align")
-        if not self.fast_version_at_query or any(
-            type(value) is not int or value < 0 for value in self.fast_version_at_query
+            raise ValueError("segment write-version boundaries must align")
+        if not self.write_version_at_query or any(
+            type(value) is not int or value < 0 for value in self.write_version_at_query
         ):
-            raise ValueError("truncated segment Query fast versions must be non-negative integers")
-        flags = (self.backward_applied, self.includes_query_backward, self.reanchored)
+            raise ValueError("truncated segment Query write versions must be non-negative integers")
+        flags = (self.backward_applied, self.includes_query_backward, self.truncated)
         if any(type(value) is not bool for value in flags):
             raise TypeError("truncated segment flags must be bool")
         if not self.backward_applied:
             raise ValueError("every truncated segment must contribute one backward collective")
         if not self.includes_query_backward:
             raise ValueError("every A5 segment must close with one Meta Query")
-        if self.reanchored != bool(self.reanchor_audits):
-            raise ValueError("segment re-anchor flag and audits disagree")
+        if self.truncated != bool(self.truncate_audits):
+            raise ValueError("segment truncation flag and audits disagree")
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,10 +563,13 @@ class CounterfactualAuditRequest:
 
     optimizer_step: int
     query_selector: int
+    queries_per_rank: int = 1
 
     def __post_init__(self) -> None:
         if self.optimizer_step <= 0 or self.query_selector < 0:
             raise ValueError("counterfactual audit request indices must be positive/non-negative")
+        if type(self.queries_per_rank) is not int or self.queries_per_rank < 1:
+            raise ValueError("counterfactual queries_per_rank must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -550,7 +582,7 @@ class CounterfactualReferenceAudit:
     descent_cosine: float
 
     def __post_init__(self) -> None:
-        if self.reference not in {"episode_w0", "segment_start"}:
+        if self.reference not in {"episode_zero", "segment_start"}:
             raise ValueError("counterfactual reference is invalid")
         if any(
             not math.isfinite(value)
@@ -578,7 +610,7 @@ class QueryCounterfactualAudit:
         if self.optimizer_step <= 0:
             raise ValueError("counterfactual optimizer step must be positive")
         if tuple(item.reference for item in self.references) != (
-            "episode_w0",
+            "episode_zero",
             "segment_start",
         ):
             raise ValueError("counterfactual Query audit must contain both ordered references")
@@ -590,13 +622,16 @@ class QueryCotangentClipAudit:
     clipped_joint_norm: float
     clip_scale: float
     clipped: bool
+    max_norm: float
 
     def __post_init__(self) -> None:
-        values = (self.raw_joint_norm, self.clipped_joint_norm, self.clip_scale)
+        values = (self.raw_joint_norm, self.clipped_joint_norm, self.clip_scale, self.max_norm)
         if any(not math.isfinite(value) or value < 0.0 for value in values):
             raise ValueError("Query cotangent clip audit values must be finite and non-negative")
-        if self.clip_scale > 1.0 or self.clipped_joint_norm > 1.0 + 1.0e-6:
-            raise ValueError("Query cotangent clip audit exceeds the frozen unit-norm cap")
+        if self.max_norm <= 0.0:
+            raise ValueError("Query cotangent clip audit requires a positive max_norm")
+        if self.clip_scale > 1.0 or self.clipped_joint_norm > self.max_norm * (1.0 + 1.0e-6):
+            raise ValueError("Query cotangent clip audit exceeds the configured norm cap")
         if self.clipped != (self.clip_scale < 1.0):
             raise ValueError("Query cotangent clipped flag disagrees with its scale")
 
@@ -614,7 +649,7 @@ class TruncatedQueryPointAudit:
     case_id: str
     query_time: float
     observation_end_time: float
-    fast_versions: tuple[int, ...]
+    write_versions: tuple[int, ...]
     metrics: QueryMetricSnapshot
     prefill_count: int
     observation_immutable: bool
@@ -623,6 +658,7 @@ class TruncatedQueryPointAudit:
     proxy_gradient_joint_norm_clipped: float
     proxy_gradient_clip_scale: float
     proxy_gradient_clipped: bool
+    proxy_gradient_max_norm: float
     proxy_gradient_status: str
     proxy_storage_isolated: bool
     proxy_max_abs_value_drift: float
@@ -662,6 +698,7 @@ class TruncatedQueryPointAudit:
             clipped_joint_norm=self.proxy_gradient_joint_norm_clipped,
             clip_scale=self.proxy_gradient_clip_scale,
             clipped=self.proxy_gradient_clipped,
+            max_norm=self.proxy_gradient_max_norm,
         )
         gradient_nonzero = any(value > 0.0 for value in self.proxy_gradient_norms)
         if gradient_nonzero != (self.proxy_gradient_status == "nonzero"):
@@ -675,17 +712,17 @@ class TruncatedQueryPointAudit:
         }:
             raise ValueError("Query proxy gradient status is invalid")
         if not self.proxy_storage_isolated:
-            raise ValueError("Query proxy fast matrices must use isolated storage")
+            raise ValueError("Query proxy memory matrices must use isolated storage")
         if (
             not math.isfinite(self.proxy_max_abs_value_drift)
             or self.proxy_max_abs_value_drift != 0.0
         ):
-            raise ValueError("Query proxy fast values must exactly match authoritative W_after")
+            raise ValueError("Query proxy memory values must exactly match authoritative M_after")
 
 
 @dataclass(frozen=True, slots=True)
 class TruncatedMetaTTTEpisodeAudit:
-    """Bounded-memory evidence for an otherwise unbounded numeric fast trajectory."""
+    """Bounded-memory evidence for an otherwise unbounded numeric memory trajectory."""
 
     associative_contract: str
     adaptation_mode: str
@@ -706,26 +743,19 @@ class TruncatedMetaTTTEpisodeAudit:
     deferred_vjp_backward_count: int
     truncation_count: int
     maximum_retained_support_graphs: int
-    update_attempt_count: int
-    update_count: int
+    write_attempt_count: int
+    write_count: int
     skip_count: int
-    associative_loss_mean: float
-    key_rms: float
-    value_rms: float
-    prediction_rms: float
-    error_rms: float
-    key_max_abs: float
-    value_max_abs: float
-    prediction_max_abs: float
-    error_max_abs: float
-    associative_element_count: int
+    readout_target_cosine_mean: float
+    post_write_cosine_mean: float
+    readout_share_mean: float
+    memory_norm_max: float
+    write_norm_mean: float
+    eta_sum_mean: float
+    renormalized_fraction: float
+    slots_written_total: int
     bank_record_count: int
     empty_bank_count: int
-    active_head_counts: tuple[tuple[str, int], ...]
-    valid_target_counts: tuple[tuple[str, int], ...]
-    unsupported_target_count: int
-    empty_target_skip_count: int
-    prediction_target_cosine_mean: float
     parameter_versions_unchanged_before_outer_step: bool
     bank_context_detached: bool
     support_supervision_reachable: bool
@@ -733,11 +763,11 @@ class TruncatedMetaTTTEpisodeAudit:
     diagnostic_counterfactual_executed: bool
     counterfactual_audited_query_count: int
     segments: tuple[TruncatedSegmentAudit, ...]
-    updates: tuple[InnerUpdateAudit, ...]
+    writes: tuple[MemoryWriteAudit, ...]
     queries: tuple[TruncatedQueryPointAudit, ...]
 
     def __post_init__(self) -> None:
-        if self.adaptation_mode not in {"meta_ttt", "static_w0"}:
+        if self.adaptation_mode not in _ADAPTATION_MODES:
             raise ValueError("A5 adaptation mode is invalid")
         if type(self.ttt_enabled) is not bool:
             raise TypeError("A5 TTT enabled audit must be bool")
@@ -749,9 +779,9 @@ class TruncatedMetaTTTEpisodeAudit:
             raise TypeError("diagnostic counterfactual flag must be bool")
         if (
             type(self.counterfactual_audited_query_count) is not int
-            or self.counterfactual_audited_query_count not in {0, 1}
+            or not 0 <= self.counterfactual_audited_query_count <= self.query_count
             or self.diagnostic_counterfactual_executed
-            != (self.counterfactual_audited_query_count == 1)
+            != (self.counterfactual_audited_query_count > 0)
         ):
             raise ValueError("diagnostic counterfactual Query count is invalid")
         if self.loss_weight not in (0.0, 1.0):
@@ -762,67 +792,42 @@ class TruncatedMetaTTTEpisodeAudit:
             raise TypeError("A5 insufficient-gap audit must be bool")
         if self.maximum_retained_support_graphs > self.truncation_horizon:
             raise ValueError("A5 retained more than K Support graphs")
+        cosines = (self.readout_target_cosine_mean, self.post_write_cosine_mean)
+        if any(not math.isfinite(value) or not -1.0 <= value <= 1.0 for value in cosines):
+            raise ValueError("A5 memory cosine audits must be finite in [-1, 1]")
         nonnegative_finite = (
-            self.associative_loss_mean,
-            self.key_rms,
-            self.value_rms,
-            self.prediction_rms,
-            self.error_rms,
-            self.key_max_abs,
-            self.value_max_abs,
-            self.prediction_max_abs,
-            self.error_max_abs,
+            self.readout_share_mean,
+            self.memory_norm_max,
+            self.write_norm_mean,
+            self.eta_sum_mean,
         )
         if any(not math.isfinite(value) or value < 0.0 for value in nonnegative_finite):
-            raise ValueError("A5 TTT scale audit values must be finite and non-negative")
+            raise ValueError("A5 memory scale audits must be finite and non-negative")
         if (
-            type(self.associative_element_count) is not int
+            not math.isfinite(self.renormalized_fraction)
+            or not 0.0 <= self.renormalized_fraction <= 1.0
+        ):
+            raise ValueError("A5 eta renormalized fraction must be in [0, 1]")
+        if (
+            type(self.slots_written_total) is not int
             or type(self.bank_record_count) is not int
             or type(self.empty_bank_count) is not int
-            or type(self.unsupported_target_count) is not int
-            or type(self.empty_target_skip_count) is not int
-            or min(
-                self.associative_element_count,
-                self.bank_record_count,
-                self.empty_bank_count,
-                self.unsupported_target_count,
-                self.empty_target_skip_count,
-            ) < 0
+            or min(self.slots_written_total, self.bank_record_count, self.empty_bank_count) < 0
         ):
-            raise ValueError("A5 associative audit counts must be non-negative integers")
-        expected_heads = ("o1", "o2", "e1", "e2")
-        if (
-            tuple(name for name, _ in self.active_head_counts) != expected_heads
-            or tuple(name for name, _ in self.valid_target_counts) != expected_heads
-            or any(
-                type(count) is not int or count < 0
-                for _, count in (*self.active_head_counts, *self.valid_target_counts)
-            )
-        ):
-            raise ValueError("A5 state-write target head audit is invalid")
-        if (
-            not math.isfinite(self.prediction_target_cosine_mean)
-            or not -1.0 <= self.prediction_target_cosine_mean <= 1.0
-        ):
-            raise ValueError("A5 prediction-target cosine mean must be in [-1, 1]")
-        expected_update_audits = self.support_count if self.ttt_enabled else 0
-        if len(self.updates) != expected_update_audits or len(self.queries) != self.query_count:
+            raise ValueError("A5 memory audit counts must be non-negative integers")
+        expected_write_audits = self.support_count if self.ttt_enabled else 0
+        if len(self.writes) != expected_write_audits or len(self.queries) != self.query_count:
             raise ValueError("A5 detailed audit counts drifted")
         if not self.ttt_enabled and (
-            self.update_attempt_count
-            or self.update_count
+            self.write_attempt_count
+            or self.write_count
             or self.skip_count
             or self.associative_valid_count
             or self.maximum_retained_support_graphs
-            or any(
-                value != 0.0
-                for value in (
-                    self.associative_loss_mean,
-                )
-            )
-            or any(segment.training_mode != "static_w0" for segment in self.segments)
+            or self.slots_written_total
+            or any(segment.training_mode != "no_write" for segment in self.segments)
         ):
-            raise ValueError("static-W0 audit contains Meta-TTT activity")
+            raise ValueError("no-write audit contains Meta-TTT activity")
         query_offset = 0
         for segment in self.segments:
             queries = self.queries[query_offset : query_offset + segment.query_count]
@@ -836,7 +841,7 @@ class TruncatedMetaTTTEpisodeAudit:
         if not self.parameter_versions_unchanged_before_outer_step:
             raise ValueError("outer parameters changed before the episode-level optimizer step")
         if self.training_counterfactual_executed:
-            raise ValueError("the production A5 path must not execute static-W0 counterfactuals")
+            raise ValueError("the production A5 path must not execute no-write counterfactuals")
 
     @property
     def meta_ttt_segment_count(self) -> int:
@@ -847,8 +852,8 @@ class TruncatedMetaTTTEpisodeAudit:
         return sum(segment.training_mode == "outer_only" for segment in self.segments)
 
     @property
-    def static_w0_segment_count(self) -> int:
-        return sum(segment.training_mode == "static_w0" for segment in self.segments)
+    def no_write_segment_count(self) -> int:
+        return sum(segment.training_mode == "no_write" for segment in self.segments)
 
 
 @dataclass(frozen=True, slots=True)
@@ -857,8 +862,7 @@ class TruncatedMetaTTTEpisodeOutput:
 
     total: Tensor
     query_loss: Tensor
-    final_fast_states: tuple[FastWeightsState, ...]
-    final_optimizer_states: tuple[OptimizerRuntimeState, ...]
+    final_fast_states: tuple[FastMemoryState, ...]
     final_runtime: BatchRuntimeState
     audit: TruncatedMetaTTTEpisodeAudit
 
@@ -879,24 +883,16 @@ class _Trajectory:
     runtime: BatchRuntimeState
 
     @property
-    def fast_states(self) -> tuple[FastWeightsState, ...]:
+    def fast_states(self) -> tuple[FastMemoryState, ...]:
         return self.runtime.fast_states
 
     @fast_states.setter
-    def fast_states(self, values: tuple[FastWeightsState, ...]) -> None:
+    def fast_states(self, values: tuple[FastMemoryState, ...]) -> None:
         self.runtime = self.runtime.with_fast_states(values)
-
-    @property
-    def optimizer_states(self) -> tuple[OptimizerRuntimeState, ...]:
-        return self.runtime.optimizer_states
-
-    @optimizer_states.setter
-    def optimizer_states(self, values: tuple[OptimizerRuntimeState, ...]) -> None:
-        self.runtime = self.runtime.with_fast_states(self.fast_states, values)
 
 
 class MetaTTTEpisodeRunner:
-    """Run the production A5 trajectory with bounded second-order graph segments."""
+    """Run the production A5 trajectory with bounded truncated graph segments."""
 
     def __init__(
         self,
@@ -937,16 +933,24 @@ class MetaTTTEpisodeRunner:
         self.outer_composer = outer_composer or OfficialWeakOuterLossComposer(
             config.loss.official_weak_balance
         )
-        if adaptation_mode not in {"meta_ttt", "static_w0"}:
-            raise ValueError("A5 adaptation mode must be meta_ttt or static_w0")
+        if adaptation_mode == _LEGACY_STATIC_W0:
+            raise ValueError(
+                "A5 adaptation mode 'static_w0' was renamed; use 'no_write' "
+                "(the memory stays zero and the memory-interface parameters freeze)"
+            )
+        if adaptation_mode not in _ADAPTATION_MODES:
+            raise ValueError("A5 adaptation mode must be meta_ttt or no_write")
         self.adaptation_mode = adaptation_mode
         self.ttt_enabled = adaptation_mode == "meta_ttt"
         if not self.ttt_enabled:
             for parameter in self.fast_controller.collect_associative_parameters():
                 parameter.requires_grad_(False)
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
-        if config.fast_ttt.optimizer.meta_gradient_mode != "full_second_order":
-            raise ValueError("the training runner only permits full_second_order inner updates")
+        audit_config = config.a5.counterfactual_audit
+        if audit_config.enabled and (
+            audit_config.interval_steps <= 0 or audit_config.queries_per_rank <= 0
+        ):
+            raise ValueError("A5 counterfactual audit requires positive interval and query count")
 
     def run_truncated(
         self,
@@ -981,11 +985,14 @@ class MetaTTTEpisodeRunner:
                 raise ValueError("counterfactual Query audit requires Meta-TTT")
             if not isinstance(counterfactual_audit, CounterfactualAuditRequest):
                 raise TypeError("counterfactual audit request is invalid")
-        selected_query_index = (
-            None
-            if counterfactual_audit is None
-            else counterfactual_audit.query_selector % len(episode.query_points)
-        )
+        if counterfactual_audit is None:
+            selected_query_indices: frozenset[int] = frozenset()
+        else:
+            total_queries = len(episode.query_points)
+            selected_query_indices = frozenset(
+                (counterfactual_audit.query_selector + offset) % total_queries
+                for offset in range(min(counterfactual_audit.queries_per_rank, total_queries))
+            )
         backward_fn = backward or _plain_backward
         self.model.train()
         adapted = self._reset_trajectory(episode.owner, differentiable=True)
@@ -993,33 +1000,22 @@ class MetaTTTEpisodeRunner:
         versions_before = tuple(parameter._version for parameter in tracked_parameters)
         horizon = self.config.a5.truncation_horizon
         support_count = len(episode.support_chunks)
-        update_audits: list[InnerUpdateAudit] = []
+        write_audits: list[MemoryWriteAudit] = []
         segment_audits: list[TruncatedSegmentAudit] = []
         query_audits: list[TruncatedQueryPointAudit] = []
         maximum_retained = 0
         support_offset = 0
-        device = adapted.fast_states[0].w_t_1.device
+        device = adapted.fast_states[0].m.device
         query_loss_detached = torch.zeros((), dtype=torch.float32, device=device)
-        support_total_detached = torch.zeros((), dtype=torch.float32, device=device)
-        associative_key_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
-        associative_value_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
-        associative_prediction_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
-        associative_error_sum_squares = torch.zeros((), dtype=torch.float32, device=device)
-        associative_element_count = torch.zeros((), dtype=torch.int64, device=device)
-        associative_key_max_abs = torch.zeros((), dtype=torch.float32, device=device)
-        associative_value_max_abs = torch.zeros((), dtype=torch.float32, device=device)
-        associative_prediction_max_abs = torch.zeros((), dtype=torch.float32, device=device)
-        associative_error_max_abs = torch.zeros((), dtype=torch.float32, device=device)
-        state_write_active_head_counts = [0, 0, 0, 0]
-        state_write_valid_target_counts = [0, 0, 0, 0]
-        unsupported_target_count = 0
-        empty_target_skip_count = 0
-        prediction_target_cosine_sum = torch.zeros(
-            (), dtype=torch.float32, device=device
-        )
-        prediction_target_cosine_count = torch.zeros(
-            (), dtype=torch.int64, device=device
-        )
+        pre_write_cosine_sum = 0.0
+        post_write_cosine_sum = 0.0
+        write_norm_sum = 0.0
+        eta_sum_total = 0.0
+        readout_share_sum = 0.0
+        readout_share_count = 0
+        memory_norm_max = 0.0
+        renormalized_write_count = 0
+        slots_written_total = 0
         bank_record_count = 0
         empty_bank_count = 0
         support_lifecycle = PrefillLifecycle(episode.owner)
@@ -1056,11 +1052,11 @@ class MetaTTTEpisodeRunner:
             with_grad=False,
             prepared_query=prewarm_query,
         )
-        if any(prewarm_fast_audit.fast_versions):
-            raise ValueError("the no-update prewarm must observe the initial W0 generation")
+        if any(prewarm_fast_audit.write_versions):
+            raise ValueError("the no-write prewarm must observe the zero-memory generation")
         adapted.runtime = _runtime_from_observation(prewarm_observation, episode.owner)
-        episode_w0_reference = (
-            _snapshot_reference_fast_states(adapted.fast_states)
+        episode_zero_reference = (
+            _zero_reference_fast_states(adapted.fast_states)
             if counterfactual_audit is not None and episode_weight == 1.0
             else None
         )
@@ -1075,8 +1071,10 @@ class MetaTTTEpisodeRunner:
             )
         ):
             segment_start = support_offset
-            segment_update_start = len(update_audits)
-            fast_version_before_segment = tuple(state.fast_version for state in adapted.fast_states)
+            segment_write_start = len(write_audits)
+            write_version_before_segment = tuple(
+                state.write_version for state in adapted.fast_states
+            )
             segment_start_reference = (
                 _snapshot_reference_fast_states(adapted.fast_states)
                 if counterfactual_audit is not None and episode_weight == 1.0
@@ -1098,7 +1096,11 @@ class MetaTTTEpisodeRunner:
                     )
                 self._validate_prepared_segment(raw_segment, prepared_segment)
                 active_segment = prepared_segment
-            segment_outputs: list[AssociativeTTTLossOutput] = []
+            segment_retained_writes = 0
+            segment_pre_write_cosine_sum = 0.0
+            segment_pre_write_cosine_count = 0
+            segment_eta_sum = 0.0
+            segment_renormalized_count = 0
             segment_query = first_segment_query if segment_index == 0 else None
             for segment_offset, chunk in enumerate(active_segment):
                 support_index = support_offset + segment_offset
@@ -1120,107 +1122,65 @@ class MetaTTTEpisodeRunner:
                 )
                 adapted.runtime = _runtime_from_observation(observation, episode.owner)
                 if not self.ttt_enabled:
-                    if tuple(state.fast_version for state in adapted.fast_states) != (
-                        fast_version_before_segment
+                    if tuple(state.write_version for state in adapted.fast_states) != (
+                        write_version_before_segment
                     ):
-                        raise RuntimeError("static-W0 Support changed fast-weight versions")
+                        raise RuntimeError("no-write Support changed memory write versions")
                     del observation
                     continue
                 intermediates = observation.soft_intermediates.fast_associative
                 if intermediates is None:
                     raise RuntimeError("Meta-TTT Support did not capture associative tensors")
-                state_write = observation.soft_intermediates.state_write
-                if state_write is None:
-                    raise RuntimeError("Meta-TTT Support did not produce state-write targets")
-                associative_output = compute_associative_ttt_loss(
-                    intermediates,
-                    state_write,
-                    observation.query.head_types,
-                )
-                before_versions = tuple(state.fast_version for state in adapted.fast_states)
-                results = functional_sgd_steps_from_associative(
-                    associative_output=associative_output,
+                spatial = observation.soft_intermediates.spatial
+                if spatial is None:
+                    raise RuntimeError("Meta-TTT Support did not produce spatial slot state")
+                write_batch = self.fast_controller.prepare_write(intermediates, spatial)
+                before_versions = tuple(state.write_version for state in adapted.fast_states)
+                results = apply_memory_writes(
                     fast_states=adapted.fast_states,
-                    optimizer_config=self.config.fast_ttt.optimizer,
-                    optimizer_states=adapted.optimizer_states,
+                    batch=write_batch,
                 )
                 adapted.fast_states = tuple(result.fast_state for result in results)
-                adapted.optimizer_states = tuple(result.optimizer_state for result in results)
-                after_versions = tuple(state.fast_version for state in adapted.fast_states)
-                update_audits.append(
-                    _make_inner_update_audit(
+                after_versions = tuple(state.write_version for state in adapted.fast_states)
+                write_audits.append(
+                    _make_memory_write_audit(
                         support_index=support_index,
                         chunk=chunk,
                         before_versions=before_versions,
                         observed_fast_audit=fast_audit,
                         results=results,
-                        associative_output=associative_output,
-                        bank_record_counts=tuple(
-                            int(value.item()) for value in intermediates.bank_record_counts
-                        ),
                         runtime=adapted.runtime,
                         after_versions=after_versions,
                     )
                 )
-                segment_outputs.append(associative_output)
-                maximum_retained = max(maximum_retained, len(segment_outputs))
-                support_total_detached = (
-                    support_total_detached
-                    + associative_output.total.detach().to(torch.float32)
-                )
-                scale_audit = associative_output.scale_audit
-                associative_key_sum_squares += scale_audit.key_sum_squares
-                associative_value_sum_squares += scale_audit.value_sum_squares
-                associative_prediction_sum_squares += scale_audit.prediction_sum_squares
-                associative_error_sum_squares += scale_audit.error_sum_squares
-                associative_element_count += scale_audit.element_count
-                associative_key_max_abs = torch.maximum(
-                    associative_key_max_abs, scale_audit.key_max_abs
-                )
-                associative_value_max_abs = torch.maximum(
-                    associative_value_max_abs, scale_audit.value_max_abs
-                )
-                associative_prediction_max_abs = torch.maximum(
-                    associative_prediction_max_abs, scale_audit.prediction_max_abs
-                )
-                associative_error_max_abs = torch.maximum(
-                    associative_error_max_abs, scale_audit.error_max_abs
-                )
-                target_audit = associative_output.target_audit
-                state_write_active_head_counts = [
-                    current + observed
-                    for current, observed in zip(
-                        state_write_active_head_counts,
-                        target_audit.active_head_counts,
-                        strict=True,
-                    )
-                ]
-                state_write_valid_target_counts = [
-                    current + observed
-                    for current, observed in zip(
-                        state_write_valid_target_counts,
-                        target_audit.valid_target_counts,
-                        strict=True,
-                    )
-                ]
-                unsupported_target_count += target_audit.unsupported_count
-                empty_target_skip_count += target_audit.empty_target_count
-                prediction_target_cosine_sum += (
-                    target_audit.prediction_target_cosine_sum
-                )
-                prediction_target_cosine_count += (
-                    target_audit.prediction_target_cosine_count
-                )
+                segment_retained_writes += 1
+                maximum_retained = max(maximum_retained, segment_retained_writes)
+                for result in results:
+                    if result.did_write:
+                        pre_write_cosine_sum += result.pre_write_cosine_mean
+                        post_write_cosine_sum += result.post_write_cosine_mean
+                        write_norm_sum += result.write_norm
+                        eta_sum_total += result.eta_sum
+                        segment_pre_write_cosine_sum += result.pre_write_cosine_mean
+                        segment_pre_write_cosine_count += 1
+                        segment_eta_sum += result.eta_sum
+                        slots_written_total += result.slots_written
+                        renormalized_write_count += int(result.eta_renormalized)
+                        segment_renormalized_count += int(result.eta_renormalized)
+                    memory_norm_max = max(memory_norm_max, result.memory_norm)
+                for share in fast_audit.readout_share_norms:
+                    readout_share_sum += share
+                    readout_share_count += 1
                 counts = tuple(int(value.item()) for value in intermediates.bank_record_counts)
                 bank_record_count += sum(counts)
                 empty_bank_count += sum(count == 0 for count in counts)
-                del results, associative_output, intermediates, observation
+                del results, write_batch, intermediates, spatial, observation
 
             query_runtime_snapshot = adapted.runtime
             authoritative_fast_states = query_runtime_snapshot.fast_states
             accumulated_gradients: tuple[Tensor, ...] | None = None
             raw_accumulated_gradients: tuple[Tensor, ...] | None = None
-            fast_versions = tuple(state.fast_version for state in authoritative_fast_states)
+            write_versions = tuple(state.write_version for state in authoritative_fast_states)
             for bundle_offset, (query, query_role, query_weight) in enumerate(
                 zip(queries, query_roles, query_weights, strict=True)
             ):
@@ -1336,18 +1296,20 @@ class MetaTTTEpisodeRunner:
                 )
                 query_counterfactual: QueryCounterfactualAudit | None = None
                 if (
-                    global_query_index == selected_query_index
+                    global_query_index in selected_query_indices
                     and episode_weight == 1.0
                     and counterfactual_audit is not None
                 ):
-                    if episode_w0_reference is None or segment_start_reference is None:
-                        raise RuntimeError("counterfactual reference fast states were not captured")
+                    if episode_zero_reference is None or segment_start_reference is None:
+                        raise RuntimeError(
+                            "counterfactual reference memory states were not captured"
+                        )
                     adapted_audit_loss = float(
                         (query_weight * objective.outer.outer).detach().float().item()
                     )
                     reference_items: list[CounterfactualReferenceAudit] = []
                     for reference_name, reference_states in (
-                        ("episode_w0", episode_w0_reference),
+                        ("episode_zero", episode_zero_reference),
                         ("segment_start", segment_start_reference),
                     ):
                         reference_loss = self._counterfactual_query_loss(
@@ -1427,7 +1389,7 @@ class MetaTTTEpisodeRunner:
                     )
                     self.last_balance_audit = balance_audit
                 maximum_proxy_drift = max(
-                    value for audit in proxy_audits for value in audit.max_abs_value_drift
+                    audit.max_abs_value_drift for audit in proxy_audits
                 )
                 query_audits.append(
                     TruncatedQueryPointAudit(
@@ -1440,7 +1402,7 @@ class MetaTTTEpisodeRunner:
                         case_id=query.case_id,
                         query_time=query.query_time,
                         observation_end_time=query.chunk.end_time,
-                        fast_versions=fast_versions,
+                        write_versions=write_versions,
                         metrics=objective.metrics,
                         prefill_count=query_lifecycle.audit().prefill_count,
                         observation_immutable=immutable,
@@ -1451,6 +1413,7 @@ class MetaTTTEpisodeRunner:
                         ),
                         proxy_gradient_clip_scale=cotangent_clip_audit.clip_scale,
                         proxy_gradient_clipped=cotangent_clip_audit.clipped,
+                        proxy_gradient_max_norm=cotangent_clip_audit.max_norm,
                         proxy_gradient_status=_proxy_gradient_status(
                             proxy_gradient_norms,
                             objective.metrics,
@@ -1464,8 +1427,7 @@ class MetaTTTEpisodeRunner:
                     )
                 )
                 for state in proxy_states:
-                    state.w_t_1.grad = None
-                    state.w_t_2.grad = None
+                    state.m.grad = None
                 adapted.runtime = query_runtime_snapshot
                 del (
                     captured_gradients,
@@ -1500,36 +1462,30 @@ class MetaTTTEpisodeRunner:
                 authoritative_fast_states,
                 accumulated_gradients,
             )
-            segment_associative_loss = (
-                float(
-                    torch.stack(
-                        tuple(output.total.detach() for output in segment_outputs)
-                    )
-                    .mean()
-                    .item()
-                )
-                if segment_outputs
-                else 0.0
-            )
             backward_fn(deferred_vjp, False)
-            reanchor_audits = self._reanchor_trajectory(adapted)
-            segment_updates = update_audits[segment_update_start:]
-            segment_update_attempts = sum(len(audit.did_update) for audit in segment_updates)
-            segment_update_count = sum(sum(audit.did_update) for audit in segment_updates)
+            truncate_audits = self._truncate_trajectory(adapted)
+            segment_writes = write_audits[segment_write_start:]
+            segment_write_attempts = sum(len(audit.did_write) for audit in segment_writes)
+            segment_write_count = sum(sum(audit.did_write) for audit in segment_writes)
             segment_skip_reasons: dict[str, int] = {}
-            for audit in segment_updates:
-                for did_update, reason in zip(
-                    audit.did_update,
+            for audit in segment_writes:
+                for did_write, reason in zip(
+                    audit.did_write,
                     audit.skip_reasons,
                     strict=True,
                 ):
-                    if not did_update:
+                    if not did_write:
                         key = reason or "unspecified"
                         segment_skip_reasons[key] = segment_skip_reasons.get(key, 0) + 1
             segment_training_mode = (
-                ("meta_ttt" if segment_update_count > 0 else "outer_only")
+                ("meta_ttt" if segment_write_count > 0 else "outer_only")
                 if self.ttt_enabled
-                else "static_w0"
+                else "no_write"
+            )
+            segment_pre_write_cosine = (
+                segment_pre_write_cosine_sum / segment_pre_write_cosine_count
+                if segment_pre_write_cosine_count
+                else 0.0
             )
             segment_audits.append(
                 TruncatedSegmentAudit(
@@ -1539,22 +1495,24 @@ class MetaTTTEpisodeRunner:
                     support_end_index=segment_start + segment_length - 1,
                     support_count=segment_length,
                     query_count=segment_query_count,
-                    associative_loss=segment_associative_loss,
+                    pre_write_cosine_mean=segment_pre_write_cosine,
+                    eta_sum=segment_eta_sum,
+                    renormalized_count=segment_renormalized_count,
                     raw_query_cotangent_sum_norm=raw_query_cotangent_sum_norm,
                     clipped_query_cotangent_sum_norm=clipped_query_cotangent_sum_norm,
                     deferred_vjp_norm=deferred_vjp_norm,
                     query_roles=query_roles,
                     query_weights=query_weights,
-                    fast_version_before_segment=fast_version_before_segment,
-                    fast_version_at_query=fast_versions,
-                    update_attempt_count=segment_update_attempts,
-                    update_count=segment_update_count,
-                    skip_count=segment_update_attempts - segment_update_count,
+                    write_version_before_segment=write_version_before_segment,
+                    write_version_at_query=write_versions,
+                    write_attempt_count=segment_write_attempts,
+                    write_count=segment_write_count,
+                    skip_count=segment_write_attempts - segment_write_count,
                     skip_reason_counts=tuple(sorted(segment_skip_reasons.items())),
                     backward_applied=True,
                     includes_query_backward=True,
-                    reanchored=True,
-                    reanchor_audits=reanchor_audits,
+                    truncated=True,
+                    truncate_audits=truncate_audits,
                 )
             )
             trace_event(
@@ -1570,10 +1528,10 @@ class MetaTTTEpisodeRunner:
                 diagnostic_query_count=episode.diagnostic_query_count,
                 training_mode=segment_training_mode,
                 ttt_enabled=self.ttt_enabled,
-                fast_version_delta=max(fast_versions) - max(fast_version_before_segment),
-                update_attempt_count=segment_update_attempts,
-                update_count=segment_update_count,
-                skip_count=segment_update_attempts - segment_update_count,
+                write_version_delta=max(write_versions) - max(write_version_before_segment),
+                write_attempt_count=segment_write_attempts,
+                write_count=segment_write_count,
+                skip_count=segment_write_attempts - segment_write_count,
                 skip_reason_counts=tuple(sorted(segment_skip_reasons.items())),
                 raw_query_cotangent_sum_norm=raw_query_cotangent_sum_norm,
                 clipped_query_cotangent_sum_norm=clipped_query_cotangent_sum_norm,
@@ -1594,9 +1552,8 @@ class MetaTTTEpisodeRunner:
                 accumulated_gradients,
                 raw_accumulated_gradients,
                 deferred_vjp,
-                segment_outputs,
                 segment_query,
-                segment_updates,
+                segment_writes,
             )
 
         if support_offset != support_count:
@@ -1604,32 +1561,22 @@ class MetaTTTEpisodeRunner:
         if query_offset != len(episode.query_points):
             raise RuntimeError("A5 supervised Query bundles did not consume every Query")
         versions_after = tuple(parameter._version for parameter in tracked_parameters)
-        attempted = sum(len(audit.did_update) for audit in update_audits)
-        updated = sum(sum(audit.did_update) for audit in update_audits)
+        attempted = sum(len(audit.did_write) for audit in write_audits)
+        written = sum(sum(audit.did_write) for audit in write_audits)
         detached_query = query_loss_detached.detach().clone()
         detached_total = detached_query.detach().clone()
-        associative_loss_mean = float((support_total_detached / support_count).item())
-        associative_elements = int(associative_element_count.item())
-        cosine_count = int(prediction_target_cosine_count.item())
-        prediction_target_cosine_mean = (
-            float((prediction_target_cosine_sum / cosine_count).item())
-            if cosine_count
-            else 0.0
+        readout_target_cosine_mean = pre_write_cosine_sum / written if written else 0.0
+        post_write_cosine_mean = post_write_cosine_sum / written if written else 0.0
+        write_norm_mean = write_norm_sum / written if written else 0.0
+        eta_sum_mean = eta_sum_total / written if written else 0.0
+        renormalized_fraction = renormalized_write_count / written if written else 0.0
+        readout_share_mean = (
+            readout_share_sum / readout_share_count if readout_share_count else 0.0
         )
-        head_names = ("o1", "o2", "e1", "e2")
-        active_head_counts = tuple(
-            zip(head_names, state_write_active_head_counts, strict=True)
-        )
-        valid_target_counts = tuple(
-            zip(head_names, state_write_valid_target_counts, strict=True)
-        )
-
-        def rms(sum_squares: Tensor, count: int) -> float:
-            return math.sqrt(float(sum_squares.item()) / count) if count else 0.0
 
         query_count = len(episode.query_points)
         trace_event(
-            "a5_ttt_numerical_audit",
+            "a5_memory_numerical_audit",
             video_ids=episode.owner.video_ids,
             trajectory_ids=episode.owner.trajectory_ids,
             support_count=support_count,
@@ -1637,30 +1584,23 @@ class MetaTTTEpisodeRunner:
             adaptation_mode=self.adaptation_mode,
             ttt_enabled=self.ttt_enabled,
             associative_contract=ASSOCIATIVE_CONTRACT,
-            associative_valid_count=updated,
-            associative_loss_mean=associative_loss_mean,
-            key_rms=rms(associative_key_sum_squares, associative_elements),
-            value_rms=rms(associative_value_sum_squares, associative_elements),
-            prediction_rms=rms(associative_prediction_sum_squares, associative_elements),
-            error_rms=rms(associative_error_sum_squares, associative_elements),
-            key_max_abs=float(associative_key_max_abs.item()),
-            value_max_abs=float(associative_value_max_abs.item()),
-            prediction_max_abs=float(associative_prediction_max_abs.item()),
-            error_max_abs=float(associative_error_max_abs.item()),
-            associative_element_count=associative_elements,
+            associative_valid_count=written,
+            readout_target_cosine_mean=readout_target_cosine_mean,
+            post_write_cosine_mean=post_write_cosine_mean,
+            readout_share_mean=readout_share_mean,
+            memory_norm_max=memory_norm_max,
+            write_norm_mean=write_norm_mean,
+            eta_sum_mean=eta_sum_mean,
+            renormalized_fraction=renormalized_fraction,
+            slots_written_total=slots_written_total,
             bank_record_count=bank_record_count,
             empty_bank_count=empty_bank_count,
-            active_head_counts=active_head_counts,
-            valid_target_counts=valid_target_counts,
-            unsupported_target_count=unsupported_target_count,
-            empty_target_skip_count=empty_target_skip_count,
-            prediction_target_cosine_mean=prediction_target_cosine_mean,
         )
         episode_audit = TruncatedMetaTTTEpisodeAudit(
             associative_contract=ASSOCIATIVE_CONTRACT,
             adaptation_mode=self.adaptation_mode,
             ttt_enabled=self.ttt_enabled,
-            associative_valid_count=updated,
+            associative_valid_count=written,
             loss_weight=episode_weight,
             support_count=support_count,
             query_count=query_count,
@@ -1676,26 +1616,19 @@ class MetaTTTEpisodeRunner:
             deferred_vjp_backward_count=len(segment_audits),
             truncation_count=len(segment_audits),
             maximum_retained_support_graphs=maximum_retained,
-            update_attempt_count=attempted,
-            update_count=updated,
-            skip_count=attempted - updated,
-            associative_loss_mean=associative_loss_mean,
-            key_rms=rms(associative_key_sum_squares, associative_elements),
-            value_rms=rms(associative_value_sum_squares, associative_elements),
-            prediction_rms=rms(associative_prediction_sum_squares, associative_elements),
-            error_rms=rms(associative_error_sum_squares, associative_elements),
-            key_max_abs=float(associative_key_max_abs.item()),
-            value_max_abs=float(associative_value_max_abs.item()),
-            prediction_max_abs=float(associative_prediction_max_abs.item()),
-            error_max_abs=float(associative_error_max_abs.item()),
-            associative_element_count=associative_elements,
+            write_attempt_count=attempted,
+            write_count=written,
+            skip_count=attempted - written,
+            readout_target_cosine_mean=readout_target_cosine_mean,
+            post_write_cosine_mean=post_write_cosine_mean,
+            readout_share_mean=readout_share_mean,
+            memory_norm_max=memory_norm_max,
+            write_norm_mean=write_norm_mean,
+            eta_sum_mean=eta_sum_mean,
+            renormalized_fraction=renormalized_fraction,
+            slots_written_total=slots_written_total,
             bank_record_count=bank_record_count,
             empty_bank_count=empty_bank_count,
-            active_head_counts=active_head_counts,
-            valid_target_counts=valid_target_counts,
-            unsupported_target_count=unsupported_target_count,
-            empty_target_skip_count=empty_target_skip_count,
-            prediction_target_cosine_mean=prediction_target_cosine_mean,
             parameter_versions_unchanged_before_outer_step=versions_before == versions_after,
             bank_context_detached=True,
             support_supervision_reachable=False,
@@ -1707,14 +1640,13 @@ class MetaTTTEpisodeRunner:
                 query.counterfactual is not None for query in query_audits
             ),
             segments=tuple(segment_audits),
-            updates=tuple(update_audits),
+            writes=tuple(write_audits),
             queries=tuple(query_audits),
         )
         return TruncatedMetaTTTEpisodeOutput(
             total=detached_total,
             query_loss=detached_query,
             final_fast_states=adapted.fast_states,
-            final_optimizer_states=adapted.optimizer_states,
             final_runtime=adapted.runtime,
             audit=episode_audit,
         )
@@ -1731,18 +1663,16 @@ class MetaTTTEpisodeRunner:
             raise ValueError("A5 production segment exceeds the configured truncation horizon")
         if episode.seed != stage.seed:
             raise ValueError("A5 episode seed must equal the fixed Stage C seed")
-        if self.config.fast_ttt.optimizer.momentum != 0.0:
-            raise ValueError("truncated A5 currently requires stateless momentum=0 Inner SGD")
 
     @staticmethod
-    def _reanchor_trajectory(
+    def _truncate_trajectory(
         trajectory: _Trajectory,
-    ) -> tuple[FastReanchorAudit, ...]:
-        pairs = tuple(reanchor_fast_state(state) for state in trajectory.fast_states)
+    ) -> tuple[MemoryTruncateAudit, ...]:
+        pairs = tuple(truncate_memory_state(state) for state in trajectory.fast_states)
         trajectory.fast_states = tuple(state for state, _ in pairs)
-        values = tuple(value for state in trajectory.fast_states for value in state.fast_parameters)
+        values = tuple(state.m for state in trajectory.fast_states)
         if len({tensor_storage_key(value) for value in values}) != len(values):
-            raise ValueError("re-anchored batched fast states must remain storage-isolated")
+            raise ValueError("truncated batched memory states must remain storage-isolated")
         return tuple(audit for _, audit in pairs)
 
     def _reset_trajectory(
@@ -1759,16 +1689,16 @@ class MetaTTTEpisodeRunner:
             self.fast_controller.reset_fast_state(differentiable=differentiable)
             for _ in owner.video_ids
         )
-        optimizer_states = tuple(
-            reset_optimizer_state(self.config.fast_ttt.optimizer) for _ in owner.video_ids
-        )
         if any(
-            state.fast_version or state.update_count or state.skip_count for state in fast_states
+            state.write_version or state.write_count or state.skip_count for state in fast_states
         ):
-            raise ValueError("fresh Meta-TTT fast states must reset all counters")
-        if any(state.optimizer_name != "sgd" for state in optimizer_states):
-            raise ValueError("fresh Meta-TTT optimizer state must use SGD")
-        return _Trajectory(runtime.with_fast_states(fast_states, optimizer_states))
+            raise ValueError("fresh Meta-TTT memory states must reset all counters")
+        if any(
+            state.m.device.type != "meta" and bool(torch.count_nonzero(state.m.detach()))
+            for state in fast_states
+        ):
+            raise ValueError("fresh Meta-TTT memory states must start at exact zero")
+        return _Trajectory(runtime.with_fast_states(fast_states))
 
     def _observe(
         self,
@@ -1794,9 +1724,9 @@ class MetaTTTEpisodeRunner:
             output = self.model.observe_chunk(request, lifecycle)
         audit = self.fast_controller.last_audit
         if not isinstance(audit, FastTTTForwardAudit) or not audit.used_runtime_state:
-            raise ValueError("Meta-TTT observe did not consume the managed FastWeightsState")
-        expected = tuple(state.fast_version for state in trajectory.fast_states)
-        if audit.fast_versions != expected:
+            raise ValueError("Meta-TTT observe did not consume the managed FastMemoryState")
+        expected = tuple(state.write_version for state in trajectory.fast_states)
+        if audit.write_versions != expected:
             raise ValueError("Fast Adapter audit version disagrees with the bound trajectory")
         return output, audit
 
@@ -1861,7 +1791,7 @@ class MetaTTTEpisodeRunner:
         observation: ObservationChunkOutput,
         lifecycle: PrefillLifecycle,
         *,
-        fast_states: Sequence[FastWeightsState],
+        fast_states: Sequence[FastMemoryState],
         with_grad: bool,
     ) -> StateTTTModelOutput:
         request = answer_query_request(observation.owner, observation, query.answer)
@@ -1880,11 +1810,11 @@ class MetaTTTEpisodeRunner:
         query: MetaTTTQueryPoint,
         query_weight: float,
         query_runtime_snapshot: BatchRuntimeState,
-        reference_states: tuple[FastWeightsState, ...],
+        reference_states: tuple[FastMemoryState, ...],
         balance_audit: OfficialWeakBalanceAudit | None,
         seed: int,
     ) -> float:
-        """Evaluate one no-grad fast-weight reference without committing any runtime state."""
+        """Evaluate one no-grad memory reference without committing any runtime state."""
 
         reference = _Trajectory(
             _fork_retrieval_runtime(query_runtime_snapshot).with_fast_states(reference_states)
@@ -2015,52 +1945,44 @@ class MetaTTTEpisodeRunner:
         return tuple(outputs)
 
 
-def _make_inner_update_audit(
+def _make_memory_write_audit(
     *,
     support_index: int,
     chunk: MetaCausalChunk,
     before_versions: tuple[int, ...],
     observed_fast_audit: FastTTTForwardAudit,
-    results: tuple[FunctionalSGDResult, ...],
-    associative_output: AssociativeTTTLossOutput,
-    bank_record_counts: tuple[int, ...],
+    results: tuple[MemoryWriteResult, ...],
     runtime: object,
     after_versions: tuple[int, ...],
-) -> InnerUpdateAudit:
+) -> MemoryWriteAudit:
     expected_after = tuple(
-        before + int(result.did_update)
+        before + int(result.did_write)
         for before, result in zip(before_versions, results, strict=True)
     )
     next_only = (
-        observed_fast_audit.fast_versions == before_versions and after_versions == expected_after
+        observed_fast_audit.write_versions == before_versions and after_versions == expected_after
     )
-    return InnerUpdateAudit(
+    return MemoryWriteAudit(
         support_index=support_index,
         start_time=chunk.start_time,
         end_time=chunk.end_time,
-        fast_versions_before=before_versions,
-        fast_versions_observed=observed_fast_audit.fast_versions,
-        fast_versions_after=after_versions,
-        did_update=tuple(result.did_update for result in results),
+        write_versions_before=before_versions,
+        write_versions_observed=observed_fast_audit.write_versions,
+        write_versions_after=after_versions,
+        did_write=tuple(result.did_write for result in results),
         skip_reasons=tuple(
             None if result.skip_reason is None else result.skip_reason.value for result in results
         ),
-        gradient_norms=tuple(result.gradient_norm for result in results),
-        update_norms=tuple(result.update_norm for result in results),
-        master_changed_fractions=tuple(
-            result.master_changed_fraction for result in results
-        ),
-        bf16_shadow_changed_fractions=tuple(
-            result.bf16_shadow_changed_fraction for result in results
-        ),
-        master_delta_norms=observed_fast_audit.master_delta_norms,
-        fast_core_prediction_delta_norms=(
-            observed_fast_audit.fast_core_prediction_delta_norms
-        ),
-        valid_token_counts=tuple(
-            int(value.item()) for value in associative_output.valid_token_counts
-        ),
-        bank_record_counts=bank_record_counts,
+        slots_written=tuple(result.slots_written for result in results),
+        eta_sums=tuple(result.eta_sum for result in results),
+        eta_renormalized=tuple(result.eta_renormalized for result in results),
+        pre_write_cosine_means=tuple(result.pre_write_cosine_mean for result in results),
+        post_write_cosine_means=tuple(result.post_write_cosine_mean for result in results),
+        write_norms=tuple(result.write_norm for result in results),
+        memory_norms=tuple(result.memory_norm for result in results),
+        readout_shares=observed_fast_audit.readout_share_norms,
+        valid_token_counts=observed_fast_audit.valid_token_counts,
+        bank_record_counts=observed_fast_audit.bank_record_counts,
         runtime_detached=not _contains_grad_tensor(runtime),
         next_only_verified=next_only,
     )
@@ -2102,7 +2024,7 @@ def _proxy_gradient_status(
     *,
     episode_weight: float,
 ) -> str:
-    """Classify a zero Query-to-fast cotangent without changing the loss path."""
+    """Classify a zero Query-to-memory cotangent without changing the loss path."""
 
     if any(value > 0.0 for value in norms):
         return "nonzero"
@@ -2148,25 +2070,39 @@ def _runtime_from_observation(
 
 
 def _snapshot_reference_fast_states(
-    states: Sequence[FastWeightsState],
-) -> tuple[FastWeightsState, ...]:
-    """Copy numeric fast state into isolated leaves with no edge to the Support graph."""
+    states: Sequence[FastMemoryState],
+) -> tuple[FastMemoryState, ...]:
+    """Copy numeric memory state into isolated leaves with no edge to the Support graph."""
 
-    snapshots: list[FastWeightsState] = []
+    snapshots: list[FastMemoryState] = []
     for state in states:
         snapshots.append(
-            FastWeightsState(
-                w0_1=state.w0_1.detach().clone(),
-                w0_2=state.w0_2.detach().clone(),
-                w_t_1=state.w_t_1.detach().clone().requires_grad_(True),
-                w_t_2=state.w_t_2.detach().clone().requires_grad_(True),
-                fast_version=state.fast_version,
-                update_count=state.update_count,
+            FastMemoryState(
+                m=state.m.detach().clone().requires_grad_(True),
+                write_version=state.write_version,
+                write_count=state.write_count,
                 skip_count=state.skip_count,
                 differentiable=False,
             )
         )
     return tuple(snapshots)
+
+
+def _zero_reference_fast_states(
+    states: Sequence[FastMemoryState],
+) -> tuple[FastMemoryState, ...]:
+    """Build the exact M=0 counterfactual reference for each batch row."""
+
+    return tuple(
+        FastMemoryState(
+            m=torch.zeros_like(state.m.detach()).requires_grad_(True),
+            write_version=0,
+            write_count=0,
+            skip_count=0,
+            differentiable=False,
+        )
+        for state in states
+    )
 
 
 @contextmanager
@@ -2191,8 +2127,8 @@ def _temporarily_clear_module_parameter_gradients(
 
 
 def _query_descent_cosine(
-    adapted_states: Sequence[FastWeightsState],
-    reference_states: Sequence[FastWeightsState],
+    adapted_states: Sequence[FastMemoryState],
+    reference_states: Sequence[FastMemoryState],
     gradients: Sequence[Tensor],
 ) -> float:
     adapted = tuple(value for state in adapted_states for value in state.fast_parameters)
@@ -2237,7 +2173,7 @@ def _plain_backward(loss: Tensor, retain_graph: bool = False) -> None:
 
 
 def _capture_query_proxy_gradients(
-    states: Sequence[FastWeightsState],
+    states: Sequence[FastMemoryState],
     *,
     backward_gradient_scale: float,
 ) -> tuple[tuple[Tensor, ...], tuple[float, ...]]:
@@ -2245,13 +2181,13 @@ def _capture_query_proxy_gradients(
 
     values = tuple(value for state in states for value in state.fast_parameters)
     if not values:
-        raise ValueError("Query proxy gradient capture requires fast matrices")
+        raise ValueError("Query proxy gradient capture requires memory matrices")
     gradients: list[Tensor] = []
     norms: list[float] = []
     for value in values:
         gradient = value.grad
         if gradient is None:
-            raise ValueError("Query loss did not produce a gradient for every proxy fast matrix")
+            raise ValueError("Query loss did not produce a gradient for every proxy memory matrix")
         unscaled = gradient.detach().float().clone().div_(backward_gradient_scale)
         if not bool(torch.isfinite(unscaled).all()):
             raise ValueError("Query proxy gradient must be finite after backward unscale")
@@ -2276,10 +2212,10 @@ def _clip_query_proxy_gradients(
         for gradient in values
     ):
         raise ValueError("Query cotangent clipping requires detached FP32 gradients")
-    if not math.isfinite(max_norm) or max_norm != 1.0:
-        raise ValueError("Query cotangent max_norm must be the frozen value 1.0")
-    if not math.isfinite(epsilon) or epsilon != 1.0e-12:
-        raise ValueError("Query cotangent epsilon must be the frozen value 1e-12")
+    if not math.isfinite(max_norm) or max_norm <= 0.0:
+        raise ValueError("Query cotangent max_norm must be finite and positive")
+    if not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError("Query cotangent epsilon must be finite and positive")
     raw_norm = _cotangent_norm_float(values)
     scale = min(1.0, max_norm / max(raw_norm, epsilon))
     clipped = tuple(gradient * scale for gradient in values)
@@ -2289,6 +2225,7 @@ def _clip_query_proxy_gradients(
         clipped_joint_norm=clipped_norm,
         clip_scale=scale,
         clipped=scale < 1.0,
+        max_norm=max_norm,
     )
 
 
@@ -2326,13 +2263,13 @@ class _SeededRNG:
         self.context.__exit__(exc_type, exc, traceback)
 
 
-def _seeded_rng(seed: int, states: Sequence[FastWeightsState]) -> _SeededRNG:
+def _seeded_rng(seed: int, states: Sequence[FastMemoryState]) -> _SeededRNG:
     devices = tuple(
         sorted(
             {
-                cast(int, state.w_t_1.device.index)
+                cast(int, state.m.device.index)
                 for state in states
-                if state.w_t_1.device.type == "cuda" and state.w_t_1.device.index is not None
+                if state.m.device.type == "cuda" and state.m.device.index is not None
             }
         )
     )

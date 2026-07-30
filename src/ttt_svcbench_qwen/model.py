@@ -32,7 +32,7 @@ from ttt_svcbench_qwen.associative_ttt import (
 )
 from ttt_svcbench_qwen.config import ProjectConfig
 from ttt_svcbench_qwen.data import RuntimeQueryInput
-from ttt_svcbench_qwen.fast_ttt import FastWeightsState, OptimizerRuntimeState
+from ttt_svcbench_qwen.fast_ttt import FastMemoryState
 from ttt_svcbench_qwen.identity_bank import IdentityBankRuntimeState
 from ttt_svcbench_qwen.input_composer import ComposedInput
 from ttt_svcbench_qwen.observation_heads import (
@@ -104,8 +104,7 @@ class TrajectoryRuntimeState:
     state_bank: StateBankRuntimeState
     identity_bank: IdentityBankRuntimeState
     retrieval_history: TensorizedRetrievalHistory | None = None
-    fast_weights: FastWeightsState | None = None
-    optimizer: OptimizerRuntimeState | None = None
+    fast_weights: FastMemoryState | None = None
     reader_audit: tuple[ReaderResult, ...] = ()
     released: bool = False
 
@@ -114,8 +113,6 @@ class TrajectoryRuntimeState:
             raise ValueError("trajectory runtime owner must contain exactly one row")
         if type(self.next_chunk_index) is not int or self.next_chunk_index < 0:
             raise ValueError("trajectory next_chunk_index must be non-negative")
-        if (self.fast_weights is None) != (self.optimizer is None):
-            raise ValueError("fast weights and optimizer state must be both present or both absent")
         video_id = self.video_id
         trajectory_id = self.trajectory_id
         for name, state in (("State Bank", self.state_bank), ("Identity Bank", self.identity_bank)):
@@ -241,35 +238,22 @@ class BatchRuntimeState:
         return self.state_bank_states
 
     @property
-    def fast_states(self) -> tuple[FastWeightsState, ...]:
+    def fast_states(self) -> tuple[FastMemoryState, ...]:
         if any(row.fast_weights is None for row in self.rows):
             raise ValueError("batch runtime has no fast state")
         return tuple(row.fast_weights for row in self.rows if row.fast_weights is not None)
 
-    @property
-    def optimizer_states(self) -> tuple[OptimizerRuntimeState, ...]:
-        if any(row.optimizer is None for row in self.rows):
-            raise ValueError("batch runtime has no optimizer state")
-        return tuple(row.optimizer for row in self.rows if row.optimizer is not None)
-
     def with_fast_states(
         self,
-        fast_states: Sequence[FastWeightsState],
-        optimizer_states: Sequence[OptimizerRuntimeState] | None = None,
+        fast_states: Sequence[FastMemoryState],
     ) -> BatchRuntimeState:
         fast = tuple(fast_states)
-        optimizers = self.optimizer_states if optimizer_states is None else tuple(optimizer_states)
-        if len(fast) != len(self.rows) or len(optimizers) != len(self.rows):
-            raise ValueError("fast/optimizer states must align to batch runtime rows")
+        if len(fast) != len(self.rows):
+            raise ValueError("fast states must align to batch runtime rows")
         return BatchRuntimeState(
             tuple(
-                replace(row, fast_weights=fast_state, optimizer=optimizer_state)
-                for row, fast_state, optimizer_state in zip(
-                    self.rows,
-                    fast,
-                    optimizers,
-                    strict=True,
-                )
+                replace(row, fast_weights=fast_state)
+                for row, fast_state in zip(self.rows, fast, strict=True)
             )
         )
 

@@ -24,7 +24,7 @@ from ttt_svcbench_qwen.associative_ttt import (
     FastAssociativeContext,
 )
 from ttt_svcbench_qwen.config import AuditLevel, ProjectConfig, load_config
-from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter, FastWeightsState, build_fast_ttt_adapter
+from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter, build_fast_ttt_adapter
 from ttt_svcbench_qwen.identity_bank import IdentityBank, build_identity_bank
 from ttt_svcbench_qwen.inference import (
     AnswerInputs,
@@ -103,7 +103,6 @@ def _manager(
         fast_adapter=dependencies.fast_adapter,
         state_bank=dependencies.state_bank,
         identity_bank=dependencies.identity_bank,
-        optimizer_config=dependencies.config.fast_ttt.optimizer,
         audit_level=audit_level,
         hot_cache_enabled=False,
     )
@@ -181,9 +180,9 @@ class _FakeSuite:
         runtime = batch.rows[0]
         assert runtime.fast_weights is not None
         chunk = cast(CausalChunk, request.video_input)
-        self.fast_versions.append(runtime.fast_weights.fast_version)
+        self.fast_versions.append(runtime.fast_weights.write_version)
         self.seen_frames.append(chunk.frames)
-        value = (chunk.frames, runtime.fast_weights.fast_version)
+        value = (chunk.frames, runtime.fast_weights.write_version)
         return VisualStageOutput(value=value)
 
     @staticmethod
@@ -321,7 +320,7 @@ class _FakeSuite:
         if self.fast_adapter is None or self.fast_adapter._active_fast_states is None:
             raise RuntimeError("tiny Answer generation requires one managed fast-state binding")
         active = self.fast_adapter._active_fast_states
-        self.answer_fast_versions.append(tuple(state.fast_version for state in active))
+        self.answer_fast_versions.append(tuple(state.write_version for state in active))
         dtype = self.fast_adapter.w0_1.dtype
         device = self.fast_adapter.w0_1.device
         self.fast_adapter(torch.zeros((len(active), 1, 4096), dtype=dtype, device=device))
@@ -329,7 +328,7 @@ class _FakeSuite:
             state = self.mutate_manager.active_runtime
             assert state is not None and state.fast_weights is not None
             with torch.no_grad():
-                state.fast_weights.w_t_1.add_(0.5)
+                state.fast_weights.m.add_(0.5)
         signature = (
             request.prefill.pixel_values_videos.shape[0],
             tuple(int(value) for value in request.prefill.video_grid_thw[0].tolist()),
@@ -464,9 +463,7 @@ class _TypedStageSuite(_FakeSuite):
         output = _typed_temporal(cast(QueryEncoderOutput, query))
         runtime = cast(BatchRuntimeState, request.runtime_state).rows[0]
         assert runtime.fast_weights is not None
-        fast_dependency = 1000.0 * (
-            runtime.fast_weights.w_t_1[0, 0] + runtime.fast_weights.w_t_2[0, 0]
-        )
+        fast_dependency = 1000.0 * runtime.fast_weights.m[0, 0]
         return replace(output, hidden=output.hidden + fast_dependency)
 
     @staticmethod
@@ -577,50 +574,32 @@ class _Updater:
         call = self.calls
         self.calls += 1
         fast = runtime.fast_weights
-        optimizer = runtime.optimizer
-        assert fast is not None and optimizer is not None
+        assert fast is not None
         if call in self.skip_calls:
-            reason = "no_valid_token"
+            reason = "no_valid_slot"
             return TTTUpdateOutcome(
                 runtime_state=replace(
                     runtime,
                     fast_weights=replace(fast, skip_count=fast.skip_count + 1),
-                    optimizer=replace(
-                        optimizer,
-                        attempted_update_count=optimizer.attempted_update_count + 1,
-                        last_skip_reason=reason,
-                    ),
                 ),
                 did_update=False,
                 skip_reason=reason,
                 valid_token_count=0,
             )
         with torch.no_grad():
-            next_w1 = (fast.w_t_1 - 1.0e-4).detach().clone().requires_grad_(True)
-            next_w2 = (fast.w_t_2 + 1.0e-4).detach().clone().requires_grad_(True)
-        next_fast = FastWeightsState(
-            w0_1=fast.w0_1,
-            w0_2=fast.w0_2,
-            w_t_1=next_w1,
-            w_t_2=next_w2,
-            fast_version=fast.fast_version + 1,
-            update_count=fast.update_count + 1,
-            skip_count=fast.skip_count,
+            next_memory = (fast.m + 1.0e-4).detach().clone().requires_grad_(True)
+        next_fast = replace(
+            fast,
+            m=next_memory,
+            write_version=fast.write_version + 1,
+            write_count=fast.write_count + 1,
         )
         return TTTUpdateOutcome(
-            runtime_state=replace(
-                runtime,
-                fast_weights=next_fast,
-                optimizer=replace(
-                    optimizer,
-                    attempted_update_count=optimizer.attempted_update_count + 1,
-                    last_skip_reason=None,
-                ),
-            ),
+            runtime_state=replace(runtime, fast_weights=next_fast),
             did_update=True,
             skip_reason=None,
             valid_token_count=1,
-            loss_value=0.25,
+            pre_write_cosine=0.25,
         )
 
 
@@ -664,7 +643,7 @@ def test_reset_isolates_consecutive_videos_and_matches_pristine_stamp(
     first = manager.reset("video-a", "trajectory-a", torch.zeros(512))
     first_state = manager.active_runtime
     assert first_state is not None
-    first_pointer = first_state.fast_weights.w_t_1.untyped_storage().data_ptr()
+    first_pointer = first_state.fast_weights.m.untyped_storage().data_ptr()
 
     second = manager.reset("video-b", "trajectory-b", torch.ones(512))
     second_state = manager.active_runtime
@@ -675,15 +654,15 @@ def test_reset_isolates_consecutive_videos_and_matches_pristine_stamp(
     assert second.previous_release is not None
     assert second.reset.boundary is not None
     assert second.reset.content_sha256 is None
-    assert second_state.fast_weights.fast_version == 0
-    assert second_state.optimizer.attempted_update_count == 0
+    assert second_state.fast_weights.write_version == 0
+    assert torch.count_nonzero(second_state.fast_weights.m.detach()) == 0
     assert second_state.temporal_cache.hidden.shape[1] == 0
     assert second_state.slot_state is None
     assert second_state.e1_state is None and second_state.e2_state is None
     assert second_state.state_bank.records == ()
     assert second_state.identity_bank.candidates == ()
     assert second_state.reader_audit == ()
-    assert second_state.fast_weights.w_t_1.untyped_storage().data_ptr() != first_pointer
+    assert second_state.fast_weights.m.untyped_storage().data_ptr() != first_pointer
     manager.release()
 
 
@@ -701,10 +680,10 @@ def test_causal_chunks_next_only_updates_and_generation_immutability(
 
     assert suite.fast_versions == [0, 1]
     assert suite.seen_frames == [("a", "b"), ("c",)]
-    assert tuple(audit.fast_version_used for audit in result.chunk_audit) == (0, 1)
-    assert tuple(audit.next_fast_version for audit in result.chunk_audit) == (1, 1)
+    assert tuple(audit.write_version_used for audit in result.chunk_audit) == (0, 1)
+    assert tuple(audit.next_write_version for audit in result.chunk_audit) == (1, 1)
     assert result.chunk_audit[1].future_frame_count == 1
-    assert result.chunk_audit[1].skip_reason == "no_valid_token"
+    assert result.chunk_audit[1].skip_reason == "no_valid_slot"
     assert result.generate_audit.prefill_count == 1
     assert result.generate_audit.decode_count == 0
     assert result.generate_audit.state_before == result.generate_audit.state_after
@@ -810,7 +789,7 @@ def test_boundary_stamp_never_moves_tensor_contents_to_cpu(
     monkeypatch.setattr(Tensor, "to", reject_cpu)
     stamp = runtime_boundary_stamp(runtime)
 
-    assert stamp.fast_version == 0
+    assert stamp.write_version == 0
     assert stamp.tensor_versions
 
 
@@ -876,7 +855,7 @@ def test_reader_statuses_and_explicit_retry_use_one_prefill_each(
     runtime = manager.active_runtime
     assert runtime is not None and runtime.fast_weights is not None
     assert suite.answer_fast_versions == [
-        (runtime.fast_weights.fast_version,),
+        (runtime.fast_weights.write_version,),
     ] * len(statuses)
     assert suite.fast_adapter is not None
     assert suite.fast_adapter._active_fast_states is None
@@ -928,7 +907,6 @@ def test_unified_runtime_commits_real_hard_state(dependencies: _Dependencies) ->
         fast_adapter=dependencies.fast_adapter,
         state_bank=dependencies.state_bank,
         identity_bank=dependencies.identity_bank,
-        optimizer_config=dependencies.config.fast_ttt.optimizer,
         hot_cache_enabled=False,
     )
     manager.reset("video-a", "trajectory-a", torch.zeros(512))
@@ -952,7 +930,6 @@ def test_unified_runtime_commits_real_hard_state(dependencies: _Dependencies) ->
     assert len(runtime.state_bank.records) == 1
     assert runtime.state_bank.records[0].head_type is HeadType.O1
     assert runtime.identity_bank.video_id == "video-a"
-    assert runtime.optimizer is not None and runtime.optimizer.attempted_update_count == 1
     manager.release()
 
 
@@ -963,7 +940,7 @@ def test_online_updater_uses_association_and_publishes_next_only_fast_state(
     suite = _TypedStageSuite()
     manager = _manager(dependencies)
     model = _stage_a_model(dependencies, suite)
-    updater = OnlineTTTUpdater(dependencies.config)
+    updater = OnlineTTTUpdater(dependencies.config, dependencies.fast_adapter)
     manager.reset("video-a", "trajectory-a", torch.zeros(512))
 
     first = manager.observe_chunk(
@@ -973,10 +950,10 @@ def test_online_updater_uses_association_and_publishes_next_only_fast_state(
         query_time=3.0,
         updater=updater,
     )
-    assert first.audit.fast_version_used == 0
+    assert first.audit.write_version_used == 0
     assert first.audit.did_update, first.audit.skip_reason
-    assert first.audit.next_fast_version == 1
-    assert first.audit.step_size == pytest.approx(1.0e-4)
+    assert first.audit.next_write_version == 1
+    assert first.audit.pre_write_cosine is not None
     assert first.audit.valid_token_count > 0
 
     second = manager.observe_chunk(
@@ -986,9 +963,9 @@ def test_online_updater_uses_association_and_publishes_next_only_fast_state(
         query_time=3.0,
         updater=updater,
     )
-    assert second.audit.fast_version_used == 1
-    assert second.audit.next_fast_version == 2
-    assert second.audit.step_size == pytest.approx(1.0e-4)
+    assert second.audit.write_version_used == 1
+    assert second.audit.next_write_version == 2
+    assert second.audit.pre_write_cosine is not None
     assert second.audit.valid_token_count > 0
     manager.release()
 

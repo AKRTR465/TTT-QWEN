@@ -197,10 +197,10 @@ def test_a5_outer_parameter_audit_rejects_frozen_state_parameter() -> None:
         )
 
 
-def test_static_w0_outer_parameter_audit_requires_frozen_associative() -> None:
+def test_no_write_outer_parameter_audit_requires_frozen_memory_interface() -> None:
     audit = OuterParameterAudit(
         stage=ProductionStage.A5,
-        a5_adaptation_mode="static_w0",
+        a5_adaptation_mode="no_write",
         total_parameter_count=100,
         trainable_parameter_count=60,
         qwen_parameter_count=60,
@@ -214,10 +214,10 @@ def test_static_w0_outer_parameter_audit_requires_frozen_associative() -> None:
     )
 
     assert audit.associative_trainable_count == 0
-    with pytest.raises(ValueError, match="Associative must remain frozen"):
+    with pytest.raises(ValueError, match="memory-interface parameters must remain frozen"):
         OuterParameterAudit(
             stage=ProductionStage.A5,
-            a5_adaptation_mode="static_w0",
+            a5_adaptation_mode="no_write",
             total_parameter_count=100,
             trainable_parameter_count=61,
             qwen_parameter_count=60,
@@ -1457,7 +1457,7 @@ def test_a5_fast_state_warmup_yaml_and_launcher_are_restart_only(
     assert 'TTT_SKIP_ENV_SETUP="${TTT_SKIP_ENV_SETUP:-1}"' in launcher
 
 
-def test_a5_static_w0_yaml_and_launcher_match_meta_ttt_data_contract(
+def test_a5_no_write_yaml_and_launcher_match_meta_ttt_data_contract(
     h200_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1472,11 +1472,11 @@ def test_a5_static_w0_yaml_and_launcher_match_meta_ttt_data_contract(
         ROOT / "configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml"
     )
     static_native, static = load_training_yaml(
-        ROOT / "configs/h200/a5_static_w0_k8_vithalf_decoder8_4gpu.yaml"
+        ROOT / "configs/h200/a5_no_write_k8_vithalf_decoder8_4gpu.yaml"
     )
 
     assert meta.a5_adaptation_mode == "meta_ttt"
-    assert static.a5_adaptation_mode == "static_w0"
+    assert static.a5_adaptation_mode == "no_write"
     assert static.stage == meta.stage == "a5"
     assert static.dataset_manifest == meta.dataset_manifest == "/tmp/v4_manifest.json"
     assert static.initialize_from_a2_checkpoint == meta.initialize_from_a2_checkpoint
@@ -1492,8 +1492,8 @@ def test_a5_static_w0_yaml_and_launcher_match_meta_ttt_data_contract(
     ):
         assert static_native[key] == meta_native[key]
 
-    launcher = (ROOT / "scripts/h200/train_a5_static_w0_ablation.sh").read_text(encoding="utf-8")
-    assert 'TTT_A5_ADAPTATION_MODE="static_w0"' in launcher
+    launcher = (ROOT / "scripts/h200/train_a5_no_write_ablation.sh").read_text(encoding="utf-8")
+    assert 'TTT_A5_ADAPTATION_MODE="no_write"' in launcher
     assert "a5_dense_querybundle_train_support_statequery_fp16_v4" in launcher
     assert 'TTT_CHECKPOINT_POLICY="atomic_final_only"' in launcher
     assert 'TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"' in launcher
@@ -1777,8 +1777,8 @@ def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Pa
         "0715_010203_a5",
         run_config={
             "stage": "a5",
-            "config_schema_version": 12,
-            "associative_ttt_contract": "bank_conditioned_state_write_v2",
+            "config_schema_version": 13,
+            "associative_ttt_contract": "bank_conditioned_slot_memory_v3",
         },
     )
 
@@ -1789,7 +1789,7 @@ def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Pa
         resolve_same_stage_resume(
             str(checkpoint),
             ProductionStage.A5,
-            a5_adaptation_mode="static_w0",
+            a5_adaptation_mode="no_write",
         )
 
     orphan = _resume_run(tmp_path, "orphan", run_config=None)
@@ -1797,15 +1797,15 @@ def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Pa
         resolve_same_stage_resume(str(orphan), ProductionStage.A5)
 
 
-def test_same_stage_resume_accepts_only_matching_static_w0_mode(tmp_path: Path) -> None:
+def test_same_stage_resume_accepts_only_matching_no_write_mode(tmp_path: Path) -> None:
     checkpoint = _resume_run(
         tmp_path,
         "static-w0",
         run_config={
             "stage": "a5",
-            "a5_adaptation_mode": "static_w0",
-            "config_schema_version": 12,
-            "associative_ttt_contract": "bank_conditioned_state_write_v2",
+            "a5_adaptation_mode": "no_write",
+            "config_schema_version": 13,
+            "associative_ttt_contract": "bank_conditioned_slot_memory_v3",
         },
     )
 
@@ -1813,7 +1813,7 @@ def test_same_stage_resume_accepts_only_matching_static_w0_mode(tmp_path: Path) 
         resolve_same_stage_resume(
             str(checkpoint),
             ProductionStage.A5,
-            a5_adaptation_mode="static_w0",
+            a5_adaptation_mode="no_write",
         )
         == checkpoint
     )
@@ -1834,7 +1834,7 @@ def test_same_stage_resume_rejects_legacy_associative_contract(
         },
     )
 
-    with pytest.raises(ValueError, match="schema-12 state-write associative"):
+    with pytest.raises(ValueError, match="schema-13 slot-memory"):
         resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
 
 
@@ -2507,7 +2507,7 @@ def test_explicit_smoke_disables_all_periodic_checkpoints() -> None:
         ),
         (
             ProductionStage.A5,
-            "static_w0",
+            "no_write",
             False,
             {
                 "qwen": 5.0e-6,
@@ -2643,6 +2643,7 @@ def test_warmup_qwen_bitwise_audit_reports_parameter_and_buffer_drift(
     tmp_path: Path,
 ) -> None:
     qwen = nn.Linear(8, 8, bias=False)
+    qwen.register_buffer("rope_scale", torch.zeros(2), persistent=True)
     qwen.register_buffer("state_counter", torch.zeros(2), persistent=False)
     qwen.requires_grad_(False)
     auditor = trainer_module._WarmupQwenBitwiseAuditor(qwen)
@@ -2650,6 +2651,9 @@ def test_warmup_qwen_bitwise_audit_reports_parameter_and_buffer_drift(
 
     with torch.no_grad():
         qwen.weight[0, 0].add_(1.0)
+        qwen.rope_scale[0].add_(1.0)
+        # Non-persistent runtime scratch legitimately changes and must never
+        # produce a false "Qwen changed" verdict.
         qwen.state_counter[0].add_(1.0)
     audit = auditor.finalize(device=torch.device("cpu"))
     changed = {change.name: change for change in audit.changed_tensors}
@@ -2659,7 +2663,9 @@ def test_warmup_qwen_bitwise_audit_reports_parameter_and_buffer_drift(
     assert audit.changed_parameter_count == 1
     assert audit.changed_buffer_count == 1
     assert changed["weight"].change_type == "content"
-    assert changed["state_counter"].change_type == "content"
+    assert changed["rope_scale"].change_type == "content"
+    assert "state_counter" not in changed
+    assert audit.excluded_non_persistent_buffers == ("state_counter",)
     rank_path, canonical_path = trainer_module._write_warmup_qwen_bitwise_audit(
         artifact_root=tmp_path,
         audit=audit,
@@ -2670,8 +2676,9 @@ def test_warmup_qwen_bitwise_audit_reports_parameter_and_buffer_drift(
     assert persisted["changed_tensor_count"] == 2
     assert {item["name"] for item in persisted["changed_tensors"]} == {
         "weight",
-        "state_counter",
+        "rope_scale",
     }
+    assert persisted["excluded_non_persistent_buffers"] == ["state_counter"]
     with pytest.raises(RuntimeError, match="post-DeepSpeed"):
         trainer_module._assert_warmup_qwen_bitwise_unchanged(audit)
 
@@ -2841,13 +2848,16 @@ def test_optimizer_rejects_noncanonical_budget_drift(tmp_path: Path) -> None:
         make_production_outer_optimizer_factory(bundle, ProductionStage.A5)(model)
 
 
-def test_outer_optimizer_rejects_removed_step_controller_parameters(
+def test_outer_optimizer_rejects_the_transient_per_video_memory(
     tmp_path: Path,
 ) -> None:
     bundle, model = _grouped_bundle(tmp_path, load_config())
-    model.step_controller = nn.Linear(7, 1)
+    model.register_parameter(
+        "m",
+        nn.Parameter(torch.zeros((4, 4), dtype=torch.float32)),
+    )
 
-    with pytest.raises(ValueError, match="step-controller parameters were removed"):
+    with pytest.raises(ValueError, match="transient per-video memory"):
         make_production_outer_optimizer_factory(
             bundle,
             ProductionStage.A5,

@@ -5,8 +5,8 @@ from ttt_svcbench_qwen.inference import main as inference_main
 from ttt_svcbench_qwen.llamafactory_trainer import main as training_main
 from ttt_svcbench_qwen.production_runtime import build_runtime
 
-V12_ARCHITECTURE_SNAPSHOT = {
-    "spec_version": "state_ttt_qwen3vl8b_state_write_associative_v3",
+V13_ARCHITECTURE_SNAPSHOT = {
+    "spec_version": "state_ttt_qwen3vl8b_slot_memory_delta_v1",
     "base_model": "Qwen/Qwen3-VL-8B-Instruct",
     "vision": {
         "output_size": 4096,
@@ -14,10 +14,19 @@ V12_ARCHITECTURE_SNAPSHOT = {
     },
     "fast_ttt": {
         "dimensions": (4096, 768, 4096),
-        "online_parameter_count": 1_179_648,
+        "online_parameter_count": 589_824,
         "update_order": "observe_state_then_update_for_next_chunk",
-        "fast_weight_dtype": "float32",
-        "fast_core_dtype": "float32",
+    },
+    "fast_memory": {
+        "write_rule": "parallel_delta_rule",
+        "key_source": "gated_probe_over_token_keys",
+        "value_source": "spatial_slot_state_detached",
+        "eta_max_per_slot": 0.25,
+        "eta_chunk_budget": 1.0,
+        "forget_beta_max": 0.1,
+        "read_gate_shape": "per_channel",
+        "memory_dtype": "float32",
+        "zero_init_per_video": True,
     },
     "state_encoders": {
         "spatial": (768, 2, 32, 64, 24_815_360),
@@ -37,14 +46,10 @@ V12_ARCHITECTURE_SNAPSHOT = {
         "signed_exact_count": True,
     },
     "associative_ttt": {
-        "contract": "bank_conditioned_state_write_v2",
+        "contract": "bank_conditioned_slot_memory_v3",
         "bank_embedding_dim": 512,
         "key_dim": 768,
-        "target_dim": 768,
         "bank_empty_policy": "zero",
-        "target_source": "predicted_active_head_soft_write_stopgrad",
-        "unsupported_target_policy": "skip",
-        "loss": "normalized_fp32_cosine",
     },
     "query_loss": {
         "operator_weight": 1.0,
@@ -53,13 +58,13 @@ V12_ARCHITECTURE_SNAPSHOT = {
     },
     "query_meta_gradient": {
         "mode": "per_query_global_norm_clip_sum",
-        "max_norm": 1.0,
+        "max_norm": 10.0,
         "epsilon": 1.0e-12,
     },
 }
 
 
-def test_v12_architecture_snapshot_is_unchanged() -> None:
+def test_v13_architecture_snapshot_is_unchanged() -> None:
     config = load_config()
     actual = {
         "spec_version": config.spec_version,
@@ -76,8 +81,17 @@ def test_v12_architecture_snapshot_is_unchanged() -> None:
             ),
             "online_parameter_count": config.fast_ttt.online_parameter_count,
             "update_order": config.fast_ttt.update_order,
-            "fast_weight_dtype": config.fast_ttt.optimizer.fast_weight_dtype,
-            "fast_core_dtype": config.fast_ttt.optimizer.fast_core_dtype,
+        },
+        "fast_memory": {
+            "write_rule": config.fast_memory.write_rule,
+            "key_source": config.fast_memory.key_source,
+            "value_source": config.fast_memory.value_source,
+            "eta_max_per_slot": config.fast_memory.eta_max_per_slot,
+            "eta_chunk_budget": config.fast_memory.eta_chunk_budget,
+            "forget_beta_max": config.fast_memory.forget_beta_max,
+            "read_gate_shape": config.fast_memory.read_gate_shape,
+            "memory_dtype": config.fast_memory.memory_dtype,
+            "zero_init_per_video": config.fast_memory.zero_init_per_video,
         },
         "state_encoders": {
             "spatial": (
@@ -111,11 +125,7 @@ def test_v12_architecture_snapshot_is_unchanged() -> None:
             "contract": config.associative_ttt.contract,
             "bank_embedding_dim": config.associative_ttt.bank_embedding_dim,
             "key_dim": config.associative_ttt.key_dim,
-            "target_dim": config.associative_ttt.target_dim,
             "bank_empty_policy": config.associative_ttt.bank_empty_policy,
-            "target_source": config.associative_ttt.target_source,
-            "unsupported_target_policy": config.associative_ttt.unsupported_target_policy,
-            "loss": config.associative_ttt.loss,
         },
         "query_loss": {
             "operator_weight": config.loss.operator_weight,
@@ -128,7 +138,7 @@ def test_v12_architecture_snapshot_is_unchanged() -> None:
             "epsilon": config.a5.query_meta_gradient.epsilon,
         },
     }
-    assert actual == V12_ARCHITECTURE_SNAPSHOT
+    assert actual == V13_ARCHITECTURE_SNAPSHOT
 
 
 def test_production_entrypoints_remain_importable() -> None:

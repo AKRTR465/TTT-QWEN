@@ -462,7 +462,7 @@ def test_stage_a_runtime_has_no_fast_or_optimizer_state() -> None:
     owner = RuntimeOwner(("video",), ("trajectory",))
     writer = StageABankWriter(build_state_bank(load_config()), build_identity_bank(load_config()))
     runtime = writer.reset(owner)
-    assert all(row.fast_weights is None and row.optimizer is None for row in runtime.rows)
+    assert all(row.fast_weights is None for row in runtime.rows)
 
 
 def test_tensor_ring_chunk_write_has_no_per_slot_python_materialization() -> None:

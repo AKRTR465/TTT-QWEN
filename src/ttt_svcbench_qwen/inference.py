@@ -23,24 +23,20 @@ from typing import Protocol, cast
 import torch
 from torch import Tensor
 
-from ttt_svcbench_qwen.associative_ttt import compute_associative_ttt_loss
-from ttt_svcbench_qwen.config import AuditLevel, InnerSGDConfig, ProjectConfig
+from ttt_svcbench_qwen.config import AuditLevel, ProjectConfig
 from ttt_svcbench_qwen.data import (
     RUNTIME_DENYLIST,
     RuntimeQueryInput,
     assert_runtime_payload_safe,
 )
 from ttt_svcbench_qwen.fast_ttt import (
+    MEMORY_DIM,
+    FastMemoryState,
     FastTTTAdapter,
     FastTTTForwardAudit,
-    FastWeightsState,
-    OptimizerRuntimeState,
-)
-from ttt_svcbench_qwen.functional_sgd import (
-    functional_sgd_steps_from_associative,
-    reset_optimizer_state,
 )
 from ttt_svcbench_qwen.identity_bank import IdentityBank
+from ttt_svcbench_qwen.memory_write import apply_memory_writes
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
     BatchRuntimeState,
@@ -247,8 +243,8 @@ class RuntimeBoundaryStamp:
     trajectory_id: str
     next_chunk_index: int
     released: bool
-    fast_version: int
-    update_count: int
+    write_version: int
+    write_count: int
     skip_count: int
     state_bank_version: int
     identity_bank_version: int
@@ -281,12 +277,12 @@ class RuntimeAuditSnapshot:
 class RuntimePristineStamp:
     """Owner-independent proof that reset produced an empty runtime."""
 
-    fast_shape: tuple[int, ...]
-    fast_dtype: str
-    fast_version: int
-    update_count: int
+    memory_shape: tuple[int, ...]
+    memory_dtype: str
+    memory_zero: bool
+    write_version: int
+    write_count: int
     skip_count: int
-    optimizer_attempted_updates: int
     temporal_width: int
     state_record_count: int
     identity_candidate_count: int
@@ -331,8 +327,8 @@ class TTTUpdateOutcome:
     did_update: bool
     skip_reason: str | None
     valid_token_count: int
-    loss_value: float | None = None
-    step_size: float | None = None
+    pre_write_cosine: float | None = None
+    eta_sum: float | None = None
 
     def __post_init__(self) -> None:
         if type(self.did_update) is not bool:
@@ -344,12 +340,15 @@ class TTTUpdateOutcome:
                 raise ValueError("successful TTT update requires valid tokens and no skip reason")
         elif not self.skip_reason:
             raise ValueError("skipped TTT update requires a skip reason")
-        if self.loss_value is not None and not math.isfinite(self.loss_value):
-            raise ValueError("TTT update loss audit must be finite")
-        if self.step_size is not None and (
-            not math.isfinite(self.step_size) or not 0.0 < self.step_size < 3.0e-4
+        if self.pre_write_cosine is not None and (
+            not math.isfinite(self.pre_write_cosine)
+            or not -1.0 <= self.pre_write_cosine <= 1.0
         ):
-            raise ValueError("TTT update step size must be finite and in (0, 3e-4)")
+            raise ValueError("TTT update pre-write cosine audit must be finite in [-1, 1]")
+        if self.eta_sum is not None and (
+            not math.isfinite(self.eta_sum) or self.eta_sum < 0.0
+        ):
+            raise ValueError("TTT update eta sum audit must be finite and non-negative")
 
 
 class TTTUpdateStage(Protocol):
@@ -363,15 +362,19 @@ class TTTUpdateStage(Protocol):
 
 
 class OnlineTTTUpdater:
-    """Apply the label-free state-write objective and publish W_(t+1)."""
+    """Apply the label-free slot-memory write and publish M_(t+1)."""
 
     def __init__(
         self,
         config: ProjectConfig,
+        fast_adapter: FastTTTAdapter,
     ) -> None:
         if not isinstance(config, ProjectConfig):
             raise TypeError("online updater requires validated ProjectConfig")
+        if not isinstance(fast_adapter, FastTTTAdapter):
+            raise TypeError("online updater requires the managed FastTTTAdapter")
         self.config = config
+        self.fast_adapter = fast_adapter
 
     def __call__(
         self,
@@ -386,32 +389,24 @@ class OnlineTTTUpdater:
         intermediates = observation.soft_intermediates.fast_associative
         if intermediates is None:
             raise InferenceProtocolError("online observation did not capture associative tensors")
-        state_write = observation.soft_intermediates.state_write
-        if state_write is None:
-            raise InferenceProtocolError("online observation did not produce state-write targets")
-        output = compute_associative_ttt_loss(
-            intermediates,
-            state_write,
-            observation.query.head_types,
-        )
-        result = functional_sgd_steps_from_associative(
-            associative_output=output,
-            fast_states=(_require_fast_state(runtime_state),),
-            optimizer_config=self.config.fast_ttt.optimizer,
-            optimizer_states=(_require_optimizer_state(runtime_state),),
-        )[0]
-        updated = replace(
-            runtime_state,
-            fast_weights=result.fast_state,
-            optimizer=result.optimizer_state,
-        )
+        spatial = observation.soft_intermediates.spatial
+        if spatial is None:
+            raise InferenceProtocolError("online observation did not produce spatial slot state")
+        fast_state = _require_fast_state(runtime_state)
+        if fast_state.differentiable:
+            raise InferenceProtocolError("online memory writes require an online-leaf state")
+        with torch.no_grad():
+            batch = self.fast_adapter.prepare_write(intermediates, spatial)
+            result = apply_memory_writes(fast_states=(fast_state,), batch=batch)[0]
+        updated = replace(runtime_state, fast_weights=result.fast_state)
+        valid_token_count = int(intermediates.valid_mask[0].sum().item())
         return TTTUpdateOutcome(
             runtime_state=updated,
-            did_update=result.did_update,
+            did_update=result.did_write,
             skip_reason=None if result.skip_reason is None else result.skip_reason.value,
-            valid_token_count=result.valid_token_count,
-            loss_value=float(output.total.detach().item()),
-            step_size=result.step_size,
+            valid_token_count=valid_token_count if result.did_write else 0,
+            pre_write_cosine=result.pre_write_cosine_mean if result.did_write else None,
+            eta_sum=result.eta_sum if result.did_write else None,
         )
 
 
@@ -425,8 +420,8 @@ class ChunkAudit:
     original_frame_count: int
     causal_frame_count: int
     future_frame_count: int
-    fast_version_used: int
-    next_fast_version: int
+    write_version_used: int
+    next_write_version: int
     update_attempted: bool
     did_update: bool
     skip_reason: str | None
@@ -434,15 +429,15 @@ class ChunkAudit:
     state_before: RuntimeAuditSnapshot
     state_after_observe: RuntimeAuditSnapshot
     state_after_update: RuntimeAuditSnapshot
-    step_size: float | None = None
+    pre_write_cosine: float | None = None
 
     def __post_init__(self) -> None:
         counts = (
             self.original_frame_count,
             self.causal_frame_count,
             self.future_frame_count,
-            self.fast_version_used,
-            self.next_fast_version,
+            self.write_version_used,
+            self.next_write_version,
             self.valid_token_count,
         )
         if any(type(value) is not int or value < 0 for value in counts):
@@ -451,14 +446,15 @@ class ChunkAudit:
             raise ValueError("chunk audit frame counts must add up")
         if self.did_update and not self.update_attempted:
             raise ValueError("chunk update cannot succeed without an attempt")
-        if self.did_update and self.next_fast_version != self.fast_version_used + 1:
-            raise ValueError("accepted chunk update must advance fast version exactly once")
-        if not self.did_update and self.next_fast_version != self.fast_version_used:
-            raise ValueError("skipped chunk update cannot change fast version")
-        if self.step_size is not None and (
-            not math.isfinite(self.step_size) or not 0.0 < self.step_size < 3.0e-4
+        if self.did_update and self.next_write_version != self.write_version_used + 1:
+            raise ValueError("accepted chunk write must advance write version exactly once")
+        if not self.did_update and self.next_write_version != self.write_version_used:
+            raise ValueError("skipped chunk write cannot change write version")
+        if self.pre_write_cosine is not None and (
+            not math.isfinite(self.pre_write_cosine)
+            or not -1.0 <= self.pre_write_cosine <= 1.0
         ):
-            raise ValueError("chunk audit step size must be finite and in (0, 3e-4)")
+            raise ValueError("chunk audit pre-write cosine must be finite in [-1, 1]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,7 +517,6 @@ class PerVideoRuntimeManager:
         fast_adapter: FastTTTAdapter,
         state_bank: StructuredStateBank,
         identity_bank: IdentityBank,
-        optimizer_config: InnerSGDConfig,
         audit_level: AuditLevel = AuditLevel.BOUNDARY,
         hot_cache_enabled: bool = False,
         hot_device: str | torch.device | None = None,
@@ -532,8 +527,6 @@ class PerVideoRuntimeManager:
             raise TypeError("runtime manager requires StructuredStateBank")
         if not isinstance(identity_bank, IdentityBank):
             raise TypeError("runtime manager requires IdentityBank")
-        if not isinstance(optimizer_config, InnerSGDConfig):
-            raise TypeError("runtime manager requires validated InnerSGDConfig")
         if type(hot_cache_enabled) is not bool:
             raise TypeError("hot_cache_enabled must be bool")
         if not isinstance(audit_level, AuditLevel):
@@ -541,7 +534,6 @@ class PerVideoRuntimeManager:
         self.fast_adapter = fast_adapter
         self.state_bank = state_bank
         self.identity_bank = identity_bank
-        self.optimizer_config = optimizer_config
         self.audit_level = audit_level
         self.hot_cache_enabled = hot_cache_enabled
         self.hot_device = hot_device
@@ -575,7 +567,7 @@ class PerVideoRuntimeManager:
         trajectory_id: str,
         query_signature: Tensor,
     ) -> RuntimeResetAudit:
-        """Reset all fast/optimizer/cache/Bank/FSM/Reader state for one video."""
+        """Reset all memory/cache/Bank/FSM/Reader state for one video."""
 
         if not video_id or not trajectory_id:
             raise ValueError("runtime reset owner identifiers must be non-empty")
@@ -602,7 +594,6 @@ class PerVideoRuntimeManager:
                 owner=owner,
                 next_chunk_index=0,
                 fast_weights=fast,
-                optimizer=reset_optimizer_state(self.optimizer_config),
                 slot_state=None,
                 temporal_cache=_empty_temporal_cache(owner, signature),
                 e1_state=None,
@@ -650,7 +641,7 @@ class PerVideoRuntimeManager:
         updater: TTTUpdateStage,
         prepared_query: PreparedQueryOutput | None = None,
     ) -> ChunkExecution:
-        """Observe with W_t, write hard state, then create W_(t+1) for the next chunk."""
+        """Observe with M_t, write hard state, then create M_(t+1) for the next chunk."""
 
         with self._lock:
             runtime = self._require_live_runtime()
@@ -669,8 +660,8 @@ class PerVideoRuntimeManager:
                     original_frame_count=len(chunk.frames),
                     causal_frame_count=0,
                     future_frame_count=len(chunk.frames),
-                    fast_version_used=fast.fast_version,
-                    next_fast_version=fast.fast_version,
+                    write_version_used=fast.write_version,
+                    next_write_version=fast.write_version,
                     update_attempted=False,
                     did_update=False,
                     skip_reason="no_causal_frames",
@@ -704,13 +695,13 @@ class PerVideoRuntimeManager:
             fast_audit = self.fast_adapter.last_audit
             if not isinstance(fast_audit, FastTTTForwardAudit) or not fast_audit.used_runtime_state:
                 raise InferenceProtocolError(
-                    "observe did not consume the manager-bound FastWeightsState"
+                    "observe did not consume the manager-bound FastMemoryState"
                 )
-            expected_version = (fast.fast_version,)
-            expected_updates = (fast.update_count,)
+            expected_version = (fast.write_version,)
+            expected_writes = (fast.write_count,)
             if (
-                fast_audit.fast_versions != expected_version
-                or fast_audit.update_counts != expected_updates
+                fast_audit.write_versions != expected_version
+                or fast_audit.write_counts != expected_writes
                 or len(fast_audit.valid_token_counts) != 1
             ):
                 raise InferenceProtocolError(
@@ -726,14 +717,11 @@ class PerVideoRuntimeManager:
             observed_fast = _require_fast_state(observed)
             if _fast_state_stamp(observed_fast) != before_fast_stamp:
                 raise InferenceProtocolError(
-                    "observe/hard-write mutated fast weights before the TTT update boundary"
+                    "observe/hard-write mutated the memory before the TTT write boundary"
                 )
-            if (
-                observed.optimizer != runtime.optimizer
-                or observed.reader_audit != runtime.reader_audit
-            ):
+            if observed.reader_audit != runtime.reader_audit:
                 raise InferenceProtocolError(
-                    "observe/hard-write cannot change optimizer or Reader audit state"
+                    "observe/hard-write cannot change Reader audit state"
                 )
             after_observe_snapshot = self._snapshot(observed)
             hard_stamp = _hard_state_stamp(observed)
@@ -763,8 +751,8 @@ class PerVideoRuntimeManager:
                 original_frame_count=len(chunk.frames),
                 causal_frame_count=len(causal.frames),
                 future_frame_count=len(chunk.frames) - len(causal.frames),
-                fast_version_used=observed_fast.fast_version,
-                next_fast_version=_require_fast_state(updated).fast_version,
+                write_version_used=observed_fast.write_version,
+                next_write_version=_require_fast_state(updated).write_version,
                 update_attempted=True,
                 did_update=outcome.did_update,
                 skip_reason=outcome.skip_reason,
@@ -772,7 +760,7 @@ class PerVideoRuntimeManager:
                 state_before=before_snapshot,
                 state_after_observe=after_observe_snapshot,
                 state_after_update=after_update_snapshot,
-                step_size=outcome.step_size,
+                pre_write_cosine=outcome.pre_write_cosine,
             )
             self._runtime = updated
             self._chunk_audits.append(audit)
@@ -870,8 +858,8 @@ class PerVideoRuntimeManager:
                     ("selected_record_count", len(reader_result.selected_record_ids)),
                     ("prefill_count", lifecycle_audit.prefill_count),
                     ("decode_count", lifecycle_audit.decode_count),
-                    ("final_fast_version", fast.fast_version),
-                    ("final_update_count", fast.update_count),
+                    ("final_write_version", fast.write_version),
+                    ("final_write_count", fast.write_count),
                     ("final_skip_count", fast.skip_count),
                 ),
             )
@@ -914,12 +902,12 @@ class PerVideoRuntimeManager:
             fast_audit = self.fast_adapter.last_audit
             if not isinstance(fast_audit, FastTTTForwardAudit) or not fast_audit.used_runtime_state:
                 raise InferenceProtocolError(
-                    "Query observation did not consume the manager-bound FastWeightsState"
+                    "Query observation did not consume the manager-bound FastMemoryState"
                 )
-            if fast_audit.fast_versions != (fast.fast_version,) or fast_audit.update_counts != (
-                fast.update_count,
+            if fast_audit.write_versions != (fast.write_version,) or fast_audit.write_counts != (
+                fast.write_count,
             ):
-                raise InferenceProtocolError("Query observation used the wrong fast version")
+                raise InferenceProtocolError("Query observation used the wrong write version")
             if runtime_boundary_stamp(runtime) != before_guard:
                 raise InferenceProtocolError("read-only Query observation mutated runtime state")
             return replace(
@@ -938,7 +926,7 @@ class PerVideoRuntimeManager:
 
     def _release_locked(self) -> RuntimeReleaseAudit:
         runtime = self._require_live_runtime()
-        fast = _require_fast_state(runtime)
+        _require_fast_state(runtime)
         temporal_cache = _require_temporal_cache(runtime)
         before_snapshot = self._snapshot(runtime, content=True)
         released_bank = self.state_bank.release(runtime.state_bank)
@@ -949,8 +937,7 @@ class PerVideoRuntimeManager:
         released = TrajectoryRuntimeState(
             owner=owner,
             next_chunk_index=0,
-            fast_weights=_released_fast_state(fast.w0_1.dtype),
-            optimizer=reset_optimizer_state(self.optimizer_config),
+            fast_weights=_released_fast_state(),
             slot_state=None,
             temporal_cache=_empty_temporal_cache(
                 owner,
@@ -1113,7 +1100,6 @@ def runtime_boundary_stamp(state: TrajectoryRuntimeState) -> RuntimeBoundaryStam
     fast = _require_fast_state(state)
     components = (
         state.fast_weights,
-        state.optimizer,
         state.slot_state,
         state.temporal_cache,
         state.e1_state,
@@ -1127,8 +1113,8 @@ def runtime_boundary_stamp(state: TrajectoryRuntimeState) -> RuntimeBoundaryStam
         trajectory_id=state.trajectory_id,
         next_chunk_index=state.next_chunk_index,
         released=state.released,
-        fast_version=fast.fast_version,
-        update_count=fast.update_count,
+        write_version=fast.write_version,
+        write_count=fast.write_count,
         skip_count=fast.skip_count,
         state_bank_version=state.state_bank.version,
         identity_bank_version=state.identity_bank.version,
@@ -1220,17 +1206,16 @@ def _empty_temporal_cache(owner: RuntimeOwner, query_signature: Tensor) -> Tempo
     )
 
 
-def _released_fast_state(dtype: torch.dtype) -> FastWeightsState:
-    def matrix(*, requires_grad: bool) -> Tensor:
-        return torch.empty((768, 768), dtype=dtype, device="meta", requires_grad=requires_grad)
-
-    return FastWeightsState(
-        w0_1=matrix(requires_grad=False),
-        w0_2=matrix(requires_grad=False),
-        w_t_1=matrix(requires_grad=True),
-        w_t_2=matrix(requires_grad=True),
-        fast_version=0,
-        update_count=0,
+def _released_fast_state() -> FastMemoryState:
+    return FastMemoryState(
+        m=torch.empty(
+            (MEMORY_DIM, MEMORY_DIM),
+            dtype=torch.float32,
+            device="meta",
+            requires_grad=True,
+        ),
+        write_version=0,
+        write_count=0,
         skip_count=0,
         differentiable=False,
     )
@@ -1256,16 +1241,10 @@ def _require_batch_runtime(value: object, owner: RuntimeOwner) -> BatchRuntimeSt
     return value
 
 
-def _require_fast_state(state: TrajectoryRuntimeState) -> FastWeightsState:
+def _require_fast_state(state: TrajectoryRuntimeState) -> FastMemoryState:
     if state.fast_weights is None:
-        raise InferenceProtocolError("online trajectory is missing fast weights")
+        raise InferenceProtocolError("online trajectory is missing its memory state")
     return state.fast_weights
-
-
-def _require_optimizer_state(state: TrajectoryRuntimeState) -> OptimizerRuntimeState:
-    if state.optimizer is None:
-        raise InferenceProtocolError("online trajectory is missing optimizer state")
-    return state.optimizer
 
 
 def _require_temporal_cache(state: TrajectoryRuntimeState) -> TemporalCache:
@@ -1278,67 +1257,39 @@ def _validate_update_transition(before: TrajectoryRuntimeState, outcome: TTTUpda
     after = outcome.runtime_state
     before_fast = _require_fast_state(before)
     after_fast = _require_fast_state(after)
-    before_optimizer = _require_optimizer_state(before)
-    after_optimizer = _require_optimizer_state(after)
-    if _boundary_tensor_versions((before_fast.w0_1, before_fast.w0_2)) != (
-        _boundary_tensor_versions((after_fast.w0_1, after_fast.w0_2))
-    ):
-        raise InferenceProtocolError("TTT updater cannot change the meta-learned W0 snapshot")
-    optimizer_contract_before = (
-        before_optimizer.optimizer_name,
-        before_optimizer.learning_rate,
-        before_optimizer.momentum,
-        before_optimizer.weight_decay,
-        before_optimizer.steps_per_chunk,
-        before_optimizer.grad_clip_norm,
-    )
-    optimizer_contract_after = (
-        after_optimizer.optimizer_name,
-        after_optimizer.learning_rate,
-        after_optimizer.momentum,
-        after_optimizer.weight_decay,
-        after_optimizer.steps_per_chunk,
-        after_optimizer.grad_clip_norm,
-    )
-    if optimizer_contract_after != optimizer_contract_before:
-        raise InferenceProtocolError("TTT updater cannot change the optimizer contract")
-    if after_optimizer.attempted_update_count != before_optimizer.attempted_update_count + 1:
-        raise InferenceProtocolError("one chunk must make exactly one optimizer update attempt")
+    if after_fast.differentiable:
+        raise InferenceProtocolError("online TTT writes must publish an online-leaf memory")
     if outcome.did_update:
         expected = (
-            before_fast.fast_version + 1,
-            before_fast.update_count + 1,
+            before_fast.write_version + 1,
+            before_fast.write_count + 1,
             before_fast.skip_count,
         )
-        actual = (after_fast.fast_version, after_fast.update_count, after_fast.skip_count)
-        if actual != expected or after_optimizer.last_skip_reason is not None:
-            raise InferenceProtocolError("accepted TTT update has inconsistent counters")
-        after_tensors = (after_fast.w_t_1, after_fast.w_t_2)
-        if any(not bool(torch.isfinite(value).all()) for value in after_tensors):
-            raise InferenceProtocolError("accepted TTT update produced non-finite W_t")
-        if _boundary_tensor_versions((before_fast.w_t_1, before_fast.w_t_2)) == (
-            _boundary_tensor_versions(after_tensors)
+        actual = (after_fast.write_version, after_fast.write_count, after_fast.skip_count)
+        if actual != expected:
+            raise InferenceProtocolError("accepted TTT write has inconsistent counters")
+        if not bool(torch.isfinite(after_fast.m).all()):
+            raise InferenceProtocolError("accepted TTT write produced non-finite memory")
+        if _boundary_tensor_versions((before_fast.m,)) == (
+            _boundary_tensor_versions((after_fast.m,))
         ):
-            raise InferenceProtocolError("accepted TTT update must publish new W_t tensors")
+            raise InferenceProtocolError("accepted TTT write must publish a new memory tensor")
     else:
         expected = (
-            before_fast.fast_version,
-            before_fast.update_count,
+            before_fast.write_version,
+            before_fast.write_count,
             before_fast.skip_count + 1,
         )
-        actual = (after_fast.fast_version, after_fast.update_count, after_fast.skip_count)
-        if actual != expected or after_optimizer.last_skip_reason != outcome.skip_reason:
-            raise InferenceProtocolError("skipped TTT update has inconsistent counters/reason")
-        before_tensors = (before_fast.w_t_1, before_fast.w_t_2)
-        after_tensors = (after_fast.w_t_1, after_fast.w_t_2)
-        if any(
-            before.shape != after.shape
-            or before.dtype != after.dtype
-            or before.device != after.device
-            or not torch.equal(before.detach(), after.detach())
-            for before, after in zip(before_tensors, after_tensors, strict=True)
+        actual = (after_fast.write_version, after_fast.write_count, after_fast.skip_count)
+        if actual != expected:
+            raise InferenceProtocolError("skipped TTT write has inconsistent counters")
+        if (
+            before_fast.m.shape != after_fast.m.shape
+            or before_fast.m.dtype != after_fast.m.dtype
+            or before_fast.m.device != after_fast.m.device
+            or not torch.equal(before_fast.m.detach(), after_fast.m.detach())
         ):
-            raise InferenceProtocolError("skipped TTT update cannot change W_t values")
+            raise InferenceProtocolError("skipped TTT write cannot change memory values")
 
 
 def _state_attention(resampler: object | None) -> Tensor | None:
@@ -1380,10 +1331,10 @@ def _hard_state_stamp(state: TrajectoryRuntimeState) -> tuple[object, ...]:
     )
 
 
-def _fast_state_stamp(state: FastWeightsState) -> tuple[object, ...]:
+def _fast_state_stamp(state: FastMemoryState) -> tuple[object, ...]:
     return (
-        state.fast_version,
-        state.update_count,
+        state.write_version,
+        state.write_count,
         state.skip_count,
         state.differentiable,
         _boundary_tensor_versions(state),
@@ -1394,15 +1345,17 @@ def _pristine_state_stamp(state: TrajectoryRuntimeState) -> RuntimePristineStamp
     """Build an owner-independent, content-free reset fingerprint."""
 
     fast = _require_fast_state(state)
-    optimizer = _require_optimizer_state(state)
     temporal_cache = _require_temporal_cache(state)
+    memory_zero = fast.m.device.type != "meta" and not bool(
+        torch.count_nonzero(fast.m.detach())
+    )
     return RuntimePristineStamp(
-        fast_shape=tuple(fast.w_t_1.shape),
-        fast_dtype=str(fast.w_t_1.dtype),
-        fast_version=fast.fast_version,
-        update_count=fast.update_count,
+        memory_shape=tuple(fast.m.shape),
+        memory_dtype=str(fast.m.dtype),
+        memory_zero=memory_zero,
+        write_version=fast.write_version,
+        write_count=fast.write_count,
         skip_count=fast.skip_count,
-        optimizer_attempted_updates=optimizer.attempted_update_count,
         temporal_width=temporal_cache.hidden.shape[1],
         state_record_count=len(state.state_bank.records),
         identity_candidate_count=len(state.identity_bank.candidates),
@@ -1745,8 +1698,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "status": result.reader_result.status.value,
             "selected_record_ids": list(result.selected_record_ids),
         },
-        "fast_version": audits["final_fast_version"],
-        "update_count": audits["final_update_count"],
+        "write_version": audits["final_write_version"],
+        "write_count": audits["final_write_count"],
         "skip_count": audits["final_skip_count"],
         "audit": {
             "level": bundle.config.inference.audit_level.value,

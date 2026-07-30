@@ -47,15 +47,35 @@ _FORBIDDEN_CHECKPOINT_TOKENS = (
 
 @dataclass(frozen=True, slots=True)
 class _LegacyA2ToA5Profile:
-    """The sole tolerated historical checkpoint shape at the A2-to-A5 boundary."""
+    """The sole tolerated historical checkpoint shape at the A2-to-A5 boundary.
 
-    missing_fragments: tuple[str, ...] = (".p_context.", "associative_contract_version")
+    Profile ``a2_to_a5_memory_v1``: schema-12 A2 checkpoints predate the slot
+    memory, so its interface tensors (probe, value projection, eta gate, read
+    gate, forget gate, contract buffer) may be missing and are initialized
+    fresh; the retired ``associative_contract_version`` buffer they still carry
+    is the sole tolerated unexpected non-module key.  Any other mismatch
+    rejects the checkpoint.
+    """
+
+    missing_fragments: tuple[str, ...] = (
+        ".p_context.",
+        ".memory_key_probe.",
+        ".memory_value_projection.",
+        ".memory_eta_gate_hidden.",
+        ".memory_eta_gate_output.",
+        ".memory_alpha",
+        ".memory_beta_raw",
+        "memory_contract_version",
+    )
     unexpected_modules: tuple[str, ...] = ("predictor.", "p_value.")
+    unexpected_fragments: tuple[str, ...] = ("associative_contract_version",)
 
     def allows_missing(self, key: str) -> bool:
         return any(fragment in key for fragment in self.missing_fragments)
 
     def allows_unexpected(self, key: str) -> bool:
+        if any(fragment in key for fragment in self.unexpected_fragments):
+            return True
         return any(
             key.startswith(module) or f".{module}" in key
             for module in self.unexpected_modules
@@ -123,7 +143,7 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     stage: Literal["a2", "a5"]
-    a5_adaptation_mode: Literal["meta_ttt", "static_w0"] = "meta_ttt"
+    a5_adaptation_mode: Literal["meta_ttt", "no_write"] = "meta_ttt"
     a5_phase: Literal["fast_state_warmup", "main"] = "main"
     warmup_bundle: str | None = Field(default=None, min_length=1)
     project_config: str = Field(min_length=1)
@@ -176,11 +196,11 @@ class ProductionTTTConfig(BaseModel):  # type: ignore[misc]
             raise ValueError("A5 requires initialize_from_a2_checkpoint")
         if self.stage == "a2" and self.qwen_outer_trainability.mode != "full":
             raise ValueError("A2 requires full Qwen outer trainability")
-        if self.stage == "a5" and self.a5_adaptation_mode == "static_w0":
+        if self.stage == "a5" and self.a5_adaptation_mode == "no_write":
             if self.a5_phase != "main" or self.warmup_bundle is not None:
-                raise ValueError("static-W0 A5 cannot use the Fast/State warmup handoff")
+                raise ValueError("no-write A5 cannot use the Fast/State warmup handoff")
             if self.qwen_outer_trainability.mode == "frozen":
-                raise ValueError("static-W0 A5 requires a trainable Qwen policy")
+                raise ValueError("no-write A5 requires a trainable Qwen policy")
         if self.stage == "a5" and self.a5_adaptation_mode == "meta_ttt":
             if self.a5_phase == "fast_state_warmup":
                 if self.qwen_outer_trainability.mode != "frozen":
@@ -846,7 +866,7 @@ def environment_manifest(bundle: LlamaFactoryBackboneBundle) -> dict[str, object
         "project_spec_version": bundle.project_config.spec_version,
         "config_schema_version": bundle.project_config.config_schema_version,
         "associative_ttt_contract": bundle.project_config.associative_ttt.contract,
-        "associative_ttt_contract_version": 2,
+        "associative_ttt_contract_version": 3,
         "ttt_config": json.loads(bundle.ttt_config.model_dump_json()),
     }
 

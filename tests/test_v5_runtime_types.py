@@ -10,7 +10,7 @@ from tests.support.runtime_factories import (
     make_temporal_cache,
 )
 from ttt_svcbench_qwen.config import load_config
-from ttt_svcbench_qwen.fast_ttt import FastWeightsState, OptimizerRuntimeState
+from ttt_svcbench_qwen.fast_ttt import FastMemoryState
 from ttt_svcbench_qwen.identity_bank import (
     CandidateIdentity,
     ConfirmedIdentity,
@@ -276,12 +276,12 @@ def test_typed_state_identity_retrieval_and_reader_contracts() -> None:
 
 
 def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank() -> None:
-    w0_1 = torch.zeros(768, 768)
-    w0_2 = torch.ones(768, 768)
-    w_t_1 = w0_1.clone().requires_grad_(True)
-    w_t_2 = w0_2.clone().requires_grad_(True)
-    fast = FastWeightsState(w0_1, w0_2, w_t_1, w_t_2, 0, 0, 0)
-    optimizer = OptimizerRuntimeState("sgd", 1.0e-4, 0.0, 0.0, 1, 1.0, 0, None)
+    fast = FastMemoryState(
+        m=torch.zeros((768, 768), dtype=torch.float32, requires_grad=True),
+        write_version=0,
+        write_count=0,
+        skip_count=0,
+    )
     cache = make_temporal_cache(
         hidden=torch.zeros(1, 0, 768),
         video_ids=("video-a",),
@@ -301,7 +301,6 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
         "owner": owner,
         "next_chunk_index": 0,
         "fast_weights": fast,
-        "optimizer": optimizer,
         "slot_state": None,
         "temporal_cache": cache,
         "e1_state": e1_state,
@@ -313,7 +312,7 @@ def test_per_video_runtime_covers_all_owned_state_and_rejects_cross_video_bank()
     }
     runtime = TrajectoryRuntimeState(**values)
 
-    assert runtime.fast_weights.fast_version == 0
+    assert runtime.fast_weights.write_version == 0
     with pytest.raises(ValueError, match="State Bank ownership"):
         TrajectoryRuntimeState(
             **{

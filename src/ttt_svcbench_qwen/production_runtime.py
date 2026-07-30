@@ -2619,7 +2619,6 @@ def build_inference_runtime_bundle(
         fast_adapter=stack.fast,
         state_bank=stack.state_bank,
         identity_bank=stack.identity_bank,
-        optimizer_config=config.fast_ttt.optimizer,
         audit_level=config.inference.audit_level,
     )
     return StateTTTRuntimeBundle(
@@ -2628,7 +2627,7 @@ def build_inference_runtime_bundle(
         state_model=state_model,
         outer_model=outer,
         manager=manager,
-        updater=OnlineTTTUpdater(config),
+        updater=OnlineTTTUpdater(config, stack.fast),
         processor=processor,
         tokenizer=tokenizer,
         video_materializer=materializer,

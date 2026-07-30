@@ -14,7 +14,12 @@
 
 - Qwen3-VL-8B Main Visual Merger 后插入 4096→768→4096 Fast Adapter。
 - DeepStack 保持原始路径，不接入 Fast Adapter。
-- 在线只更新两块 768x768 Wt；W0 是 checkpointed meta parameter。
+- 在线只写入一块零初始化的 768x768 delta-rule memory M；W0₁/W0₂ 是 checkpointed
+  静态核参数，memory 接口（key probe、value projection、eta gate、read gate α、
+  forget gate β）是 checkpointed Outer 参数，随 `associative` 组训练。
+- 写入是闭式并行 delta rule（Ση ≤ 1 保证收缩），没有 inner 优化器、inner 学习率或
+  inner 梯度裁剪；schema-12 的 functional SGD、`L_assoc` cosine 目标与 1e-4 频率固定
+  contract 已整体删除（2026-07-30，slot-memory refactor）。
 - Spatial Encoder 固定为两阶段 Slot Attention；Temporal Encoder 固定为 6 层因果 Transformer。
 - Query Encoder 固定为 4 层、512 维；State Resampler 固定输出 16 个 4096 维 token。
 - Deterministic Reader 是精确计数唯一真值源，LLM 不覆盖 Reader 算术。
@@ -22,9 +27,13 @@
 ## 训练
 
 - 正式流程为 A2→128-step Fast/State Warmup→A5 Main。
-- A2 全量解冻 Qwen、状态路径和 W0，冻结 `P_C`，禁止 Inner SGD。
-- A5 inner target 使用当前模型 active-head soft-write source 的 normalized FP32 cosine，K=8
-  截断二阶并重锚 W0；Query Answer/State loss 是唯一 Outer 目标。
+- A2 全量解冻 Qwen、状态路径和 W0，冻结 `P_C`，memory 写入不可达。
+- A5 Support 写入直接归档本 chunk 的 slot (key, value) 对，无 inner loss；K=8 截断
+  meta 图（detach 保值，无 W0 重锚）；Query Answer/State loss 是唯一 Outer 目标。
+- Query memory cotangent 的裁剪上限由 `a5.query_meta_gradient.max_norm` 配置（当前
+  10.0），不再是冻结常量；counterfactual 参照为 `episode_zero`（精确 M=0）与
+  `segment_start`，每 rank 可审计多条 Query。
+- NoWrite 对照改名 `no_write`（旧名 `static_w0` 报错拒绝）。
 - Warmup 完全冻结 Qwen，仅保存带来源 hash 的非 Qwen handoff bundle；A5 Main 重新加载 A2
   后叠加 bundle，恢复部分 Qwen 解冻，4 epoch 只保存 final checkpoint。
 - A1/A3/A4 与 full-graph Meta-TTT 已从生产实现和配置中删除。
@@ -35,14 +44,14 @@
 
 - Support/Query runtime 禁止答案、count、occurrence_times、counting_type 和 counting_subtype。
 - query_time 后帧必须在模型边界前裁剪。
-- 当前 chunk 使用旧 Wt，功能性 SGD 的结果只供下一 chunk 使用。
+- 当前 chunk 使用 M_{t-1}，delta-rule 写入的结果只供下一 chunk 使用。
 - hard state、Bank 与 overlap snapshot 必须 detach；不同视频不得共享 storage 或 owner。
 - clean test 不得进入训练或校准。
 
 ## 推理
 
 - 每个视频独立 reset、observe/update、answer、release。
-- generation 期间 Fast、Bank、FSM、cache 不变。
+- generation 期间 memory、Bank、FSM、cache 不变。
 - retry 只允许在相同因果状态上执行。
 - 默认 audit 为 `boundary`；只有 `full` 计算 Tensor 内容 hash。
 - 首版 generation 固定 greedy、`num_beams=1`、`do_sample=false`、`max_new_tokens=16`。

@@ -2,7 +2,8 @@
 
 Inputs: typed soft observation outputs, encoder states, query routing, and a reset Stage A runtime.
 Outputs: detached hard Bank/Identity/FSM state plus gradient-carrying semantic projections.
-Forbidden: Inner SGD, transient fast weights, labels, future chunks, or checkpointed runtime state.
+Forbidden: memory writes, transient memory state, labels, future chunks, or checkpointed
+runtime state.
 """
 
 from __future__ import annotations
@@ -188,9 +189,9 @@ class StageAWriteAudit:
     identity_counts_after: tuple[int, ...]
     identity_decisions: tuple[tuple[IdentityObservationDecision, ...], ...]
     skipped_rows: tuple[int, ...]
-    inner_sgd_attempted: int = 0
-    inner_sgd_updated: int = 0
-    inner_sgd_skipped: int = 0
+    memory_writes_attempted: int = 0
+    memory_writes_applied: int = 0
+    memory_writes_skipped: int = 0
 
     def __post_init__(self) -> None:
         batch_size = len(self.head_types)
@@ -206,12 +207,12 @@ class StageAWriteAudit:
         if any(
             value != 0
             for value in (
-                self.inner_sgd_attempted,
-                self.inner_sgd_updated,
-                self.inner_sgd_skipped,
+                self.memory_writes_attempted,
+                self.memory_writes_applied,
+                self.memory_writes_skipped,
             )
         ):
-            raise ValueError("Stage A write audit cannot report Inner SGD activity")
+            raise ValueError("Stage A write audit cannot report memory-write activity")
 
 
 class StageABankWriter:

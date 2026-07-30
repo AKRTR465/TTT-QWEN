@@ -6,16 +6,18 @@ synthetic ablation harness 已从主线删除。
 ## 已实现的边界
 
 - A2 全量解冻 Qwen ViT、Main Merger、DeepStack merger、36 层 Decoder，并训练状态模块和
-  `W0`；Associative 投影冻结，不运行 Inner SGD，目标严格为 `L_state + L_answer`。
-- A5 对 Support 数不设上限，按处理过的 Support 每 `K=8` 步截断。段内
-  `create_graph=True`，截断点使用
-  `stopgrad(W_t) + W0 - stopgrad(W0)`，保留数值状态并重新建立到 `W0` 的梯度路径。
-- 每个 Support 先用写入前 Bank 语义构造 key，再以 stop-gradient 的 active-head 768D
-  soft-write source 为 target，执行一次 normalized FP32 cosine objective 的 functional SGD；
-  该损失只更新 transient `w_t_1/w_t_2`，
-  不执行 Support auxiliary backward。一个 episode 只由外层 Trainer 裁剪和执行一次 AdamW step。
-- Inner SGD 的唯一参数是 transient `w_t_1/w_t_2`，momentum 固定为 0。Qwen、状态模块、
-  `W0` 和 `P_C` 只能进入 Outer AdamW；Query Answer/State loss 是唯一 Outer objective。
+  `W0`；Associative 投影冻结，memory 写入不可达，目标严格为 `L_state + L_answer`。
+- A5 对 Support 数不设上限，按处理过的 Support 每 `K=8` 步截断。段内 meta 图沿闭式
+  delta-rule 线性递推构建（无 `create_graph` 二阶项），截断点对 memory `M` 执行
+  detach-保值（`truncate_memory_state`），无 W0 重锚——memory 每视频零初始化，
+  没有需要保留的 W0 血统。
+- 每个 Support hard commit 后，adapter 从已提交 soft state 派生至多 32 条 slot
+  (key, value, eta) 写入对并执行一次并行 delta-rule 写入
+  `M ← (1-β)M + Ση(v - Mk)kᵀ`；写入只更新 transient `M`，不执行 Support auxiliary
+  backward。一个 episode 只由外层 Trainer 裁剪和执行一次 AdamW step。
+- 在线唯一可变状态是 transient `M`（零初始化、Ση ≤ 1 收缩界）。Qwen、状态模块、`W0`、
+  `P_C` 与 memory 接口参数只能进入 Outer AdamW；Query Answer/State loss 是唯一 Outer
+  objective。
 - hard Bank/FSM commit 与 soft observation forward 分离；activation checkpoint 重算只能经过
   soft 路径。
 - Support 每一步只物化一个 8/16 帧动态 chunk，处理后不保留历史视觉 Token；Query 单独从
@@ -68,7 +70,7 @@ factory。中央 bridge 会覆盖 runtime 的 dataset 字段，强制使用 mani
   才解码并处理当前 chunk；
 - Query/weak/answer sidecar 的 join 发生在 forward 后；
 - A5 padding episode 必须完整执行同数目的 backward collective，但返回 `loss_weight=0`；
-- 不把 transient `W_t`、Bank、FSM、时序/视觉 cache 注册成 parameter 或 buffer。
+- 不把 transient `M`、Bank、FSM、时序/视觉 cache 注册成 parameter 或 buffer。
 
 入口会在训练前审计以上关键参数边界，不会退回普通 SFT。
 
@@ -126,11 +128,13 @@ bash scripts/h200/benchmark_fullprefix256_8step.sh a5 /absolute/path/a2/checkpoi
 - A2→Warmup 和 A2+handoff→Main 都创建全新的 optimizer/scheduler/RNG；handoff bundle
   绑定 A2 checkpoint、project config、dataset manifest、seed 与代码 commit hash。
   该绑定取 `project.model_dump()` 的 sha256，因此任何 **字段级** config schema 变更都会作废
-  已有 bundle。schema-12 移除 `paths` 块即属此类：此前生成的 `a5_warmup_bundle/` 全部需要
-  重跑 Warmup 重建。只删 validator 不改字段则不影响该哈希。
+  已有 bundle。schema-13 的 slot-memory refactor（新增 `fast_memory` 块、删除
+  `fast_ttt.optimizer`）即属此类：schema-12 及更早生成的 `a5_warmup_bundle/` 全部需要
+  重跑 Warmup 重建（schema-12 移除 `paths` 块时已首次作废过一轮）。只删 validator
+  不改字段则不影响该哈希。
 - `final-checkpoint/` 保存最终模型，`resume_state/` 保存 Accelerator 完整分布式状态；运行中断
   时可从尚存的最后一个标准 `checkpoint-*` 新建 run 续训。
-- transient `W_t`、Bank、FSM、视觉/时序 cache 从所有 checkpoint 中排除。
+- transient `M`、Bank、FSM、视觉/时序 cache 从所有 checkpoint 中排除。
 
 同阶段续训示例：
 
@@ -138,6 +142,23 @@ bash scripts/h200/benchmark_fullprefix256_8step.sh a5 /absolute/path/a2/checkpoi
 export TTT_RESUME_CHECKPOINT=/absolute/path/old_run/checkpoints/checkpoint-20
 bash scripts/h200/launch_4gpu.sh a5
 ```
+
+## Warmup 释放门（schema-13）
+
+128-step Fast/State Warmup 以下列五门判定（发射点：`a5_memory_numerical_audit` trace 与
+`memory/*` 指标；空值列为机制未生效时的读数）：
+
+| 门 | 定义 | 阈值 | 空值 |
+|---|---|---|---|
+| G1 episode 内召回 | `memory/readout_target_cosine`（写前 cos(Mk,v)），episode 末段 vs 首段 | 末−首 ≥ +0.15 且末 ≥ 0.2（最后 32 步均值） | 0（M=0 起点；768 维随机 ≈ 0.029） |
+| G2 读取显著性 | `memory/readout_share` = ‖α⊙(K Mᵀ)‖ / ‖f_W0(K)‖（Query 重编码处） | ∈ [0.01, 0.3]，且逐 token 相对效应中位数 > 2⁻⁸ | 0 |
+| G3 反事实 | vs `episode_zero`：descent cosine 均值；正增益率 CI（n = interval 2 × 4 rank × 2 query/rank） | cosine ≥ 0.05；95% CI 排除 0.5 | 0 / 50% |
+| G4 管路健康 | cotangent 裁剪率 @ max_norm 10；η 重归一率；各组 Outer 裁剪率 | < 30% / < 20% / < 30% | — |
+| G5 基础设施 | Qwen bitwise（param+persistent buffer 范围）通过、bundle 发布、≥95% Support 执行写入 | 硬性通过 | — |
+
+次级仪表（无门槛）：`memory/eta_sum`、`memory/beta`、`memory/memory_norm`、
+`memory/post_write_cosine`（预期 > 0.8）、probe attention 熵、各 role Query loss
+（中位数与均值）、原始 loss 分量（不看 “outer total”）。
 
 ## 验收入口
 
@@ -152,10 +173,11 @@ python -m pytest -q \
 bash -n scripts/h200/launch_4gpu.sh
 ```
 
-CPU 测试覆盖 `T=17/K=8`、两次历史截断、数值连续、旧图断开、`W0` 重锚梯度、严格两矩阵
-Inner 参数、256 帧 causal Query、LLaMA-Factory 索引一致性、顺序 Query 梯度等价、manifest
-防泄漏、四 rank backward parity 和原子 checkpoint 边界。真实四卡 8B 验收证据写入各自 run
-目录。
+CPU 测试覆盖 `T=17/K=8`、两次历史截断、数值连续、旧图断开、`M=0` 前向 bitwise 等于
+静态前向（A2 保留回归）、单对写入精确召回、并行写入 slot 顺序不变、Ση 预算重归一、
+200 步写入收缩界、写入梯度边界（gate/probe/value/β/token-keys 可达、slot state 不可达）、
+256 帧 causal Query、LLaMA-Factory 索引一致性、顺序 Query 梯度等价、manifest 防泄漏、
+四 rank backward parity 和原子 checkpoint 边界。真实四卡 8B 验收证据写入各自 run 目录。
 
 ## H200 观测工具
 
