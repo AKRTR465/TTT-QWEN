@@ -224,7 +224,9 @@ else:
 state_names = ("state_shared", "state_task", "state_router_time", "state_retrieval")
 budget_audit = {
     "policy": project.outer_gradient_control.mode.value,
-    "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
+    "memory_eta_max_per_slot": float(project.fast_memory.eta_max_per_slot),
+    "memory_eta_chunk_budget": float(project.fast_memory.eta_chunk_budget),
+    "memory_forget_beta_max": float(project.fast_memory.forget_beta_max),
     "reference": (
         fast_slow_lr * float(caps.fast_slow)
         if stage == "a5" and extension.a5_phase == "fast_state_warmup"
@@ -243,9 +245,8 @@ payload = {
     "a5_adaptation_mode": adaptation_mode,
     "a5_phase": extension.a5_phase if stage == "a5" else None,
     "warmup_bundle": extension.warmup_bundle if stage == "a5" else None,
-    "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
-    "fast_weight_dtype": project.fast_ttt.optimizer.fast_weight_dtype,
-    "fast_core_dtype": project.fast_ttt.optimizer.fast_core_dtype,
+    "memory_write_rule": project.fast_memory.write_rule,
+    "memory_dtype": project.fast_memory.memory_dtype,
     "query_meta_gradient": {
         "mode": project.a5.query_meta_gradient.mode,
         "max_norm": float(project.a5.query_meta_gradient.max_norm),

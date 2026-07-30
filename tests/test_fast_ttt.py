@@ -10,16 +10,17 @@ from torch.nn import functional as F
 from tests.support import parameter_count, tensor_count
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.fast_ttt import (
+    FastMemoryState,
     FastTTTAdapter,
     FastTTTForwardAudit,
-    FastWeightsState,
     build_fast_ttt_adapter,
     collect_fast_parameters,
     deferred_fast_vjp_loss,
     make_query_proxy_fast_state,
-    reanchor_fast_state,
 )
 from ttt_svcbench_qwen.qwen_adapter import QwenVideoFeatureBoundary
+
+MEMORY_INTERFACE_PARAMETER_COUNT = 1_231_298
 
 
 def make_adapter(*, dtype: torch.dtype = torch.float32) -> FastTTTAdapter:
@@ -29,6 +30,18 @@ def make_adapter(*, dtype: torch.dtype = torch.float32) -> FastTTTAdapter:
 
 def storage_pointer(tensor: Tensor) -> int:
     return int(tensor.untyped_storage().data_ptr())
+
+
+def _written_state(state: FastMemoryState, magnitude: float = 0.05) -> FastMemoryState:
+    memory = state.m.detach().clone()
+    with torch.no_grad():
+        memory[0, 0] = magnitude
+    return replace(
+        state,
+        m=memory.requires_grad_(True),
+        write_version=1,
+        write_count=1,
+    )
 
 
 def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> None:
@@ -46,15 +59,28 @@ def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> N
     assert adapter.p_in.bias is not None
     assert adapter.p_out.bias is not None
     assert adapter.w0_1.shape == adapter.w0_2.shape == (768, 768)
+    assert adapter.memory_key_probe.weight.shape == (768, 768)
+    assert adapter.memory_value_projection.weight.shape == (768, 768)
+    assert adapter.memory_eta_gate_hidden.in_features == 769
+    assert adapter.memory_eta_gate_output.out_features == 1
+    assert adapter.memory_alpha.shape == (768,)
+    assert adapter.memory_beta_raw.shape == ()
     assert set(adapter._modules) == {
         "rms_norm",
         "p_in",
         "p_context",
         "p_out",
+        "memory_key_probe",
+        "memory_value_projection",
+        "memory_eta_gate_hidden",
+        "memory_eta_gate_output",
     }
-    assert parameter_count(adapter) == 7_874_048
+    assert parameter_count(adapter) == 7_874_048 + MEMORY_INTERFACE_PARAMETER_COUNT
     assert tensor_count(adapter.collect_slow_parameters()) == 6_300_416
-    assert tensor_count(adapter.collect_associative_parameters()) == 393_984
+    assert (
+        tensor_count(adapter.collect_associative_parameters())
+        == 393_984 + MEMORY_INTERFACE_PARAMETER_COUNT
+    )
     assert (
         sum(parameter.numel() for parameter in adapter.collect_meta_fast_parameters()) == 1_179_648
     )
@@ -68,8 +94,36 @@ def test_structure_parameter_groups_and_checkpoint_keys_are_exact_on_meta() -> N
         "w0_2",
         "p_out.weight",
         "p_out.bias",
-        "associative_contract_version",
+        "memory_key_probe.weight",
+        "memory_key_probe.bias",
+        "memory_value_projection.weight",
+        "memory_value_projection.bias",
+        "memory_eta_gate_hidden.weight",
+        "memory_eta_gate_hidden.bias",
+        "memory_eta_gate_output.weight",
+        "memory_eta_gate_output.bias",
+        "memory_alpha",
+        "memory_beta_raw",
+        "memory_contract_version",
     }
+
+
+def test_memory_gate_initialization_matches_the_frozen_schema() -> None:
+    config = load_config()
+    adapter = make_adapter()
+    eta_at_zero_input = config.fast_memory.eta_max_per_slot * torch.sigmoid(
+        adapter.memory_eta_gate_output.bias.detach()
+    )
+    assert float(eta_at_zero_input) == pytest.approx(config.fast_memory.eta_gate_init, rel=1.0e-5)
+    beta = config.fast_memory.forget_beta_max * torch.sigmoid(
+        adapter.memory_beta_raw.detach()
+    )
+    assert float(beta) == pytest.approx(config.fast_memory.forget_beta_init, rel=1.0e-5)
+    assert torch.equal(
+        adapter.memory_alpha.detach(),
+        torch.full((768,), config.fast_memory.read_gate_init),
+    )
+    assert int(adapter.memory_contract_version.item()) == 3
 
 
 def test_demo_forward_preserves_shape_dtype_device_and_reports_true_residual_norm() -> None:
@@ -91,11 +145,13 @@ def test_demo_forward_preserves_shape_dtype_device_and_reports_true_residual_nor
     assert hook_outputs == [output]
     audit = adapter.last_audit
     assert audit is not None
-    assert audit.fast_versions == audit.update_counts == (0,)
+    assert audit.write_versions == audit.write_counts == (0,)
     assert audit.valid_token_counts == (392,)
     assert audit.used_runtime_state is False
     assert audit.used_associative_context is False
     assert audit.bank_record_counts == (0,)
+    assert audit.memory_norms == (0.0,)
+    assert audit.readout_share_norms == (0.0,)
     actual_residual_norm = torch.linalg.vector_norm(output - visual).item()
     assert audit.residual_norms[0] == pytest.approx(actual_residual_norm, rel=1.0e-5)
     assert actual_residual_norm / torch.linalg.vector_norm(visual).item() < 0.25
@@ -122,13 +178,28 @@ def test_forward_matches_frozen_formula_exactly() -> None:
     assert torch.equal(actual, expected)
 
 
+def test_zero_memory_forward_is_bitwise_identical_to_static_forward() -> None:
+    """The A2-preservation regression: M=0 must change nothing, bit for bit."""
+
+    adapter = make_adapter().eval()
+    visual = torch.randn(2, 7, 4096)
+    mask = torch.ones(2, 7, dtype=torch.bool)
+
+    static_output = adapter(visual, mask)
+    states = tuple(adapter.initialize_fast_state(differentiable=True) for _ in range(2))
+    bound_output = adapter(visual, mask, fast_state=states)
+
+    assert torch.equal(bound_output, static_output)
+    online = tuple(adapter.initialize_fast_state() for _ in range(2))
+    with adapter.use_fast_state(online):
+        online_output = adapter(visual, mask)
+    assert torch.equal(online_output, static_output)
+
+
 def test_runtime_batch_uses_one_independent_state_per_row_and_preserves_padding() -> None:
     adapter = make_adapter().eval()
     first = adapter.initialize_fast_state()
-    second = adapter.initialize_fast_state()
-    with torch.no_grad():
-        second.w_t_1.add_(0.05)
-    second = replace(second, fast_version=2, update_count=2)
+    second = _written_state(adapter.initialize_fast_state(), magnitude=5.0)
     row = torch.randn(1, 3, 4096)
     visual = row.repeat(2, 1, 1)
     mask = torch.tensor([[True, True, False], [True, False, False]])
@@ -139,9 +210,13 @@ def test_runtime_batch_uses_one_independent_state_per_row_and_preserves_padding(
     assert not torch.equal(output[0, 0], output[1, 0])
     audit = adapter.last_audit
     assert audit is not None
-    assert audit.fast_versions == audit.update_counts == (0, 2)
+    assert audit.write_versions == audit.write_counts == (0, 1)
     assert audit.valid_token_counts == (2, 1)
     assert audit.used_runtime_state is True
+    assert audit.memory_norms[0] == 0.0
+    assert audit.memory_norms[1] == pytest.approx(5.0)
+    assert audit.readout_share_norms[0] == 0.0
+    assert audit.readout_share_norms[1] > 0.0
     for batch_index in range(2):
         delta = output[batch_index][mask[batch_index]] - visual[batch_index][mask[batch_index]]
         assert audit.residual_norms[batch_index] == pytest.approx(
@@ -153,32 +228,20 @@ def test_runtime_batch_uses_one_independent_state_per_row_and_preserves_padding(
         adapter(visual, mask, fast_state=first)
     with pytest.raises(ValueError, match="one runtime state per batch item"):
         adapter(visual, mask, fast_state=(first,))
-    with pytest.raises(ValueError, match="must not share W_t storage"):
+    with pytest.raises(ValueError, match="must not share memory storage"):
         adapter(visual, mask, fast_state=(first, first))
-    shared = FastWeightsState(
-        second.w0_1,
-        second.w0_2,
-        first.w_t_1,
-        second.w_t_2,
-        0,
-        0,
-        0,
-    )
-    with pytest.raises(ValueError, match="must not share W_t storage"):
-        adapter(visual, mask, fast_state=(first, shared))
     differentiable = adapter.initialize_fast_state(differentiable=True)
     with pytest.raises(ValueError, match="cannot mix"):
         adapter(visual, mask, fast_state=(first, differentiable))
 
 
-def test_online_forward_gives_only_w_t_and_input_gradients() -> None:
+def test_online_forward_gives_only_memory_and_input_gradients() -> None:
     adapter = make_adapter()
-    state = adapter.initialize_fast_state()
+    state = _written_state(adapter.initialize_fast_state())
     visual = torch.randn(1, 2, 4096, requires_grad=True)
-    state_tensors = (state.w0_1, state.w0_2, state.w_t_1, state.w_t_2)
-    state_values = tuple(tensor.detach().clone() for tensor in state_tensors)
-    state_storage = tuple(storage_pointer(tensor) for tensor in state_tensors)
-    state_counters = (state.fast_version, state.update_count, state.skip_count)
+    state_value = state.m.detach().clone()
+    state_storage = storage_pointer(state.m)
+    state_counters = (state.write_version, state.write_count, state.skip_count)
 
     output = adapter(visual, fast_state=state)
     output.square().mean().backward()
@@ -189,10 +252,9 @@ def test_online_forward_gives_only_w_t_and_input_gradients() -> None:
         assert torch.isfinite(fast_parameter.grad).all()
         assert fast_parameter.grad.abs().sum() > 0
     assert all(parameter.grad is None for parameter in adapter.parameters())
-    assert (state.fast_version, state.update_count, state.skip_count) == state_counters
-    assert tuple(storage_pointer(tensor) for tensor in state_tensors) == state_storage
-    for tensor, expected in zip(state_tensors, state_values, strict=True):
-        assert torch.equal(tensor, expected)
+    assert (state.write_version, state.write_count, state.skip_count) == state_counters
+    assert storage_pointer(state.m) == state_storage
+    assert torch.equal(state.m.detach(), state_value)
 
 
 def test_differentiable_state_preserves_outer_gradients_to_w0_and_slow_parameters() -> None:
@@ -202,8 +264,6 @@ def test_differentiable_state_preserves_outer_gradients_to_w0_and_slow_parameter
 
     adapter(visual, fast_state=state).square().mean().backward()
 
-    assert state.w_t_1.is_leaf is False
-    assert state.w_t_2.is_leaf is False
     for parameter in (
         *adapter.collect_slow_parameters(),
         *adapter.collect_meta_fast_parameters(),
@@ -212,52 +272,30 @@ def test_differentiable_state_preserves_outer_gradients_to_w0_and_slow_parameter
         assert torch.isfinite(parameter.grad).all()
         assert parameter.grad.abs().sum() > 0
     assert all(parameter.grad is not None for parameter in adapter.p_context.parameters())
-    assert not hasattr(adapter, "p_value")
+    # The zero-init memory cannot be co-opted as static capacity: its readout is
+    # exactly zero, so the read gate receives a zero (not missing) gradient.
+    assert adapter.memory_alpha.grad is not None
+    assert torch.count_nonzero(adapter.memory_alpha.grad) == 0
+    assert state.m.grad is not None
 
 
-def test_initial_bound_fast_state_matches_static_w0_forward() -> None:
-    adapter = make_adapter()
-    visual = torch.randn(1, 3, 4096)
-
-    static_output = adapter(visual)
-    initial = adapter.initialize_fast_state(differentiable=True)
-    with adapter.use_fast_state(initial):
-        bound_output = adapter(visual)
-
-    torch.testing.assert_close(bound_output, static_output, rtol=1.0e-5, atol=1.0e-6)
-
-
-def test_reset_and_video_initialization_clone_current_w0_without_storage_sharing() -> None:
+def test_reset_and_video_initialization_are_zero_without_storage_sharing() -> None:
     adapter = make_adapter()
     first = adapter.initialize_fast_state()
     second = adapter.initialize_fast_state()
-    all_runtime = (
-        first.w0_1,
-        first.w0_2,
-        first.w_t_1,
-        first.w_t_2,
-        second.w0_1,
-        second.w0_2,
-        second.w_t_1,
-        second.w_t_2,
-    )
-    assert len({storage_pointer(tensor) for tensor in all_runtime}) == len(all_runtime)
-    assert torch.equal(first.w_t_1, adapter.w0_1)
-    assert torch.equal(first.w_t_2, adapter.w0_2)
+    assert storage_pointer(first.m) != storage_pointer(second.m)
+    assert torch.count_nonzero(first.m.detach()) == 0
+    assert torch.count_nonzero(second.m.detach()) == 0
 
-    with torch.no_grad():
-        first.w_t_1.add_(1.0)
-        adapter.w0_1.add_(0.25)
-    changed = replace(first, fast_version=3, update_count=3, skip_count=2)
+    changed = _written_state(first)
+    changed = replace(changed, write_version=3, write_count=3, skip_count=2)
     reset = adapter.reset_fast_state(changed)
 
-    assert reset.fast_version == reset.update_count == reset.skip_count == 0
-    assert torch.equal(reset.w_t_1, adapter.w0_1)
-    assert torch.equal(reset.w_t_2, adapter.w0_2)
-    assert storage_pointer(reset.w_t_1) not in {
-        storage_pointer(first.w_t_1),
-        storage_pointer(second.w_t_1),
-        storage_pointer(adapter.w0_1),
+    assert reset.write_version == reset.write_count == reset.skip_count == 0
+    assert torch.count_nonzero(reset.m.detach()) == 0
+    assert storage_pointer(reset.m) not in {
+        storage_pointer(first.m),
+        storage_pointer(second.m),
     }
 
 
@@ -267,61 +305,47 @@ def test_parameter_collection_is_stable_exact_and_rejects_boundary_drift() -> No
     groups = adapter.parameter_groups(state)
 
     assert groups.meta_fast == (adapter.w0_1, adapter.w0_2)
-    assert groups.online_fast[0] is state.w_t_1
-    assert groups.online_fast[1] is state.w_t_2
+    assert groups.online_fast == (state.m,)
     assert groups.slow == adapter.collect_slow_parameters()
-    assert tensor_count(collect_fast_parameters(state)) == 2 * 768 * 768 == 1_179_648
+    assert tensor_count(collect_fast_parameters(state)) == 768 * 768 == 589_824
     assert tensor_count(adapter.collect_slow_parameters()) == 6_300_416
-    assert tensor_count(adapter.collect_associative_parameters()) == 393_984
+    assert (
+        tensor_count(adapter.collect_associative_parameters())
+        == 393_984 + MEMORY_INTERFACE_PARAMETER_COUNT
+    )
     assert not ({id(parameter) for parameter in groups.online_fast} & {id(p) for p in groups.slow})
 
 
-def test_truncated_meta_reanchor_preserves_value_cuts_history_and_restores_w0_path() -> None:
-    adapter = make_adapter()
-    initial = adapter.initialize_fast_state(differentiable=True)
-    support_scale = torch.tensor(0.25, requires_grad=True)
-    old_1 = initial.w_t_1 + support_scale * initial.w_t_1.square()
-    old_2 = initial.w_t_2 + support_scale * initial.w_t_2.square()
-    old_state = replace(initial, w_t_1=old_1, w_t_2=old_2, fast_version=1, update_count=1)
-
-    reanchored, audit = reanchor_fast_state(old_state)
-    query = reanchored.w_t_1.sum() + 2.0 * reanchored.w_t_2.sum()
-    grad_w0 = torch.autograd.grad(query, (adapter.w0_1, adapter.w0_2), retain_graph=True)
-    grad_old_support = torch.autograd.grad(query, support_scale, allow_unused=True)[0]
-
-    assert torch.equal(reanchored.w_t_1.detach(), old_state.w_t_1.detach())
-    assert torch.equal(reanchored.w_t_2.detach(), old_state.w_t_2.detach())
-    assert audit.max_abs_value_drift == (0.0, 0.0)
-    assert audit.old_graph_truncated
-    assert audit.w0_identity_path_restored
-    assert audit.storage_isolated
-    assert torch.equal(grad_w0[0], torch.ones_like(grad_w0[0]))
-    assert torch.equal(grad_w0[1], torch.full_like(grad_w0[1], 2.0))
-    assert grad_old_support is None
-
-
-def test_state_dict_roundtrip_saves_w0_and_never_transient_w_t() -> None:
+def test_state_dict_roundtrip_saves_w0_and_never_the_transient_memory() -> None:
     source = make_adapter()
-    state = source.initialize_fast_state()
-    with torch.no_grad():
-        state.w_t_1.add_(5.0)
+    state = _written_state(source.initialize_fast_state(), magnitude=5.0)
     checkpoint = {key: value.detach().clone() for key, value in source.state_dict().items()}
     target = make_adapter()
     target.load_state_dict(checkpoint)
 
     assert torch.equal(target.w0_1, source.w0_1)
     assert torch.equal(target.w0_2, source.w0_2)
-    assert not torch.equal(target.w0_1, state.w_t_1)
-    assert all("w_t" not in key and "active_fast" not in key for key in checkpoint)
+    assert state.m.detach().abs().max() > 0
+    assert all(
+        key.split(".")[-1] != "m" and "active_fast" not in key for key in checkpoint
+    )
+
+
+def test_memory_contract_version_is_persistent_and_strict() -> None:
+    adapter = make_adapter()
+    state = adapter.state_dict()
+    assert int(state["memory_contract_version"].item()) == 3
+    legacy = dict(state)
+    legacy.pop("memory_contract_version")
+    with pytest.raises(RuntimeError, match="Missing key"):
+        adapter.load_state_dict(legacy, strict=True)
 
 
 def test_context_binding_integrates_with_p3_boundary_and_cleans_up_after_errors() -> None:
     adapter = make_adapter().eval()
     assert adapter.p_out.bias is not None
     adapter.p_out.bias.requires_grad_(False)
-    state = adapter.initialize_fast_state()
-    with torch.no_grad():
-        state.w_t_2.mul_(0.5)
+    state = _written_state(adapter.initialize_fast_state())
     boundary = QwenVideoFeatureBoundary(load_config(), adapter, adapter_enabled=True)
     grid = torch.tensor([[1, 2, 2]], dtype=torch.int64)
     main = (torch.randn(1, 4096),)
@@ -338,7 +362,7 @@ def test_context_binding_integrates_with_p3_boundary_and_cleans_up_after_errors(
 
     assert not torch.equal(adapted[0], main[0])
     assert returned_deepstack is deepstack
-    assert all("w_t" not in key for key in boundary.state_dict())
+    assert all(key.split(".")[-1] != "m" for key in boundary.state_dict())
     assert tuple(parameter.requires_grad for parameter in adapter.parameters()) == outer_flags
     with pytest.raises(RuntimeError, match="sentinel"), adapter.use_fast_state(state):
         raise RuntimeError("sentinel")
@@ -374,21 +398,19 @@ def test_online_binding_rejects_stale_slow_grad_and_differentiable_binding_stays
         )
     )
     assert all(parameter.grad is not None for parameter in adapter.p_context.parameters())
-    assert not hasattr(adapter, "p_value")
 
 
-def test_float64_is_preserved_and_stale_state_after_module_move_fails() -> None:
+def test_float64_module_still_runs_its_fp32_memory_core() -> None:
     adapter = make_adapter()
-    stale = adapter.initialize_fast_state()
+    state = adapter.initialize_fast_state()
     adapter = adapter.to(dtype=torch.float64)
     visual = torch.randn(1, 1, 4096, dtype=torch.float64)
 
-    output = adapter(visual)
+    output = adapter(visual, fast_state=state)
 
     assert output.dtype == torch.float64
     assert output.device == visual.device
-    with pytest.raises(ValueError, match="runtime W0 must match the module"):
-        adapter(visual, fast_state=stale)
+    assert state.m.dtype == torch.float32
 
 
 def test_bfloat16_online_runtime_preserves_dtype() -> None:
@@ -401,20 +423,18 @@ def test_bfloat16_online_runtime_preserves_dtype() -> None:
     assert output.dtype == torch.bfloat16
     assert output.device == visual.device
     assert torch.isfinite(output).all()
-    assert state.w0_1.dtype == state.w0_2.dtype == torch.bfloat16
-    assert state.w_t_1.dtype == state.w_t_2.dtype == torch.float32
+    assert state.m.dtype == torch.float32
 
 
-def test_sub_bfloat16_ulp_master_delta_changes_fp32_fast_core_prediction() -> None:
+def test_small_memory_delta_changes_fp32_fast_core_prediction() -> None:
     adapter = make_adapter(dtype=torch.bfloat16)
     baseline = adapter.initialize_fast_state()
     visual = torch.randn(1, 1, 4096, dtype=torch.bfloat16)
 
     adapter(visual, fast_state=baseline)
     baseline_prediction = adapter.consume_associative_intermediates().predictions.detach()
-    changed_w1 = (baseline.w_t_1.detach() + 1.0e-5).requires_grad_(True)
-    changed_w2 = baseline.w_t_2.detach().clone().requires_grad_(True)
-    changed = replace(baseline, w_t_1=changed_w1, w_t_2=changed_w2)
+    changed_memory = (baseline.m.detach() + 1.0e-3).requires_grad_(True)
+    changed = replace(baseline, m=changed_memory)
 
     adapter(visual, fast_state=changed)
     changed_prediction = adapter.consume_associative_intermediates().predictions.detach()
@@ -422,8 +442,8 @@ def test_sub_bfloat16_ulp_master_delta_changes_fp32_fast_core_prediction() -> No
     assert baseline_prediction.dtype == changed_prediction.dtype == torch.float32
     assert not torch.equal(baseline_prediction, changed_prediction)
     assert adapter.last_audit is not None
-    assert adapter.last_audit.master_delta_norms[0] > 0.0
-    assert adapter.last_audit.fast_core_prediction_delta_norms[0] > 0.0
+    assert adapter.last_audit.memory_norms[0] > 0.0
+    assert adapter.last_audit.readout_share_norms[0] > 0.0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is optional for local P5 checks")
@@ -466,99 +486,96 @@ def test_forward_rejects_invalid_inputs_and_masks(
         adapter(visual, mask)
 
 
-def test_fast_state_rejects_alias_nonfinite_nonleaf_and_invalid_metadata() -> None:
-    w0_1 = torch.zeros(768, 768)
-    w0_2 = torch.ones(768, 768)
-    w_t_1 = w0_1.clone().requires_grad_(True)
-    w_t_2 = w0_2.clone().requires_grad_(True)
+def test_memory_state_rejects_nonfinite_nonleaf_and_invalid_metadata() -> None:
+    memory = torch.zeros((768, 768), requires_grad=True)
 
-    with pytest.raises(ValueError, match="distinct storage"):
-        FastWeightsState(w0_1, w0_2, w0_1.view_as(w0_1), w_t_2, 0, 0, 0)
-    bad = w_t_1.detach().clone().requires_grad_(True)
+    bad = memory.detach().clone().requires_grad_(True)
     with torch.no_grad():
         bad[0, 0] = torch.nan
     with pytest.raises(ValueError, match="finite"):
-        FastWeightsState(w0_1, w0_2, bad, w_t_2, 0, 0, 0)
-    bad_inf = w_t_1.detach().clone().requires_grad_(True)
+        FastMemoryState(bad, 0, 0, 0)
+    bad_inf = memory.detach().clone().requires_grad_(True)
     with torch.no_grad():
         bad_inf[0, 0] = torch.inf
     with pytest.raises(ValueError, match="finite"):
-        FastWeightsState(w0_1, w0_2, bad_inf, w_t_2, 0, 0, 0)
-    nonleaf = w_t_1 + 1.0
+        FastMemoryState(bad_inf, 0, 0, 0)
+    nonleaf = memory + 1.0
     with pytest.raises(ValueError, match="leaf"):
-        FastWeightsState(w0_1, w0_2, nonleaf, w_t_2, 0, 0, 0)
+        FastMemoryState(nonleaf, 0, 0, 0)
+    with pytest.raises(ValueError, match="require gradients"):
+        FastMemoryState(memory.detach(), 0, 0, 0)
     with pytest.raises(TypeError, match="exact integers"):
-        FastWeightsState(w0_1, w0_2, w_t_1, w_t_2, True, 1, 0)
-    with pytest.raises(ValueError, match="accepted updates"):
-        FastWeightsState(w0_1, w0_2, w_t_1, w_t_2, 2, 1, 0)
+        FastMemoryState(memory, True, 1, 0)
+    with pytest.raises(ValueError, match="accepted writes"):
+        FastMemoryState(memory, 2, 1, 0)
     with pytest.raises(TypeError, match="differentiable"):
-        FastWeightsState(w0_1, w0_2, w_t_1, w_t_2, 0, 0, 0, 1)  # type: ignore[arg-type]
+        FastMemoryState(memory, 0, 0, 0, 1)  # type: ignore[arg-type]
 
     adapter = make_adapter()
     state = adapter.initialize_fast_state()
     visual = torch.zeros(1, 1, 4096)
-    with pytest.raises(TypeError, match="only FastWeightsState"):
+    with pytest.raises(TypeError, match="only FastMemoryState"):
         adapter(visual, fast_state=(object(),))  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="reset mode"):
         adapter.reset_fast_state(state, differentiable=1)  # type: ignore[arg-type]
 
     with pytest.raises(TypeError, match="exact integers"):
         FastTTTForwardAudit(
-            fast_versions=(True,),
-            update_counts=(0,),
+            write_versions=(True,),
+            write_counts=(0,),
             valid_token_counts=(1,),
             used_runtime_state=False,
             used_associative_context=False,
             bank_record_counts=(0,),
-            w_t_1_norms=(0.0,),
-            w_t_2_norms=(0.0,),
-            master_delta_norms=(0.0,),
-            fast_core_prediction_delta_norms=(0.0,),
+            memory_norms=(0.0,),
+            readout_share_norms=(0.0,),
             input_norms=(0.0,),
             residual_norms=(0.0,),
         )
     with pytest.raises(TypeError, match="runtime/context audit flags"):
         FastTTTForwardAudit(
-            fast_versions=(0,),
-            update_counts=(0,),
+            write_versions=(0,),
+            write_counts=(0,),
             valid_token_counts=(1,),
             used_runtime_state=1,  # type: ignore[arg-type]
             used_associative_context=False,
             bank_record_counts=(0,),
-            w_t_1_norms=(0.0,),
-            w_t_2_norms=(0.0,),
-            master_delta_norms=(0.0,),
-            fast_core_prediction_delta_norms=(0.0,),
+            memory_norms=(0.0,),
+            readout_share_norms=(0.0,),
             input_norms=(0.0,),
             residual_norms=(0.0,),
         )
 
 
-def test_fast_state_accepts_disjoint_w0_views_from_one_flattened_allocation() -> None:
+def test_batched_states_reject_views_of_one_flattened_allocation() -> None:
     matrix_elements = 768 * 768
-    flat = torch.zeros(2 * matrix_elements)
-    w0_1 = flat[:matrix_elements].view(768, 768)
-    w0_2 = flat[matrix_elements:].view(768, 768)
-    assert storage_pointer(w0_1) == storage_pointer(w0_2)
-    assert w0_1.storage_offset() != w0_2.storage_offset()
+    flat = torch.zeros(2 * matrix_elements, requires_grad=True)
+    first = flat[:matrix_elements].view(768, 768)
+    second = flat[matrix_elements:].view(768, 768)
+    assert storage_pointer(first) == storage_pointer(second)
 
-    state = FastWeightsState(
-        w0_1=w0_1,
-        w0_2=w0_2,
-        w_t_1=w0_1.clone().requires_grad_(True),
-        w_t_2=w0_2.clone().requires_grad_(True),
-        fast_version=0,
-        update_count=0,
-        skip_count=0,
+    adapter = make_adapter()
+    states = (
+        FastMemoryState(first, 0, 0, 0, True),
+        FastMemoryState(second, 0, 0, 0, True),
     )
+    # Disjoint spans of one allocation are legal (they never alias element-wise).
+    output = adapter(torch.randn(2, 1, 4096), fast_state=states)
+    assert output.shape == (2, 1, 4096)
 
-    flat_pointer = flat.untyped_storage().data_ptr()
-    assert state.fast_parameters[0].untyped_storage().data_ptr() != flat_pointer
-    assert state.fast_parameters[1].untyped_storage().data_ptr() != flat_pointer
+    overlapping = FastMemoryState(
+        flat[: matrix_elements].view(768, 768),
+        0,
+        0,
+        0,
+        True,
+    )
+    with pytest.raises(ValueError, match="must not share memory storage"):
+        adapter(torch.randn(2, 1, 4096), fast_state=(states[0], overlapping))
 
 
 @pytest.mark.parametrize("query_count", (2, 4, 15))
-def test_query_proxy_deferred_vjp_matches_one_shot_second_order_gradient(
+def test_query_proxy_deferred_vjp_matches_one_shot_gradient(
     query_count: int,
 ) -> None:
     reference = make_adapter(dtype=torch.float32)
@@ -567,30 +584,17 @@ def test_query_proxy_deferred_vjp_matches_one_shot_second_order_gradient(
     direct_reference = nn.Parameter(torch.tensor(0.125, dtype=torch.float32))
     direct_streamed = nn.Parameter(direct_reference.detach().clone())
 
-    def updated_state(adapter: FastTTTAdapter) -> FastWeightsState:
+    def updated_state(adapter: FastTTTAdapter) -> FastMemoryState:
         initial = adapter.initialize_fast_state(differentiable=True)
-        return FastWeightsState(
-            w0_1=initial.w0_1,
-            w0_2=initial.w0_2,
-            w_t_1=initial.w_t_1 - 0.01 * torch.sin(initial.w_t_1),
-            w_t_2=initial.w_t_2 - 0.02 * torch.tanh(initial.w_t_2),
-            fast_version=1,
-            update_count=1,
-            skip_count=0,
-            differentiable=True,
-        )
+        # A differentiable write analog: the memory becomes a function of the
+        # read gate so the deferred VJP has an outer parameter to reach.
+        memory = initial.m + 0.01 * torch.tanh(adapter.memory_alpha).unsqueeze(0)
+        return replace(initial, m=memory, write_version=1, write_count=1)
 
     reference_state = updated_state(reference)
     cases = tuple((0.5 + index / 7.0, -0.25 + index / 11.0) for index in range(query_count))
     reference_losses = tuple(
-        (
-            scale * reference_state.w_t_1[:2, :3]
-            + reference_state.w_t_2[:2, :3]
-            + direct_reference
-            - target
-        )
-        .square()
-        .mean()
+        (scale * reference_state.m[:2, :3] + direct_reference - target).square().mean()
         for scale, target in cases
     )
     torch.stack(reference_losses).mean().backward()
@@ -602,16 +606,9 @@ def test_query_proxy_deferred_vjp_matches_one_shot_second_order_gradient(
     )
     for scale, target in cases:
         proxy, audit = make_query_proxy_fast_state(streamed_state)
-        assert audit.max_abs_value_drift == (0.0, 0.0)
+        assert audit.max_abs_value_drift == 0.0
         query_loss = (
-            (
-                scale * proxy.w_t_1[:2, :3]
-                + proxy.w_t_2[:2, :3]
-                + direct_streamed
-                - target
-            )
-            .square()
-            .mean()
+            (scale * proxy.m[:2, :3] + direct_streamed - target).square().mean()
             / float(query_count)
         )
         query_loss.backward()
@@ -620,11 +617,14 @@ def test_query_proxy_deferred_vjp_matches_one_shot_second_order_gradient(
             total.add_(value.grad.detach())
     deferred_fast_vjp_loss((streamed_state,), accumulated).backward()
 
-    assert reference.w0_1.grad is not None and streamed.w0_1.grad is not None
-    assert reference.w0_2.grad is not None and streamed.w0_2.grad is not None
+    assert reference.memory_alpha.grad is not None and streamed.memory_alpha.grad is not None
     assert direct_reference.grad is not None and direct_streamed.grad is not None
-    assert torch.allclose(streamed.w0_1.grad, reference.w0_1.grad, atol=1.0e-6, rtol=1.0e-6)
-    assert torch.allclose(streamed.w0_2.grad, reference.w0_2.grad, atol=1.0e-6, rtol=1.0e-6)
+    assert torch.allclose(
+        streamed.memory_alpha.grad,
+        reference.memory_alpha.grad,
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
     assert torch.allclose(
         direct_streamed.grad,
         direct_reference.grad,

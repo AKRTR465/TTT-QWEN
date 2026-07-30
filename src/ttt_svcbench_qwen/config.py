@@ -1,6 +1,6 @@
-"""Load and validate the frozen retrieval-history project configuration.
+"""Load and validate the frozen slot-memory project configuration.
 
-Inputs: one UTF-8 YAML file describing the frozen schema-12 contract.
+Inputs: one UTF-8 YAML file describing the frozen schema-13 contract.
 Outputs: an immutable, fully validated :class:`ProjectConfig`.
 Forbidden: model forward logic, training logic, secret values, or platform absolute paths.
 """
@@ -15,8 +15,8 @@ from typing import Annotated, Literal, Self, cast
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SPEC_VERSION = "state_ttt_qwen3vl8b_state_write_associative_v3"
-CONFIG_SCHEMA_VERSION = 12
+SPEC_VERSION = "state_ttt_qwen3vl8b_slot_memory_delta_v1"
+CONFIG_SCHEMA_VERSION = 13
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -110,19 +110,6 @@ class ModelConfig(FrozenModel):
     online_freeze: OnlineFreezeConfig
 
 
-class InnerSGDConfig(FrozenModel):
-    name: str
-    learning_rate: PositiveFloat
-    momentum: NonNegativeFloat
-    weight_decay: NonNegativeFloat
-    steps_per_chunk: PositiveInt
-    grad_clip_norm: PositiveFloat
-    reset_per_video: bool
-    meta_gradient_mode: str
-    fast_weight_dtype: Literal["float32"]
-    fast_core_dtype: Literal["float32"]
-
-
 class FastTTTConfig(FrozenModel):
     input_dim: PositiveInt
     bottleneck_dim: PositiveInt
@@ -135,7 +122,35 @@ class FastTTTConfig(FrozenModel):
     fast_matrix_count: PositiveInt
     online_parameter_count: PositiveInt
     update_order: str
-    optimizer: InnerSGDConfig
+
+
+class FastMemoryConfig(FrozenModel):
+    """Zero-initialized per-video delta-rule slot memory replacing inner SGD."""
+
+    write_rule: Literal["parallel_delta_rule"]
+    key_source: Literal["gated_probe_over_token_keys"]
+    value_source: Literal["spatial_slot_state_detached"]
+    eta_max_per_slot: PositiveFloat = Field(le=1.0)
+    eta_chunk_budget: PositiveFloat = Field(le=1.0)
+    eta_gate_hidden_dim: PositiveInt
+    eta_gate_init: PositiveFloat
+    forget_beta_max: PositiveFloat = Field(le=0.5)
+    forget_beta_init: PositiveFloat
+    read_gate_init: PositiveFloat
+    read_gate_shape: Literal["per_channel"]
+    memory_dtype: Literal["float32"]
+    zero_init_per_video: Literal[True]
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def validate_gate_bounds(self) -> Self:
+        if self.eta_gate_init >= self.eta_max_per_slot:
+            raise ValueError("fast_memory.eta_gate_init must be below eta_max_per_slot")
+        if self.forget_beta_init >= self.forget_beta_max:
+            raise ValueError("fast_memory.forget_beta_init must be below forget_beta_max")
+        # The K-step BPTT contraction bound requires sum(eta) <= 2 * (1 - beta_max).
+        if self.eta_chunk_budget > 2.0 * (1.0 - self.forget_beta_max):
+            raise ValueError("fast_memory eta budget violates the write contraction bound")
+        return self
 
 
 class SpatialEncoderConfig(FrozenModel):
@@ -518,16 +533,12 @@ class InputComposerConfig(FrozenModel):
 
 
 class AssociativeTTTConfig(FrozenModel):
-    """Frozen Bank-conditioned state-write association contract."""
+    """Frozen Bank-conditioned key-context contract feeding the slot memory."""
 
-    contract: Literal["bank_conditioned_state_write_v2"]
+    contract: Literal["bank_conditioned_slot_memory_v3"]
     bank_embedding_dim: PositiveInt
     key_dim: PositiveInt
-    target_dim: PositiveInt
     bank_empty_policy: Literal["zero"]
-    target_source: Literal["predicted_active_head_soft_write_stopgrad"]
-    unsupported_target_policy: Literal["skip"]
-    loss: Literal["normalized_fp32_cosine"]
 
 
 class OfficialWeakBalanceConfig(FrozenModel):
@@ -613,9 +624,9 @@ class A5CounterfactualAuditConfig(FrozenModel):
 
     enabled: bool = False
     interval_steps: PositiveInt = 8
-    queries_per_rank: Literal[1] = 1
-    references: tuple[Literal["episode_w0"], Literal["segment_start"]] = (
-        "episode_w0",
+    queries_per_rank: PositiveInt = 1
+    references: tuple[Literal["episode_zero"], Literal["segment_start"]] = (
+        "episode_zero",
         "segment_start",
     )
 
@@ -629,7 +640,7 @@ class A5QueryMetaGradientConfig(FrozenModel):
 
 
 class A5WarmupConfig(FrozenModel):
-    """Independent Fast/State handoff stage; values are part of schema-12."""
+    """Independent Fast/State handoff stage; values are part of schema-13."""
 
     max_steps: Literal[128]
     linear_warmup_steps: Literal[4]
@@ -649,7 +660,7 @@ class A5WarmupConfig(FrozenModel):
             float(self.associative_learning_rate),
         )
         if actual != expected:
-            raise ValueError("A5 Fast/State warmup learning rates drifted from schema-12")
+            raise ValueError("A5 Fast/State warmup learning rates drifted from schema-13")
         return self
 
 
@@ -737,12 +748,18 @@ _FROZEN_CONTRACT: dict[str, object] = {
         "slow_projection_bias": True,
         "fast_bias": False,
         "fast_initialization": "xavier_uniform",
-        "fast_matrix_count": 2,
-        "online_parameter_count": 1_179_648,
+        "fast_matrix_count": 1,
+        "online_parameter_count": 589_824,
         "update_order": "observe_state_then_update_for_next_chunk",
-        "optimizer": {
-            "learning_rate": 1.0e-4,
-        },
+    },
+    "fast_memory": {
+        "write_rule": "parallel_delta_rule",
+        "key_source": "gated_probe_over_token_keys",
+        "value_source": "spatial_slot_state_detached",
+        "eta_chunk_budget": 1.0,
+        "read_gate_shape": "per_channel",
+        "memory_dtype": "float32",
+        "zero_init_per_video": True,
     },
     "spatial_encoder": {
         "input_dim": 4096,
@@ -932,14 +949,10 @@ _FROZEN_CONTRACT: dict[str, object] = {
         "generation_num_beams": 1,
     },
     "associative_ttt": {
-        "contract": "bank_conditioned_state_write_v2",
+        "contract": "bank_conditioned_slot_memory_v3",
         "bank_embedding_dim": 512,
         "key_dim": 768,
-        "target_dim": 768,
         "bank_empty_policy": "zero",
-        "target_source": "predicted_active_head_soft_write_stopgrad",
-        "unsupported_target_policy": "skip",
-        "loss": "normalized_fp32_cosine",
     },
     "loss": {
         "operator_weight": 1.0,
@@ -1056,14 +1069,15 @@ def _validate_frozen_contract(node: object, contract: dict[str, object], prefix:
 
 
 class ProjectConfig(FrozenModel):
-    """Schema-12 production configuration with cross-component contract validation."""
+    """Schema-13 production configuration with cross-component contract validation."""
 
     spec_version: str
-    config_schema_version: Literal[12]
+    config_schema_version: Literal[13]
     data: DataConfig
     video_preprocessing: VideoPreprocessingConfig
     model: ModelConfig
     fast_ttt: FastTTTConfig
+    fast_memory: FastMemoryConfig
     spatial_encoder: SpatialEncoderConfig
     temporal_encoder: TemporalEncoderConfig
     observation_heads: ObservationHeadsConfig
@@ -1089,10 +1103,6 @@ class ProjectConfig(FrozenModel):
             raise ValueError(
                 "a5.query_meta_gradient.mode must be 'per_query_global_norm_clip_sum'"
             )
-        if self.a5.query_meta_gradient.max_norm != 1.0:
-            raise ValueError("a5.query_meta_gradient.max_norm must be 1.0")
-        if self.a5.query_meta_gradient.epsilon != 1.0e-12:
-            raise ValueError("a5.query_meta_gradient.epsilon must be 1e-12")
         self._validate_attention_dimensions()
         self._validate_video_preprocessing_contract()
         self._validate_head_contracts()
@@ -1253,7 +1263,9 @@ class ProjectConfig(FrozenModel):
         if self.fast_ttt.online_parameter_count != (
             self.fast_ttt.fast_matrix_count * self.fast_ttt.bottleneck_dim**2
         ):
-            raise ValueError("fast_ttt.online_parameter_count does not match two fast matrices")
+            raise ValueError("fast_ttt.online_parameter_count does not match one memory matrix")
+        if self.associative_ttt.key_dim != self.fast_ttt.bottleneck_dim:
+            raise ValueError("associative_ttt.key_dim must equal the fast bottleneck dimension")
         if self.spatial_encoder.active_slots > self.spatial_encoder.max_active_slots:
             raise ValueError("spatial_encoder.active_slots cannot exceed max_active_slots")
 
@@ -1269,7 +1281,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Validate and print the schema-12 configuration")
+    parser = argparse.ArgumentParser(description="Validate and print the schema-13 configuration")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     args = parser.parse_args(argv)
     print(load_config(args.config).model_dump_json(indent=2))

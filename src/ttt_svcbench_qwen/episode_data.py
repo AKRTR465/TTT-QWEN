@@ -1072,7 +1072,7 @@ def adaptive_support_schedule(
         raise ValueError("production adaptive schedule is frozen at 40/8/4 with 4s overlap")
 
     # Reserve a causal current-Query observation after the final Support.  That Query chunk is
-    # evaluated with W_after and is deliberately not an Inner-SGD Support update.  Its recent
+    # evaluated with M_after and is deliberately not a Support memory write.  Its recent
     # window overlaps the final Support by four seconds, so the union still covers the complete
     # prefix while MetaTTTEpisode can enforce Query.end > final Support.end.
     query_observation_gap = min(4.0, first_query_time / 2.0)
@@ -1120,7 +1120,7 @@ def adaptive_support_schedule(
             raise ValueError("adjacent adaptive Support chunks must overlap by at least 4 seconds")
     first = supports[0]
     # Prewarm establishes the initial detached online state, but must leave a real
-    # unseen tail for the first Support Inner-SGD update.  Consuming an entire
+    # unseen tail for the first Support memory write.  Consuming an entire
     # short first Support here made W_after identical to W0 for many segments.
     first_duration = first.end_time - first.start_time
     prewarm_end = first.start_time + min(4.0, first_duration / 2.0)

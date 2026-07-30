@@ -24,7 +24,11 @@ from ttt_svcbench_qwen.associative_ttt import (
 )
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.data import RuntimeQueryInput, assert_runtime_payload_safe
-from ttt_svcbench_qwen.fast_ttt import FastTTTForwardAudit, FastWeightsState
+from ttt_svcbench_qwen.fast_ttt import (
+    FastMemoryState,
+    FastTTTForwardAudit,
+    MemoryWriteBatch,
+)
 from ttt_svcbench_qwen.identity_bank import (
     IdentityDecisionStatus,
     IdentityObservationDecision,
@@ -143,6 +147,8 @@ class _RuntimeResetter:
 
 
 class _TinyFastController(nn.Module):
+    """Minimal FastStateController analog with a real per-video memory matrix."""
+
     def __init__(self) -> None:
         super().__init__()
         first = torch.zeros((768, 768), dtype=torch.float32)
@@ -151,41 +157,37 @@ class _TinyFastController(nn.Module):
         second[0, 0] = 0.3
         self.w0_1 = nn.Parameter(first)
         self.w0_2 = nn.Parameter(second)
-        self._active: tuple[FastWeightsState, ...] | None = None
+        self._active: tuple[FastMemoryState, ...] | None = None
         self._context: FastAssociativeContext | None = None
         self._intermediates: AssociativeTTTIntermediates | None = None
         self.value_scale = nn.Parameter(torch.tensor(0.5))
         self.context_scale = nn.Parameter(torch.tensor(0.01))
+        self.eta_raw = nn.Parameter(torch.tensor(0.0))
         self.last_audit: FastTTTForwardAudit | None = None
 
     def reset_fast_state(
         self,
-        state: FastWeightsState | None = None,
+        state: FastMemoryState | None = None,
         *,
         differentiable: bool | None = None,
-    ) -> FastWeightsState:
+    ) -> FastMemoryState:
         del state
-        mode = bool(differentiable)
-        if mode:
-            w0_1: Tensor = self.w0_1
-            w0_2: Tensor = self.w0_2
-            w_t_1 = self.w0_1.clone()
-            w_t_2 = self.w0_2.clone()
-        else:
-            w0_1 = self.w0_1.detach().clone()
-            w0_2 = self.w0_2.detach().clone()
-            w_t_1 = w0_1.clone().requires_grad_(True)
-            w_t_2 = w0_2.clone().requires_grad_(True)
-        return FastWeightsState(w0_1, w0_2, w_t_1, w_t_2, 0, 0, 0, mode)
+        return FastMemoryState(
+            m=torch.zeros((768, 768), dtype=torch.float32, requires_grad=True),
+            write_version=0,
+            write_count=0,
+            skip_count=0,
+            differentiable=bool(differentiable),
+        )
 
     @contextmanager
     def use_fast_state(
         self,
-        state: FastWeightsState | Sequence[FastWeightsState],
+        state: FastMemoryState | Sequence[FastMemoryState],
     ) -> Iterator[object]:
         if self._active is not None:
             raise RuntimeError("tiny fast binding is not re-entrant")
-        states = (state,) if isinstance(state, FastWeightsState) else tuple(state)
+        states = (state,) if isinstance(state, FastMemoryState) else tuple(state)
         if not states[0].differentiable and any(
             parameter.grad is not None for parameter in self.parameters()
         ):
@@ -200,7 +202,33 @@ class _TinyFastController(nn.Module):
         return (self.w0_1, self.w0_2)
 
     def collect_associative_parameters(self) -> tuple[nn.Parameter, ...]:
-        return (self.value_scale, self.context_scale)
+        return (self.value_scale, self.context_scale, self.eta_raw)
+
+    def prepare_write(
+        self,
+        intermediates: AssociativeTTTIntermediates,
+        spatial: object,
+    ) -> MemoryWriteBatch:
+        del spatial
+        keys_tokens = intermediates.keys.float()
+        valid = intermediates.valid_mask
+        counts = valid.sum(dim=1)
+        denominator = counts.clamp_min(1).to(torch.float32).unsqueeze(-1)
+        pooled = (keys_tokens * valid.unsqueeze(-1).to(torch.float32)).sum(dim=1) / denominator
+        unit = pooled * torch.rsqrt(pooled.square().sum(dim=-1, keepdim=True) + 1.0e-12)
+        slot_mask = (counts > 0).unsqueeze(-1)
+        slot_scale = slot_mask.to(torch.float32)
+        keys = (unit * slot_scale).unsqueeze(1)
+        etas = torch.sigmoid(self.eta_raw).reshape(1, 1).expand(keys_tokens.shape[0], 1)
+        etas = etas * slot_scale
+        return MemoryWriteBatch(
+            keys=keys,
+            values=keys.clone(),
+            etas=etas,
+            slot_mask=slot_mask,
+            beta=torch.tensor(0.01, dtype=torch.float32),
+            eta_renormalized=(False,) * keys_tokens.shape[0],
+        )
 
     @contextmanager
     def use_associative_context(
@@ -230,7 +258,8 @@ class _TinyFastController(nn.Module):
     ) -> VisualStageOutput:
         if self._active is None or not isinstance(visual.value, Tensor):
             raise RuntimeError("tiny fast stage requires one managed binding")
-        gains = torch.stack([state.w_t_1[0, 0] * state.w_t_2[0, 0] for state in self._active])
+        static_gain = self.w0_1[0, 0] * self.w0_2[0, 0]
+        gains = torch.stack([static_gain + state.m[0, 0] for state in self._active])
         adapted = visual.value + gains[:, None, None]
         residual = adapted - visual.value
         context = self._context
@@ -241,9 +270,7 @@ class _TinyFastController(nn.Module):
             * self.context_scale
         )
         keys = visual.value * self.value_scale + context_term
-        w1 = torch.stack(tuple(state.w_t_1 for state in self._active))
-        w2 = torch.stack(tuple(state.w_t_2 for state in self._active))
-        predictions = torch.bmm(F.silu(torch.bmm(keys, w1.transpose(1, 2))), w2.transpose(1, 2))
+        predictions = keys + gains[:, None, None]
         payload = _request.video_input
         if not isinstance(payload, _VideoChunk):
             raise TypeError("tiny Fast forward requires a _VideoChunk payload")
@@ -259,28 +286,16 @@ class _TinyFastController(nn.Module):
             bank_versions=context.bank_versions,
         )
         self.last_audit = FastTTTForwardAudit(
-            fast_versions=tuple(state.fast_version for state in self._active),
-            update_counts=tuple(state.update_count for state in self._active),
+            write_versions=tuple(state.write_version for state in self._active),
+            write_counts=tuple(state.write_count for state in self._active),
             valid_token_counts=tuple(adapted.shape[1] for _ in self._active),
             used_runtime_state=True,
             used_associative_context=True,
             bank_record_counts=tuple(int(value.item()) for value in context.bank_record_counts),
-            w_t_1_norms=tuple(float(state.w_t_1.detach().norm()) for state in self._active),
-            w_t_2_norms=tuple(float(state.w_t_2.detach().norm()) for state in self._active),
-            master_delta_norms=tuple(
-                float(
-                    torch.sqrt(
-                        (state.w_t_1.detach().float() - state.w0_1.detach().float())
-                        .square()
-                        .sum()
-                        + (state.w_t_2.detach().float() - state.w0_2.detach().float())
-                        .square()
-                        .sum()
-                    )
-                )
-                for state in self._active
+            memory_norms=tuple(float(state.m.detach().norm()) for state in self._active),
+            readout_share_norms=tuple(
+                float(state.m.detach()[0, 0].abs()) for state in self._active
             ),
-            fast_core_prediction_delta_norms=(0.0,) * len(self._active),
             input_norms=tuple(
                 float(visual.value[row].detach().norm()) for row in range(len(gains))
             ),
@@ -608,7 +623,7 @@ class _Qwen(nn.Module):
         super().__init__()
         object.__setattr__(self, "_fast_controller", fast_controller)
         self.answer_features: list[Tensor] = []
-        self.answer_fast_versions: list[tuple[int, ...]] = []
+        self.answer_write_versions: list[tuple[int, ...]] = []
 
     def forward(self, request: QwenPrefillRequest) -> object:
         if not isinstance(request.input_ids, Tensor):
@@ -618,10 +633,8 @@ class _Qwen(nn.Module):
         if active is None:
             raise RuntimeError("tiny Answer prefill requires one managed fast-state binding")
         self.answer_features.append(request.pixel_values_videos.detach().clone())
-        self.answer_fast_versions.append(tuple(state.fast_version for state in active))
-        gains = torch.stack(
-            tuple(state.w_t_1[0, 0] * state.w_t_2[0, 0] for state in active)
-        )
+        self.answer_write_versions.append(tuple(state.write_version for state in active))
+        gains = torch.stack(tuple(state.m[0, 0] for state in active))
         score = request.pixel_values_videos.float().mean().reshape(1) + gains - gains.detach()
         zeros = torch.zeros_like(score)
         row = torch.stack((score, -score, zeros), dim=-1)
@@ -977,15 +990,15 @@ def test_stage_c_invalid_chunk_skips_then_later_supports_continue(
     output = runner.run_truncated(
         _truncated_episode(config, support_count=4, invalid_first_support=True)
     )
-    assert output.audit.updates[0].did_update == (False,)
-    assert output.audit.updates[0].skip_reasons == ("no_valid_token",)
-    assert [update.fast_versions_before for update in output.audit.updates] == [
+    assert output.audit.writes[0].did_write == (False,)
+    assert output.audit.writes[0].skip_reasons == ("no_valid_slot",)
+    assert [write.write_versions_before for write in output.audit.writes] == [
         (0,),
         (0,),
         (1,),
         (2,),
     ]
-    assert output.final_fast_states[0].update_count == 3
+    assert output.final_fast_states[0].write_count == 3
     assert output.final_fast_states[0].skip_count == 1
     assert len(output.audit.queries) == 1
 
@@ -1001,8 +1014,8 @@ def test_a5_all_skipped_segment_is_explicit_outer_only(
 
     segment = output.audit.segments[0]
     assert segment.training_mode == "outer_only"
-    assert segment.update_attempt_count == 1
-    assert segment.update_count == 0
+    assert segment.write_attempt_count == 1
+    assert segment.write_count == 0
     assert segment.skip_count == 1
     assert output.audit.meta_ttt_segment_count == 0
     assert output.audit.outer_only_segment_count == 1
@@ -1020,11 +1033,11 @@ def test_a5_support_schedule_is_bounded_and_next_only(
     assert output.audit.support_count == support_count
     assert output.audit.maximum_retained_support_graphs == min(support_count, 8)
     assert output.audit.truncation_horizon == 8
-    assert output.audit.update_attempt_count == support_count
-    assert all(update.next_only_verified for update in output.audit.updates)
-    assert output.final_fast_states[0].update_count == support_count
+    assert output.audit.write_attempt_count == support_count
+    assert all(write.next_only_verified for write in output.audit.writes)
+    assert output.final_fast_states[0].write_count == support_count
     if support_count > 1:
-        assert sum(output.audit.updates[1].valid_token_counts) > 0
+        assert sum(output.audit.writes[1].valid_token_counts) > 0
         assert output.audit.bank_context_detached
 
 
@@ -1048,9 +1061,12 @@ def test_truncated_a5_two_k8_segments_each_close_with_a_query(
     assert output.audit.meta_ttt_segment_count == 2
     assert output.audit.outer_only_segment_count == 0
     assert all(segment.includes_query_backward for segment in output.audit.segments)
-    assert all(segment.reanchored for segment in output.audit.segments)
-    assert output.final_fast_states[0].fast_version == 16
-    assert output.final_fast_states[0].update_count == 16
+    assert all(segment.truncated for segment in output.audit.segments)
+    assert output.audit.readout_target_cosine_mean != 0.0
+    assert output.audit.post_write_cosine_mean > 0.0
+    assert output.audit.eta_sum_mean > 0.0
+    assert output.final_fast_states[0].write_version == 16
+    assert output.final_fast_states[0].write_count == 16
     assert [query.query_role for query in output.audit.queries] == [
         "intermediate",
         "final",
@@ -1059,18 +1075,22 @@ def test_truncated_a5_two_k8_segments_each_close_with_a_query(
     assert output.query_loss.item() == pytest.approx(
         sum(query.weighted_outer_loss for query in output.audit.queries)
     )
-    assert [segment.fast_version_at_query for segment in output.audit.segments] == [
+    assert [segment.write_version_at_query for segment in output.audit.segments] == [
         (8,),
         (16,),
     ]
     assert all(segment.deferred_vjp_norm > 0.0 for segment in output.audit.segments)
-    assert output.final_fast_states[0].w_t_1.grad_fn is not None
-    assert output.final_fast_states[0].w_t_2.grad_fn is not None
+    # The final memory was truncated at the last segment boundary: a leaf with no
+    # retained Support graph, values preserved bitwise.
+    assert output.final_fast_states[0].m.is_leaf
+    assert output.final_fast_states[0].m.grad_fn is None
     assert output.total.grad_fn is None and not output.total.requires_grad
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
     assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
     assert associative.value_scale.grad is not None
     assert float(associative.value_scale.grad.abs()) > 0.0
+    assert associative.eta_raw.grad is not None
+    assert float(associative.eta_raw.grad.abs()) > 0.0
     assert resetter.calls == 1
 
 
@@ -1109,7 +1129,7 @@ def test_truncated_a5_query_bundle_sums_proxy_gradients_then_closes_once(
     assert output.audit.deferred_vjp_backward_count == 1
     assert output.audit.segments[0].query_count == 2
     assert output.audit.segments[0].query_roles == ("intermediate", "final")
-    assert output.audit.segments[0].update_count == 8
+    assert output.audit.segments[0].write_count == 8
     assert output.audit.segments[0].skip_count == 0
     assert output.audit.segments[0].deferred_vjp_norm > 0.0
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
@@ -1150,6 +1170,7 @@ def test_query_cotangents_clip_independently_then_sum_without_averaging() -> Non
     )
     assert [audit.clip_scale for audit in audits] == pytest.approx([1.0, 1.0, 0.1])
     assert [audit.clipped for audit in audits] == [False, False, True]
+    assert all(audit.max_norm == 1.0 for audit in audits)
 
     segment_sum = tuple(
         sum(query[matrix_index] for query in clipped_queries)
@@ -1162,6 +1183,28 @@ def test_query_cotangents_clip_independently_then_sum_without_averaging() -> Non
     for query, original in zip((ordinary, small, extreme), originals, strict=True):
         for gradient, expected in zip(query, original, strict=True):
             torch.testing.assert_close(gradient, expected)
+
+
+def test_query_cotangent_clip_norm_is_config_driven() -> None:
+    gradients = (torch.tensor([30.0, 40.0], dtype=torch.float32),)
+
+    clipped, audit = meta_trainer_module._clip_query_proxy_gradients(
+        gradients,
+        max_norm=10.0,
+        epsilon=1.0e-12,
+    )
+
+    assert audit.raw_joint_norm == pytest.approx(50.0)
+    assert audit.clipped_joint_norm == pytest.approx(10.0)
+    assert audit.max_norm == 10.0
+    assert audit.clipped
+    torch.testing.assert_close(clipped[0], torch.tensor([6.0, 8.0]))
+    with pytest.raises(ValueError, match="finite and positive"):
+        meta_trainer_module._clip_query_proxy_gradients(
+            gradients,
+            max_norm=0.0,
+            epsilon=1.0e-12,
+        )
 
 
 def test_query_cotangent_clipping_does_not_rescale_direct_outer_gradient() -> None:
@@ -1195,7 +1238,7 @@ def test_query_proxy_gradient_equals_answer_plus_state_components(
     captured: list[tuple[Tensor, ...]] = []
 
     def capture(
-        states: Sequence[FastWeightsState],
+        states: Sequence[FastMemoryState],
         *,
         backward_gradient_scale: float,
     ) -> tuple[tuple[Tensor, ...], tuple[float, ...]]:
@@ -1231,24 +1274,27 @@ def test_query_proxy_gradient_equals_answer_plus_state_components(
         )
 
 
-def test_static_w0_keeps_dense_queries_and_outer_trains_w0_without_ttt(
+def test_legacy_static_w0_adaptation_mode_is_rejected_by_name(
+    config: ProjectConfig,
+) -> None:
+    with pytest.raises(ValueError, match="renamed; use 'no_write'"):
+        _system(config, adaptation_mode="static_w0")
+
+
+def test_no_write_keeps_dense_queries_and_outer_trains_w0_without_writes(
     config: ProjectConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runner, fast, associative, _ = _system(config, adaptation_mode="static_w0")
+    runner, fast, associative, _ = _system(config, adaptation_mode="no_write")
     episode = _truncated_episode(config, support_count=16)
     backward_values: list[float] = []
 
-    def unexpected_ttt_call(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("static-W0 must not construct or optimize a Support TTT target")
+    def unexpected_write_call(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("no-write A5 must not construct or apply a memory write")
 
     monkeypatch.setattr(
-        "ttt_svcbench_qwen.meta_trainer.compute_associative_ttt_loss",
-        unexpected_ttt_call,
-    )
-    monkeypatch.setattr(
-        "ttt_svcbench_qwen.meta_trainer.functional_sgd_steps_from_associative",
-        unexpected_ttt_call,
+        "ttt_svcbench_qwen.meta_trainer.apply_memory_writes",
+        unexpected_write_call,
     )
 
     def backward(loss: Tensor, retain_graph: bool) -> None:
@@ -1258,44 +1304,46 @@ def test_static_w0_keeps_dense_queries_and_outer_trains_w0_without_ttt(
 
     output = runner.run_truncated(episode, backward=backward)
 
-    assert output.audit.adaptation_mode == "static_w0"
+    assert output.audit.adaptation_mode == "no_write"
     assert not output.audit.ttt_enabled
     assert output.audit.associative_valid_count == 0
     assert output.audit.query_count == len(episode.query_points) == 2
     assert output.audit.query_backward_count == 2
     assert output.audit.deferred_vjp_backward_count == 2
     assert output.audit.backward_count == 4
-    assert output.audit.update_attempt_count == 0
-    assert output.audit.update_count == 0
+    assert output.audit.write_attempt_count == 0
+    assert output.audit.write_count == 0
     assert output.audit.skip_count == 0
-    assert output.audit.updates == ()
-    assert output.audit.static_w0_segment_count == 2
+    assert output.audit.writes == ()
+    assert output.audit.no_write_segment_count == 2
     assert output.audit.meta_ttt_segment_count == 0
     assert output.audit.outer_only_segment_count == 0
     assert all(
-        segment.training_mode == "static_w0"
-        and segment.update_attempt_count == 0
-        and segment.update_count == 0
+        segment.training_mode == "no_write"
+        and segment.write_attempt_count == 0
+        and segment.write_count == 0
         and segment.skip_count == 0
-        and segment.associative_loss == 0.0
+        and segment.pre_write_cosine_mean == 0.0
+        and segment.eta_sum == 0.0
         for segment in output.audit.segments
     )
     assert output.audit.maximum_retained_support_graphs == 0
-    assert output.audit.associative_loss_mean == 0.0
-    assert output.audit.associative_element_count == 0
+    assert output.audit.readout_target_cosine_mean == 0.0
+    assert output.audit.slots_written_total == 0
     assert output.total.item() == pytest.approx(output.query_loss.item())
     assert [query.query_role for query in output.audit.queries] == [
         "intermediate",
         "final",
     ]
     assert all(query.query_weight == 1.0 for query in output.audit.queries)
-    assert output.final_fast_states[0].fast_version == 0
-    assert output.final_fast_states[0].update_count == 0
+    assert output.final_fast_states[0].write_version == 0
+    assert output.final_fast_states[0].write_count == 0
     assert output.final_fast_states[0].skip_count == 0
     assert output.final_runtime.next_chunk_index == 17
     assert output.final_runtime.state_bank_states[0].version == 17
     assert associative.value_scale.grad is None
     assert not associative.value_scale.requires_grad
+    assert not associative.eta_raw.requires_grad
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
     assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
     assert len(backward_values) == 4
@@ -1323,11 +1371,11 @@ def test_truncated_a5_batches_raw_visuals_only_within_each_k_segment(
 
     assert calls == [(8, 2), (8, 2)]
     assert [segment.support_count for segment in output.audit.segments] == [8, 8]
-    assert all(update.next_only_verified for update in output.audit.updates)
-    assert output.final_fast_states[0].fast_version == 16
+    assert all(write.next_only_verified for write in output.audit.writes)
+    assert output.final_fast_states[0].write_version == 16
 
 
-def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectConfig) -> None:
+def test_truncated_a5_exact_k_waits_for_query_before_truncation(config: ProjectConfig) -> None:
     runner, fast, _, _ = _system(config)
 
     output = runner.run_truncated(_truncated_episode(config, support_count=8))
@@ -1339,7 +1387,7 @@ def test_truncated_a5_exact_k_waits_for_query_before_reanchor(config: ProjectCon
     assert output.audit.truncation_count == 1
     assert output.audit.segments[0].support_count == 8
     assert output.audit.segments[0].includes_query_backward
-    assert output.audit.segments[0].reanchored
+    assert output.audit.segments[0].truncated
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
     assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
 
@@ -1421,7 +1469,7 @@ def test_truncated_a5_ema_balance_composes_all_queries_once(
     )
     qwen = runner.model.components.qwen_prefill
     assert isinstance(qwen, _Qwen)
-    assert qwen.answer_fast_versions == [(8,), (8,), (9,), (9,)]
+    assert qwen.answer_write_versions == [(8,), (8,), (9,), (9,)]
 
 
 def test_truncated_a5_reuses_one_query_graph_per_segment_and_final_key(
@@ -1628,20 +1676,49 @@ def test_diagnostic_counterfactual_is_no_grad_and_does_not_change_training(
     assert counterfactual is not None
     assert counterfactual.optimizer_step == 8
     assert tuple(item.reference for item in counterfactual.references) == (
-        "episode_w0",
+        "episode_zero",
         "segment_start",
     )
     audited_qwen = audited_runner.model.components.qwen_prefill
     assert isinstance(audited_qwen, _Qwen)
-    assert audited_qwen.answer_fast_versions == [(4,), (4,), (0,), (0,)]
-    assert all(torch.equal(left.w_t_1, right.w_t_1) for left, right in zip(
+    assert audited_qwen.answer_write_versions == [(4,), (4,), (0,), (0,)]
+    assert all(torch.equal(left.m.detach(), right.m.detach()) for left, right in zip(
         baseline.final_fast_states,
         audited.final_fast_states,
         strict=True,
     ))
 
 
-def test_answer_only_proxy_gradient_trains_associative_target(
+def test_counterfactual_can_audit_multiple_queries_per_rank(
+    config: ProjectConfig,
+) -> None:
+    raw = config.model_dump(mode="python")
+    raw["a5"]["counterfactual_audit"]["enabled"] = True
+    audit_config = ProjectConfig.model_validate(raw)
+    runner, _, _, _ = _system(audit_config)
+    episode = _truncated_episode(audit_config, support_count=16)
+
+    output = runner.run_truncated(
+        episode,
+        counterfactual_audit=CounterfactualAuditRequest(
+            optimizer_step=4,
+            query_selector=0,
+            queries_per_rank=2,
+        ),
+    )
+
+    assert output.audit.counterfactual_audited_query_count == 2
+    audited = tuple(
+        query for query in output.audit.queries if query.counterfactual is not None
+    )
+    assert len(audited) == 2
+    for query in audited:
+        assert query.counterfactual is not None
+        references = {item.reference for item in query.counterfactual.references}
+        assert references == {"episode_zero", "segment_start"}
+
+
+def test_answer_only_proxy_gradient_trains_the_memory_interface(
     config: ProjectConfig,
 ) -> None:
     runner, _, associative, _ = _system(
@@ -1656,6 +1733,8 @@ def test_answer_only_proxy_gradient_trains_associative_target(
     assert output.audit.segments[0].deferred_vjp_norm > 0.0
     assert associative.value_scale.grad is not None
     assert float(torch.linalg.vector_norm(associative.value_scale.grad).item()) > 0.0
+    assert associative.eta_raw.grad is not None
+    assert float(torch.linalg.vector_norm(associative.eta_raw.grad).item()) > 0.0
 
 
 @pytest.mark.parametrize("denied", ["answer", "count", "occurrence_times"])

@@ -2,7 +2,7 @@
 
 Inputs: label-free runtime payloads, separate supervision, and one StateTTT model.
 Outputs: typed model-forward values used by the formal A2 training runtime.
-Forbidden: Inner SGD, transient runtime checkpoints, or label leakage into model inputs.
+Forbidden: memory writes, transient runtime checkpoints, or label leakage into model inputs.
 """
 
 from __future__ import annotations
@@ -54,17 +54,23 @@ class StageAExecutionAudit:
     fsm_rollout_count: int
     decode_step_count: int = 0
     ground_truth_reader_input_count: int = 0
-    inner_sgd_attempted: int = 0
-    inner_sgd_updated: int = 0
-    inner_sgd_skipped: int = 0
+    memory_writes_attempted: int = 0
+    memory_writes_applied: int = 0
+    memory_writes_skipped: int = 0
 
     def validate(self) -> None:
         if self.decode_step_count:
             raise ValueError("Stage A teacher forcing must use prefill only, never decode")
         if self.ground_truth_reader_input_count:
             raise ValueError("Reader exact count cannot consume ground-truth labels")
-        if any((self.inner_sgd_attempted, self.inner_sgd_updated, self.inner_sgd_skipped)):
-            raise ValueError("Stage A cannot attempt, update, or skip Inner SGD")
+        if any(
+            (
+                self.memory_writes_attempted,
+                self.memory_writes_applied,
+                self.memory_writes_skipped,
+            )
+        ):
+            raise ValueError("Stage A cannot attempt, apply, or skip memory writes")
         if self.reader_result_count != self.row_count:
             raise ValueError("A2 Reader results must cover every row")
         # A randomly initialized label-free router may legitimately choose UNSUPPORTED for
@@ -299,7 +305,7 @@ class StageAEpisodeRunner:
                 # lets variable Support counts change the distributed autograd hook schedule.
                 # Keep their numerical state transition exactly the same, but do not retain
                 # activations.  A5 deliberately does not take this path: its supports carry
-                # the differentiable Inner-SGD computation.
+                # the differentiable memory-write computation.
                 with torch.no_grad():
                     observed = self.model.observe_chunk(request, lifecycle)
             else:

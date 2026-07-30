@@ -1,5 +1,5 @@
-spec_version: state_ttt_qwen3vl8b_state_write_associative_v3
-config_schema_version: 12
+spec_version: state_ttt_qwen3vl8b_slot_memory_delta_v1
+config_schema_version: 13
 
 data:
   grouped_annotation_file: data/vcbench_data.jsonl
@@ -56,20 +56,24 @@ fast_ttt:
   slow_projection_bias: true
   fast_bias: false
   fast_initialization: xavier_uniform
-  fast_matrix_count: 2
-  online_parameter_count: 1179648
+  fast_matrix_count: 1
+  online_parameter_count: 589824
   update_order: observe_state_then_update_for_next_chunk
-  optimizer:
-    name: sgd
-    learning_rate: 1.0e-4
-    momentum: 0.0
-    weight_decay: 0.0
-    steps_per_chunk: 1
-    grad_clip_norm: 1.0
-    reset_per_video: true
-    meta_gradient_mode: full_second_order
-    fast_weight_dtype: float32
-    fast_core_dtype: float32
+
+fast_memory:
+  write_rule: parallel_delta_rule
+  key_source: gated_probe_over_token_keys
+  value_source: spatial_slot_state_detached
+  eta_max_per_slot: 0.25
+  eta_chunk_budget: 1.0
+  eta_gate_hidden_dim: 64
+  eta_gate_init: 0.05
+  forget_beta_max: 0.1
+  forget_beta_init: 0.01
+  read_gate_init: 0.1
+  read_gate_shape: per_channel
+  memory_dtype: float32
+  zero_init_per_video: true
 
 spatial_encoder:
   input_dim: 4096
@@ -433,14 +437,10 @@ input_composer:
   generation_num_beams: 1
 
 associative_ttt:
-  contract: bank_conditioned_state_write_v2
+  contract: bank_conditioned_slot_memory_v3
   bank_embedding_dim: 512
   key_dim: 768
-  target_dim: 768
   bank_empty_policy: zero
-  target_source: predicted_active_head_soft_write_stopgrad
-  unsupported_target_policy: skip
-  loss: normalized_fp32_cosine
 
 loss:
   operator_weight: 1.0
@@ -497,14 +497,14 @@ a5:
     bundle_schema_version: 1
   query_meta_gradient:
     mode: per_query_global_norm_clip_sum
-    max_norm: 1.0
+    max_norm: 10.0
     epsilon: 1.0e-12
   counterfactual_audit:
     enabled: true
-    interval_steps: 8
-    queries_per_rank: 1
+    interval_steps: 2
+    queries_per_rank: 2
     references:
-      - episode_w0
+      - episode_zero
       - segment_start
 
 inference:

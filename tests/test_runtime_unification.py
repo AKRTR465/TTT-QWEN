@@ -48,7 +48,6 @@ def test_runtime_state_has_one_trajectory_and_one_batch_representation() -> None
         "identity_bank",
         "retrieval_history",
         "fast_weights",
-        "optimizer",
         "reader_audit",
         "released",
     )

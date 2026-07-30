@@ -5,19 +5,21 @@
 - A2 全量状态模型训练，再初始化 A5 Meta-TTT；
 - 按视频隔离、按 chunk 因果更新的在线推理。
 
-当前架构规范为 `state_ttt_qwen3vl8b_state_write_associative_v3`，正式配置 schema 为 12；历史阶段 gate 与 synthetic 报告不再随源码分发。
+当前架构规范为 `state_ttt_qwen3vl8b_slot_memory_delta_v1`，正式配置 schema 为 13；历史阶段 gate 与 synthetic 报告不再随源码分发。
 
 ## 架构摘要
 
 - Fast Adapter 位于 Qwen Main Visual Merger 与 video `masked_scatter` 之间；DeepStack 保持原始路径。
-- A5 的 key 由 Query 和写入前 Bank 的有效语义记录共同构造；inner target 来自当前模型 active
-  head 的 768D soft-write source，`P_C` 是唯一独立 Associative 投影。
-- 在线状态仅更新两块 768x768 fast matrix，更新顺序固定为“当前 chunk 使用 Wt，更新后的 Wt+1 从下一 chunk 生效”。
+- A5 的 token key 由 Query 和写入前 Bank 的有效语义记录共同构造；per-video 在线状态是
+  单块零初始化 768x768 delta-rule memory `M`，写入对来自已提交 slot state 的
+  (probe-attention key, projected value, gated eta)，`P_C` 与 memory 接口
+  （key probe、value projection、eta gate、read gate、forget gate）同属 `associative` 组。
+- 更新顺序固定为“当前 chunk 读取 M_{t-1}，闭式 delta-rule 写入的 M_t 从下一 chunk 生效”。
 - 状态路包含 Spatial Slot Encoder、Temporal Encoder、O1/O2/E1/E2 heads、Structured State Bank、Identity Bank、Retriever 和 Deterministic Reader。
 - State Bank 同时维护写后 aggregate/Confirmed 状态和 append-only retrieval history；Query 从写前 history 重投影 768D source，Reader 直接读取写后状态。
 - Reader 负责精确计数及证据，Qwen 负责自然语言答案。
-- A5 使用单一无标签 FP32 state-write cosine objective；它只驱动 Support 内层 functional
-  SGD 产生 `W_{t+1}`，K=8 截断二阶梯度并重锚 W0。
+- A5 没有 Support 内层损失：写入是闭式并行 delta rule（Ση ≤ 1 收缩界），K=8 截断的
+  meta 梯度沿线性递推回传到 memory 接口与 token keys，截断点 detach 保值。
 - A2/A5 正式训练唯一使用 `ema_answer_ref`：loss EMA 对齐 Answer 尺度，再按
   `q_target/q_operator/q_time` 激活面的梯度 RMS EMA 平衡四项 official-weak loss；辅助组仍限制为
   Answer 的至多 30%。
@@ -51,23 +53,24 @@ bash scripts/h200/train_a5_associative_lttt_finalonly.sh \
 
 固定训练语义：
 
-- A2：Qwen、状态模块和 W0 全量解冻，Associative 投影冻结，禁用 Inner SGD；
+- A2：Qwen、状态模块和 W0 全量解冻，Associative 投影冻结，memory 写入不可达；
 - A5 Warmup：从完整 A2 checkpoint 初始化，Qwen 全冻结且不进入 optimizer；训练 Fast/State
   128 step，只保存不含 Qwen、optimizer 与瞬态状态的原子 handoff bundle；
 - A5 Main：重新加载完整 A2 checkpoint并严格叠加 handoff bundle，恢复原部分解冻策略，训练
   4 epoch 且只保存 final checkpoint；
-- A5 的唯一 Support 内层目标是 active-head state-write source 的 FP32 normalized cosine；
-  它只产生下一步 `W_t`，不作为 auxiliary loss 加入 Outer objective，Answer/State Query loss
-  通过 deferred VJP 学习更新方向；
+- A5 Support 写入是纯归档：slot (key, value) 对以学习到的 eta 强度写入 `M`，无
+  auxiliary loss 加入 Outer objective，Answer/State Query loss 通过 deferred VJP 学习
+  写入几何与强度；
 - Support 保持 8/16 帧动态块；每个 Query 独立读取 `[0, query_time]` 因果前缀，2 FPS、最多
   256 帧，动态视觉 Token 数不变；
-- A5 多 Query 逐个 forward/backward，释放各自激活；所有 Query 使用同一段末 fast state，
-  Bank/FSM 仍是只读权威状态；每个 Query 的 FP32 fast-weight cotangent 按联合范数裁剪到
-  1.0 后在 segment 内求和，直接 Query→Qwen/State 梯度不参与该逐 Query 裁剪；
-- W0 保持 checkpoint/model dtype，瞬态 Wt 和 fast MLP 核心固定为 FP32；Support 内层损失不
-  进入 Outer backward，关联中间量不跨调用保存。
+- A5 多 Query 逐个 forward/backward，释放各自激活；所有 Query 使用同一段末 memory
+  state，Bank/FSM 仍是只读权威状态；每个 Query 的 FP32 memory cotangent 按联合范数裁剪
+  到 `a5.query_meta_gradient.max_norm`（当前 10.0）后在 segment 内求和，直接
+  Query→Qwen/State 梯度不参与该逐 Query 裁剪；
+- W0 保持 checkpoint/model dtype，瞬态 `M` 和 fast/memory 核心固定为 FP32；写入路径不
+  产生独立 Outer backward，关联中间量不跨调用保存。
 - 四卡 sampler 保持任务/segment parity，padding 样本 loss 权重为零；
-- checkpoint 保存模型、optimizer、scheduler、RNG，但排除 Wt、Bank、cache 和 FSM runtime。
+- checkpoint 保存模型、optimizer、scheduler、RNG，但排除 `M`、Bank、cache 和 FSM runtime。
 
 `ema_answer_ref` 是唯一 official-weak loss-balance 算法，不再提供 mode 或 experimental
 开关。loss 与 gradient EMA 均采用一步滞后并随同阶段 checkpoint 恢复；A2 初始化 A5 时
@@ -88,9 +91,9 @@ updater、严格 checkpoint 和 per-video runtime 生命周期均由同一 bundl
 
 - 禁止答案、count、occurrence_times、counting_type 和 counting_subtype 进入 Support/Query 模型输入；
 - query_time 之后的帧不得进入状态更新或回答；
-- 新 Wt 只影响下一 chunk；
+- 新 M_t 只影响下一 chunk；
 - 每个视频 reset/release，异常路径同样 release；
-- generate 不修改 Fast、Bank、FSM 或 temporal state。
+- generate 不修改 memory、Bank、FSM 或 temporal state。
 
 ## 验证边界
 

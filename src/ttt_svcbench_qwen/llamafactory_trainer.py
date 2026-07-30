@@ -94,9 +94,10 @@ class CheckpointPolicy(StrEnum):
 
 
 _WARMUP_BUNDLE_SCHEMA_VERSION = 1
+_WARMUP_BUNDLE_ASSOCIATIVE_CONTRACT_VERSION = 3
 _WARMUP_BUNDLE_EXCLUDED_TOKENS = (
     "official_weak_balancer",
-    "transient_w_t",
+    "transient_memory",
     "state_bank_runtime",
     "identity_bank_runtime",
     "fsm_runtime",
@@ -105,6 +106,18 @@ _WARMUP_BUNDLE_EXCLUDED_TOKENS = (
     "runtime",
     "cache",
 )
+_A5_ADAPTATION_MODES = ("meta_ttt", "no_write")
+
+
+def _is_transient_memory_name(lowered: str) -> bool:
+    """Match the per-video memory tensor `m` and any explicit transient marker."""
+
+    return (
+        "transient_memory" in lowered
+        or lowered == "m"
+        or lowered.endswith(".m")
+        or lowered.endswith(("w_t_1", "w_t_2"))
+    )
 
 
 class StageALossStep(Protocol):
@@ -774,7 +787,7 @@ class OuterParameterAudit:
     a5_phase: str = "main"
 
     def __post_init__(self) -> None:
-        if self.a5_adaptation_mode not in {"meta_ttt", "static_w0"}:
+        if self.a5_adaptation_mode not in _A5_ADAPTATION_MODES:
             raise ValueError("outer parameter audit has an invalid A5 adaptation mode")
         if self.a5_phase not in {"fast_state_warmup", "main"}:
             raise ValueError("outer parameter audit has an invalid A5 phase")
@@ -813,13 +826,13 @@ class OuterParameterAudit:
                 raise ValueError("A5 Associative must be fully trainable")
         else:
             if self.qwen_trainable_count <= 0:
-                raise ValueError("static-W0 A5 must train configured Qwen parameters")
+                raise ValueError("no-write A5 must train configured Qwen parameters")
             if self.associative_trainable_count:
-                raise ValueError("static-W0 A5 Associative must remain frozen")
+                raise ValueError("no-write A5 memory-interface parameters must remain frozen")
             expected_non_qwen = self.non_qwen_parameter_count - self.associative_parameter_count
             if self.non_qwen_trainable_count != expected_non_qwen:
                 raise ValueError(
-                    "static-W0 A5 must train every non-Associative state and W0 parameter"
+                    "no-write A5 must train every non-memory state and W0 parameter"
                 )
 
 
@@ -850,7 +863,7 @@ class ProductionTrainerRuntime:
             raise TypeError("production runtime stage/model is invalid")
         if not callable(self.data_collator):
             raise TypeError("production runtime requires a data collator")
-        if self.a5_adaptation_mode not in {"meta_ttt", "static_w0"}:
+        if self.a5_adaptation_mode not in _A5_ADAPTATION_MODES:
             raise ValueError("production runtime has an invalid A5 adaptation mode")
         if self.stage is ProductionStage.A2 and self.a5_adaptation_mode != "meta_ttt":
             raise ValueError("A2 cannot select an A5 adaptation mode")
@@ -1490,17 +1503,13 @@ class TTTQwenTrainerMixin:
                     ),
                     "a5/meta_ttt_segment_count": float(meta_audit.meta_ttt_segment_count),
                     "a5/outer_only_segment_count": float(meta_audit.outer_only_segment_count),
-                    "a5/static_w0_segment_count": float(meta_audit.static_w0_segment_count),
+                    "a5/no_write_segment_count": float(meta_audit.no_write_segment_count),
                     "a5/ablation/ttt_enabled": float(meta_audit.ttt_enabled),
-                    "a5/associative/valid": float(meta_audit.associative_valid_count > 0),
-                    "a5/associative/valid_count": float(meta_audit.associative_valid_count),
-                    "a5/ablation/associative_trainable": float(
-                        self.ttt_runtime.a5_adaptation_mode == "meta_ttt"
-                    ),
-                    "a5/ablation/associative_gradient_enabled": float(
-                        self.ttt_runtime.a5_adaptation_mode == "meta_ttt"
-                    ),
-                    "a5/ablation/associative_parameter_delta_enabled": float(
+                    "a5/memory/write_valid": float(meta_audit.associative_valid_count > 0),
+                    "a5/memory/write_count": float(meta_audit.write_count),
+                    "a5/memory/write_attempt_count": float(meta_audit.write_attempt_count),
+                    "a5/memory/skip_count": float(meta_audit.skip_count),
+                    "a5/ablation/memory_interface_trainable": float(
                         self.ttt_runtime.a5_adaptation_mode == "meta_ttt"
                     ),
                     "a5/ablation/w0_outer_trainable": 1.0,
@@ -1508,36 +1517,21 @@ class TTTQwenTrainerMixin:
                         meta_audit.insufficient_inter_query_gap
                     ),
                     "a5/loss/meta_query_sum": float(meta_output.query_loss.item()),
-                    "a5/associative/loss": meta_audit.associative_loss_mean,
-                    "a5/associative/key_rms": meta_audit.key_rms,
-                    "a5/associative/value_rms": meta_audit.value_rms,
-                    "a5/associative/prediction_rms": meta_audit.prediction_rms,
-                    "a5/associative/error_rms": meta_audit.error_rms,
-                    "a5/associative/key_max_abs": meta_audit.key_max_abs,
-                    "a5/associative/value_max_abs": meta_audit.value_max_abs,
-                    "a5/associative/prediction_max_abs": meta_audit.prediction_max_abs,
-                    "a5/associative/error_max_abs": meta_audit.error_max_abs,
-                    "a5/associative/element_count": float(meta_audit.associative_element_count),
-                    "a5/associative/bank_record_count": float(meta_audit.bank_record_count),
-                    "a5/associative/empty_bank_count": float(meta_audit.empty_bank_count),
-                    "a5/associative/state_write/valid_target_count": float(
-                        sum(count for _, count in meta_audit.valid_target_counts)
+                    "memory/readout_target_cosine": meta_audit.readout_target_cosine_mean,
+                    "memory/pre_write_error_mean": (
+                        1.0 - meta_audit.readout_target_cosine_mean
                     ),
-                    "a5/associative/state_write/unsupported_target_count": float(
-                        meta_audit.unsupported_target_count
-                    ),
-                    "a5/associative/state_write/empty_target_skip_count": float(
-                        meta_audit.empty_target_skip_count
-                    ),
-                    "a5/associative/state_write/prediction_target_cosine": (
-                        meta_audit.prediction_target_cosine_mean
-                    ),
+                    "memory/post_write_cosine": meta_audit.post_write_cosine_mean,
+                    "memory/readout_share": meta_audit.readout_share_mean,
+                    "memory/memory_norm_max": meta_audit.memory_norm_max,
+                    "memory/write_norm": meta_audit.write_norm_mean,
+                    "memory/eta_sum": meta_audit.eta_sum_mean,
+                    "memory/eta_renormalized_fraction": meta_audit.renormalized_fraction,
+                    "memory/slots_written": float(meta_audit.slots_written_total),
+                    "a5/memory/bank_record_count": float(meta_audit.bank_record_count),
+                    "a5/memory/empty_bank_count": float(meta_audit.empty_bank_count),
                 }
             )
-            for head, count in meta_audit.active_head_counts:
-                enriched[f"a5/associative/state_write/active_head/{head}"] = float(count)
-            for head, count in meta_audit.valid_target_counts:
-                enriched[f"a5/associative/state_write/valid_target/{head}"] = float(count)
             role_norms: dict[str, list[float]] = {}
             role_clipped_norms: dict[str, list[float]] = {}
             role_losses: dict[str, list[float]] = {}
@@ -1625,17 +1619,18 @@ class TTTQwenTrainerMixin:
                 enriched[f"a5/deferred_vjp_norm/segment_{segment.segment_index}"] = (
                     segment.deferred_vjp_norm
                 )
-                enriched[f"a5/fast_version_at_query/segment_{segment.segment_index}"] = float(
-                    max(segment.fast_version_at_query)
+                enriched[f"a5/write_version_at_query/segment_{segment.segment_index}"] = float(
+                    max(segment.write_version_at_query)
                 )
-                enriched[f"a5/fast_version_delta/segment_{segment.segment_index}"] = float(
-                    max(segment.fast_version_at_query) - max(segment.fast_version_before_segment)
+                enriched[f"a5/write_version_delta/segment_{segment.segment_index}"] = float(
+                    max(segment.write_version_at_query)
+                    - max(segment.write_version_before_segment)
                 )
-                enriched[f"a5/update_attempt_count/segment_{segment.segment_index}"] = float(
-                    segment.update_attempt_count
+                enriched[f"a5/write_attempt_count/segment_{segment.segment_index}"] = float(
+                    segment.write_attempt_count
                 )
-                enriched[f"a5/update_count/segment_{segment.segment_index}"] = float(
-                    segment.update_count
+                enriched[f"a5/write_count/segment_{segment.segment_index}"] = float(
+                    segment.write_count
                 )
                 enriched[f"a5/skip_count/segment_{segment.segment_index}"] = float(
                     segment.skip_count
@@ -1655,76 +1650,47 @@ class TTTQwenTrainerMixin:
                 enriched[f"a5/outer_only/segment_{segment.segment_index}"] = float(
                     segment.training_mode == "outer_only"
                 )
-                enriched[f"a5/static_w0/segment_{segment.segment_index}"] = float(
-                    segment.training_mode == "static_w0"
+                enriched[f"a5/no_write/segment_{segment.segment_index}"] = float(
+                    segment.training_mode == "no_write"
                 )
+                enriched[f"memory/pre_write_cosine/segment_{segment.segment_index}"] = (
+                    segment.pre_write_cosine_mean
+                )
+                enriched[f"memory/eta_sum/segment_{segment.segment_index}"] = segment.eta_sum
                 for reason, count in segment.skip_reason_counts:
                     enriched[f"a5/skip_reason/segment_{segment.segment_index}/{reason}"] = float(
                         count
                     )
-            if meta_audit.updates:
-                update_norms = tuple(
-                    value for update in meta_audit.updates for value in update.update_norms
+            if meta_audit.writes:
+                write_norms = tuple(
+                    value for write in meta_audit.writes for value in write.write_norms
                 )
-                master_changed = tuple(
-                    value
-                    for update in meta_audit.updates
-                    for value in update.master_changed_fractions
+                memory_norms = tuple(
+                    value for write in meta_audit.writes for value in write.memory_norms
                 )
-                bf16_shadow_changed = tuple(
-                    value
-                    for update in meta_audit.updates
-                    for value in update.bf16_shadow_changed_fractions
+                readout_shares = tuple(
+                    value for write in meta_audit.writes for value in write.readout_shares
                 )
-                master_deltas = tuple(
-                    value for update in meta_audit.updates for value in update.master_delta_norms
-                )
-                core_deltas = tuple(
-                    value
-                    for update in meta_audit.updates
-                    for value in update.fast_core_prediction_delta_norms
-                )
-                enriched["a5/fast_weight/master_update_norm"] = sum(update_norms) / len(
-                    update_norms
-                )
-                enriched["a5/fast_weight/master_changed_fraction"] = sum(master_changed) / len(
-                    master_changed
-                )
-                enriched["a5/fast_weight/bf16_shadow_changed_fraction"] = sum(
-                    bf16_shadow_changed
-                ) / len(bf16_shadow_changed)
-                enriched["a5/fast_weight/master_delta_norm"] = sum(master_deltas) / len(
-                    master_deltas
-                )
-                enriched["a5/fast_weight/fast_core_prediction_delta_norm"] = sum(core_deltas) / len(
-                    core_deltas
+                enriched["a5/memory/write_norm_mean"] = sum(write_norms) / len(write_norms)
+                enriched["a5/memory/memory_norm_mean"] = sum(memory_norms) / len(memory_norms)
+                enriched["a5/memory/readout_share_mean"] = sum(readout_shares) / len(
+                    readout_shares
                 )
                 skip_reasons = tuple(
                     reason
-                    for update in meta_audit.updates
-                    for did_update, reason in zip(
-                        update.did_update,
-                        update.skip_reasons,
+                    for write in meta_audit.writes
+                    for did_write, reason in zip(
+                        write.did_write,
+                        write.skip_reasons,
                         strict=True,
                     )
-                    if not did_update
+                    if not did_write
                 )
-                enriched["a5/fast_weight/skip_count/unrepresentable"] = float(
-                    sum(reason == "unrepresentable_update" for reason in skip_reasons)
+                enriched["a5/memory/skip_count/no_valid_slot"] = float(
+                    sum(reason == "no_valid_slot" for reason in skip_reasons)
                 )
-                enriched["a5/fast_weight/skip_count/zero"] = float(
-                    sum(reason == "zero_gradient" for reason in skip_reasons)
-                )
-                enriched["a5/fast_weight/skip_count/nonfinite"] = float(
-                    sum(
-                        reason
-                        in {
-                            "nonfinite_loss",
-                            "nonfinite_gradient",
-                            "invalid_after_clip",
-                        }
-                        for reason in skip_reasons
-                    )
+                enriched["a5/memory/skip_count/nonfinite"] = float(
+                    sum(reason == "nonfinite_key_value" for reason in skip_reasons)
                 )
         enriched.update(self.last_semantic_projector_metrics)
         controller = self.ttt_runtime.gradient_controller
@@ -1849,6 +1815,7 @@ class TTTQwenTrainerMixin:
                 counterfactual_request = CounterfactualAuditRequest(
                     optimizer_step=next_optimizer_step,
                     query_selector=_counterfactual_query_selector(next_optimizer_step),
+                    queries_per_rank=counterfactual_config.queries_per_rank,
                 )
                 self._counterfactual_audit_pending = False
             else:
@@ -1907,20 +1874,20 @@ class TTTQwenTrainerMixin:
         self,
         output: TruncatedMetaTTTEpisodeOutput,
     ) -> dict[str, float]:
-        references = {
-            item.reference: item
+        audited = tuple(
+            query.counterfactual
             for query in output.audit.queries
             if query.counterfactual is not None
-            for item in query.counterfactual.references
-        }
+        )
         local = torch.zeros((9,), dtype=torch.float64, device=self.args.device)  # type: ignore[attr-defined]
-        if references:
-            if set(references) != {"episode_w0", "segment_start"}:
+        for counterfactual in audited:
+            references = {item.reference: item for item in counterfactual.references}
+            if set(references) != {"episode_zero", "segment_start"}:
                 raise RuntimeError("counterfactual audit did not publish both references")
-            local[0] = 1.0
-            for offset, name in ((1, "episode_w0"), (5, "segment_start")):
+            local[0] += 1.0
+            for offset, name in ((1, "episode_zero"), (5, "segment_start")):
                 item = references[name]
-                local[offset : offset + 4] = torch.tensor(
+                local[offset : offset + 4] += torch.tensor(
                     (
                         item.gain_abs,
                         item.gain_rel,
@@ -1936,7 +1903,7 @@ class TTTQwenTrainerMixin:
         if count == 0.0:
             return {}
         metrics = {"a5/cf/audited_query_count": count}
-        for offset, name in ((1, "episode_w0"), (5, "segment_start")):
+        for offset, name in ((1, "episode_zero"), (5, "segment_start")):
             metrics.update(
                 {
                     f"a5/cf/query_gain_abs/{name}": float(rows[:, offset].sum().item()) / count,
@@ -2351,7 +2318,9 @@ def _run_main(argv: list[str] | None = None) -> int:
         if full_unfreeze_audit is not None:
             environment["full_unfreeze_audit"] = asdict(full_unfreeze_audit)
         environment["outer_parameter_audit"] = asdict(parameter_audit)
-        environment["inner_sgd_learning_rate"] = float(project.fast_ttt.optimizer.learning_rate)
+        environment["memory_eta_max_per_slot"] = float(project.fast_memory.eta_max_per_slot)
+        environment["memory_eta_chunk_budget"] = float(project.fast_memory.eta_chunk_budget)
+        environment["memory_forget_beta_max"] = float(project.fast_memory.forget_beta_max)
         environment["outer_update_norm_budget_audit"] = budget_audit
         checkpoint_environment = None
         if checkpoint_audit is not None:
@@ -2393,7 +2362,6 @@ def _run_main(argv: list[str] | None = None) -> int:
                     "stage": runtime_raw.stage.value,
                     "a5_phase": backbone.ttt_config.a5_phase,
                     "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
-                    "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
                     "outer_update_norm_budget_audit": budget_audit,
                     "global_step": int(trainer.state.global_step),
                     "elapsed_seconds": time.monotonic() - started,
@@ -2501,7 +2469,6 @@ def _run_main(argv: list[str] | None = None) -> int:
                     "status": "completed",
                     "stage": runtime_raw.stage.value,
                     "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
-                    "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
                     "outer_update_norm_budget_audit": budget_audit,
                     "global_step": int(trainer.state.global_step),
                     "elapsed_seconds": time.monotonic() - started,
@@ -2546,7 +2513,6 @@ def _run_main(argv: list[str] | None = None) -> int:
                 "status": "completed",
                 "stage": runtime_raw.stage.value,
                 "a5_adaptation_mode": runtime_raw.a5_adaptation_mode,
-                "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
                 "outer_update_norm_budget_audit": budget_audit,
                 "global_step": int(trainer.state.global_step),
                 "elapsed_seconds": time.monotonic() - started,
@@ -2771,11 +2737,11 @@ def resolve_same_stage_resume(
     if not isinstance(raw, dict) or raw.get("stage") != stage.value:
         raise ValueError("resume checkpoint stage does not match the configured production stage")
     if (
-        raw.get("config_schema_version") != 12
-        or raw.get("associative_ttt_contract") != "bank_conditioned_state_write_v2"
+        raw.get("config_schema_version") != 13
+        or raw.get("associative_ttt_contract") != "bank_conditioned_slot_memory_v3"
     ):
         raise ValueError(
-            "same-stage resume requires the schema-12 state-write associative contract"
+            "same-stage resume requires the schema-13 slot-memory contract"
         )
     if stage is ProductionStage.A5:
         checkpoint_mode = raw.get("a5_adaptation_mode", "meta_ttt")
@@ -2845,18 +2811,11 @@ def _audit_outer_parameters(
     a5_phase: str = "main",
 ) -> OuterParameterAudit:
     named = tuple(runtime.model.named_parameters())
-    removed = tuple(name for name, _ in named if "step_controller" in name.casefold())
-    if removed:
-        raise ValueError(
-            "production Outer model still registers removed step-controller parameters"
-        )
     associative = tuple(
         (name, parameter) for name, parameter in named if _is_associative_parameter_name(name)
     )
     transient = tuple(
-        name
-        for name, _ in named
-        if "transient_w_t" in name.casefold() or name.casefold().endswith(("w_t_1", "w_t_2"))
+        name for name, _ in named if _is_transient_memory_name(name.casefold())
     )
     backbone_ids = {id(parameter) for parameter in backbone.model.parameters()}
     runtime_ids = {id(parameter) for _, parameter in named}
@@ -2901,6 +2860,8 @@ def _outer_update_norm_budget_audit(
     a5_adaptation_mode: str,
     a5_phase: str = "main",
 ) -> dict[str, object]:
+    if a5_adaptation_mode not in _A5_ADAPTATION_MODES:
+        raise ValueError("A5 adaptation mode must be meta_ttt or no_write")
     caps = project.outer_gradient_control.max_grad_norm
     if stage is ProductionStage.A5:
         reference_budget = fast_slow_lr * float(caps.fast_slow)
@@ -2951,7 +2912,9 @@ def _outer_update_norm_budget_audit(
         raise ValueError("A5 main Qwen update-norm budget drifted from Fast/State reference")
     return {
         "policy": mode.value,
-        "inner_sgd_learning_rate": float(project.fast_ttt.optimizer.learning_rate),
+        "memory_eta_max_per_slot": float(project.fast_memory.eta_max_per_slot),
+        "memory_eta_chunk_budget": float(project.fast_memory.eta_chunk_budget),
+        "memory_forget_beta_max": float(project.fast_memory.forget_beta_max),
         "reference": reference_budget,
         "independent": independent_budgets,
         "state_rss": state_rss_budget,
@@ -2967,8 +2930,8 @@ def make_production_outer_optimizer_factory(
     a5_adaptation_mode: str = "meta_ttt",
     a5_phase: str = "main",
 ) -> Callable[[nn.Module], torch.optim.Optimizer]:
-    if a5_adaptation_mode not in {"meta_ttt", "static_w0"}:
-        raise ValueError("A5 adaptation mode must be meta_ttt or static_w0")
+    if a5_adaptation_mode not in _A5_ADAPTATION_MODES:
+        raise ValueError("A5 adaptation mode must be meta_ttt or no_write")
     if stage is ProductionStage.A2 and a5_adaptation_mode != "meta_ttt":
         raise ValueError("A2 cannot select an A5 adaptation mode")
     if a5_phase not in {"fast_state_warmup", "main"}:
@@ -3015,10 +2978,8 @@ def make_production_outer_optimizer_factory(
                 continue
             parameter_id = id(parameter)
             lowered = name.casefold()
-            if "transient_w_t" in lowered or lowered.endswith(("w_t_1", "w_t_2")):
-                raise ValueError("transient W_t cannot enter the Outer optimizer")
-            if "step_controller" in lowered:
-                raise ValueError("step-controller parameters were removed from canonical A5")
+            if _is_transient_memory_name(lowered):
+                raise ValueError("the transient per-video memory cannot enter the Outer optimizer")
             if parameter_id in qwen_ids:
                 group = "qwen"
             elif stage is ProductionStage.A5 and parameter_id in fast_slow_ids:
@@ -3053,8 +3014,8 @@ def make_production_outer_optimizer_factory(
                 raise ValueError("Fast/State warmup cannot own a Qwen optimizer group")
             if a5_adaptation_mode == "meta_ttt" and not groups["associative"]:
                 raise ValueError("Meta-TTT A5 Outer AdamW must own Associative")
-            if a5_adaptation_mode == "static_w0" and groups["associative"]:
-                raise ValueError("static-W0 A5 Outer AdamW cannot own Associative")
+            if a5_adaptation_mode == "no_write" and groups["associative"]:
+                raise ValueError("no-write A5 Outer AdamW cannot own the memory interface")
         semantic_projector_ids = {
             id(parameter)
             for name, parameter in model.named_parameters(remove_duplicate=False)
@@ -3127,9 +3088,24 @@ def make_production_outer_optimizer_factory(
     return factory
 
 
+_MEMORY_INTERFACE_TOKENS = (
+    "p_context",
+    "memory_key_probe",
+    "memory_value_projection",
+    "memory_eta_gate_hidden",
+    "memory_eta_gate_output",
+    "memory_alpha",
+    "memory_beta_raw",
+)
+
+
 def _is_associative_parameter_name(name: str) -> bool:
     lowered = name.casefold()
-    return lowered.startswith("p_context.") or ".p_context." in lowered
+    return any(
+        lowered.startswith(f"{token}.") or f".{token}." in lowered or lowered.endswith(f".{token}")
+        or lowered == token
+        for token in _MEMORY_INTERFACE_TOKENS
+    )
 
 
 def _state_group_for_name(lowered: str) -> str:
@@ -3298,8 +3274,8 @@ def _warmup_bundle_allowlist(
     state_keys = set(model.state_dict())
     if not names <= state_keys:
         raise RuntimeError("warmup bundle allowlist contains non-persistent tensors")
-    if any(name.casefold().endswith(("w_t_1", "w_t_2")) for name in names):
-        raise RuntimeError("transient W_t entered the warmup bundle allowlist")
+    if any(_is_transient_memory_name(name.casefold()) for name in names):
+        raise RuntimeError("the transient per-video memory entered the warmup bundle allowlist")
     return tuple(sorted(names))
 
 
@@ -3320,6 +3296,7 @@ class _ModuleBitwiseSnapshot:
 
     sha256: str
     tensors: tuple[_TensorBitwiseDigest, ...]
+    excluded_non_persistent_buffers: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -3356,6 +3333,7 @@ class WarmupQwenBitwiseAudit:
     local_unchanged: bool
     all_ranks_unchanged: bool
     changed_tensors: tuple[_TensorBitwiseChange, ...]
+    excluded_non_persistent_buffers: tuple[str, ...] = ()
 
 
 class _WarmupQwenBitwiseAuditor:
@@ -3437,19 +3415,39 @@ class _WarmupQwenBitwiseAuditor:
             local_unchanged=local_unchanged,
             all_ranks_unchanged=all_ranks_unchanged,
             changed_tensors=changes,
+            excluded_non_persistent_buffers=final.excluded_non_persistent_buffers,
         )
         return self._final_audit
 
 
-def _module_bitwise_snapshot(module: nn.Module) -> _ModuleBitwiseSnapshot:
-    """Hash every parameter and buffer, including non-persistent runtime buffers."""
+def _non_persistent_buffer_names(module: nn.Module) -> frozenset[str]:
+    """Collect the fully-qualified names of every non-persistent buffer."""
 
+    names: set[str] = set()
+    for prefix, submodule in module.named_modules():
+        for local_name in getattr(submodule, "_non_persistent_buffers_set", ()):
+            names.add(f"{prefix}.{local_name}" if prefix else local_name)
+    return frozenset(names)
+
+
+def _module_bitwise_snapshot(module: nn.Module) -> _ModuleBitwiseSnapshot:
+    """Hash every parameter and persistent buffer.
+
+    Non-persistent buffers are runtime scratch (rotary caches and the like) that
+    legitimately changes value across forwards; hashing them produced false
+    "Qwen changed" verdicts.  The excluded names are recorded so the exclusion
+    itself stays auditable.
+    """
+
+    non_persistent = _non_persistent_buffer_names(module)
     named_tensors = [
         (name, "parameter", tensor)
         for name, tensor in module.named_parameters(remove_duplicate=False)
     ]
     named_tensors.extend(
-        (name, "buffer", tensor) for name, tensor in module.named_buffers(remove_duplicate=False)
+        (name, "buffer", tensor)
+        for name, tensor in module.named_buffers(remove_duplicate=False)
+        if name not in non_persistent
     )
     names = tuple(name for name, _, _ in named_tensors)
     if len(names) != len(set(names)):
@@ -3482,6 +3480,7 @@ def _module_bitwise_snapshot(module: nn.Module) -> _ModuleBitwiseSnapshot:
     return _ModuleBitwiseSnapshot(
         sha256=digest.hexdigest(),
         tensors=tuple(tensors),
+        excluded_non_persistent_buffers=tuple(sorted(non_persistent)),
     )
 
 
@@ -3696,7 +3695,7 @@ def _publish_warmup_bundle(
     manifest: dict[str, object] = {
         "bundle_schema_version": _WARMUP_BUNDLE_SCHEMA_VERSION,
         "associative_contract": backbone.project_config.associative_ttt.contract,
-        "associative_contract_version": 2,
+        "associative_contract_version": _WARMUP_BUNDLE_ASSOCIATIVE_CONTRACT_VERSION,
         "config_schema_version": backbone.project_config.config_schema_version,
         **source,
         "optimizer_steps": global_step,
@@ -3742,7 +3741,7 @@ def _load_warmup_bundle(
     expected_scalars: dict[str, object] = {
         "bundle_schema_version": _WARMUP_BUNDLE_SCHEMA_VERSION,
         "associative_contract": backbone.project_config.associative_ttt.contract,
-        "associative_contract_version": 2,
+        "associative_contract_version": _WARMUP_BUNDLE_ASSOCIATIVE_CONTRACT_VERSION,
         "config_schema_version": backbone.project_config.config_schema_version,
         "optimizer_steps": int(backbone.project_config.a5.warmup.max_steps),
         "qwen_bitwise_sha256": _module_bitwise_sha256(qwen_model),
