@@ -117,7 +117,7 @@ Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由�
 - `P_C` 冻结、memory 写入不可达（A2 前向不绑定 memory state，等价于 `M=0`）；
 - Query outer loss 正式使用 `ema_answer_ref`：先用一步滞后的 loss EMA 对齐 Answer，
   再用 `q_target/q_operator/q_time` 激活梯度 RMS EMA 平衡 Task、Operator、Retrieval、Time；
-  四槽固定且辅助组限制为 Answer 的至多 30%；
+  四槽固定且辅助组限制为 Answer 的至多 40%（`official_weak_balance.group_weight`）；
 - loss/gradient EMA 随同阶段 resume 恢复，A2 初始化 A5 时重置；不提供其他 loss-balance
   模式；
 - 状态参数按 shared、task、router-time、retrieval 四组独立裁剪，四组 RSS 预算保持与旧

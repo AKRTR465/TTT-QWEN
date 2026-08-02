@@ -2,8 +2,8 @@
 
 Inputs: differentiable soft predictions and explicit dense labels/masks.
 Outputs: FP32 per-row loss terms, validity audits, metrics, and Query-only Outer objectives.
-The label-free Bank-conditioned state-write objective lives in ``associative_ttt`` and
-is deliberately not part of the Query Outer loss.
+The delta-rule memory write carries no objective of its own: its parameters are reached
+only by the Query deferred VJP, so nothing in this module supervises the write path.
 """
 
 from __future__ import annotations

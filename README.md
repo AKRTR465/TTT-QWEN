@@ -22,7 +22,7 @@
   meta 梯度沿线性递推回传到 memory 接口与 token keys，截断点 detach 保值。
 - A2/A5 正式训练唯一使用 `ema_answer_ref`：loss EMA 对齐 Answer 尺度，再按
   `q_target/q_operator/q_time` 激活面的梯度 RMS EMA 平衡四项 official-weak loss；辅助组仍限制为
-  Answer 的至多 30%。
+  Answer 的至多 40%（`official_weak_balance.group_weight`）。
 
 完整设计见 [ARCHITECTURE.md](./ARCHITECTURE.md)，固定决策见 [DECISIONS.md](./DECISIONS.md)。
 
