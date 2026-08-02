@@ -652,9 +652,9 @@ class A5WarmupConfig(FrozenModel):
 
     max_steps: Literal[256]
     linear_warmup_steps: Literal[4]
-    fast_slow_learning_rate: Literal[0.0]
+    fast_slow_learning_rate: NonNegativeFloat
     state_learning_rate: PositiveFloat
-    w0_learning_rate: Literal[0.0]
+    w0_learning_rate: NonNegativeFloat
     associative_learning_rate: PositiveFloat
     bundle_schema_version: Literal[2]
 

@@ -59,6 +59,29 @@ def test_schema14_slot_memory_and_robust_query_contract_roundtrips() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("fast_slow_learning_rate", 1.0e-6),
+        ("state_learning_rate", 2.0e-5),
+        ("w0_learning_rate", 1.0e-6),
+        ("associative_learning_rate", 1.0e-4),
+    ],
+)
+def test_a5_warmup_learning_rate_drift_fails_before_startup(
+    field: str, value: float
+) -> None:
+    raw = _raw()
+    a5 = deepcopy(raw["a5"])
+    assert isinstance(a5, dict)
+    warmup = a5["warmup"]
+    assert isinstance(warmup, dict)
+    warmup[field] = value
+    raw["a5"] = a5
+    with pytest.raises(ValidationError, match="drifted from schema-14"):
+        ProjectConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
         ("contract", "legacy"),
         ("contract", "bank_conditioned_state_write_v2"),
         ("bank_embedding_dim", 256),
