@@ -653,8 +653,9 @@ class _TinyQueryLossBuilder:
         *,
         answer: StageAEpisodeAnswerInputs,
         supervision: StageASupervisionBatch,
+        dedup: object | None = None,
     ) -> MetaQueryLossInput:
-        del answer
+        del answer, dedup
         if not isinstance(output.answer_logits, Tensor) or not isinstance(
             output.observations, ObservationOutputs
         ):
@@ -691,8 +692,9 @@ class _TinyOfficialWeakQueryLossBuilder:
         *,
         answer: StageAEpisodeAnswerInputs,
         supervision: StageASupervisionBatch,
+        dedup: object | None = None,
     ) -> MetaQueryLossInput:
-        del answer
+        del answer, dedup
         if not isinstance(output.answer_logits, Tensor) or not isinstance(
             output.observations, ObservationOutputs
         ):

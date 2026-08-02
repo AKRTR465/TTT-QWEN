@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+from ttt_svcbench_qwen.identity_bank import IDENTITY_DIM, IdentityBankRuntimeState
 from ttt_svcbench_qwen.losses import (
     E1StateTarget,
     E2StateTarget,
@@ -26,7 +27,7 @@ from ttt_svcbench_qwen.losses import (
     StateLossInput,
     TimeLossInput,
 )
-from ttt_svcbench_qwen.observation_heads import ObservationOutputs
+from ttt_svcbench_qwen.observation_heads import O2SoftOutput, ObservationOutputs
 from ttt_svcbench_qwen.query_encoder import (
     OPERATOR_TO_HEAD_TYPE,
     OPERATORS,
@@ -869,6 +870,51 @@ class OfficialWeakSupervision:
 
 
 @dataclass(frozen=True, slots=True)
+class O2DedupContext:
+    """Detached pre-query Identity Bank view for the O2 soft-dedup objective.
+
+    The prototypes and counts must come from the snapshot taken before the query
+    chunk's own hard commit: a post-write view would let the current slots match
+    themselves and degenerate the novelty target to zero.
+    """
+
+    prototypes: tuple[Tensor, ...]
+    confirmed_counts: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.prototypes) != len(self.confirmed_counts):
+            raise ValueError("O2 dedup context rows must align")
+        for prototypes, count in zip(self.prototypes, self.confirmed_counts, strict=True):
+            if type(count) is not int or count < 0:
+                raise ValueError("O2 dedup confirmed counts must be non-negative integers")
+            if prototypes.ndim != 2 or prototypes.shape != (count, IDENTITY_DIM):
+                raise ValueError("O2 dedup prototypes must be [confirmed_count, identity_dim]")
+            if prototypes.requires_grad or prototypes.grad_fn is not None:
+                raise ValueError("O2 dedup prototypes must be detached")
+
+    @classmethod
+    def from_identity_states(
+        cls,
+        states: Sequence[IdentityBankRuntimeState | None],
+    ) -> O2DedupContext:
+        prototypes: list[Tensor] = []
+        counts: list[int] = []
+        for state in states:
+            if state is None or not state.confirmed_chunks:
+                prototypes.append(torch.zeros((0, IDENTITY_DIM), dtype=torch.float32))
+                counts.append(0)
+                continue
+            prototypes.append(
+                torch.cat(
+                    tuple(chunk.prototypes[chunk.occupied] for chunk in state.confirmed_chunks),
+                    dim=0,
+                )
+            )
+            counts.append(int(state.unique_count))
+        return cls(prototypes=tuple(prototypes), confirmed_counts=tuple(counts))
+
+
+@dataclass(frozen=True, slots=True)
 class OfficialWeakLossTerm:
     value: Tensor
     valid_rows: int
@@ -1036,6 +1082,9 @@ class OfficialWeakLossAudit:
     annotation_count_mismatch: int = 0
     o2_identity_cosine_sum: float = 0.0
     o2_identity_rows: int = 0
+    o2_dedup_rows: int = 0
+    o2_novelty_sum: float = 0.0
+    o2_dedup_base_sum: float = 0.0
     operator_diagnostics: OperatorDiagnosticAudit = field(
         default_factory=OperatorDiagnosticAudit.empty
     )
@@ -1072,11 +1121,15 @@ class OfficialWeakLossAudit:
             self.retrieval_causal_excluded_count,
             self.annotation_count_mismatch,
             self.o2_identity_rows,
+            self.o2_dedup_rows,
         )
         if any(type(value) is not int or value < 0 for value in counts):
             raise ValueError("official weak retrieval audit row counts must be non-negative")
         if not math.isfinite(self.o2_identity_cosine_sum):
             raise ValueError("official weak o2 identity cosine audit must be finite")
+        dedup_sums = (self.o2_novelty_sum, self.o2_dedup_base_sum)
+        if any(not math.isfinite(value) or value < 0.0 for value in dedup_sums):
+            raise ValueError("official weak o2 dedup audit sums must be finite and non-negative")
         aligned = (
             self.retrieval_candidate_counts,
             self.retrieval_positive_counts,
@@ -1157,6 +1210,9 @@ class OfficialWeakLossAudit:
             ("task/annotation_count_mismatch", float(self.annotation_count_mismatch)),
             ("task/o2_identity_cosine_sum", float(self.o2_identity_cosine_sum)),
             ("task/o2_identity_rows", float(self.o2_identity_rows)),
+            ("task/o2_dedup_rows", float(self.o2_dedup_rows)),
+            ("task/o2_novelty_sum", float(self.o2_novelty_sum)),
+            ("task/o2_dedup_base_sum", float(self.o2_dedup_base_sum)),
         )
 
 
@@ -1188,8 +1244,10 @@ class OfficialWeakTargetBuilder:
         query: QueryEncoderOutput,
         retrieval: RetrieverOutput,
         supervision: Sequence[OfficialWeakSupervision],
+        *,
+        dedup: O2DedupContext | None = None,
     ) -> OfficialWeakStateLossOutput:
-        return self.build(observations, query, retrieval, supervision)
+        return self.build(observations, query, retrieval, supervision, dedup=dedup)
 
     def build(
         self,
@@ -1197,6 +1255,8 @@ class OfficialWeakTargetBuilder:
         query: QueryEncoderOutput,
         retrieval: RetrieverOutput,
         supervision: Sequence[OfficialWeakSupervision],
+        *,
+        dedup: O2DedupContext | None = None,
     ) -> OfficialWeakStateLossOutput:
         batch_size, _ = _validate_builder_inputs(
             observations,
@@ -1209,6 +1269,8 @@ class OfficialWeakTargetBuilder:
             not isinstance(label, OfficialWeakSupervision) for label in labels
         ):
             raise ValueError("official weak supervision must align to the prediction batch")
+        if dedup is not None and len(dedup.prototypes) != batch_size:
+            raise ValueError("O2 dedup context must align to the prediction batch")
         # Every soft head participates in every rank's differentiable graph even when the
         # official weak label masks a term. This preserves the exact numerical objective while
         # giving ZeRO-2 a stable, identical parameter-hook surface across mixed task classes.
@@ -1254,6 +1316,9 @@ class OfficialWeakTargetBuilder:
         annotation_count_mismatch = 0
         o2_identity_cosine_sum = 0.0
         o2_identity_rows = 0
+        o2_dedup_rows = 0
+        o2_novelty_sum = 0.0
+        o2_dedup_base_sum = 0.0
         raw_operator_confusion = [0] * 72
         effective_operator_confusion = [0] * 72
         operator_loss_sums = [0.0] * 8
@@ -1337,7 +1402,7 @@ class OfficialWeakTargetBuilder:
                 )
             time_losses.append(row_time)
 
-            task_result = _official_weak_task_result(observations, row, label)
+            task_result = _official_weak_task_result(observations, row, label, dedup=dedup)
             task_losses.append(task_result.loss)
             family = task_result.family_index
             task_count_loss_sums[family] += float(task_result.count_loss.detach().item())
@@ -1371,6 +1436,10 @@ class OfficialWeakTargetBuilder:
             if task_result.o2_row:
                 o2_identity_cosine_sum += task_result.o2_identity_offdiag_cosine
                 o2_identity_rows += 1
+            if task_result.o2_dedup_row:
+                o2_dedup_rows += 1
+                o2_novelty_sum += task_result.o2_novelty_sum
+                o2_dedup_base_sum += task_result.o2_dedup_base
             annotation_count_mismatch += int(_official_count_mismatch(label))
             retrieval_result = _official_weak_retrieval_loss(retrieval, row, label)
             retrieval_loss = retrieval_result.loss
@@ -1446,6 +1515,7 @@ class OfficialWeakTargetBuilder:
                 e1_representable_occurrences,
                 e1_unrepresentable_occurrences,
                 o2_identity_rows,
+                o2_dedup_rows,
             ),
             audit_device,
         )
@@ -1468,6 +1538,7 @@ class OfficialWeakTargetBuilder:
         task_channel_fn = take_ints(7)
         e1_representable_occurrences, e1_unrepresentable_occurrences = take_ints(2)
         (o2_identity_rows,) = take_ints(1)
+        (o2_dedup_rows,) = take_ints(1)
 
         task_float_values = _distributed_sum_floats(
             (
@@ -1476,6 +1547,8 @@ class OfficialWeakTargetBuilder:
                 *task_component_loss_sums,
                 *task_o1_loss_sums,
                 o2_identity_cosine_sum,
+                o2_novelty_sum,
+                o2_dedup_base_sum,
             ),
             audit_device,
         )
@@ -1484,6 +1557,8 @@ class OfficialWeakTargetBuilder:
         task_component_loss_sums = list(task_float_values[8:11])
         task_o1_loss_sums = list(task_float_values[11:13])
         o2_identity_cosine_sum = task_float_values[13]
+        o2_novelty_sum = task_float_values[14]
+        o2_dedup_base_sum = task_float_values[15]
 
         retrieval_global_values = _distributed_sum_integers(
             (
@@ -1561,6 +1636,9 @@ class OfficialWeakTargetBuilder:
                 annotation_count_mismatch=annotation_count_mismatch,
                 o2_identity_cosine_sum=o2_identity_cosine_sum,
                 o2_identity_rows=o2_identity_rows,
+                o2_dedup_rows=o2_dedup_rows,
+                o2_novelty_sum=o2_novelty_sum,
+                o2_dedup_base_sum=o2_dedup_base_sum,
                 operator_diagnostics=OperatorDiagnosticAudit(
                     raw_confusion=tuple(raw_operator_confusion),
                     effective_confusion=tuple(effective_operator_confusion),
@@ -1612,12 +1690,61 @@ class _TaskLossResult:
     e1_unrepresentable_occurrences: int = 0
     o2_identity_offdiag_cosine: float = 0.0
     o2_row: bool = False
+    o2_dedup_row: bool = False
+    o2_novelty_sum: float = 0.0
+    o2_dedup_base: float = 0.0
+
+
+# Soft-dedup constants mirror the frozen Identity Bank match threshold; the temperature
+# is a fixed objective shape, not a tunable contract surface.
+_NOVELTY_MATCH_THRESHOLD = 0.8
+_NOVELTY_TEMPERATURE = 0.1
+
+
+def _o2_dedup_prediction(
+    o2: O2SoftOutput,
+    row: int,
+    prototypes: Tensor,
+    confirmed_count: int,
+) -> tuple[Tensor, float, float]:
+    """Differentiable soft-unique count: detached confirmed base + this chunk's novelty mass.
+
+    novelty_i multiplies "not the same object" factors against the detached bank
+    prototypes and against earlier in-chunk slots, accumulated in log space so a
+    few hundred factors cannot underflow to NaN. Only the current chunk's identity
+    vectors carry gradient; the base is a constant, keeping the target unbounded.
+    """
+
+    identity = o2.identity[row]
+    valid = o2.valid_mask[row]
+    anchor = identity.float().sum() * 0.0
+    base = float(confirmed_count)
+    if not bool(valid.any().item()):
+        return anchor + base, 0.0, base
+    selected = identity[valid].float()
+    log_keep = torch.zeros(selected.shape[0], dtype=torch.float32, device=selected.device)
+    if int(prototypes.shape[0]):
+        bank_cosines = selected @ prototypes.to(
+            device=selected.device, dtype=torch.float32
+        ).transpose(0, 1)
+        log_keep = log_keep + F.logsigmoid(
+            -(bank_cosines - _NOVELTY_MATCH_THRESHOLD) / _NOVELTY_TEMPERATURE
+        ).sum(dim=1)
+    peer_cosines = selected @ selected.transpose(0, 1)
+    peer_log = F.logsigmoid(-(peer_cosines - _NOVELTY_MATCH_THRESHOLD) / _NOVELTY_TEMPERATURE)
+    earlier = torch.tril(torch.ones_like(peer_log, dtype=torch.bool), diagonal=-1)
+    log_keep = log_keep + torch.where(earlier, peer_log, torch.zeros_like(peer_log)).sum(dim=1)
+    novelty = torch.exp(log_keep)
+    prediction = anchor + base + novelty.sum()
+    return prediction, float(novelty.detach().sum().item()), base
 
 
 def _official_weak_task_result(
     observations: ObservationOutputs,
     row: int,
     label: OfficialWeakSupervision,
+    *,
+    dedup: O2DedupContext | None = None,
 ) -> _TaskLossResult:
     target_count = torch.tensor(
         float(label.count), dtype=torch.float32, device=observations.o1.logits.device
@@ -1633,13 +1760,37 @@ def _official_weak_task_result(
             o1_subtype_index=(0 if label.operator is Operator.O1_SNAP else 1),
         )
     if label.operator in (Operator.O2_UNIQUE, Operator.O2_GAIN):
-        prediction = observations.o2.count_prediction[row]
-        count_loss = _robust_count_loss(prediction, target_count)
         with torch.no_grad():
             identity_cosine = _identity_offdiag_cosine(
                 observations.o2.identity[row],
                 observations.o2.valid_mask[row],
             )
+        if label.operator is Operator.O2_UNIQUE and dedup is not None:
+            prediction, novelty_sum, base = _o2_dedup_prediction(
+                observations.o2,
+                row,
+                dedup.prototypes[row],
+                dedup.confirmed_counts[row],
+            )
+            count_loss = _robust_count_loss(prediction, target_count)
+            return _TaskLossResult(
+                loss=count_loss,
+                family_index=1,
+                count_loss=count_loss,
+                count_abs_error=float(
+                    (prediction.detach().float() - target_count).abs().item()
+                ),
+                o2_identity_offdiag_cosine=identity_cosine,
+                o2_row=True,
+                o2_dedup_row=True,
+                o2_novelty_sum=novelty_sum,
+                o2_dedup_base=base,
+            )
+        # O2-Gain keeps the pooled fallback: its label counts a window increment the
+        # cumulative confirmed base cannot represent, so full-base pressure would push
+        # novelty toward zero (identity collapse) — the opposite of this objective.
+        prediction = observations.o2.count_prediction[row]
+        count_loss = _robust_count_loss(prediction, target_count)
         return _TaskLossResult(
             loss=count_loss,
             family_index=1,

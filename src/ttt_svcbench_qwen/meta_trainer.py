@@ -75,6 +75,7 @@ from ttt_svcbench_qwen.outer_loss_balance import (
 from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput
 from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase, trace_event
 from ttt_svcbench_qwen.stage_a_targets import (
+    O2DedupContext,
     OfficialWeakStateLossOutput,
     OfficialWeakTargetBuilder,
     StageATargetBuilder,
@@ -282,6 +283,7 @@ class MetaQueryLossBuilder(Protocol):
         *,
         answer: StageAEpisodeAnswerInputs,
         supervision: StageASupervisionBatch,
+        dedup: O2DedupContext | None = None,
     ) -> MetaQueryLossInput: ...
 
 
@@ -298,6 +300,7 @@ class StageAQueryLossBuilder:
         *,
         answer: StageAEpisodeAnswerInputs,
         supervision: StageASupervisionBatch,
+        dedup: O2DedupContext | None = None,
     ) -> MetaQueryLossInput:
         if not isinstance(output.answer_logits, Tensor) or not isinstance(
             output.composed, ComposedInput
@@ -340,6 +343,7 @@ class StageAQueryLossBuilder:
                 output.query,
                 output.retrieval,
                 supervision.official_weak,
+                dedup=dedup,
             )
         else:
             assert supervision.state is not None
@@ -1189,6 +1193,11 @@ class MetaTTTEpisodeRunner:
                 del results, write_batch, intermediates, spatial, observation
 
             query_runtime_snapshot = adapted.runtime
+            # Pre-query snapshot: the dedup base must not see the query chunk's own
+            # commit, or the current slots would match themselves and zero the novelty.
+            query_dedup = O2DedupContext.from_identity_states(
+                query_runtime_snapshot.identity_bank_states
+            )
             authoritative_fast_states = query_runtime_snapshot.fast_states
             accumulated_gradients: tuple[Tensor, ...] | None = None
             raw_accumulated_gradients: tuple[Tensor, ...] | None = None
@@ -1228,7 +1237,7 @@ class MetaTTTEpisodeRunner:
                         with_grad=False,
                     )
                     self._balance_query_objectives(
-                        (self._query_objective(query, calibration_output),),
+                        (self._query_objective(query, calibration_output, dedup=query_dedup),),
                         calibration=True,
                         statistical_weight=episode_weight,
                     )
@@ -1277,7 +1286,7 @@ class MetaTTTEpisodeRunner:
                         with_grad=True,
                     )
                 immutable = observation_versions == _tensor_version_signature(observation)
-                objective = self._query_objective(query, output)
+                objective = self._query_objective(query, output, dedup=query_dedup)
                 balanced_outer: OuterLossOutput | None = None
                 gradient_statistics: Tensor | None = None
                 if balance_audit is not None:
@@ -1331,6 +1340,7 @@ class MetaTTTEpisodeRunner:
                             reference_states=reference_states,
                             balance_audit=balance_audit,
                             seed=episode.seed + 10_000 + global_query_index,
+                            dedup=query_dedup,
                         )
                         gain_abs = reference_loss - adapted_audit_loss
                         reference_items.append(
@@ -1825,6 +1835,7 @@ class MetaTTTEpisodeRunner:
         reference_states: tuple[FastMemoryState, ...],
         balance_audit: OfficialWeakBalanceAudit | None,
         seed: int,
+        dedup: O2DedupContext | None = None,
     ) -> float:
         """Evaluate one no-grad memory reference without committing any runtime state."""
 
@@ -1859,7 +1870,7 @@ class MetaTTTEpisodeRunner:
                 fast_states=reference.fast_states,
                 with_grad=False,
             )
-            objective = self._query_objective(query, output)
+            objective = self._query_objective(query, output, dedup=dedup)
             if balance_audit is not None:
                 outer = self.outer_composer.compose_one_from_audit(
                     objective.answer,
@@ -1880,12 +1891,15 @@ class MetaTTTEpisodeRunner:
         self,
         query: MetaTTTQueryPoint,
         output: StateTTTModelOutput,
+        *,
+        dedup: O2DedupContext | None = None,
     ) -> MetaQueryObjective:
         with trace_cuda_phase("outer_loss", stage="a5_query"):
             inputs = self.query_loss_builder(
                 output,
                 answer=query.answer,
                 supervision=query.supervision,
+                dedup=dedup,
             )
             answer = compute_answer_loss(inputs.answer)
             state = (

@@ -30,6 +30,7 @@ from ttt_svcbench_qwen.observation_heads import ObservationOutputs
 from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput
 from ttt_svcbench_qwen.stage_a_targets import (
     AnswerTargetLabels,
+    O2DedupContext,
     OfficialWeakSupervision,
     StageATargetBatch,
 )
@@ -134,6 +135,7 @@ class StageAModelForwardOutput:
     retrieval: RetrieverOutput | None = None
     metrics: tuple[tuple[str, float | None], ...] = ()
     failure_cases: tuple[str, ...] = ()
+    o2_dedup: O2DedupContext | None = None
 
     def __post_init__(self) -> None:
         batch_size, sequence_length = self.composed_input.input_ids.shape
@@ -290,8 +292,13 @@ class StageAEpisodeRunner:
             prepared_query, detached_query = prepared_query_pair(
                 self.model, final_request, inference=final_request.inference
             )
+        pre_query_identity_states = initial.identity_bank_states
         for chunk_index, template in enumerate(episode.observation_requests):
             is_current_query_chunk = chunk_index + 1 == len(episode.observation_requests)
+            if is_current_query_chunk:
+                # Snapshot the confirmed identities before the query chunk's own hard
+                # commit: the O2 soft-dedup base must not contain the current slots.
+                pre_query_identity_states = runtime.identity_bank_states
             request = replace(
                 template,
                 runtime_state=runtime,
@@ -395,4 +402,5 @@ class StageAEpisodeRunner:
             retrieval=retrieval_output,
             metrics=metrics,
             failure_cases=failure_cases,
+            o2_dedup=O2DedupContext.from_identity_states(pre_query_identity_states),
         )

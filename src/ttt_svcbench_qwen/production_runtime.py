@@ -2224,6 +2224,7 @@ class ProductionA2LossStep:
             raw.query,
             raw.retrieval,
             batch.supervision.official_weak,
+            dedup=raw.o2_dedup,
         )
         self.last_weak_audit = weak.audit
         balanced = self.outer_composer.compose(

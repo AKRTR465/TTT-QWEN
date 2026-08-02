@@ -118,6 +118,12 @@ Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由�
 - Query outer loss 正式使用 `ema_answer_ref`：先用一步滞后的 loss EMA 对齐 Answer，
   再用 `q_target/q_operator/q_time` 激活梯度 RMS EMA 平衡 Task、Operator、Retrieval、Time；
   四槽固定且辅助组限制为 Answer 的至多 40%（`official_weak_balance.group_weight`）；
+- O2-Unique 行的官方弱监督计数使用软去重目标（A2/A5 共用同一 builder）：预测 =
+  写前 Identity Bank confirmed 基数（detach）+ 当前 chunk 的可微软新颖数——identity 与
+  confirmed 原型及同 chunk 更早槽的余弦经 logsigmoid 在 log 域累积，阈值对齐
+  `match_threshold=0.8`、温度 0.1 为固定目标形状，不进配置。`o2.identity` 由此获得
+  任务梯度；O2-Gain 保持池化计数头回归；dedup 上下文缺失时整体回退池化路径。
+  基数快照必须取自 query chunk 硬提交之前，否则当前槽会与自身匹配、软新颖数退化为零；
 - loss/gradient EMA 随同阶段 resume 恢复，A2 初始化 A5 时重置；不提供其他 loss-balance
   模式；
 - 状态参数按 shared、task、router-time、retrieval 四组独立裁剪，四组 RSS 预算保持与旧

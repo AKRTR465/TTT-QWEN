@@ -16,6 +16,7 @@ from tests.support.runtime_factories import (
     make_stream_audit,
 )
 from ttt_svcbench_qwen.config import load_config
+from ttt_svcbench_qwen.identity_bank import ConfirmedChunk, IdentityBankRuntimeState
 from ttt_svcbench_qwen.losses import compute_state_loss
 from ttt_svcbench_qwen.observation_heads import (
     E1RuntimeState,
@@ -44,6 +45,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     E1TargetLabels,
     E2TargetLabels,
     O1TargetLabels,
+    O2DedupContext,
     O2TargetLabels,
     OfficialWeakStateLossOutput,
     OfficialWeakSupervision,
@@ -55,9 +57,11 @@ from ttt_svcbench_qwen.stage_a_targets import (
     TargetProvenance,
     _balanced_dense_bce,
     _build_e1_fsm_targets,
+    _o2_dedup_prediction,
     _official_weak_task_result,
     _official_weak_term,
     _record_matches_causal_occurrence,
+    _robust_count_loss,
 )
 from ttt_svcbench_qwen.state_bank import (
     E1EventKind,
@@ -794,6 +798,9 @@ def test_official_retrieval_requires_aligned_mixed_bag_and_ignores_selection_mas
         "task/annotation_count_mismatch": 0.0,
         "task/o2_identity_cosine_sum": 0.0,
         "task/o2_identity_rows": 0.0,
+        "task/o2_dedup_rows": 0.0,
+        "task/o2_novelty_sum": 0.0,
+        "task/o2_dedup_base_sum": 0.0,
     }
 
     no_positive = build((9.0,))
@@ -941,6 +948,182 @@ def test_o2_identity_cosine_audit_scalar_reaches_metrics() -> None:
     output.task.value.backward()
     assert identity.grad is not None
     assert int(torch.count_nonzero(identity.grad).item()) == 0
+
+
+def _o2_unique_label(count: int) -> OfficialWeakSupervision:
+    return OfficialWeakSupervision(
+        query_id=f"o2-dedup-{count}",
+        operator=Operator.O2_UNIQUE,
+        time_mode=TimeWindowMode.HISTORY,
+        count=count,
+        query_time=10.0,
+        occurrence_points=(),
+        occurrence_intervals=(),
+    )
+
+
+def test_o2_dedup_identity_gradient_flows_and_is_directional() -> None:
+    observations, query, retrieval, _ = _typed_predictions(1)
+    theta = 0.35
+    identity = torch.zeros(1, 2, 256)
+    identity[0, 0, 0] = 1.0
+    identity[0, 1, 0] = math.cos(theta)
+    identity[0, 1, 1] = math.sin(theta)
+    identity = identity.clone().requires_grad_(True)
+    observations = replace(observations, o2=replace(observations.o2, identity=identity))
+    prototype = torch.zeros(1, 256)
+    prototype[0, 0] = 1.0
+
+    prediction, novelty_sum, base = _o2_dedup_prediction(observations.o2, 0, prototype, 1)
+    assert base == 1.0
+    assert 0.0 <= novelty_sum <= 2.0
+
+    # The dot-product gradient lives in the span of the reference vectors, so the
+    # directional probe is slot 1's e0 coordinate: raising it moves slot 1 toward
+    # the prototype and slot 0, lowering novelty and the prediction.
+    # Undercount (label above the soft count) must therefore push it down.
+    under_loss = _robust_count_loss(prediction, torch.tensor(3.0))
+    grad_under = torch.autograd.grad(under_loss, identity, retain_graph=False)[0]
+    assert int(torch.count_nonzero(grad_under).item()) > 0
+    assert float(grad_under[0, 1, 0].item()) > 0.0
+
+    # Overcount: the same geometry with a smaller label must pull slot 1 back
+    # toward the prototype (negative gradient on the e0 coordinate).
+    prediction_over, _, _ = _o2_dedup_prediction(observations.o2, 0, prototype, 1)
+    over_loss = _robust_count_loss(prediction_over, torch.tensor(1.0))
+    grad_over = torch.autograd.grad(over_loss, identity)[0]
+    assert float(grad_over[0, 1, 0].item()) < 0.0
+
+    dedup = O2DedupContext(prototypes=(prototype,), confirmed_counts=(1,))
+    output = OfficialWeakTargetBuilder().build(
+        observations, query, retrieval, (_o2_unique_label(3),), dedup=dedup
+    )
+    output.total.backward()
+    assert identity.grad is not None
+    assert int(torch.count_nonzero(identity.grad).item()) > 0
+    metrics = dict(output.audit.metrics())
+    assert metrics["task/o2_dedup_rows"] == 1.0
+    assert metrics["task/o2_novelty_sum"] > 0.0
+    assert metrics["task/o2_dedup_base_sum"] == 1.0
+
+
+def test_o2_dedup_target_remains_unbounded() -> None:
+    observations, query, retrieval, _ = _typed_predictions(1)
+    identity = torch.zeros(1, 2, 256)
+    identity[0, 0, 100] = 1.0
+    identity[0, 1, 101] = 1.0
+    identity = identity.clone().requires_grad_(True)
+    observations = replace(observations, o2=replace(observations.o2, identity=identity))
+    dedup = O2DedupContext(
+        prototypes=(torch.eye(256)[:40].clone(),),
+        confirmed_counts=(40,),
+    )
+
+    output = OfficialWeakTargetBuilder().build(
+        observations, query, retrieval, (_o2_unique_label(47),), dedup=dedup
+    )
+    output.task.value.backward()
+
+    assert torch.isfinite(output.task.value)
+    assert identity.grad is not None
+    assert torch.isfinite(identity.grad).all()
+    assert int(torch.count_nonzero(identity.grad).item()) > 0
+    assert dict(output.audit.metrics())["task/o2_dedup_base_sum"] == 40.0
+
+
+def test_o2_dedup_novelty_log_domain_stability() -> None:
+    observations, _, _, _ = _typed_predictions(1)
+    identity = torch.zeros(1, 2, 256)
+    identity[0, 0, 7] = 1.0
+    identity[0, 1, 7] = 1.0
+    identity = identity.clone().requires_grad_(True)
+    observations = replace(observations, o2=replace(observations.o2, identity=identity))
+
+    # 256 prototypes all identical to both slots: the log-domain product underflows
+    # cleanly to zero novelty instead of producing NaN.
+    saturated = torch.zeros(256, 256)
+    saturated[:, 7] = 1.0
+    prediction, novelty_sum, base = _o2_dedup_prediction(observations.o2, 0, saturated, 256)
+    assert base == 256.0
+    assert torch.isfinite(prediction)
+    assert novelty_sum == pytest.approx(0.0, abs=1.0e-6)
+    grad = torch.autograd.grad(prediction, identity)[0]
+    assert torch.isfinite(grad).all()
+
+    # Empty bank: the bank factor drops out; only the in-chunk peer factor remains.
+    empty = torch.zeros((0, 256))
+    prediction_empty, novelty_empty, base_empty = _o2_dedup_prediction(
+        observations.o2, 0, empty, 0
+    )
+    assert base_empty == 0.0
+    sigmoid_at_full_match = 1.0 / (1.0 + math.exp(2.0))
+    assert novelty_empty == pytest.approx(1.0 + sigmoid_at_full_match, abs=1.0e-4)
+    assert float(prediction_empty.detach().item()) == pytest.approx(
+        novelty_empty, abs=1.0e-5
+    )
+
+
+def test_o2_gain_rows_keep_pooled_fallback() -> None:
+    observations, _, _, _ = _typed_predictions(1)
+    dedup = O2DedupContext(prototypes=(torch.zeros((0, 256)),), confirmed_counts=(0,))
+    label = OfficialWeakSupervision(
+        query_id="o2-gain-fallback",
+        operator=Operator.O2_GAIN,
+        time_mode=TimeWindowMode.RECENT,
+        count=1,
+        query_time=10.0,
+        occurrence_points=(),
+        occurrence_intervals=(),
+    )
+
+    with_dedup = _official_weak_task_result(observations, 0, label, dedup=dedup)
+    without_dedup = _official_weak_task_result(observations, 0, label)
+
+    assert with_dedup.o2_dedup_row is False
+    assert torch.allclose(with_dedup.loss, without_dedup.loss)
+
+
+def _confirmed_chunk_with(prototypes: Tensor) -> ConfirmedChunk:
+    capacity = 256
+    count = int(prototypes.shape[0])
+    full = torch.zeros((capacity, 256), dtype=torch.float32)
+    full[:count] = prototypes
+    occupied = torch.zeros(capacity, dtype=torch.bool)
+    occupied[:count] = True
+    return ConfirmedChunk(
+        prototypes=full,
+        occupied=occupied,
+        identity_ids=tuple(
+            f"identity-{index}" if index < count else None for index in range(capacity)
+        ),
+        first_seen=torch.zeros(capacity, dtype=torch.float64),
+        last_seen=torch.zeros(capacity, dtype=torch.float64),
+        observation_counts=torch.ones(capacity, dtype=torch.int64),
+        first_seen_position_ids=torch.zeros(capacity, dtype=torch.int64),
+        last_seen_position_ids=torch.zeros(capacity, dtype=torch.int64),
+        semantic_record_ids=tuple(
+            f"record-{index}" if index < count else None for index in range(capacity)
+        ),
+        prototype_versions=torch.zeros(capacity, dtype=torch.int64),
+    )
+
+
+def test_o2_dedup_context_from_identity_states() -> None:
+    prototypes = torch.eye(256)[:3].clone()
+    state = IdentityBankRuntimeState(
+        video_id="video-a",
+        trajectory_id="trajectory-a",
+        confirmed_chunks=(_confirmed_chunk_with(prototypes),),
+        issued_identity_ids=("identity-0", "identity-1", "identity-2"),
+        next_identity_sequence=3,
+    )
+
+    context = O2DedupContext.from_identity_states((state, None))
+
+    assert context.confirmed_counts == (3, 0)
+    assert context.prototypes[0].shape == (3, 256)
+    assert torch.equal(context.prototypes[0], prototypes)
+    assert context.prototypes[1].shape == (0, 256)
 
 
 def test_historical_occurrences_outside_state_tail_do_not_create_dense_targets() -> None:
