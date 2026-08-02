@@ -69,11 +69,13 @@ class CandidateIdentity:
     last_reliable_chunk_index: int = 0
     reliable_streak: int = 1
     semantic_record_id: str | None = None
+    relevance: float = 0.5
 
     def __post_init__(self) -> None:
         _validate_identity_tensor(self.identity_prototype, "candidate identity prototype")
         if not self.candidate_id:
             raise ValueError("candidate_id must be non-empty")
+        _validate_probability(self.relevance, "candidate relevance")
         if (
             type(self.observation_count) is not int
             or self.observation_count < 1
@@ -108,9 +110,11 @@ class ConfirmedIdentity:
     prototype_version: int = 0
     first_seen_position_id: int = 0
     last_seen_position_id: int = 0
+    relevance: float = 0.5
 
     def __post_init__(self) -> None:
         _validate_identity_tensor(self.identity_prototype, "confirmed identity prototype")
+        _validate_probability(self.relevance, "confirmed relevance")
         if (
             not self.identity_id
             or type(self.observation_count) is not int
@@ -144,6 +148,7 @@ class ConfirmedChunk:
     last_seen_position_ids: Tensor
     semantic_record_ids: tuple[str | None, ...]
     prototype_versions: Tensor
+    relevance: Tensor
 
     def __post_init__(self) -> None:
         capacity = len(self.identity_ids)
@@ -167,9 +172,12 @@ class ConfirmedChunk:
             self.first_seen_position_ids,
             self.last_seen_position_ids,
             self.prototype_versions,
+            self.relevance,
         )
         if any(tensor.shape != expected or tensor.device.type != "cpu" for tensor in tensors):
             raise ValueError("Confirmed chunk fields must be aligned CPU vectors")
+        if self.relevance.dtype != torch.float32:
+            raise ValueError("Confirmed relevance must be CPU float32")
         if self.occupied.dtype != torch.bool:
             raise ValueError("Confirmed occupied mask must be bool")
         if self.first_seen.dtype != torch.float64 or self.last_seen.dtype != torch.float64:
@@ -204,6 +212,8 @@ class ConfirmedChunk:
                 raise ValueError("Confirmed observation count must be positive")
             if int(self.prototype_versions[index].item()) < 0:
                 raise ValueError("Confirmed prototype version must be non-negative")
+            if not 0.0 <= float(self.relevance[index].item()) <= 1.0:
+                raise ValueError("Confirmed relevance must lie in [0, 1]")
 
     @property
     def capacity(self) -> int:
@@ -410,6 +420,7 @@ class IdentityBankRuntimeState:
                         prototype_version=int(chunk.prototype_versions[index].item()),
                         first_seen_position_id=int(chunk.first_seen_position_ids[index].item()),
                         last_seen_position_id=int(chunk.last_seen_position_ids[index].item()),
+                        relevance=float(chunk.relevance[index].item()),
                     )
                 )
         return tuple(records)
@@ -500,6 +511,7 @@ class _Observation:
     novelty: float
     match_confidence: float
     confidence: float
+    relevance: float
 
 
 class IdentityBank:
@@ -829,6 +841,7 @@ class IdentityBank:
                     novelty=novelty,
                     match_confidence=match_confidence,
                     confidence=confidence,
+                    relevance=float(observation.relevance[row, slot_index].float().item()),
                 )
             )
         return tuple(sorted(items, key=lambda item: (item.position_id, item.slot_index)))
@@ -918,6 +931,11 @@ class IdentityBank:
                 last_seen_position_id=item.position_id,
                 observation_count=previous.observation_count + 1,
                 prototype_version=previous.prototype_version + 1,
+                relevance=_relevance_ema(
+                    previous.relevance,
+                    item.relevance,
+                    self.o2_config.prototype_ema,
+                ),
             )
             next_state_bank = state_bank.update_o2_confirmed(
                 next_state_bank,
@@ -1031,6 +1049,11 @@ class IdentityBank:
                 if reliable
                 else previous.last_reliable_chunk_index,
                 reliable_streak=reliable_streak,
+                relevance=_relevance_ema(
+                    previous.relevance,
+                    item.relevance,
+                    self.o2_config.prototype_ema,
+                ),
             )
             if reliable_streak >= self.o2_config.confirmation_observations:
                 next_identity, next_state_bank, confirmed = self._promote_candidate(
@@ -1162,6 +1185,7 @@ class IdentityBank:
             last_reliable_chunk_index=chunk_index,
             reliable_streak=1 if item.confidence >= self.o2_config.reliability_threshold else 0,
             semantic_record_id=None,
+            relevance=item.relevance,
         )
         next_state_bank, record = state_bank.append_o2_candidate(
             next_state_bank,
@@ -1215,6 +1239,7 @@ class IdentityBank:
             prototype_version=0,
             first_seen_position_id=candidate.first_seen_position_id,
             last_seen_position_id=candidate.last_seen_position_id,
+            relevance=candidate.relevance,
         )
         assert candidate.semantic_record_id is not None
         next_state_bank, record = state_bank.promote_o2_candidate(
@@ -1556,6 +1581,7 @@ def _empty_confirmed_chunk(capacity: int) -> ConfirmedChunk:
         last_seen_position_ids=torch.full((capacity,), -1, dtype=torch.int64),
         semantic_record_ids=(None,) * capacity,
         prototype_versions=torch.zeros(capacity, dtype=torch.int64),
+        relevance=torch.full((capacity,), 0.5, dtype=torch.float32),
     )
 
 
@@ -1583,6 +1609,7 @@ def _append_confirmed(
     first_positions = target.first_seen_position_ids.detach().clone()
     last_positions = target.last_seen_position_ids.detach().clone()
     versions = target.prototype_versions.detach().clone()
+    relevance = target.relevance.detach().clone()
     identity_ids = list(target.identity_ids)
     record_ids = list(target.semantic_record_ids)
     prototypes[slot] = _hard_identity(confirmed.identity_prototype)
@@ -1593,6 +1620,7 @@ def _append_confirmed(
     first_positions[slot] = confirmed.first_seen_position_id
     last_positions[slot] = confirmed.last_seen_position_id
     versions[slot] = confirmed.prototype_version
+    relevance[slot] = confirmed.relevance
     identity_ids[slot] = confirmed.identity_id
     record_ids[slot] = confirmed.semantic_record_id
     cloned[target_index] = ConfirmedChunk(
@@ -1606,6 +1634,7 @@ def _append_confirmed(
         last_positions,
         tuple(record_ids),
         versions,
+        relevance,
     )
     return tuple(cloned)
 
@@ -1631,12 +1660,14 @@ def _update_confirmed(
     counts = chunk.observation_counts.detach().clone()
     last_positions = chunk.last_seen_position_ids.detach().clone()
     versions = chunk.prototype_versions.detach().clone()
+    relevance = chunk.relevance.detach().clone()
     record_ids = list(chunk.semantic_record_ids)
     prototypes[slot] = _hard_identity(confirmed.identity_prototype)
     last_seen[slot] = confirmed.last_seen
     counts[slot] = confirmed.observation_count
     last_positions[slot] = confirmed.last_seen_position_id
     versions[slot] = confirmed.prototype_version
+    relevance[slot] = confirmed.relevance
     record_ids[slot] = confirmed.semantic_record_id
     cloned[chunk_index] = ConfirmedChunk(
         prototypes,
@@ -1649,6 +1680,7 @@ def _update_confirmed(
         last_positions,
         tuple(record_ids),
         versions,
+        relevance,
     )
     return tuple(cloned)
 
@@ -1687,6 +1719,11 @@ def _prototype_ema(old: Tensor, observation: Tensor, decay: float) -> Tensor:
     return _normalize_identity(decay * old.float() + (1.0 - decay) * observation.float())
 
 
+def _relevance_ema(old: float, observation: float, decay: float) -> float:
+    value = decay * old + (1.0 - decay) * observation
+    return min(1.0, max(0.0, value))
+
+
 def _hard_identity(identity: Tensor) -> Tensor:
     _validate_identity_tensor(identity, "identity observation")
     return _normalize_identity(identity.detach().to(device="cpu", dtype=torch.float32, copy=True))
@@ -1723,6 +1760,7 @@ def _clone_chunk(chunk: ConfirmedChunk) -> ConfirmedChunk:
         last_seen_position_ids=chunk.last_seen_position_ids.detach().clone(),
         semantic_record_ids=tuple(chunk.semantic_record_ids),
         prototype_versions=chunk.prototype_versions.detach().clone(),
+        relevance=chunk.relevance.detach().clone(),
     )
 
 

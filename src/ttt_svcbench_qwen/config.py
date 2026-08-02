@@ -1,6 +1,6 @@
 """Load and validate the frozen slot-memory project configuration.
 
-Inputs: one UTF-8 YAML file describing the frozen schema-13 contract.
+Inputs: one UTF-8 YAML file describing the frozen schema-14 contract.
 Outputs: an immutable, fully validated :class:`ProjectConfig`.
 Forbidden: model forward logic, training logic, secret values, or platform absolute paths.
 """
@@ -16,7 +16,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SPEC_VERSION = "state_ttt_qwen3vl8b_slot_memory_delta_v1"
-CONFIG_SCHEMA_VERSION = 13
+CONFIG_SCHEMA_VERSION = 14
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 BASE_MODEL_REVISION = "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
 TRANSFORMERS_VERSION = "4.57.1"
@@ -249,6 +249,14 @@ class O2Config(FrozenModel):
     candidate_low_confidence_threshold: Probability
     match_ambiguity_margin: PositiveFloat
     threshold_status: CalibrationStatus
+    relevance_gate_mode: Literal["audit_only", "enforce"]
+    relevance_threshold: Probability | None
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def _validate_relevance_gate(self) -> O2Config:
+        if self.relevance_gate_mode == "enforce" and self.relevance_threshold is None:
+            raise ValueError("O2 relevance enforce mode requires a calibrated threshold")
+        return self
 
 
 class E1Config(FrozenModel):
@@ -640,7 +648,7 @@ class A5QueryMetaGradientConfig(FrozenModel):
 
 
 class A5WarmupConfig(FrozenModel):
-    """Independent Memory/State handoff stage; values are part of schema-13."""
+    """Independent Memory/State handoff stage; values are part of schema-14."""
 
     max_steps: Literal[256]
     linear_warmup_steps: Literal[4]
@@ -660,7 +668,7 @@ class A5WarmupConfig(FrozenModel):
             float(self.associative_learning_rate),
         )
         if actual != expected:
-            raise ValueError("A5 Memory/State warmup learning rates drifted from schema-13")
+            raise ValueError("A5 Memory/State warmup learning rates drifted from schema-14")
         return self
 
 
@@ -1029,6 +1037,8 @@ _FROZEN_CONTRACT: dict[str, object] = {
             "candidate_low_confidence_threshold": 0.5,
             "match_ambiguity_margin": 1.0e-6,
             "threshold_status": CalibrationStatus.BOOTSTRAP_CALIBRATION_REQUIRED,
+            "relevance_gate_mode": "audit_only",
+            "relevance_threshold": None,
         },
         "e1": {
             "output_names": ("eventness", "completion", "transition"),
@@ -1072,7 +1082,7 @@ class ProjectConfig(FrozenModel):
     """Schema-13 production configuration with cross-component contract validation."""
 
     spec_version: str
-    config_schema_version: Literal[13]
+    config_schema_version: Literal[14]
     data: DataConfig
     video_preprocessing: VideoPreprocessingConfig
     model: ModelConfig
@@ -1281,7 +1291,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> ProjectConfig:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Validate and print the schema-13 configuration")
+    parser = argparse.ArgumentParser(description="Validate and print the schema-14 configuration")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     args = parser.parse_args(argv)
     print(load_config(args.config).model_dump_json(indent=2))

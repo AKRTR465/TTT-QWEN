@@ -2792,11 +2792,11 @@ def resolve_same_stage_resume(
     if not isinstance(raw, dict) or raw.get("stage") != stage.value:
         raise ValueError("resume checkpoint stage does not match the configured production stage")
     if (
-        raw.get("config_schema_version") != 13
+        raw.get("config_schema_version") != 14
         or raw.get("associative_ttt_contract") != "bank_conditioned_slot_memory_v3"
     ):
         raise ValueError(
-            "same-stage resume requires the schema-13 slot-memory contract"
+            "same-stage resume requires the schema-14 slot-memory contract"
         )
     if stage is ProductionStage.A5:
         checkpoint_mode = raw.get("a5_adaptation_mode", "meta_ttt")

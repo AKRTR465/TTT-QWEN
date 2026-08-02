@@ -1051,13 +1051,14 @@ def test_o2_dedup_novelty_log_domain_stability() -> None:
     assert torch.isfinite(grad).all()
 
     # Empty bank: the bank factor drops out; only the in-chunk peer factor remains.
+    # The fixture relevance defaults to 0.5 per valid slot and scales the novelty mass.
     empty = torch.zeros((0, 256))
     prediction_empty, novelty_empty, base_empty = _o2_dedup_prediction(
         observations.o2, 0, empty, 0
     )
     assert base_empty == 0.0
     sigmoid_at_full_match = 1.0 / (1.0 + math.exp(2.0))
-    assert novelty_empty == pytest.approx(1.0 + sigmoid_at_full_match, abs=1.0e-4)
+    assert novelty_empty == pytest.approx(0.5 * (1.0 + sigmoid_at_full_match), abs=1.0e-4)
     assert float(prediction_empty.detach().item()) == pytest.approx(
         novelty_empty, abs=1.0e-5
     )
@@ -1105,6 +1106,7 @@ def _confirmed_chunk_with(prototypes: Tensor) -> ConfirmedChunk:
             f"record-{index}" if index < count else None for index in range(capacity)
         ),
         prototype_versions=torch.zeros(capacity, dtype=torch.int64),
+        relevance=torch.full((capacity,), 0.5, dtype=torch.float32),
     )
 
 

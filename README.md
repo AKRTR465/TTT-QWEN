@@ -5,7 +5,7 @@
 - A2 全量状态模型训练，再初始化 A5 Meta-TTT；
 - 按视频隔离、按 chunk 因果更新的在线推理。
 
-当前架构规范为 `state_ttt_qwen3vl8b_slot_memory_delta_v1`，正式配置 schema 为 13；历史阶段 gate 与 synthetic 报告不再随源码分发。
+当前架构规范为 `state_ttt_qwen3vl8b_slot_memory_delta_v1`，正式配置 schema 为 14；历史阶段 gate 与 synthetic 报告不再随源码分发。
 
 ## 架构摘要
 
@@ -23,8 +23,11 @@
 - A2/A5 正式训练唯一使用 `ema_answer_ref`：loss EMA 对齐 Answer 尺度，再按
   `q_target/q_operator/q_time` 激活面的梯度 RMS EMA 平衡四项 official-weak loss；辅助组仍限制为
   Answer 的至多 40%（`official_weak_balance.group_weight`）。
-- O2-Unique 计数监督为软去重目标：sg(写前 confirmed 基数) + 当前 chunk 可微软新颖数，
-  `o2.identity` 直接获得任务梯度；O2-Gain 保持池化计数回归。
+- O2-Unique 计数监督为软去重目标：sg(写前 confirmed 基数) + 当前 chunk 可微软新颖数
+  （经 relevance 门控加权），`o2.identity` 直接获得任务梯度；O2-Gain 保持池化计数回归。
+- O2 relevance 头 `r_i = σ(⟨identity_i, W·q_target⟩)` 回答"是不是问题所指类别"，分数随
+  Identity Bank 生命周期入 Confirmed 记录；Reader 闸门默认 audit_only（只审计不拦截），
+  enforce 需已标定阈值且属显式契约变更。
 
 完整设计见 [ARCHITECTURE.md](./ARCHITECTURE.md)，固定决策见 [DECISIONS.md](./DECISIONS.md)。
 

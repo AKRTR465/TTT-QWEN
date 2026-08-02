@@ -102,6 +102,7 @@ class O2SoftOutput:
     timestamps: Tensor
     position_ids: Tensor
     count_prediction: Tensor = field(default_factory=lambda: torch.empty(0))
+    relevance: Tensor = field(default_factory=lambda: torch.empty(0))
 
     def __post_init__(self) -> None:
         _require_float_shape(self.identity, 256, "O2 identity")
@@ -123,6 +124,25 @@ class O2SoftOutput:
                 (self.score_probabilities[..., 0] * self.valid_mask).sum(dim=1),
             )
         _validate_count_prediction(self.count_prediction, self.score_logits, "O2")
+        if self.relevance.numel() == 0 and self.valid_mask.numel():
+            object.__setattr__(
+                self,
+                "relevance",
+                0.5 * self.valid_mask.to(dtype=self.score_logits.dtype),
+            )
+        if (
+            self.relevance.shape != self.valid_mask.shape
+            or not torch.is_floating_point(self.relevance)
+            or self.relevance.device != self.score_logits.device
+        ):
+            raise ValueError("O2 relevance must be floating [B, N] on the score device")
+        if self.relevance.device.type != "meta":
+            if not bool(torch.isfinite(self.relevance).all()):
+                raise ValueError("O2 relevance must be finite")
+            if bool(torch.any((self.relevance < 0.0) | (self.relevance > 1.0))):
+                raise ValueError("O2 relevance must lie in [0, 1]")
+            if bool(torch.any(self.relevance[~self.valid_mask] != 0.0)):
+                raise ValueError("invalid O2 relevance entries must be zero")
         if (
             self.identity.dtype != self.score_logits.dtype
             or self.identity.device != self.score_logits.device
@@ -504,6 +524,10 @@ class O2IdentityDecoder(nn.Module):  # type: ignore[misc]
             config.hidden_dims[1] + 512,
             layer_norm_eps=config.layer_norm_eps,
         )
+        # Multiplicative query interaction: sigma(<identity_i, W q_target>). A concat-Linear
+        # would rank slots independently of the query and cannot express "is this the asked
+        # class"; the bilinear form is the smallest head that can.
+        self.relevance_projection = nn.Linear(512, config.identity_dim, bias=True)
 
     def forward(
         self,
@@ -550,6 +574,11 @@ class O2IdentityDecoder(nn.Module):  # type: ignore[misc]
         score_logits = torch.where(slot_valid_mask.unsqueeze(-1), score_logits, 0.0)
         score_probabilities = torch.sigmoid(score_logits.float()).to(dtype=score_logits.dtype)
         score_probabilities = torch.where(slot_valid_mask.unsqueeze(-1), score_probabilities, 0.0)
+        relevance_query = self.relevance_projection(q_target)
+        relevance = torch.sigmoid(
+            torch.einsum("bnd,bd->bn", identity.float(), relevance_query.float())
+        ).to(dtype=identity.dtype)
+        relevance = torch.where(slot_valid_mask, relevance, 0.0)
         return O2SoftOutput(
             identity=identity,
             score_logits=score_logits,
@@ -558,6 +587,7 @@ class O2IdentityDecoder(nn.Module):  # type: ignore[misc]
             timestamps=expanded_timestamps,
             position_ids=expanded_positions,
             count_prediction=count_prediction,
+            relevance=relevance,
         )
 
 
@@ -1586,7 +1616,7 @@ def _validate_o2_config(config: O2Config) -> None:
         "identity_normalization": "l2_fp32_unit_basis_fallback",
         "normalization_eps": 1.0e-8,
         "score_names": O2SoftOutput.SCORE_NAMES,
-        "parameter_count": 2_499_843,
+        "parameter_count": 2_631_171,
     }
     _validate_config_fields(config, expected, "O2")
 

@@ -52,8 +52,9 @@ class _LegacyA2ToA5Profile:
     Profile ``a2_to_a5_memory_v1``: schema-12 A2 checkpoints predate the slot
     memory, so its interface tensors (probe, value projection, eta gate, read
     gate, forget gate, contract buffer) may be missing and are initialized
-    fresh; the retired ``associative_contract_version`` buffer they still carry
-    is the sole tolerated unexpected non-module key.  Any other mismatch
+    fresh; pre-schema-14 checkpoints additionally predate the O2 relevance
+    projection.  The retired ``associative_contract_version`` buffer they still
+    carry is the sole tolerated unexpected non-module key.  Any other mismatch
     rejects the checkpoint.
     """
 
@@ -66,6 +67,7 @@ class _LegacyA2ToA5Profile:
         ".memory_alpha",
         ".memory_beta_raw",
         "memory_contract_version",
+        ".relevance_projection.",
     )
     unexpected_modules: tuple[str, ...] = ("predictor.", "p_value.")
     unexpected_fragments: tuple[str, ...] = ("associative_contract_version",)

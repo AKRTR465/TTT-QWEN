@@ -23,6 +23,10 @@
 - Spatial Encoder 固定为两阶段 Slot Attention；Temporal Encoder 固定为 6 层因果 Transformer。
 - Query Encoder 固定为 4 层、512 维；State Resampler 固定输出 16 个 4096 维 token。
 - Deterministic Reader 是精确计数唯一真值源，LLM 不覆盖 Reader 算术。
+- O2 relevance 头固定为乘性 query 交互 `σ(⟨identity, W·q_target⟩)`（schema-14 新增，
+  Linear 512→256）；分数随 Identity Bank 生命周期以 `prototype_ema` 同衰减传递并
+  落入 Confirmed 列存。Reader 闸门冻结为 audit_only + 无阈值；切 enforce 需要已标定
+  阈值并构成显式契约变更。
 
 ## 训练
 
@@ -34,6 +38,10 @@
   10.0），不再是冻结常量；counterfactual 参照为 `episode_zero`（精确 M=0）与
   `segment_start`，每 rank 可审计多条 Query。
 - NoWrite 对照改名 `no_write`（旧名 `static_w0` 报错拒绝）。
+- O2-Unique 官方弱监督计数为软去重目标：sg(写前 confirmed 基数) + 当前 chunk 的
+  relevance 门控可微软新颖数（log 域累积，τ 对齐 match_threshold=0.8、温度 0.1 为
+  固定目标形状）；O2-Gain 保持池化计数回归；dedup 上下文缺失整体回退池化路径。
+  基数快照必须取自 query chunk 硬提交之前。
 - Warmup 完全冻结 Qwen、W0 与 RMSNorm/P_in/P_out；只训练 P_C、memory 接口和四个 state
   组，并仅保存带来源 hash 的非 Qwen handoff bundle；A5 Main 重新加载 A2 后叠加 bundle，
   恢复部分 Qwen 解冻，4 epoch 只保存 final checkpoint。

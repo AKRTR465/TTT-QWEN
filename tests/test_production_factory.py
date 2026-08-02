@@ -1810,7 +1810,7 @@ def test_same_stage_resume_is_distinct_from_a2_to_a5_initialization(tmp_path: Pa
         "0715_010203_a5",
         run_config={
             "stage": "a5",
-            "config_schema_version": 13,
+            "config_schema_version": 14,
             "associative_ttt_contract": "bank_conditioned_slot_memory_v3",
         },
     )
@@ -1837,7 +1837,7 @@ def test_same_stage_resume_accepts_only_matching_no_write_mode(tmp_path: Path) -
         run_config={
             "stage": "a5",
             "a5_adaptation_mode": "no_write",
-            "config_schema_version": 13,
+            "config_schema_version": 14,
             "associative_ttt_contract": "bank_conditioned_slot_memory_v3",
         },
     )
@@ -1867,7 +1867,7 @@ def test_same_stage_resume_rejects_legacy_associative_contract(
         },
     )
 
-    with pytest.raises(ValueError, match="schema-13 slot-memory"):
+    with pytest.raises(ValueError, match="schema-14 slot-memory"):
         resolve_same_stage_resume(str(checkpoint), ProductionStage.A5)
 
 

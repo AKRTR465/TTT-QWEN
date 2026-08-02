@@ -20,6 +20,9 @@ from ttt_svcbench_qwen.identity_bank import (
     IdentityBankRuntimeState,
     IdentityDecisionStatus,
     IdentityUpdateResult,
+    _append_confirmed,
+    _relevance_ema,
+    _update_confirmed,
     build_identity_bank,
 )
 from ttt_svcbench_qwen.observation_heads import O2SoftOutput
@@ -285,6 +288,7 @@ def _confirmed_chunk(
         last_seen_position_ids=last_positions,
         semantic_record_ids=record_ids,
         prototype_versions=torch.zeros(capacity, dtype=torch.int64),
+        relevance=torch.full((capacity,), 0.5, dtype=torch.float32),
     )
 
 
@@ -1085,3 +1089,51 @@ def test_ann_is_disabled_and_every_decision_reports_full_cpu_scan(
         "identity-00000008",
         "identity-00000016",
     )
+
+
+def test_relevance_survives_confirmed_storage_roundtrip() -> None:
+    prototype = torch.zeros(IDENTITY_DIM, dtype=torch.float32)
+    prototype[3] = 1.0
+    base = ConfirmedIdentity(
+        identity_id="identity-relevance",
+        identity_prototype=prototype,
+        first_seen=0.0,
+        last_seen=1.0,
+        observation_count=2,
+        semantic_record_id="record-relevance",
+        first_seen_position_id=0,
+        last_seen_position_id=1,
+        relevance=0.7,
+    )
+    empty = _confirmed_chunk(torch.zeros((0, IDENTITY_DIM)), id_offset=0)
+
+    chunks = _append_confirmed((empty,), base, 256)
+    assert float(chunks[0].relevance[0].item()) == pytest.approx(0.7)
+
+    updated = ConfirmedIdentity(
+        identity_id="identity-relevance",
+        identity_prototype=prototype,
+        first_seen=0.0,
+        last_seen=2.0,
+        observation_count=3,
+        semantic_record_id="record-relevance",
+        prototype_version=1,
+        first_seen_position_id=0,
+        last_seen_position_id=2,
+        relevance=0.9,
+    )
+    chunks = _update_confirmed(chunks, updated)
+    assert float(chunks[0].relevance[0].item()) == pytest.approx(0.9)
+
+    state = IdentityBankRuntimeState(
+        video_id="video-a",
+        trajectory_id="trajectory-a",
+        confirmed_chunks=chunks,
+        issued_identity_ids=("identity-relevance",),
+        next_identity_sequence=1,
+    )
+    assert state.confirmed[0].relevance == pytest.approx(0.9)
+
+    assert _relevance_ema(0.5, 0.9, 0.9) == pytest.approx(0.54)
+    assert _relevance_ema(1.0, 1.0, 0.9) == 1.0
+    assert _relevance_ema(0.0, 0.0, 0.9) == 0.0

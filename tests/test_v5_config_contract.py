@@ -23,9 +23,9 @@ def _raw() -> dict[str, object]:
     return value
 
 
-def test_schema13_slot_memory_and_robust_query_contract_roundtrips() -> None:
+def test_schema14_slot_memory_and_robust_query_contract_roundtrips() -> None:
     config = load_config(CONFIG_PATH)
-    assert config.config_schema_version == CONFIG_SCHEMA_VERSION == 13
+    assert config.config_schema_version == CONFIG_SCHEMA_VERSION == 14
     assert (
         config.spec_version
         == SPEC_VERSION
@@ -96,6 +96,19 @@ def test_fast_memory_contract_drift_fails_before_startup(field: str, value: obje
     memory[field] = value
     raw["fast_memory"] = memory
     with pytest.raises((ValidationError, ValueError)):
+        ProjectConfig.model_validate(raw)
+
+
+def test_o2_relevance_gate_rejects_enforce_without_threshold() -> None:
+    raw = _raw()
+    heads = deepcopy(raw["observation_heads"])
+    assert isinstance(heads, dict)
+    o2 = heads["o2"]
+    assert isinstance(o2, dict)
+    o2["relevance_gate_mode"] = "enforce"
+    o2["relevance_threshold"] = None
+    raw["observation_heads"] = heads
+    with pytest.raises(ValidationError, match="calibrated threshold"):
         ProjectConfig.model_validate(raw)
 
 

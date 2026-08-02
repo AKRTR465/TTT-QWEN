@@ -135,6 +135,7 @@ def _confirmed_record(
     *,
     first_seen: float = 1.0,
     semantic_index: int | None = None,
+    relevance: float = 0.5,
 ) -> StateRecord:
     record_id = f"o2-{sequence:08d}"
     return make_state_record(
@@ -147,6 +148,7 @@ def _confirmed_record(
             last_seen=first_seen,
             observation_count=2,
             semantic_record_id=record_id,
+            relevance=relevance,
         ),
         semantic_embedding=_unit_semantic(sequence if semantic_index is None else semantic_index),
         timestamp=first_seen,
@@ -909,6 +911,89 @@ def test_reader_o2_gain_uses_closed_first_seen_window_boundaries(
     assert result.exact_count == 2
     assert dict(result.audit_fields)["matched_first_seen_count"] == 2
     _assert_number_roundtrip(number_tokenizer, result)
+
+
+def test_reader_o2_relevance_gate_audit_only_counts_all_and_reports(
+    reader: DeterministicStateReader,
+    number_tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    records = tuple(
+        _confirmed_record(index, relevance=relevance)
+        for index, relevance in enumerate((0.9, 0.4, 0.6))
+    )
+
+    # Default reader: no threshold, audit_only — nothing filtered, everything reported.
+    result = _read_one(reader, Operator.O2_UNIQUE, _resolution(), records)
+    assert result.status is ReaderStatus.OK
+    assert result.exact_count == 3
+    audit = dict(result.audit_fields)
+    assert audit["operand_relevance_gate_mode"] == "audit_only"
+    assert audit["operand_relevance_ok_count"] == 3
+
+    # Shadow calibration: threshold set but audit_only — the count is unchanged while
+    # the audit shows what enforce would keep.
+    shadow = DeterministicStateReader(number_tokenizer, o2_relevance_threshold=0.5)
+    shadow_result = _read_one(shadow, Operator.O2_UNIQUE, _resolution(), records)
+    assert shadow_result.exact_count == 3
+    shadow_audit = dict(shadow_result.audit_fields)
+    assert shadow_audit["operand_relevance_gate_mode"] == "audit_only"
+    assert shadow_audit["operand_relevance_ok_count"] == 2
+
+
+def test_reader_o2_relevance_gate_enforce_filters_below_threshold(
+    number_tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    enforcing = DeterministicStateReader(
+        number_tokenizer,
+        o2_relevance_gate_mode="enforce",
+        o2_relevance_threshold=0.5,
+    )
+    records = tuple(
+        _confirmed_record(index, relevance=relevance)
+        for index, relevance in enumerate((0.9, 0.4, 0.6))
+    )
+
+    unique = _read_one(enforcing, Operator.O2_UNIQUE, _resolution(), records)
+    assert unique.status is ReaderStatus.OK
+    assert unique.exact_count == 2
+    unique_audit = dict(unique.audit_fields)
+    assert unique_audit["operand_confirmed_record_count"] == 3
+    assert unique_audit["operand_relevance_ok_count"] == 2
+    assert unique_audit["operand_relevance_gate_mode"] == "enforce"
+    _assert_number_roundtrip(number_tokenizer, unique)
+
+    gain_records = (
+        _confirmed_record(0, first_seen=5.0, relevance=0.3),
+        _confirmed_record(1, first_seen=10.0, relevance=0.9),
+    )
+    gain = _read_one(
+        enforcing,
+        Operator.O2_GAIN,
+        _resolution(mode=TimeWindowMode.RECENT, start_time=5.0),
+        gain_records,
+    )
+    assert gain.status is ReaderStatus.OK
+    assert gain.exact_count == 1
+
+    # Enforce may filter every record: the count is a plain zero, never an error.
+    drained = _read_one(
+        enforcing,
+        Operator.O2_UNIQUE,
+        _resolution(),
+        (_confirmed_record(0, relevance=0.1), _confirmed_record(1, relevance=0.2)),
+    )
+    assert drained.status is ReaderStatus.OK
+    assert drained.exact_count == 0
+    _assert_number_roundtrip(number_tokenizer, drained)
+
+
+def test_reader_rejects_enforce_without_calibrated_threshold(
+    number_tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    with pytest.raises(ValueError, match="calibrated"):
+        DeterministicStateReader(number_tokenizer, o2_relevance_gate_mode="enforce")
+    with pytest.raises(ValueError, match="audit_only or enforce"):
+        DeterministicStateReader(number_tokenizer, o2_relevance_gate_mode="always")
 
 
 def test_reader_e1_action_uses_action_completion_history(

@@ -1279,6 +1279,7 @@ class OfficialWeakTargetBuilder:
             + observations.o2.identity.float().sum()
             + observations.o2.score_logits.float().sum()
             + observations.o2.count_prediction.float().sum()
+            + observations.o2.relevance.float().sum()
             + observations.e1.logits.float().sum()
             + observations.e1.count_prediction.float().sum()
             + observations.e2.event_logits.float().sum()
@@ -1722,6 +1723,7 @@ def _o2_dedup_prediction(
     if not bool(valid.any().item()):
         return anchor + base, 0.0, base
     selected = identity[valid].float()
+    relevance = o2.relevance[row][valid].float()
     log_keep = torch.zeros(selected.shape[0], dtype=torch.float32, device=selected.device)
     if int(prototypes.shape[0]):
         bank_cosines = selected @ prototypes.to(
@@ -1734,7 +1736,9 @@ def _o2_dedup_prediction(
     peer_log = F.logsigmoid(-(peer_cosines - _NOVELTY_MATCH_THRESHOLD) / _NOVELTY_TEMPERATURE)
     earlier = torch.tril(torch.ones_like(peer_log, dtype=torch.bool), diagonal=-1)
     log_keep = log_keep + torch.where(earlier, peer_log, torch.zeros_like(peer_log)).sum(dim=1)
-    novelty = torch.exp(log_keep)
+    # The relevance gate rides the same count label: over-counting pushes r down on
+    # the least matching slots, under-counting pulls it up.
+    novelty = relevance * torch.exp(log_keep)
     prediction = anchor + base + novelty.sum()
     return prediction, float(novelty.detach().sum().item()), base
 

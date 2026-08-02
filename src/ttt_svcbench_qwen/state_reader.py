@@ -461,10 +461,24 @@ class _ExactCountComputation:
 class DeterministicStateReader:
     """Read exact integers from the complete, uncompressed selected typed records."""
 
-    def __init__(self, tokenizer: NumberTokenizerProtocol) -> None:
+    def __init__(
+        self,
+        tokenizer: NumberTokenizerProtocol,
+        *,
+        o2_relevance_gate_mode: str = "audit_only",
+        o2_relevance_threshold: float | None = None,
+    ) -> None:
         if tokenizer is None:
             raise ValueError("Deterministic State Reader requires the pinned tokenizer")
+        if o2_relevance_gate_mode not in ("audit_only", "enforce"):
+            raise ValueError("O2 relevance gate mode must be audit_only or enforce")
+        if o2_relevance_threshold is not None and not 0.0 <= o2_relevance_threshold <= 1.0:
+            raise ValueError("O2 relevance threshold must lie in [0, 1]")
+        if o2_relevance_gate_mode == "enforce" and o2_relevance_threshold is None:
+            raise ValueError("enforce requires a calibrated O2 relevance threshold")
         self.tokenizer = tokenizer
+        self.o2_relevance_gate_mode = o2_relevance_gate_mode
+        self.o2_relevance_threshold = o2_relevance_threshold
 
     def read(
         self,
@@ -635,6 +649,8 @@ class DeterministicStateReader:
                 operator,
                 resolution.window,
                 typed_records,
+                relevance_gate_mode=self.o2_relevance_gate_mode,
+                relevance_threshold=self.o2_relevance_threshold,
             )
         except _ReaderStateError as error:
             return self._no_count_result(
@@ -947,7 +963,11 @@ def build_state_reader(
         raise ValueError("build_state_reader requires the pinned tokenizer")
     _validate_state_reader_config(config.state_reader)
     _validate_pinned_tokenizer(config, tokenizer)
-    return DeterministicStateReader(tokenizer)
+    return DeterministicStateReader(
+        tokenizer,
+        o2_relevance_gate_mode=config.observation_heads.o2.relevance_gate_mode,
+        o2_relevance_threshold=config.observation_heads.o2.relevance_threshold,
+    )
 
 
 def _validate_state_resampler_config(config: StateResamplerConfig) -> None:
@@ -1072,6 +1092,9 @@ def _read_exact_count(
     operator: Operator,
     window: TimeWindow,
     records: tuple[StateRecord, ...],
+    *,
+    relevance_gate_mode: str = "audit_only",
+    relevance_threshold: float | None = None,
 ) -> _ExactCountComputation:
     if not records:
         raise _ReaderStateError("ok_retrieval_without_records")
@@ -1124,10 +1147,23 @@ def _read_exact_count(
         identity_ids = tuple(payload.identity_id for payload in confirmed)
         if len(set(identity_ids)) != len(identity_ids):
             raise _ReaderStateError("duplicate_confirmed_identity")
+        # Integrity checks stay over the full confirmed set; the relevance gate only
+        # narrows which records are counted, and only in enforce mode.
+        if relevance_threshold is None:
+            relevance_ok = confirmed
+        else:
+            relevance_ok = [
+                payload for payload in confirmed if payload.relevance >= relevance_threshold
+            ]
+        counted = relevance_ok if relevance_gate_mode == "enforce" else confirmed
+        relevance_operands: tuple[tuple[str, AuditValue], ...] = (
+            ("operand_relevance_ok_count", len(relevance_ok)),
+            ("operand_relevance_gate_mode", relevance_gate_mode),
+        )
         if operator is Operator.O2_UNIQUE:
             if any(payload.first_seen > window.query_time for payload in confirmed):
                 raise _ReaderStateError("o2_future_identity_reached_reader")
-            count = len(confirmed)
+            count = len(counted)
             return _ExactCountComputation(
                 exact_count=count,
                 arithmetic="o2_confirmed_first_seen_at_or_before_query",
@@ -1138,7 +1174,8 @@ def _read_exact_count(
                     ("operand_first_seen_min", min(item.first_seen for item in confirmed)),
                     ("operand_first_seen_max", max(item.first_seen for item in confirmed)),
                     ("matched_first_seen_count", count),
-                ),
+                )
+                + relevance_operands,
             )
         if window.start_time is None:
             raise _ReaderStateError("o2_gain_requires_bounded_window")
@@ -1146,7 +1183,7 @@ def _read_exact_count(
             not window.start_time <= payload.first_seen <= window.end_time for payload in confirmed
         ):
             raise _ReaderStateError("o2_identity_outside_gain_window")
-        count = len(confirmed)
+        count = len(counted)
         return _ExactCountComputation(
             exact_count=count,
             arithmetic="o2_confirmed_first_seen_in_closed_window",
@@ -1157,7 +1194,8 @@ def _read_exact_count(
                 ("operand_first_seen_min", min(item.first_seen for item in confirmed)),
                 ("operand_first_seen_max", max(item.first_seen for item in confirmed)),
                 ("matched_first_seen_count", count),
-            ),
+            )
+            + relevance_operands,
         )
 
     if operator in (Operator.E1_ACTION, Operator.E1_TRANSIT):

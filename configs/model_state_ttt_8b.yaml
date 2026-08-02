@@ -1,5 +1,5 @@
 spec_version: state_ttt_qwen3vl8b_slot_memory_delta_v1
-config_schema_version: 13
+config_schema_version: 14
 
 data:
   grouped_annotation_file: data/vcbench_data.jsonl
@@ -169,7 +169,7 @@ observation_heads:
     linear_bias: true
     identity_normalization: l2_fp32_unit_basis_fallback
     normalization_eps: 1.0e-8
-    parameter_count: 2499843
+    parameter_count: 2631171
     prototype_ema: 0.9
     confirmation_observations: 2
     match_threshold: 0.8
@@ -179,6 +179,8 @@ observation_heads:
     candidate_low_confidence_threshold: 0.5
     match_ambiguity_margin: 1.0e-6
     threshold_status: bootstrap_calibration_required
+    relevance_gate_mode: audit_only
+    relevance_threshold: null
   e1:
     input_dim: 768
     channels: 512
