@@ -1034,6 +1034,8 @@ class OfficialWeakLossAudit:
     retrieval_positive_total: int | None = None
     retrieval_negative_total: int | None = None
     annotation_count_mismatch: int = 0
+    o2_identity_cosine_sum: float = 0.0
+    o2_identity_rows: int = 0
     operator_diagnostics: OperatorDiagnosticAudit = field(
         default_factory=OperatorDiagnosticAudit.empty
     )
@@ -1069,9 +1071,12 @@ class OfficialWeakLossAudit:
             self.retrieval_ineligible_excluded_count,
             self.retrieval_causal_excluded_count,
             self.annotation_count_mismatch,
+            self.o2_identity_rows,
         )
         if any(type(value) is not int or value < 0 for value in counts):
             raise ValueError("official weak retrieval audit row counts must be non-negative")
+        if not math.isfinite(self.o2_identity_cosine_sum):
+            raise ValueError("official weak o2 identity cosine audit must be finite")
         aligned = (
             self.retrieval_candidate_counts,
             self.retrieval_positive_counts,
@@ -1150,6 +1155,8 @@ class OfficialWeakLossAudit:
                 ),
             ),
             ("task/annotation_count_mismatch", float(self.annotation_count_mismatch)),
+            ("task/o2_identity_cosine_sum", float(self.o2_identity_cosine_sum)),
+            ("task/o2_identity_rows", float(self.o2_identity_rows)),
         )
 
 
@@ -1245,6 +1252,8 @@ class OfficialWeakTargetBuilder:
         retrieval_ineligible_excluded_count = 0
         retrieval_causal_excluded_count = 0
         annotation_count_mismatch = 0
+        o2_identity_cosine_sum = 0.0
+        o2_identity_rows = 0
         raw_operator_confusion = [0] * 72
         effective_operator_confusion = [0] * 72
         operator_loss_sums = [0.0] * 8
@@ -1359,6 +1368,9 @@ class OfficialWeakTargetBuilder:
                     target[index] += value
             e1_representable_occurrences += task_result.e1_representable_occurrences
             e1_unrepresentable_occurrences += task_result.e1_unrepresentable_occurrences
+            if task_result.o2_row:
+                o2_identity_cosine_sum += task_result.o2_identity_offdiag_cosine
+                o2_identity_rows += 1
             annotation_count_mismatch += int(_official_count_mismatch(label))
             retrieval_result = _official_weak_retrieval_loss(retrieval, row, label)
             retrieval_loss = retrieval_result.loss
@@ -1433,6 +1445,7 @@ class OfficialWeakTargetBuilder:
                 *task_channel_fn,
                 e1_representable_occurrences,
                 e1_unrepresentable_occurrences,
+                o2_identity_rows,
             ),
             audit_device,
         )
@@ -1454,6 +1467,7 @@ class OfficialWeakTargetBuilder:
         task_channel_fp = take_ints(7)
         task_channel_fn = take_ints(7)
         e1_representable_occurrences, e1_unrepresentable_occurrences = take_ints(2)
+        (o2_identity_rows,) = take_ints(1)
 
         task_float_values = _distributed_sum_floats(
             (
@@ -1461,6 +1475,7 @@ class OfficialWeakTargetBuilder:
                 *task_count_abs_error_sums,
                 *task_component_loss_sums,
                 *task_o1_loss_sums,
+                o2_identity_cosine_sum,
             ),
             audit_device,
         )
@@ -1468,6 +1483,7 @@ class OfficialWeakTargetBuilder:
         task_count_abs_error_sums = list(task_float_values[4:8])
         task_component_loss_sums = list(task_float_values[8:11])
         task_o1_loss_sums = list(task_float_values[11:13])
+        o2_identity_cosine_sum = task_float_values[13]
 
         retrieval_global_values = _distributed_sum_integers(
             (
@@ -1543,6 +1559,8 @@ class OfficialWeakTargetBuilder:
                 retrieval_positive_total=retrieval_positive_total,
                 retrieval_negative_total=retrieval_negative_total,
                 annotation_count_mismatch=annotation_count_mismatch,
+                o2_identity_cosine_sum=o2_identity_cosine_sum,
+                o2_identity_rows=o2_identity_rows,
                 operator_diagnostics=OperatorDiagnosticAudit(
                     raw_confusion=tuple(raw_operator_confusion),
                     effective_confusion=tuple(effective_operator_confusion),
@@ -1592,6 +1610,8 @@ class _TaskLossResult:
     channel_false_negative_counts: tuple[int, ...] = (0,) * 7
     e1_representable_occurrences: int = 0
     e1_unrepresentable_occurrences: int = 0
+    o2_identity_offdiag_cosine: float = 0.0
+    o2_row: bool = False
 
 
 def _official_weak_task_result(
@@ -1615,11 +1635,18 @@ def _official_weak_task_result(
     if label.operator in (Operator.O2_UNIQUE, Operator.O2_GAIN):
         prediction = observations.o2.count_prediction[row]
         count_loss = _robust_count_loss(prediction, target_count)
+        with torch.no_grad():
+            identity_cosine = _identity_offdiag_cosine(
+                observations.o2.identity[row],
+                observations.o2.valid_mask[row],
+            )
         return _TaskLossResult(
             loss=count_loss,
             family_index=1,
             count_loss=count_loss,
             count_abs_error=float((prediction.detach().float() - target_count).abs().item()),
+            o2_identity_offdiag_cosine=identity_cosine,
+            o2_row=True,
         )
     if label.operator in (Operator.E1_ACTION, Operator.E1_TRANSIT):
         valid = observations.e1.valid_mask[row]
@@ -1988,6 +2015,20 @@ def _robust_count_loss(prediction: Tensor, target: Tensor) -> Tensor:
         torch.log1p(target.float()),
         beta=0.25,
     )
+
+
+def _identity_offdiag_cosine(identity: Tensor, valid_mask: Tensor) -> float:
+    """Mean pairwise cosine over one row's valid identity vectors; a pure probe scalar."""
+
+    selected = identity[valid_mask].float()
+    count = int(selected.shape[0])
+    if count < 2:
+        return 0.0
+    gram = selected @ selected.transpose(0, 1)
+    value = float((gram.sum() - gram.diagonal().sum()).item()) / float(count * (count - 1))
+    if not math.isfinite(value):
+        return 0.0
+    return max(-1.0, min(1.0, value))
 
 
 def _voronoi_timestamp_index(timestamps: Tensor, target: float) -> int | None:

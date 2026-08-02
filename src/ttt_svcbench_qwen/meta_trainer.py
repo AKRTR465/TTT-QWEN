@@ -405,6 +405,9 @@ class MemoryWriteAudit:
     eta_renormalized: tuple[bool, ...]
     pre_write_cosine_means: tuple[float, ...]
     post_write_cosine_means: tuple[float, ...]
+    key_pairwise_cosine_means: tuple[float, ...]
+    value_pairwise_cosine_means: tuple[float, ...]
+    delta_pairwise_cosine_means: tuple[float, ...]
     write_norms: tuple[float, ...]
     memory_norms: tuple[float, ...]
     readout_shares: tuple[float, ...]
@@ -425,6 +428,9 @@ class MemoryWriteAudit:
             self.eta_renormalized,
             self.pre_write_cosine_means,
             self.post_write_cosine_means,
+            self.key_pairwise_cosine_means,
+            self.value_pairwise_cosine_means,
+            self.delta_pairwise_cosine_means,
             self.write_norms,
             self.memory_norms,
             self.readout_shares,
@@ -437,7 +443,13 @@ class MemoryWriteAudit:
             raise ValueError("current Support was not observed with its before-write memory")
         if not self.next_only_verified:
             raise ValueError("Meta-TTT write failed the next-chunk-only audit")
-        cosines = (*self.pre_write_cosine_means, *self.post_write_cosine_means)
+        cosines = (
+            *self.pre_write_cosine_means,
+            *self.post_write_cosine_means,
+            *self.key_pairwise_cosine_means,
+            *self.value_pairwise_cosine_means,
+            *self.delta_pairwise_cosine_means,
+        )
         if any(not math.isfinite(value) or not -1.0 <= value <= 1.0 for value in cosines):
             raise ValueError("memory write cosine audits must be finite in [-1, 1]")
         norms = (
@@ -1978,6 +1990,9 @@ def _make_memory_write_audit(
         eta_renormalized=tuple(result.eta_renormalized for result in results),
         pre_write_cosine_means=tuple(result.pre_write_cosine_mean for result in results),
         post_write_cosine_means=tuple(result.post_write_cosine_mean for result in results),
+        key_pairwise_cosine_means=tuple(result.key_pairwise_cosine_mean for result in results),
+        value_pairwise_cosine_means=tuple(result.value_pairwise_cosine_mean for result in results),
+        delta_pairwise_cosine_means=tuple(result.delta_pairwise_cosine_mean for result in results),
         write_norms=tuple(result.write_norm for result in results),
         memory_norms=tuple(result.memory_norm for result in results),
         readout_shares=observed_fast_audit.readout_share_norms,

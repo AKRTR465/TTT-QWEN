@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 from dataclasses import fields, replace
 
 import pytest
@@ -791,6 +792,8 @@ def test_official_retrieval_requires_aligned_mixed_bag_and_ignores_selection_mas
         "retrieval/positive_count": 1.0,
         "retrieval/negative_count": 1.0,
         "task/annotation_count_mismatch": 0.0,
+        "task/o2_identity_cosine_sum": 0.0,
+        "task/o2_identity_rows": 0.0,
     }
 
     no_positive = build((9.0,))
@@ -906,6 +909,38 @@ def test_unbounded_count_predictions_train_beyond_local_axis(
     assert prediction.grad is not None
     assert torch.isfinite(prediction.grad).all()
     assert prediction.grad.abs().item() > 0.0
+
+
+def test_o2_identity_cosine_audit_scalar_reaches_metrics() -> None:
+    observations, query, retrieval, _ = _typed_predictions(1)
+    identity = torch.zeros(1, 2, 256)
+    identity[0, 0, 0] = 1.0
+    identity[0, 1, 0] = math.sqrt(0.5)
+    identity[0, 1, 1] = math.sqrt(0.5)
+    identity.requires_grad_(True)
+    observations = replace(observations, o2=replace(observations.o2, identity=identity))
+    label = OfficialWeakSupervision(
+        query_id="o2-cosine-audit",
+        operator=Operator.O2_UNIQUE,
+        time_mode=TimeWindowMode.HISTORY,
+        count=2,
+        query_time=10.0,
+        occurrence_points=(),
+        occurrence_intervals=(),
+    )
+
+    task_result = _official_weak_task_result(observations, 0, label)
+    assert task_result.o2_row is True
+    assert task_result.o2_identity_offdiag_cosine == pytest.approx(math.sqrt(0.5), abs=1.0e-6)
+
+    output = OfficialWeakTargetBuilder().build(observations, query, retrieval, (label,))
+    metrics = dict(output.audit.metrics())
+    assert metrics["task/o2_identity_cosine_sum"] == pytest.approx(math.sqrt(0.5), abs=1.0e-6)
+    assert metrics["task/o2_identity_rows"] == 1.0
+
+    output.task.value.backward()
+    assert identity.grad is not None
+    assert int(torch.count_nonzero(identity.grad).item()) == 0
 
 
 def test_historical_occurrences_outside_state_tail_do_not_create_dense_targets() -> None:

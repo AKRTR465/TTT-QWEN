@@ -1689,6 +1689,26 @@ class TTTQwenTrainerMixin:
                 enriched["a5/memory/readout_share_mean"] = sum(readout_shares) / len(
                     readout_shares
                 )
+                pairwise_fields = (
+                    ("key_pairwise_cosine_mean", "key_pairwise_cosine_means"),
+                    ("value_pairwise_cosine_mean", "value_pairwise_cosine_means"),
+                    ("delta_pairwise_cosine_mean", "delta_pairwise_cosine_means"),
+                )
+                for metric_name, field_name in pairwise_fields:
+                    written_values = tuple(
+                        value
+                        for write in meta_audit.writes
+                        for did_write, value in zip(
+                            write.did_write,
+                            getattr(write, field_name),
+                            strict=True,
+                        )
+                        if did_write
+                    )
+                    if written_values:
+                        enriched[f"a5/memory/{metric_name}"] = sum(written_values) / len(
+                            written_values
+                        )
                 skip_reasons = tuple(
                     reason
                     for write in meta_audit.writes
