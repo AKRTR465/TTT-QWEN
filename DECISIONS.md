@@ -26,7 +26,13 @@
 - O2 relevance 头固定为乘性 query 交互 `σ(⟨identity, W·q_target⟩)`（schema-14 新增，
   Linear 512→256）；分数随 Identity Bank 生命周期以 `prototype_ema` 同衰减传递并
   落入 Confirmed 列存。Reader 闸门冻结为 audit_only + 无阈值；切 enforce 需要已标定
-  阈值并构成显式契约变更。
+  阈值并构成显式契约变更，且该变更必须同时解决三笔已知欠账：
+  （a）训练目标的 confirmed 基数随门控对齐——现为未门控全量，历史 confirmed 记录的
+  relevance 拿不到梯度，enforce 下训练路与 Reader 计数会在基数项重新分叉；
+  （b）Reader 的 `arithmetic` 标识与 `matched_first_seen_count` 如实反映门控，
+  否则审计误归因；
+  （c）门控排空全部记录时"OK + count 0"的枯竭语义显式敲定（错误的门会把
+  "不知道"变成"0"）。
 
 ## 训练
 

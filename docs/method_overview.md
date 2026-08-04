@@ -2,7 +2,7 @@
 
 > 用途：讲解材料，帮助快速理解本仓库的方法设计。规范性定义以
 > [README](../README.md)、[ARCHITECTURE](../ARCHITECTURE.md)、[DECISIONS](../DECISIONS.md)
-> 为准（规范版本 `state_ttt_qwen3vl8b_slot_memory_delta_v1`，schema 13）。
+> 为准（规范版本 `state_ttt_qwen3vl8b_slot_memory_delta_v1`，schema 14）。
 > 本文对应 2026-08 的主线实现。
 
 ## 1. 问题与动机
@@ -123,13 +123,19 @@ M_t = (1-β)·M_{t-1} + Σᵢ η_i (v_i - M_{t-1} k_i) k_iᵀ             # 闭�
 |---|---|---|
 | Spatial Slot Encoder | 2-stage Slot Attention，32 active / 64 max slots | 把 chunk 特征分解为对象 slot |
 | Temporal Encoder | 6 层因果 Transformer，hidden 768，64 tubelet cache | 跨帧因果建模，overlap 只回放已见位置 |
-| O1 / O2 / E1 / E2 | 观测头 | 瞬时计数 / 身份向量与去重证据 / 事件概率 / 事件与阶段状态 |
+| O1 / O2 / E1 / E2 | 观测头 | 瞬时计数 / 身份向量、去重证据与 relevance / 事件概率 / 事件与阶段状态 |
 | State Bank + Identity Bank | 硬提交，detach | 结构化事实：聚合状态、Confirmed 记录、append-only retrieval history |
 | Retriever + Semantic Projector | 只读**写前** history | Query 的语义检索（768D detached source 重投影为 512D key） |
 | Deterministic Reader | 读**写后** aggregate/Confirmed Bank | 精确计数、record IDs、算术与审计字段的唯一所有者 |
 
 硬状态（Bank/FSM）在提交前 detach，不参与反向传播；Reader 的算术不进
 optimizer。软路径（可微）与硬路径（确定性）的分离贯穿全部设计。
+
+O2 头额外输出 query 条件化的 relevance 分数 `r_i = σ(⟨identity_i, W·q_target⟩)`
+（schema-14 新增），回答"该对象是否问题所指的类别"；分数随 Identity Bank 生命周期
+EMA 传递并落入 Confirmed 记录。Reader 侧对应一个 O2 relevance 闸门，当前冻结为
+audit_only——只在审计里记录"若按阈值过滤会剩几条"，不改变计数；切 enforce
+需要已标定阈值，属未来显式契约变更。
 
 ## 4. 训练方法：A2 → A5 Warmup → A5 Main
 
@@ -142,6 +148,14 @@ optimizer。软路径（可微）与硬路径（确定性）的分离贯穿全�
   loss EMA 先对齐 Answer 尺度，再按 `q_target/q_operator/q_time` 激活面的
   梯度 RMS EMA 平衡 Task/Operator/Retrieval/Time 四项弱监督，
   辅助组合计不超过 Answer 的 40%（`official_weak_balance.group_weight`）。
+- O2-Unique 的官方弱监督计数训练在与 Reader 同构的软路径上（A2/A5 共用同一
+  builder）。动机：此前该监督压在池化计数头（训练路），而推理时 Reader 数的是
+  Identity Bank confirmed 记录数（推理路），两路分叉使 `o2.identity` 拿不到
+  任务梯度、身份几何没有分离压力。软去重目标为：预测 = sg(query chunk 硬提交
+  **之前**的 confirmed 基数) + 当前 chunk 的 relevance 门控可微软新颖数——
+  identity 与 confirmed 原型及同 chunk 更早槽的余弦经 logsigmoid 在 log 域累积
+  （τ 对齐 `match_threshold=0.8`，温度 0.1 为固定目标形状）。`o2.identity` 与
+  relevance 头由此获得任务梯度；O2-Gain 保持池化计数回归。
 
 ### 4.2 A5 Warmup：256 步只学"记忆机制"
 
