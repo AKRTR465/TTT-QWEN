@@ -1,8 +1,8 @@
 # Qwen3-VL-8B Slot-Memory Delta-Rule State-TTT 架构
 
 > 规范版本：state_ttt_qwen3vl8b_slot_memory_delta_v1
-> 配置 schema：13（schema 12 及更早的 A5 checkpoint/bundle 不自动迁移）
-> 修订日期：2026-07-30
+> 配置 schema：14（schema 13 及更早的 A5 checkpoint/bundle 不自动迁移）
+> 修订日期：2026-08-02
 > 状态：A2/A5 TRAINING MAINLINE IMPLEMENTED；ONLINE INFERENCE WIRED
 
 ## 1. 固定目标
@@ -96,28 +96,43 @@ Spatial Encoder 使用 2-stage Slot Attention，32 active slots、64 最大容�
 ### 3.3 Observation heads
 
 - O1：瞬时计数；
-- O2：身份向量与去重证据；
+- O2：身份向量与去重证据，另含 relevance 头：`r_i = σ(⟨identity_i, W·q_target⟩)`
+  （`relevance_projection`，乘性 query 交互），回答"该对象是否问题所指类别"；
 - E1：事件概率；
 - E2：事件与阶段状态。
 
 hard path 在提交前 detach；Identity Bank 只依据模型输出和因果 overlap 更新。
+relevance 分数随身份生命周期传递（candidate 创建/匹配 EMA/晋升/confirmed EMA，
+复用 `prototype_ema`），落入 `ConfirmedIdentity.relevance` 与 Confirmed 列存。
 
 ### 3.4 Query、Retriever 与 Reader
 
 Query Encoder 为 4 层、输出 512 维，并产生 operator prototype 路由与时间窗口。Semantic Retriever 只读取当前 Query 写入前的 append-only retrieval history，并在 Query graph 中用现有 SemanticProjector 将 detached 768D source 重投影为 512D key；因此 retrieval loss 可同时更新 q_target 与 Projector，但不会回传到历史 Support encoder。Reader 不经过 semantic threshold 或 retrieval history，直接读取当前 Query 写入后的 aggregate/Confirmed Bank，并作为唯一精确计数所有者输出状态、record IDs、算术结果和审计字段。
+
+Reader 的 O2 relevance 闸门（`o2.relevance_gate_mode` / `o2.relevance_threshold`）：
+audit_only（当前冻结值）只在 operands 中记录 `operand_relevance_ok_count` 与门模式、
+不改变计数；enforce 需要已标定阈值（配置校验拒绝 enforce+null），此时 o2-unique/o2-gain
+只数 `relevance ≥ threshold` 的 confirmed 记录，完整性校验仍作用于全量记录集。
+生产切换 enforce 属显式契约变更（`_FROZEN_CONTRACT` 冻结为 audit_only/null）。
 
 ## 4. 训练主线
 
 ### A2
 
 - 全量解冻 Qwen、状态模块与 W0；
-- schema-13 是当前唯一正式训练契约；schema-12 及更早的 A5 checkpoint/bundle 明确拒绝，
+- schema-14 是当前唯一正式训练契约；schema-13 及更早的 A5 checkpoint/bundle 明确拒绝，
   A5 只能从显式允许的 A2 权重初始化，并全新初始化 memory 接口、optimizer、scheduler、
   RNG 与 runtime state；
 - `P_C` 冻结、memory 写入不可达（A2 前向不绑定 memory state，等价于 `M=0`）；
 - Query outer loss 正式使用 `ema_answer_ref`：先用一步滞后的 loss EMA 对齐 Answer，
   再用 `q_target/q_operator/q_time` 激活梯度 RMS EMA 平衡 Task、Operator、Retrieval、Time；
-  四槽固定且辅助组限制为 Answer 的至多 30%；
+  四槽固定且辅助组限制为 Answer 的至多 40%（`official_weak_balance.group_weight`）；
+- O2-Unique 行的官方弱监督计数使用软去重目标（A2/A5 共用同一 builder）：预测 =
+  写前 Identity Bank confirmed 基数（detach）+ 当前 chunk 的可微软新颖数——identity 与
+  confirmed 原型及同 chunk 更早槽的余弦经 logsigmoid 在 log 域累积，阈值对齐
+  `match_threshold=0.8`、温度 0.1 为固定目标形状，不进配置。`o2.identity` 由此获得
+  任务梯度；O2-Gain 保持池化计数头回归；dedup 上下文缺失时整体回退池化路径。
+  基数快照必须取自 query chunk 硬提交之前，否则当前槽会与自身匹配、软新颖数退化为零；
 - loss/gradient EMA 随同阶段 resume 恢复，A2 初始化 A5 时重置；不提供其他 loss-balance
   模式；
 - 状态参数按 shared、task、router-time、retrieval 四组独立裁剪，四组 RSS 预算保持与旧
@@ -192,17 +207,18 @@ load checkpoint
 
 ## 6. Checkpoint 与分布式
 
-正式 checkpoint 必须完整匹配 schema-13 模型 key，支持单文件和 sharded safetensors，并包含
+正式 checkpoint 必须完整匹配 schema-14 模型 key，支持单文件和 sharded safetensors，并包含
 `memory_contract_version`。Warmup bundle 只含 allowlist 中的非 Qwen persistent tensor
 （memory 接口参数随 adapter 注册自动进入），并绑定 A2/config/data/code hash；禁止保存
 `M`、Bank、cache、FSM 和 Associative 临时 context。
 
 唯一历史权重兼容是私有 `a2_to_a5_memory_v1` profile：只允许旧 A2 缺少新增的 `p_context`、
 memory 接口参数（`memory_key_probe`、`memory_value_projection`、eta gate、`memory_alpha`、
-`memory_beta_raw`）与 `memory_contract_version`，包含已删除的 `predictor`、`p_value` 与旧
+`memory_beta_raw`）、`memory_contract_version` 与 schema-14 新增的 O2
+`relevance_projection`，包含已删除的 `predictor`、`p_value` 与旧
 `associative_contract_version` buffer；其余 missing/unexpected key 一律拒绝。加载后立即重置
 Associative 状态，且该 profile 不得用于 same-stage resume。旧 A5 checkpoint 仍必须按
-schema-13/current contract 严格恢复，不推断、不迁移。
+schema-14/current contract 严格恢复，不推断、不迁移。
 
 A2/A5 sampler 必须保持配置的 4/8 rank 任务或 segment parity；每 rank 每 episode 的 backward 数固定为
 `query_count + segment_count`，写入本身是本地张量运算、不含 collective。非有限
@@ -210,11 +226,11 @@ loss/gradient 必须 warning/skip，不能产生部分参数更新。Warmup 的 
 覆盖 parameter 与 persistent buffer；被排除的 non-persistent buffer 名单随审计 JSON 一并
 持久化。ZeRO、BF16、显存和性能是否可接受只由真实 H200 记录决定。
 
-schema-13 的冻结常量分两层强制：`ProjectConfig._FROZEN_CONTRACT` 在 `load_config()` 处拒绝
+schema-14 的冻结常量分两层强制：`ProjectConfig._FROZEN_CONTRACT` 在 `load_config()` 处拒绝
 其覆盖的路径漂移；observation head、State Bank、Spatial/Temporal Encoder 与 fast memory 的
 字段由各模块 `_validate_*_config`/构造器在 build 时拒绝。后者是唯一能拦住
 `model_copy(update=...)` 绕过 pydantic validator 的路径，因此这些字段只在模块构建期报错——
-多卡启动时意味着在 distributed init 之后。schema-13 不含 `paths` 配置块，四个环境变量名直接从
+多卡启动时意味着在 distributed init 之后。schema-14 不含 `paths` 配置块，四个环境变量名直接从
 `os.environ` 读取。
 
 ## 7. 验证边界

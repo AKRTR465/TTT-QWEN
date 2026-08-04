@@ -50,6 +50,9 @@ class MemoryWriteResult:
     skip_reason: MemoryWriteSkipReason | None
     skip_detail: str | None
     gradient_mode: GradientMode
+    key_pairwise_cosine_mean: float = 0.0
+    value_pairwise_cosine_mean: float = 0.0
+    delta_pairwise_cosine_mean: float = 0.0
 
     def __post_init__(self) -> None:
         if type(self.did_write) is not bool or type(self.eta_renormalized) is not bool:
@@ -65,7 +68,13 @@ class MemoryWriteResult:
         )
         if any(not math.isfinite(value) or value < 0.0 for value in values):
             raise ValueError("memory write scalar audits must be finite and non-negative")
-        cosines = (self.pre_write_cosine_mean, self.post_write_cosine_mean)
+        cosines = (
+            self.pre_write_cosine_mean,
+            self.post_write_cosine_mean,
+            self.key_pairwise_cosine_mean,
+            self.value_pairwise_cosine_mean,
+            self.delta_pairwise_cosine_mean,
+        )
         if any(not math.isfinite(value) or not -1.0 <= value <= 1.0 for value in cosines):
             raise ValueError("memory write cosine audits must be finite in [-1, 1]")
         if self.did_write:
@@ -76,7 +85,15 @@ class MemoryWriteResult:
         else:
             if self.skip_reason is None or not self.skip_detail:
                 raise ValueError("skipped writes require a reason and detail")
-            if self.slots_written != 0 or self.eta_sum != 0.0 or self.write_norm != 0.0:
+            zero_audits = (
+                float(self.slots_written),
+                self.eta_sum,
+                self.write_norm,
+                self.key_pairwise_cosine_mean,
+                self.value_pairwise_cosine_mean,
+                self.delta_pairwise_cosine_mean,
+            )
+            if any(value != 0.0 for value in zero_audits):
                 raise ValueError("skipped writes must report zero slot/eta/write audits")
         mode_is_differentiable = self.gradient_mode is GradientMode.META_LINEAR_RECURRENCE
         if mode_is_differentiable is not self.fast_state.differentiable:
@@ -180,6 +197,9 @@ def apply_memory_write(
         )
         memory_norm = float(torch.linalg.matrix_norm(next_m.detach()).cpu().item())
         eta_sum = float(etas.detach().sum().cpu().item())
+        key_pairwise_cosine = _pairwise_offdiag_cosine_mean(keys.detach(), mask)
+        value_pairwise_cosine = _pairwise_offdiag_cosine_mean(values.detach(), mask)
+        delta_pairwise_cosine = _pairwise_offdiag_cosine_mean(delta.detach(), mask)
     next_state = FastMemoryState(
         m=_next_memory(next_m, differentiable=fast_state.differentiable),
         write_version=fast_state.write_version + 1,
@@ -200,6 +220,9 @@ def apply_memory_write(
         skip_reason=None,
         skip_detail=None,
         gradient_mode=gradient_mode,
+        key_pairwise_cosine_mean=key_pairwise_cosine,
+        value_pairwise_cosine_mean=value_pairwise_cosine,
+        delta_pairwise_cosine_mean=delta_pairwise_cosine,
     )
 
 
@@ -304,6 +327,23 @@ def _next_memory(value: Tensor, *, differentiable: bool) -> Tensor:
     if differentiable:
         return value.clone()
     return value.detach().clone().requires_grad_(True)
+
+
+def _pairwise_offdiag_cosine_mean(rows: Tensor, mask: Tensor) -> float:
+    """Mean off-diagonal cosine over the valid payload rows; a pure probe scalar."""
+
+    selected = rows[mask]
+    count = int(selected.shape[0])
+    if count < 2:
+        return 0.0
+    normalized = selected / selected.norm(dim=-1, keepdim=True).clamp_min(_COSINE_EPSILON)
+    gram = normalized @ normalized.transpose(0, 1)
+    total = float(gram.sum().cpu().item())
+    trace = float(gram.diagonal().sum().cpu().item())
+    value = (total - trace) / float(count * (count - 1))
+    if not math.isfinite(value):
+        return 0.0
+    return max(-1.0, min(1.0, value))
 
 
 def _masked_cosine_mean(predictions: Tensor, targets: Tensor, mask: Tensor) -> float:

@@ -27,11 +27,11 @@ from ttt_svcbench_qwen.state_encoder import (
 
 EXACT_HEAD_COUNTS = {
     "o1": 2_632_710,
-    "o2": 2_499_843,
+    "o2": 2_631_171,
     "e1": 9_717_252,
     "e2": 7_293_449,
 }
-EXACT_TOTAL = 22_143_254
+EXACT_TOTAL = 22_274_582
 HIDDEN_DIM = 768
 QUERY_DIM = 512
 
@@ -443,6 +443,50 @@ def test_o1_film_formula_soft_count_query_isolation_and_gradients(
     assert float(slots.grad.abs().sum()) > 0.0
     assert float(q_target.grad.abs().sum()) > 0.0
     assert decoder.film_projection.weight.grad is not None
+
+
+def test_o2_relevance_head_is_query_conditioned_and_formula_exact(
+    heads: ObservationHeads,
+) -> None:
+    decoder = heads.o2
+    decoder.zero_grad(set_to_none=True)
+    generator = torch.Generator().manual_seed(31)
+    slots = torch.randn(2, 3, HIDDEN_DIM, generator=generator)
+    q_target = torch.randn(2, QUERY_DIM, generator=generator, requires_grad=True)
+    mask = torch.tensor([[True, True, False], [True, False, True]])
+    timestamps = torch.tensor([1.0, 2.0], dtype=torch.float64)
+    position_ids = torch.tensor([4, 8], dtype=torch.int64)
+
+    output = decoder(slots, mask, timestamps, position_ids, q_target=q_target)
+
+    expected = torch.sigmoid(
+        torch.einsum(
+            "bnd,bd->bn",
+            output.identity.float(),
+            decoder.relevance_projection(q_target).float(),
+        )
+    ).to(dtype=output.identity.dtype)
+    expected = torch.where(mask, expected, torch.zeros_like(expected))
+    torch.testing.assert_close(output.relevance, expected)
+    assert bool(torch.all((output.relevance >= 0.0) & (output.relevance <= 1.0)))
+    assert bool(torch.all(output.relevance[~mask] == 0.0))
+
+    # Same slots, different query: the multiplicative head must move the perturbed
+    # row's relevance while leaving the untouched row bitwise identical.
+    perturbed_query = q_target.detach().clone()
+    perturbed_query[0] += 4.0
+    with torch.no_grad():
+        perturbed = decoder(slots, mask, timestamps, position_ids, q_target=perturbed_query)
+    assert not torch.allclose(
+        output.relevance.detach()[0][mask[0]],
+        perturbed.relevance[0][mask[0]],
+    )
+    torch.testing.assert_close(output.relevance.detach()[1], perturbed.relevance[1])
+
+    output.relevance.sum().backward()
+    assert q_target.grad is not None
+    assert float(q_target.grad.abs().sum()) > 0.0
+    assert decoder.relevance_projection.weight.grad is not None
 
 
 def test_o2_zero_identity_fallback_and_raw_score_logits(heads: ObservationHeads) -> None:

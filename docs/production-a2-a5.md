@@ -154,7 +154,7 @@ export TTT_RESUME_CHECKPOINT=/absolute/path/old_run/checkpoints/checkpoint-20
 bash scripts/h200/launch_4gpu.sh a5
 ```
 
-## Warmup 释放门（schema-13，bundle schema 2）
+## Warmup 释放门（schema-14，bundle schema 2）
 
 256-step Memory/State Warmup 以下列五门判定（发射点：`a5_memory_numerical_audit` trace 与
 `memory/*` 指标；空值列为机制未生效时的读数）：

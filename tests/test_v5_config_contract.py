@@ -23,9 +23,9 @@ def _raw() -> dict[str, object]:
     return value
 
 
-def test_schema13_slot_memory_and_robust_query_contract_roundtrips() -> None:
+def test_schema14_slot_memory_and_robust_query_contract_roundtrips() -> None:
     config = load_config(CONFIG_PATH)
-    assert config.config_schema_version == CONFIG_SCHEMA_VERSION == 13
+    assert config.config_schema_version == CONFIG_SCHEMA_VERSION == 14
     assert (
         config.spec_version
         == SPEC_VERSION
@@ -54,6 +54,29 @@ def test_schema13_slot_memory_and_robust_query_contract_roundtrips() -> None:
     assert config.a5.warmup.associative_learning_rate == 5.0e-5
     assert config.a5.warmup.bundle_schema_version == 2
     assert ProjectConfig.model_validate(config.model_dump()) == config
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("fast_slow_learning_rate", 1.0e-6),
+        ("state_learning_rate", 2.0e-5),
+        ("w0_learning_rate", 1.0e-6),
+        ("associative_learning_rate", 1.0e-4),
+    ],
+)
+def test_a5_warmup_learning_rate_drift_fails_before_startup(
+    field: str, value: float
+) -> None:
+    raw = _raw()
+    a5 = deepcopy(raw["a5"])
+    assert isinstance(a5, dict)
+    warmup = a5["warmup"]
+    assert isinstance(warmup, dict)
+    warmup[field] = value
+    raw["a5"] = a5
+    with pytest.raises(ValidationError, match="drifted from schema-14"):
+        ProjectConfig.model_validate(raw)
 
 
 @pytest.mark.parametrize(
@@ -96,6 +119,19 @@ def test_fast_memory_contract_drift_fails_before_startup(field: str, value: obje
     memory[field] = value
     raw["fast_memory"] = memory
     with pytest.raises((ValidationError, ValueError)):
+        ProjectConfig.model_validate(raw)
+
+
+def test_o2_relevance_gate_rejects_enforce_without_threshold() -> None:
+    raw = _raw()
+    heads = deepcopy(raw["observation_heads"])
+    assert isinstance(heads, dict)
+    o2 = heads["o2"]
+    assert isinstance(o2, dict)
+    o2["relevance_gate_mode"] = "enforce"
+    o2["relevance_threshold"] = None
+    raw["observation_heads"] = heads
+    with pytest.raises(ValidationError, match="calibrated threshold"):
         ProjectConfig.model_validate(raw)
 
 

@@ -201,6 +201,77 @@ def test_masks_and_skip_reasons_are_fail_closed() -> None:
         _batch(keys=keys, values=values, etas=etas, slot_mask=mask, beta=0.0)
 
 
+def test_write_probe_reports_pairwise_payload_cosines() -> None:
+    shared_key = _unit(torch.ones(768)).reshape(1, 1, 768).repeat(1, 4, 1)
+    shared_value = (
+        _unit(torch.arange(768, dtype=torch.float32) + 1.0).reshape(1, 1, 768).repeat(1, 4, 1)
+    )
+    collinear = apply_memory_write(
+        fast_state=_zero_state(),
+        batch=_batch(keys=shared_key, values=shared_value, etas=torch.full((1, 4), 0.1)),
+        row=0,
+    )
+    assert collinear.did_write
+    assert collinear.key_pairwise_cosine_mean == pytest.approx(1.0, abs=1.0e-5)
+    assert collinear.value_pairwise_cosine_mean == pytest.approx(1.0, abs=1.0e-5)
+    assert collinear.delta_pairwise_cosine_mean == pytest.approx(1.0, abs=1.0e-5)
+
+    basis = torch.eye(768)
+    orthogonal = apply_memory_write(
+        fast_state=_zero_state(),
+        batch=_batch(
+            keys=basis[:4].reshape(1, 4, 768),
+            values=basis[4:8].reshape(1, 4, 768),
+            etas=torch.full((1, 4), 0.1),
+        ),
+        row=0,
+    )
+    assert orthogonal.key_pairwise_cosine_mean == pytest.approx(0.0, abs=1.0e-6)
+    assert orthogonal.value_pairwise_cosine_mean == pytest.approx(0.0, abs=1.0e-6)
+    assert orthogonal.delta_pairwise_cosine_mean == pytest.approx(0.0, abs=1.0e-6)
+
+    antiparallel = apply_memory_write(
+        fast_state=_zero_state(),
+        batch=_batch(
+            keys=torch.stack((basis[0], -basis[0])).reshape(1, 2, 768),
+            values=torch.stack((basis[1], -basis[1])).reshape(1, 2, 768),
+            etas=torch.full((1, 2), 0.1),
+        ),
+        row=0,
+    )
+    assert antiparallel.key_pairwise_cosine_mean == pytest.approx(-1.0, abs=1.0e-6)
+    assert antiparallel.value_pairwise_cosine_mean == pytest.approx(-1.0, abs=1.0e-6)
+
+    single = apply_memory_write(
+        fast_state=_zero_state(),
+        batch=_batch(
+            keys=basis[0].reshape(1, 1, 768),
+            values=basis[1].reshape(1, 1, 768),
+            etas=torch.full((1, 1), 0.1),
+        ),
+        row=0,
+    )
+    assert single.did_write
+    assert single.key_pairwise_cosine_mean == 0.0
+    assert single.value_pairwise_cosine_mean == 0.0
+    assert single.delta_pairwise_cosine_mean == 0.0
+
+    skipped = apply_memory_write(
+        fast_state=_zero_state(),
+        batch=_batch(
+            keys=basis[:2].reshape(1, 2, 768),
+            values=basis[2:4].reshape(1, 2, 768),
+            etas=torch.full((1, 2), 0.1),
+            slot_mask=torch.zeros((1, 2), dtype=torch.bool),
+        ),
+        row=0,
+    )
+    assert skipped.skip_reason is MemoryWriteSkipReason.NO_VALID_SLOT
+    assert skipped.key_pairwise_cosine_mean == 0.0
+    assert skipped.value_pairwise_cosine_mean == 0.0
+    assert skipped.delta_pairwise_cosine_mean == 0.0
+
+
 def test_fp32_master_and_storage_isolation_are_mandatory() -> None:
     with pytest.raises(ValueError, match="float32"):
         FastMemoryState(
