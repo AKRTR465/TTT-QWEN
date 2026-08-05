@@ -28,7 +28,7 @@ def parse_nvidia_smi(output: str) -> list[tuple[int, float, int, float]]:
 def sample_gpus() -> list[tuple[int, float, int, float]]:
     completed = subprocess.run(
         [
-            "nvidia-smi",
+            "/usr/bin/nvidia-smi",
             "--query-gpu=index,utilization.gpu,memory.used,power.draw",
             "--format=csv,noheader,nounits",
         ],

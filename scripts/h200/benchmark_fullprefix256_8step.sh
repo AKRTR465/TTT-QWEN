@@ -60,7 +60,7 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
   exit 0
 fi
 
-GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
+GPU_COUNT="$(/usr/bin/nvidia-smi -L | wc -l | tr -d ' ')"
 if (( GPU_COUNT < 4 )); then
   echo "four GPUs are required; nvidia-smi reported $GPU_COUNT" >&2
   exit 1
@@ -72,7 +72,7 @@ fi
 
 mkdir -p "$LOG_DIR"
 GPU_LOG="$LOG_DIR/gpu_samples.csv"
-nvidia-smi \
+/usr/bin/nvidia-smi \
   --query-gpu=timestamp,index,utilization.gpu,memory.used,power.draw \
   --format=csv,noheader,nounits -l 1 > "$GPU_LOG" 2>&1 &
 MONITOR_PID="$!"

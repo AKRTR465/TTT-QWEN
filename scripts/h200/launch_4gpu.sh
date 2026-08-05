@@ -81,7 +81,7 @@ if [[ "$STAGE" == "a5" ]]; then
   fi
 fi
 
-GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
+GPU_COUNT="$(/usr/bin/nvidia-smi -L | wc -l | tr -d ' ')"
 if (( GPU_COUNT < WORLD_SIZE )); then
   echo "$WORLD_SIZE GPUs are required; nvidia-smi reported $GPU_COUNT" >&2
   exit 1
@@ -446,7 +446,7 @@ if [[ -n "${TTT_GPU_SAMPLE_LOG:-}" ]]; then
     exit 2
   fi
   mkdir -p "$(dirname "$TTT_GPU_SAMPLE_LOG")"
-  nvidia-smi \
+  /usr/bin/nvidia-smi \
     --query-gpu=timestamp,index,utilization.gpu,memory.used,power.draw \
     --format=csv,noheader,nounits -l 1 > "$TTT_GPU_SAMPLE_LOG" 2>&1 &
   GPU_MONITOR_PID="$!"

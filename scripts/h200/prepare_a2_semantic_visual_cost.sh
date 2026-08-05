@@ -40,7 +40,7 @@ processor = transformers.AutoProcessor.from_pretrained(sys.argv[1], local_files_
 print(f"{type(processor).__module__}.{type(processor).__qualname__}")
 PY
 )"
-GPU_MODEL="${GPU_MODEL:-$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)}"
+GPU_MODEL="${GPU_MODEL:-$(/usr/bin/nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)}"
 mkdir -p "$(dirname "$OUTPUT")"
 
 cd "$PROJECT_ROOT"

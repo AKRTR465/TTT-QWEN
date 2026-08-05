@@ -108,7 +108,7 @@ done
 }
 GPU_COUNT="$(printf '%s' "$CUDA_VISIBLE_DEVICES" | awk -F, '{print NF}')"
 [[ "$GPU_COUNT" -eq 4 ]] || { echo "exactly four visible GPUs are required" >&2; exit 1; }
-[[ "$(nvidia-smi -L | wc -l)" -ge 4 ]] || { echo "four H200 GPUs are not visible" >&2; exit 1; }
+[[ "$(/usr/bin/nvidia-smi -L | wc -l)" -ge 4 ]] || { echo "four H200 GPUs are not visible" >&2; exit 1; }
 
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="$LF_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
