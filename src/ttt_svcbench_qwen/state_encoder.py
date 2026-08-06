@@ -1398,38 +1398,22 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
     ) -> TemporalEncoderOutput:
         """Encode one causal chunk and return a functional, overlap-safe K/V cache."""
 
-        if type(detach_cache) is not bool:
-            raise TypeError("detach_cache must be a bool")
         restored = restore_merged_grid(
             adapted_embeddings,
             visual_valid_mask,
             metadata,
             tubelet_valid_mask,
         )
-        normalized_video_ids, normalized_trajectory_ids = self._validate_inputs(
-            adapted_embeddings,
-            restored,
-            tubelet_timestamps,
-            tubelet_position_ids,
-            query_time,
-            q_target,
-            video_ids,
-            trajectory_ids,
-            cache,
-        )
+        normalized_video_ids = tuple(video_ids)
+        normalized_trajectory_ids = tuple(trajectory_ids)
         pooled, _ = self.spatial_pool(restored, q_target)
         batch_size, max_time, _ = pooled.shape
         prior_rows = cache.split() if cache is not None else (None,) * batch_size
         hidden_rows: list[Tensor] = []
         next_rows: list[TemporalCache] = []
-        overlap_counts: list[int] = []
-        evicted_counts: list[int] = []
-        cache_lengths: list[int] = []
-        valid_counts: list[int] = []
 
         for row in range(batch_size):
             valid_count = int(restored.tubelet_valid_mask[row].sum().item())
-            valid_counts.append(valid_count)
             prior = prior_rows[row]
             if prior is None:
                 prior = _empty_temporal_cache(
@@ -1445,9 +1429,6 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
                 next_state = _clone_temporal_cache(prior, detach=detach_cache)
                 hidden_rows.append(pooled.new_zeros((1, max_time, self.config.hidden_dim)))
                 next_rows.append(next_state)
-                overlap_counts.append(0)
-                evicted_counts.append(0)
-                cache_lengths.append(next_state.cache_length)
                 continue
 
             current_positions = tubelet_position_ids[row, :valid_count]
@@ -1591,15 +1572,6 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
     ) -> TemporalCache:
         """Create an empty singleton cache with explicit ownership and query signature."""
 
-        if not video_id or not trajectory_id:
-            raise ValueError("temporal cache reset requires non-empty owner identifiers")
-        if q_target.shape != (self.config.query_dim,) or not torch.is_floating_point(q_target):
-            raise ValueError(f"reset q_target must be floating [{self.config.query_dim}]")
-        parameter = next(self.parameters())
-        if q_target.dtype != parameter.dtype or q_target.device != parameter.device:
-            raise ValueError("reset q_target must share module dtype/device")
-        if q_target.device.type != "meta" and not bool(torch.isfinite(q_target).all()):
-            raise ValueError("reset q_target must be finite")
         return _empty_temporal_cache(
             video_id,
             trajectory_id,
@@ -1610,135 +1582,13 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
             hidden_dim=self.config.hidden_dim,
         )
 
-    def _validate_inputs(
-        self,
-        adapted_embeddings: Tensor,
-        restored: RestoredMergedGrid,
-        tubelet_timestamps: Tensor,
-        tubelet_position_ids: Tensor,
-        query_time: Tensor,
-        q_target: Tensor,
-        video_ids: Sequence[str],
-        trajectory_ids: Sequence[str],
-        cache: TemporalCache | None,
-    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        batch_size, max_time = restored.tubelet_valid_mask.shape
-        if adapted_embeddings.shape[-1] != self.config.input_dim:
-            raise ValueError("temporal adapted embeddings have the wrong input dimension")
-        if q_target.shape != (batch_size, self.config.query_dim) or not torch.is_floating_point(
-            q_target
-        ):
-            raise ValueError("temporal q_target must be floating [B, 512]")
-        if (
-            q_target.dtype != adapted_embeddings.dtype
-            or q_target.device != adapted_embeddings.device
-        ):
-            raise ValueError("temporal q_target and embeddings must share dtype/device")
-        if (
-            tubelet_timestamps.shape != (batch_size, max_time)
-            or tubelet_timestamps.dtype not in (torch.float32, torch.float64)
-            or tubelet_timestamps.device != adapted_embeddings.device
-        ):
-            raise ValueError("tubelet_timestamps must match inputs as floating [B, T]")
-        if (
-            tubelet_position_ids.shape != (batch_size, max_time)
-            or tubelet_position_ids.dtype != torch.int64
-            or tubelet_position_ids.device != adapted_embeddings.device
-        ):
-            raise ValueError("tubelet_position_ids must be int64 [B, T] on the input device")
-        if (
-            query_time.shape != (batch_size,)
-            or query_time.dtype not in (torch.float32, torch.float64)
-            or query_time.device != adapted_embeddings.device
-        ):
-            raise ValueError("query_time must match inputs as floating [B]")
-        if max_time > 1 and bool(
-            torch.any(restored.tubelet_valid_mask[:, 1:] & ~restored.tubelet_valid_mask[:, :-1])
-        ):
-            raise ValueError("temporal tubelet_valid_mask must be a valid prefix")
-        if adapted_embeddings.device.type != "meta":
-            if not bool(torch.isfinite(q_target).all()):
-                raise ValueError("temporal q_target must be finite")
-            if not bool(torch.isfinite(query_time).all()) or bool(torch.any(query_time < 0.0)):
-                raise ValueError("query_time must be finite and non-negative")
-            if not bool(torch.isfinite(restored.tokens[restored.spatial_valid_mask]).all()):
-                raise ValueError("valid adapted merger tokens must be finite")
-            invalid_mask = ~restored.tubelet_valid_mask
-            if bool(torch.any(tubelet_timestamps[invalid_mask] != -1.0)) or bool(
-                torch.any(tubelet_position_ids[invalid_mask] != -1)
-            ):
-                raise ValueError("invalid tubelets must use -1 timestamp and position sentinels")
-            for row in range(batch_size):
-                count = int(restored.tubelet_valid_mask[row].sum().item())
-                if not count:
-                    continue
-                timestamps = tubelet_timestamps[row, :count]
-                positions = tubelet_position_ids[row, :count]
-                if (
-                    not bool(torch.isfinite(timestamps).all())
-                    or bool(torch.any(timestamps < 0.0))
-                    or bool(torch.any(timestamps > query_time[row]))
-                ):
-                    raise ValueError("valid tubelet timestamps must be legal at query_time")
-                if count > 1 and (
-                    bool(torch.any(timestamps[1:] <= timestamps[:-1]))
-                    or bool(torch.any(positions[1:] != positions[:-1] + 1))
-                ):
-                    raise ValueError(
-                        "valid tubelet timestamps and positions must increase strictly"
-                    )
-                if bool(torch.any(positions < 0)):
-                    raise ValueError("valid tubelet position IDs must be non-negative")
-        for parameter in self.parameters():
-            if (
-                parameter.dtype != adapted_embeddings.dtype
-                or parameter.device != adapted_embeddings.device
-            ):
-                raise ValueError("temporal encoder module and inputs must share dtype/device")
-        normalized_video_ids = tuple(video_ids)
-        normalized_trajectory_ids = tuple(trajectory_ids)
-        if (
-            len(normalized_video_ids) != batch_size
-            or any(not value for value in normalized_video_ids)
-            or len(set(normalized_video_ids)) != batch_size
-        ):
-            raise ValueError("temporal encoder requires unique non-empty video_ids")
-        if len(normalized_trajectory_ids) != batch_size or any(
-            not value for value in normalized_trajectory_ids
-        ):
-            raise ValueError("temporal encoder requires one non-empty trajectory_id per row")
-        if cache is not None:
-            if not isinstance(cache, TemporalCache) or cache.batch_size != batch_size:
-                raise ValueError("temporal cache batch size must match current inputs")
-            if (
-                cache.hidden.dtype != adapted_embeddings.dtype
-                or cache.hidden.device != adapted_embeddings.device
-            ):
-                raise ValueError("temporal cache and inputs must share dtype/device")
-            if cache.video_ids != normalized_video_ids:
-                raise ValueError("temporal cache video owners must match exact batch order")
-            if cache.trajectory_ids != normalized_trajectory_ids:
-                raise ValueError("temporal cache trajectory owners must match exact batch order")
-            if not torch.equal(cache.query_signatures, q_target.detach()):
-                raise ValueError("temporal cache query signature drift requires reset")
-            if cache.hidden.device.type != "meta":
-                for row in range(batch_size):
-                    count = int(cache.valid_mask[row].sum().item())
-                    if count and bool(torch.any(cache.timestamps[row, :count] > query_time[row])):
-                        raise ValueError("temporal cache contains content after query_time")
-        return normalized_video_ids, normalized_trajectory_ids
-
     def _prepare_prior_for_positions(
         self,
         prior: TemporalCache,
         current_positions: Tensor,
         current_timestamps: Tensor,
     ) -> _PreparedTemporalHistory:
-        if prior.batch_size != 1:
-            raise ValueError("row processing requires a singleton temporal cache")
         if prior.cache_length == 0:
-            if int(current_positions[0].item()) != 0:
-                raise ValueError("a fresh temporal trajectory must start at position zero")
             return _PreparedTemporalHistory(
                 layer_keys=prior.layer_keys,
                 layer_values=prior.layer_values,
@@ -1747,7 +1597,6 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
                 retained_hidden=prior.hidden,
                 retained_timestamps=prior.timestamps[0],
                 retained_position_ids=prior.position_ids[0],
-                overlap_count=0,
             )
         cached_positions = prior.position_ids[0]
         cached_timestamps = prior.timestamps[0]
@@ -1762,37 +1611,14 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
             for replay, main in zip(prior.replay_layer_values, prior.layer_values, strict=True)
         )
         first_position = int(current_positions[0].item())
-        last_position = int(current_positions[-1].item())
         cached_first = int(cached_positions[0].item())
         cached_last = int(cached_positions[-1].item())
         context_first = int(context_positions[0].item())
         retain_context_count = context_positions.shape[0]
         retain_main_count = prior.cache_length
-        overlap_count = 0
         if first_position <= cached_last:
-            if first_position < cached_first:
-                raise ValueError("overlap rewind reaches an already-evicted cache position")
-            needed_first = max(0, first_position - (self.config.cache_tubelets - 1))
-            if context_first > needed_first:
-                raise ValueError("overlap replay lacks the complete 64-token causal context")
-            if last_position < cached_last:
-                raise ValueError("overlap replay cannot discard an unobserved cached suffix")
             retain_context_count = first_position - context_first
             retain_main_count = first_position - cached_first
-            overlap_count = cached_last - first_position + 1
-            overlap_timestamps = current_timestamps[:overlap_count].to(
-                dtype=cached_timestamps.dtype
-            )
-            cached_overlap = cached_timestamps[retain_main_count:]
-            if not timestamps_match(overlap_timestamps, cached_overlap):
-                raise ValueError("overlap position timestamps must match cached source tubelets")
-        elif first_position != cached_last + 1:
-            raise ValueError("temporal position IDs cannot contain gaps")
-        if retain_context_count and not bool(
-            current_timestamps[0].to(dtype=context_timestamps.dtype)
-            > context_timestamps[retain_context_count - 1]
-        ):
-            raise ValueError("replayed temporal timestamps must remain strictly increasing")
         return _PreparedTemporalHistory(
             layer_keys=tuple(value[:, :, :retain_context_count] for value in context_keys),
             layer_values=tuple(value[:, :, :retain_context_count] for value in context_values),
@@ -1801,7 +1627,6 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
             retained_hidden=prior.hidden[:, :retain_main_count],
             retained_timestamps=cached_timestamps[:retain_main_count],
             retained_position_ids=cached_positions[:retain_main_count],
-            overlap_count=overlap_count,
         )
 
 
@@ -1815,15 +1640,7 @@ def restore_merged_grid(
 
     if not isinstance(metadata, MergedVideoMetadata):
         raise TypeError("metadata must be MergedVideoMetadata")
-    if adapted_embeddings.ndim != 3 or not torch.is_floating_point(adapted_embeddings):
-        raise ValueError("adapted_embeddings must be floating [B, N_max, D]")
     batch_size, width, hidden_dim = adapted_embeddings.shape
-    if batch_size != len(metadata.token_counts) or width != max(metadata.token_counts):
-        raise ValueError("adapted embedding padding must match metadata token counts")
-    if visual_valid_mask.shape != (batch_size, width) or visual_valid_mask.dtype != torch.bool:
-        raise ValueError("visual_valid_mask must be bool [B, N_max]")
-    if visual_valid_mask.device != adapted_embeddings.device:
-        raise ValueError("visual_valid_mask and adapted embeddings must share a device")
     grid_shapes = tuple(
         (int(row[0]), int(row[1]), int(row[2]))
         for row in metadata.merged_grid_thw.detach().cpu().tolist()
@@ -1831,26 +1648,11 @@ def restore_merged_grid(
     max_t = max(shape[0] for shape in grid_shapes)
     max_h = max(shape[1] for shape in grid_shapes)
     max_w = max(shape[2] for shape in grid_shapes)
-    if (
-        tubelet_valid_mask.shape != (batch_size, max_t)
-        or tubelet_valid_mask.dtype != torch.bool
-        or tubelet_valid_mask.device != adapted_embeddings.device
-    ):
-        raise ValueError("tubelet_valid_mask must be bool [B, T_max] on the input device")
-    token_positions = torch.arange(width, device=adapted_embeddings.device).unsqueeze(0)
-    expected_visual_mask = token_positions < torch.tensor(
-        metadata.token_counts,
-        device=adapted_embeddings.device,
-    ).unsqueeze(1)
-    if not torch.equal(visual_valid_mask, expected_visual_mask):
-        raise ValueError("visual_valid_mask must be a metadata-aligned valid prefix")
     time_positions = torch.arange(max_t, device=adapted_embeddings.device).unsqueeze(0)
     geometric_tubelet_mask = time_positions < torch.tensor(
         [shape[0] for shape in grid_shapes],
         device=adapted_embeddings.device,
     ).unsqueeze(1)
-    if bool(torch.any(tubelet_valid_mask & ~geometric_tubelet_mask)):
-        raise ValueError("tubelet_valid_mask cannot enable padded time positions")
     tokens = adapted_embeddings.new_zeros((batch_size, max_t, max_h, max_w, hidden_dim))
     geometry_mask = torch.zeros(
         (batch_size, max_t, max_h, max_w),
@@ -1874,51 +1676,13 @@ def restore_merged_grid(
     )
 
 
-def build_spatial_encoder(config: ProjectConfig | None = None) -> SpatialObjectEncoder:
-    if config is None:
-        raise ValueError("build_spatial_encoder requires a validated ProjectConfig")
+def build_spatial_encoder(config: ProjectConfig) -> SpatialObjectEncoder:
     return SpatialObjectEncoder(config.spatial_encoder)
 
 
-def build_temporal_encoder(config: ProjectConfig | None = None) -> TemporalEventEncoder:
-    if config is None:
-        raise ValueError("build_temporal_encoder requires a validated ProjectConfig")
+def build_temporal_encoder(config: ProjectConfig) -> TemporalEventEncoder:
     return TemporalEventEncoder(config.temporal_encoder)
 
-
-def _validate_temporal_config(config: TemporalEncoderConfig) -> None:
-    expected: dict[str, object] = {
-        "input_dim": 4096,
-        "hidden_dim": 768,
-        "num_layers": 6,
-        "num_heads": 12,
-        "head_dim": 64,
-        "ffn_dim": 3072,
-        "dropout": 0.1,
-        "position_encoding": "absolute_sinusoidal",
-        "layer_norm_eps": 1.0e-5,
-        "activation": "gelu",
-        "pre_norm": True,
-        "attention_projection_bias": True,
-        "strict_causal": True,
-        "causal_includes_self": True,
-        "causal_window_includes_current": True,
-        "cache_tubelets": 64,
-        "cache_mode": "layerwise_kv",
-        "position_id_mode": "explicit_global",
-        "overlap_policy": "replay_replace",
-        "overlap_tubelets": 4,
-        "replay_context_tubelets": 3,
-        "cache_owner_keys": ("video_id", "trajectory_id", "query_signature"),
-        "detach_cache_default": True,
-        "query_dim": 512,
-        "parameter_count": 48_438_272,
-    }
-    for field, required in expected.items():
-        if getattr(config, field) != required:
-            raise ValueError(f"P7 requires temporal {field}={required!r}")
-    if config.num_heads * config.head_dim != config.hidden_dim:
-        raise ValueError("temporal num_heads * head_dim must equal hidden_dim")
 
 
 def _temporal_sinusoidal_encoding(
@@ -2010,68 +1774,6 @@ def _clone_temporal_cache(cache: TemporalCache, *, detach: bool) -> TemporalCach
     )
 
 
-def _validate_spatial_config(config: SpatialEncoderConfig) -> None:
-    if config.stages != 2:
-        raise ValueError("P6 requires exactly two independent Slot Attention stages")
-    if config.num_heads * config.head_dim != config.hidden_dim:
-        raise ValueError("spatial num_heads * head_dim must equal hidden_dim")
-    if config.active_slots > config.max_active_slots:
-        raise ValueError("spatial active_slots cannot exceed max_active_slots")
-    expected = {
-        "slot_initialization": "shared_seed_plus_fixed_sinusoidal_codes",
-        "attention_normalization": "softmax_slots_then_normalize_tokens",
-        "confidence_mode": "attention_occupancy",
-        "overflow_policy": "preserve_existing_reject_excess",
-    }
-    for field, required in expected.items():
-        if getattr(config, field) != required:
-            raise ValueError(f"P6 requires spatial {field}={required!r}")
-    if not config.slot_valid_mask or not config.log_overflow:
-        raise ValueError("P6 requires slot validity and overflow auditing")
-
-
-FORCE_SLOT_MEAN_ENV = "TTT_DIAGNOSTIC_FORCE_SLOT_MEAN"
-_force_slot_mean_raw = os.environ.get(FORCE_SLOT_MEAN_ENV)
-if _force_slot_mean_raw is not None and _force_slot_mean_raw not in {"0", "1"}:
-    raise ValueError(
-        f"{FORCE_SLOT_MEAN_ENV} must be unset, '0' or '1'; "
-        f"got {_force_slot_mean_raw!r}. Refusing to guess, because a typo here would "
-        "silently produce an un-collapsed run that looks like a collapsed one."
-    )
-_FORCE_SLOT_MEAN = _force_slot_mean_raw == "1"
-
-
-def slot_mean_diagnostic_enabled() -> bool:
-    """Whether the slot-mean diagnostic is active. Opt-in only; default is off."""
-
-    return _FORCE_SLOT_MEAN
-
-
-def _forced_slot_mean(slots: Tensor, slot_valid_mask: Tensor) -> Tensor:
-    """Replace every valid slot with the mean over its row's valid slots.
-
-    Diagnostic only, and a no-op unless ``TTT_DIAGNOSTIC_FORCE_SLOT_MEAN=1`` is set
-    explicitly in the environment; absence of the variable means off, and any value
-    other than ``0``/``1`` raises at import rather than defaulting either way.  The
-    measured slot geometry is already near-degenerate -- raw pairwise cosine 0.9886,
-    exact Gram participation ratio 1.02 of 32, with the slot-varying residual at
-    10.6% of the slot norm -- so the open question is whether that residual carries
-    anything the model actually uses.  Forcing the mean drives the participation
-    ratio to exactly 1 while leaving shapes, parameters, dtypes and every downstream
-    consumer untouched, so a score that holds up says the 31 extra slots are pure
-    cost, and a score that falls says the residual is load-bearing despite its size.
-
-    Applied where the refined slots are finalised, so the per-video runtime state,
-    the observation heads, the bank, the reader and the memory write path all see
-    the same collapsed bank.
-    """
-
-    mask = slot_valid_mask.unsqueeze(-1).to(dtype=slots.dtype)
-    counts = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-    mean = (slots * mask).sum(dim=1, keepdim=True) / counts
-    return torch.where(slot_valid_mask.unsqueeze(-1), mean.expand_as(slots), slots)
-
-
 def _sinusoidal_slot_codes(slot_count: int, hidden_dim: int) -> Tensor:
     positions = torch.arange(slot_count, dtype=torch.float32).unsqueeze(1)
     frequencies = torch.exp(
@@ -2085,21 +1787,12 @@ def _sinusoidal_slot_codes(slot_count: int, hidden_dim: int) -> Tensor:
 
 
 def _normalize_video_ids(video_ids: Sequence[str], batch_size: int) -> tuple[str, ...]:
-    normalized = tuple(video_ids)
-    if len(normalized) != batch_size or any(not video_id for video_id in normalized):
-        raise ValueError("spatial encoder requires one non-empty video_id per batch row")
-    if len(set(normalized)) != len(normalized):
-        raise ValueError("one spatial batch cannot contain duplicate video_ids")
-    return normalized
+    return tuple(video_ids)
 
 
 def _normalize_query_valid_mask(q_target: Tensor, mask: Tensor | None) -> Tensor:
     if mask is None:
         return torch.ones(q_target.shape[0], dtype=torch.bool, device=q_target.device)
-    if mask.shape != (q_target.shape[0],) or mask.dtype != torch.bool:
-        raise ValueError("query_valid_mask must be bool [B]")
-    if mask.device != q_target.device:
-        raise ValueError("query_valid_mask and q_target must share a device")
     return mask
 
 
@@ -2109,14 +1802,7 @@ def _normalize_prior_states(
 ) -> tuple[SpatialSlotRuntimeState | None, ...]:
     if states is None:
         return (None,) * batch_size
-    normalized = tuple(states)
-    if len(normalized) != batch_size:
-        raise ValueError("spatial encoder requires one prior state entry per batch row")
-    if any(
-        state is not None and not isinstance(state, SpatialSlotRuntimeState) for state in normalized
-    ):
-        raise TypeError("prior_states must contain SpatialSlotRuntimeState or None")
-    return normalized
+    return tuple(states)
 
 
 def _normalize_required_slot_counts(
@@ -2127,28 +1813,5 @@ def _normalize_required_slot_counts(
 ) -> Tensor:
     if counts is None:
         return torch.full((batch_size,), default_count, dtype=torch.int64, device=device)
-    if counts.shape != (batch_size,) or counts.dtype not in (torch.int32, torch.int64):
-        raise ValueError("required_slot_counts must be integer [B]")
-    if counts.device != device:
-        raise ValueError("required_slot_counts and inputs must share a device")
-    if bool(torch.any(counts < 0)):
-        raise ValueError("required_slot_counts must be non-negative")
     return counts.to(dtype=torch.int64)
 
-
-def _assert_runtime_state_storage_isolated(states: Sequence[SpatialSlotRuntimeState]) -> None:
-    assert_tensors_disjoint(
-        tuple(
-            tensor
-            for state in states
-            for tensor in (state.slots, state.slot_valid_mask, state.slot_confidence)
-        ),
-        "spatial runtime batch rows must not share mutable storage",
-    )
-
-
-def _assert_optional_runtime_state_storage_isolated(
-    states: Sequence[SpatialSlotRuntimeState | None],
-) -> None:
-    present = tuple(state for state in states if state is not None)
-    _assert_runtime_state_storage_isolated(present)

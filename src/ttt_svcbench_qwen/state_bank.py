@@ -2687,27 +2687,10 @@ def _append_runtime_audit(
     )
 
 
-def _validate_row(row: int, batch_size: int, name: str) -> None:
-    if type(row) is not int or not 0 <= row < batch_size:
-        raise ValueError(f"{name} row index is out of range")
-
-
 def _select_semantics(semantics: Tensor, shape: torch.Size, row: int) -> Tensor:
     if semantics.ndim == 3:
-        if semantics.shape[:2] != shape or semantics.shape[2] != 512:
-            raise ValueError("semantic embeddings must align as [B, T, 512]")
-        selected = semantics[row]
-    elif semantics.ndim == 2:
-        if semantics.shape != (shape[1], 512):
-            raise ValueError("singleton semantic embeddings must be [T, 512]")
-        selected = semantics
-    else:
-        raise ValueError("semantic embeddings must be [B, T, 512] or [T, 512]")
-    if not torch.is_floating_point(selected):
-        raise ValueError("semantic embeddings must use a floating dtype")
-    if selected.device.type != "meta" and not bool(torch.isfinite(selected).all()):
-        raise ValueError("semantic embeddings must be finite")
-    return selected
+        return semantics[row]
+    return semantics
 
 
 def _float_close(left: float, right: float) -> bool:
@@ -2728,65 +2711,6 @@ def _same_o1_evidence(left: O1SlotState, right: O1SlotState) -> bool:
 
 
 def _canonical_audit_time(state: StateBankRuntimeState, timestamp: float) -> float:
-    if not math.isfinite(timestamp) or timestamp < 0.0:
-        raise ValueError("State Bank audit timestamp must be finite and non-negative")
     return max(timestamp, state.audit_log[-1].timestamp if state.audit_log else 0.0)
 
 
-def _validate_semantic_projector_config(config: SemanticProjectorConfig) -> None:
-    expected: dict[str, object] = {
-        "input_dim": 768,
-        "hidden_dim": 1024,
-        "output_dim": 512,
-        "head_type_count": 4,
-        "head_types": ("o1", "o2", "e1", "e2"),
-        "layer_norm_eps": 1.0e-5,
-        "activation": "silu",
-        "dropout": 0.0,
-        "linear_bias": True,
-        "normalization_dtype": "float32",
-        "normalization_eps": 1.0e-8,
-        "zero_norm_fallback": "first_unit_basis",
-        "parameter_count": 1_316_864,
-        "included_in_model_state_dict": True,
-        "included_in_outer_optimizer": True,
-        "included_in_inner_optimizer": False,
-        "online_frozen": True,
-        "online_forward_no_grad": False,
-        "detach_inputs": False,
-    }
-    _validate_config_fields(config, expected, "Semantic Projector")
-
-
-def _validate_state_bank_config(config: StateBankConfig) -> None:
-    expected: dict[str, object] = {
-        "semantic_dim": 512,
-        "identity_dim": 256,
-        "event_history_capacity": 512,
-        "retrieval_history_capacity_per_head": 512,
-        "retrieval_history_source_dim": 768,
-        "isolation_keys": ("video_id", "trajectory_id", "head_type"),
-        "hard_updates_no_grad": True,
-        "detach_before_write": True,
-        "runtime_in_model_state_dict": False,
-        "runtime_registered_parameters": False,
-        "runtime_registered_buffers": False,
-        "runtime_in_outer_optimizer": False,
-        "runtime_in_inner_optimizer": False,
-        "snapshot_separate_from_model_checkpoint": True,
-        "aggregate_update_mode": "functional_replace",
-        "record_time_metadata_policy": "exactly_one",
-        "record_id_policy": "trajectory_monotonic_never_reuse",
-        "aggregate_record_heads": ("o1", "e1", "e2"),
-        "committed_position_policy": "idempotent_ignore_and_audit",
-        "o2_p9_policy": "generic_crud_only_p10_owns_lifecycle",
-        "dynamic_view_padding": "batch_max",
-        "n_state_definition": "owner_head_present_records_before_filters",
-    }
-    _validate_config_fields(config, expected, "State Bank")
-
-
-def _validate_config_fields(config: object, expected: dict[str, object], name: str) -> None:
-    for field, required in expected.items():
-        if getattr(config, field) != required:
-            raise ValueError(f"P9 requires {name} {field}={required!r}")

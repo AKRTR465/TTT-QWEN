@@ -806,118 +806,10 @@ def build_state_retriever(config: ProjectConfig | None = None) -> EmbeddingState
     return EmbeddingStateRetriever(config.retriever)
 
 
-def _validate_retriever_config(config: RetrieverConfig) -> None:
-    expected_operator_heads = ("o1", "o1", "o2", "o2", "e1", "e1", "e2", "e2", None)
-    checks: tuple[tuple[str, object, object], ...] = (
-        ("semantic_dim", config.semantic_dim, 512),
-        ("record_similarity_threshold", config.record_similarity_threshold, 0.35),
-        (
-            "threshold_status",
-            config.threshold_status,
-            CalibrationStatus.BOOTSTRAP_CALIBRATION_REQUIRED,
-        ),
-        ("similarity_dtype", config.similarity_dtype, "float32"),
-        ("normalization_eps", config.normalization_eps, 1.0e-8),
-        ("zero_query_policy", config.zero_query_policy, "unsupported"),
-        ("threshold_comparison", config.threshold_comparison, "greater_than_or_equal"),
-        ("record_confidence_threshold", config.record_confidence_threshold, None),
-        ("operator_head_types", config.operator_head_types, expected_operator_heads),
-        (
-            "filter_order",
-            config.filter_order,
-            ("invalid", "retrieval_ineligible", "future", "outside_window", "below_similarity"),
-        ),
-        ("selection_order", config.selection_order, ("score_desc", "record_id_asc")),
-        ("owner_mismatch_status", config.owner_mismatch_status, "invalid"),
-        (
-            "aggregate_time_policy",
-            config.aggregate_time_policy,
-            "causal_availability_only_window_in_reader",
-        ),
-        ("atomic_window_boundary", config.atomic_window_boundary, "closed"),
-        (
-            "metrics_policy",
-            config.metrics_policy,
-            "offline_ground_truth_runtime_label_free",
-        ),
-        ("score_chunk_size", config.score_chunk_size, 256),
-        ("top_k", config.top_k, None),
-        ("ann_enabled", config.ann_enabled, False),
-    )
-    for name, actual, expected in checks:
-        if actual != expected:
-            raise ValueError(f"Retriever {name} must equal {expected!r}; got {actual!r}")
-
-
-def _validate_retrieval_inputs(
-    config: RetrieverConfig,
-    q_target: Tensor,
-    hard_operators: Sequence[Operator],
-    time_resolutions: Sequence[TimeResolution],
-    state_view: RetrievalHistoryView,
-    video_ids: Sequence[str],
-    trajectory_ids: Sequence[str],
-    state_embeddings: Tensor,
-) -> int:
-    if (
-        q_target.ndim != 2
-        or q_target.shape[1] != config.semantic_dim
-        or not torch.is_floating_point(q_target)
-    ):
-        raise ValueError("q_target must be floating [B, 512]")
-    if not bool(torch.isfinite(q_target).all()):
-        raise ValueError("q_target must be finite")
-    batch_size = int(q_target.shape[0])
-    if state_embeddings.shape != (*state_view.present_mask.shape, config.semantic_dim):
-        raise ValueError("projected retrieval embeddings must be [B, N, 512]")
-    if state_embeddings.shape[0] != batch_size:
-        raise ValueError("q_target and State Bank view batch sizes must match")
-    if state_embeddings.device != q_target.device:
-        raise ValueError("q_target and State Bank view must share one device")
-    _normalize_operators(hard_operators, batch_size)
-    _normalize_resolutions(time_resolutions, batch_size)
-    normalized_video_ids = _normalize_owner_ids(video_ids, batch_size, "video_ids")
-    normalized_trajectory_ids = _normalize_owner_ids(trajectory_ids, batch_size, "trajectory_ids")
-    if len(set(zip(normalized_video_ids, normalized_trajectory_ids, strict=True))) != batch_size:
-        raise ValueError("Retriever query owners must be unique within a batch")
-    return batch_size
-
-
-def _normalize_operators(operators: Sequence[Operator], batch_size: int) -> tuple[Operator, ...]:
-    normalized = tuple(operators)
-    if len(normalized) != batch_size or any(not isinstance(item, Operator) for item in normalized):
-        raise ValueError("hard_operators must contain one Operator per batch row")
-    return normalized
-
-
-def _normalize_resolutions(
-    resolutions: Sequence[TimeResolution], batch_size: int
-) -> tuple[TimeResolution, ...]:
-    normalized = tuple(resolutions)
-    if len(normalized) != batch_size or any(
-        not isinstance(item, TimeResolution) for item in normalized
-    ):
-        raise ValueError("time_resolutions must contain one TimeResolution per batch row")
-    return normalized
-
-
-def _normalize_owner_ids(values: Sequence[str], batch_size: int, name: str) -> tuple[str, ...]:
-    normalized = tuple(values)
-    if len(normalized) != batch_size or any(
-        not isinstance(value, str) or not value for value in normalized
-    ):
-        raise ValueError(f"{name} must contain one non-empty string per batch row")
-    return normalized
-
-
 def _rejected_row(
     status: RetrievalStatus,
     reason: RetrievalReason,
     n_state: int,
-    head_excluded: int,
-    *,
-    query_rejected: bool = False,
-    owner_mismatch: bool = False,
 ) -> tuple[
     RetrievalStatus,
     RetrievalReason,
@@ -926,18 +818,7 @@ def _rejected_row(
     tuple[float, ...],
     tuple[RetrievalCandidate, ...],
 ]:
-    audit = RetrievalFilterAudit(
-        n_state=n_state,
-        head_partition_excluded_count=head_excluded,
-        query_rejected_count=n_state if query_rejected else 0,
-        owner_mismatch_count=n_state if owner_mismatch else 0,
-        invalid_count=0,
-        retrieval_ineligible_count=0,
-        future_count=0,
-        outside_window_count=0,
-        below_similarity_count=0,
-        selected_count=0,
-    )
+    audit = RetrievalFilterAudit(n_state=n_state, selected_count=0)
     return status, reason, audit, (), (), ()
 
 
@@ -1029,21 +910,12 @@ def _causal_mask(
     return view.present_mask & (record_end <= query_times)
 
 
-def _clone_candidate(record: RetrievalCandidate) -> RetrievalCandidate:
-    if isinstance(record, StateRecord):
-        return clone_state_record(record)
-    return clone_retrieval_history_record(record)
-
-
 def _required_record_id(view: RetrievalHistoryView, row: int, column: int) -> str:
     sequence_ids, _, _ = view.require_tensor_metadata()
     record_id = view.record_ids[row][column]
     if record_id is None:
         sequence_id = int(sequence_ids[row, column].item())
-        if sequence_id >= 0:
-            record_id = f"retrieval-{sequence_id:08d}"
-    if not isinstance(record_id, str) or not record_id:
-        raise ValueError("present State Bank records require record IDs")
+        record_id = f"retrieval-{sequence_id:08d}"
     return record_id
 
 
@@ -1056,17 +928,9 @@ def _materialize_history_record(
     head = view.head_types[row][column]
     if head is None:
         head_code = int(head_codes[row, column].item())
-        head = (
-            RETRIEVAL_HEAD_ORDER[head_code]
-            if 0 <= head_code < len(RETRIEVAL_HEAD_ORDER)
-            else None
-        )
+        head = RETRIEVAL_HEAD_ORDER[head_code]
     record_id = _required_record_id(view, row, column)
-    if head is None:
-        raise ValueError("selected retrieval columns require tensor metadata")
     operator_code = int(operator_codes[row, column].item())
-    if not 0 <= operator_code < len(OPERATORS):
-        raise ValueError("selected retrieval operator code is invalid")
     timestamp_value = float(view.timestamps[row, column].item())
     if timestamp_value >= 0.0:
         timestamp: float | None = timestamp_value
@@ -1090,41 +954,6 @@ def _materialize_history_record(
 
 
 def _empty_reason(audit: RetrievalFilterAudit, owner_record_count: int) -> RetrievalReason:
-    if owner_record_count == 0:
+    if owner_record_count == 0 or audit.n_state == 0:
         return RetrievalReason.EMPTY_BANK
-    if audit.n_state == 0 or audit.head_partition_excluded_count == audit.n_state:
-        return RetrievalReason.EMPTY_HEAD_PARTITION
-    if audit.invalid_count == audit.n_state:
-        return RetrievalReason.ALL_INVALID
-    if audit.retrieval_ineligible_count == audit.n_state:
-        return RetrievalReason.ALL_RETRIEVAL_INELIGIBLE
-    if audit.future_count == audit.n_state:
-        return RetrievalReason.ALL_FUTURE
-    if audit.outside_window_count == audit.n_state:
-        return RetrievalReason.ALL_OUTSIDE_WINDOW
-    if audit.below_similarity_count == audit.n_state:
-        return RetrievalReason.BELOW_SIMILARITY
     return RetrievalReason.NO_MATCH
-
-
-def _snapshot_values_equal(left: object, right: object) -> bool:
-    """Compare frozen typed-record snapshots, including every tensor-backed payload field."""
-
-    if type(left) is not type(right):
-        return False
-    if isinstance(left, Tensor) and isinstance(right, Tensor):
-        return bool(torch.equal(left, right))
-    if isinstance(left, tuple) and isinstance(right, tuple):
-        return len(left) == len(right) and all(
-            _snapshot_values_equal(left_item, right_item)
-            for left_item, right_item in zip(left, right, strict=True)
-        )
-    if is_dataclass(left) and not isinstance(left, type):
-        return all(
-            _snapshot_values_equal(
-                getattr(left, field.name),
-                getattr(right, field.name),
-            )
-            for field in fields(left)
-        )
-    return bool(left == right)

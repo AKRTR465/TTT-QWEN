@@ -1259,29 +1259,10 @@ class IdentityBank:
         next_identity = replace(
             identity_state,
             candidates=remaining,
-            confirmed_chunks=_append_confirmed(
-                identity_state.confirmed_chunks,
-                linked,
-                self.confirmed_config.growth_chunk,
-            ),
+            confirmed=_append_confirmed(identity_state.confirmed, linked),
             next_identity_sequence=identity_state.next_identity_sequence + 1,
             issued_identity_ids=identity_state.issued_identity_ids + (identity_id,),
-            audit_log=identity_state.audit_log
-            + (
-                _audit(
-                    "candidate_promoted",
-                    item,
-                    (
-                        ("candidate_id", candidate.candidate_id),
-                        ("identity_id", identity_id),
-                        ("record_id", linked.semantic_record_id),
-                    ),
-                ),
-            ),
             version=identity_state.version + 1,
-        )
-        next_identity = self._touch_hot_cache(
-            next_identity, identity_id, item.position_id, enabled=True
         )
         return next_identity, next_state_bank, linked
 
@@ -1294,15 +1275,7 @@ class IdentityBank:
         chunk_index: int,
         observations: Sequence[_Observation],
     ) -> tuple[IdentityBankRuntimeState, StateBankRuntimeState]:
-        last_audit = identity_state.audit_log[-1] if identity_state.audit_log else None
-        timestamp = max(
-            max((item.timestamp for item in observations), default=float(chunk_index)),
-            last_audit.timestamp if last_audit is not None else 0.0,
-        )
-        position_id = max(
-            max((item.position_id for item in observations), default=chunk_index),
-            last_audit.position_id if last_audit is not None else 0,
-        )
+        timestamp = max((item.timestamp for item in observations), default=float(chunk_index))
         kept: list[CandidateIdentity] = []
         expired: list[CandidateIdentity] = []
         low_confidence: list[CandidateIdentity] = []
@@ -1338,25 +1311,6 @@ class IdentityBank:
             )
         if not expired and not low_confidence and tuple(kept) == identity_state.candidates:
             return identity_state, next_state_bank
-        audit_log = identity_state.audit_log
-        if expired:
-            audit_log += (
-                IdentityBankAuditEntry(
-                    "candidate_ttl_prune",
-                    timestamp,
-                    position_id,
-                    (("count", len(expired)),),
-                ),
-            )
-        if low_confidence:
-            audit_log += (
-                IdentityBankAuditEntry(
-                    "candidate_low_confidence_prune",
-                    timestamp,
-                    position_id,
-                    (("count", len(low_confidence)),),
-                ),
-            )
         return (
             replace(
                 identity_state,
@@ -1365,7 +1319,6 @@ class IdentityBank:
                 candidate_low_confidence_pruned_count=(
                     identity_state.candidate_low_confidence_pruned_count + len(low_confidence)
                 ),
-                audit_log=audit_log,
                 version=identity_state.version + 1,
             ),
             next_state_bank,
@@ -1402,92 +1355,9 @@ class IdentityBank:
         confirmed: ConfirmedIdentity,
         item: _Observation,
     ) -> IdentityBankRuntimeState:
-        old = self.confirmed_by_id(state, confirmed.identity_id)
-        chunks = _update_confirmed(state.confirmed_chunks, confirmed)
         return replace(
             state,
-            confirmed_chunks=chunks,
-            audit_log=state.audit_log
-            + (
-                _audit(
-                    "confirmed_updated",
-                    item,
-                    (
-                        ("identity_id", confirmed.identity_id),
-                        ("old_prototype_checksum", _tensor_checksum(old.identity_prototype)),
-                        ("new_prototype_checksum", _tensor_checksum(confirmed.identity_prototype)),
-                        ("prototype_version", confirmed.prototype_version),
-                    ),
-                ),
-            ),
-            version=state.version + 1,
-        )
-
-    def _touch_hot_cache(
-        self,
-        state: IdentityBankRuntimeState,
-        identity_id: str,
-        position_id: int,
-        *,
-        enabled: bool,
-    ) -> IdentityBankRuntimeState:
-        if not enabled or not state.hot_cache_enabled:
-            return state
-        confirmed = self.confirmed_by_id(state, identity_id)
-        assert state.hot_cache_device is not None
-        dtype = _parse_dtype(state.hot_cache_dtype)
-        prototype = confirmed.identity_prototype.to(
-            device=torch.device(state.hot_cache_device), dtype=dtype, copy=True
-        ).detach()
-        replacement = HotCacheEntry(
-            identity_id=identity_id,
-            identity_prototype=prototype,
-            last_accessed_position_id=position_id,
-            prototype_version=confirmed.prototype_version,
-        )
-        entries = [
-            _clone_hot_cache(entry) for entry in state.hot_cache if entry.identity_id != identity_id
-        ]
-        entries.append(replacement)
-        evicted: HotCacheEntry | None = None
-        if len(entries) > state.hot_cache_capacity:
-            evicted = min(
-                entries,
-                key=lambda entry: (entry.last_accessed_position_id, entry.identity_id),
-            )
-            entries = [entry for entry in entries if entry.identity_id != evicted.identity_id]
-        timestamp = confirmed.last_seen
-        details: tuple[tuple[str, AuditValue], ...] = (
-            ("identity_id", identity_id),
-            ("prototype_version", confirmed.prototype_version),
-            ("evicted_identity_id", evicted.identity_id if evicted is not None else None),
-        )
-        return replace(
-            state,
-            hot_cache=tuple(entries),
-            audit_log=state.audit_log
-            + (IdentityBankAuditEntry("hot_cache_touch", timestamp, position_id, details),),
-            version=state.version + 1,
-        )
-
-    def _record_match_conflict(
-        self,
-        state: IdentityBankRuntimeState,
-        item: _Observation,
-        reason: str,
-        conflicting_ids: tuple[str, ...],
-    ) -> IdentityBankRuntimeState:
-        return replace(
-            state,
-            match_conflict_count=state.match_conflict_count + 1,
-            audit_log=state.audit_log
-            + (
-                _audit(
-                    "match_conflict",
-                    item,
-                    (("reason", reason), ("conflicting_ids", ",".join(conflicting_ids))),
-                ),
-            ),
+            confirmed=_update_confirmed(state.confirmed, confirmed),
             version=state.version + 1,
         )
 
@@ -1509,180 +1379,29 @@ class IdentityBank:
             status=status,
             candidate_id=candidate_id,
             identity_id=identity_id,
-            similarity=similarity,
-            novelty=item.novelty,
-            match_confidence=item.match_confidence,
-            scanned_confirmed_count=scanned,
-            reason=reason,
         )
-
-    def _resolve_hot_cache(
-        self,
-        requested: bool,
-        hot_device: str | torch.device | None,
-    ) -> tuple[bool, str | None, str | None]:
-        if not requested:
-            return False, None, "disabled_by_caller"
-        explicit = torch.device(hot_device) if hot_device is not None else None
-        configured = torch.device(self.confirmed_config.hot_cache_device)
-        device = explicit or configured
-        if device.type == "cuda":
-            if not torch.cuda.is_available():
-                return False, None, "cuda_unavailable"
-            device = torch.device(
-                "cuda",
-                torch.cuda.current_device() if device.index is None else device.index,
-            )
-        if device.type not in {"cpu", "cuda"}:
-            raise ValueError("Hot Cache device must be explicit CPU test backend or CUDA")
-        return True, str(device), None
-
-    def _validate_config(self) -> None:
-        checks: tuple[tuple[str, object, object], ...] = (
-            ("O2 identity_dim", self.o2_config.identity_dim, IDENTITY_DIM),
-            ("O2 prototype_ema", self.o2_config.prototype_ema, 0.9),
-            ("O2 confirmation_observations", self.o2_config.confirmation_observations, 2),
-            ("O2 match_threshold", self.o2_config.match_threshold, 0.8),
-            ("Candidate initial_capacity", self.candidate_config.initial_capacity, 64),
-            ("Candidate growth_chunk", self.candidate_config.growth_chunk, 64),
-            ("Candidate hard_limit", self.candidate_config.hard_limit, 512),
-            ("Candidate ttl_chunks", self.candidate_config.ttl_chunks, 8),
-            ("Confirmed initial_capacity", self.confirmed_config.initial_capacity, 256),
-            ("Confirmed growth_chunk", self.confirmed_config.growth_chunk, 256),
-            ("Confirmed hard_limit", self.confirmed_config.hard_limit, None),
-            ("Confirmed storage_device", self.confirmed_config.storage_device, "cpu"),
-            ("Confirmed storage_dtype", self.confirmed_config.storage_dtype, "float32"),
-            ("Confirmed gpu_hot_capacity", self.confirmed_config.gpu_hot_capacity, 256),
-            ("Confirmed exact_search", self.confirmed_config.exact_search, True),
-            ("Confirmed ann_enabled", self.confirmed_config.ann_enabled, False),
-        )
-        for name, actual, expected in checks:
-            if actual != expected:
-                raise ValueError(f"{name} must equal {expected!r}; got {actual!r}")
 
 
 def build_identity_bank(config: ProjectConfig | None = None) -> IdentityBank:
-    if config is None:
-        raise ValueError("build_identity_bank requires a validated ProjectConfig")
     return IdentityBank(config)
 
 
-def _empty_confirmed_chunk(capacity: int) -> ConfirmedChunk:
-    if type(capacity) is not int or capacity <= 0:
-        raise ValueError("Confirmed capacity must be positive")
-    return ConfirmedChunk(
-        prototypes=torch.zeros(capacity, IDENTITY_DIM, dtype=torch.float32),
-        occupied=torch.zeros(capacity, dtype=torch.bool),
-        identity_ids=(None,) * capacity,
-        first_seen=torch.full((capacity,), -1.0, dtype=torch.float64),
-        last_seen=torch.full((capacity,), -1.0, dtype=torch.float64),
-        observation_counts=torch.zeros(capacity, dtype=torch.int64),
-        first_seen_position_ids=torch.full((capacity,), -1, dtype=torch.int64),
-        last_seen_position_ids=torch.full((capacity,), -1, dtype=torch.int64),
-        semantic_record_ids=(None,) * capacity,
-        prototype_versions=torch.zeros(capacity, dtype=torch.int64),
-        relevance=torch.full((capacity,), 0.5, dtype=torch.float32),
-    )
-
-
 def _append_confirmed(
-    chunks: tuple[ConfirmedChunk, ...],
+    confirmed_store: tuple[ConfirmedIdentity, ...],
     confirmed: ConfirmedIdentity,
-    growth_chunk: int,
-) -> tuple[ConfirmedChunk, ...]:
-    if confirmed.semantic_record_id is None:
-        raise ValueError("Confirmed store requires a semantic record link")
-    cloned = [_clone_chunk(chunk) for chunk in chunks]
-    target_index = next(
-        (index for index, chunk in enumerate(cloned) if chunk.size < chunk.capacity), None
-    )
-    if target_index is None:
-        cloned.append(_empty_confirmed_chunk(growth_chunk))
-        target_index = len(cloned) - 1
-    target = cloned[target_index]
-    slot = int(torch.nonzero(~target.occupied, as_tuple=False)[0].item())
-    prototypes = target.prototypes.detach().clone()
-    occupied = target.occupied.detach().clone()
-    first_seen = target.first_seen.detach().clone()
-    last_seen = target.last_seen.detach().clone()
-    counts = target.observation_counts.detach().clone()
-    first_positions = target.first_seen_position_ids.detach().clone()
-    last_positions = target.last_seen_position_ids.detach().clone()
-    versions = target.prototype_versions.detach().clone()
-    relevance = target.relevance.detach().clone()
-    identity_ids = list(target.identity_ids)
-    record_ids = list(target.semantic_record_ids)
-    prototypes[slot] = _hard_identity(confirmed.identity_prototype)
-    occupied[slot] = True
-    first_seen[slot] = confirmed.first_seen
-    last_seen[slot] = confirmed.last_seen
-    counts[slot] = confirmed.observation_count
-    first_positions[slot] = confirmed.first_seen_position_id
-    last_positions[slot] = confirmed.last_seen_position_id
-    versions[slot] = confirmed.prototype_version
-    relevance[slot] = confirmed.relevance
-    identity_ids[slot] = confirmed.identity_id
-    record_ids[slot] = confirmed.semantic_record_id
-    cloned[target_index] = ConfirmedChunk(
-        prototypes,
-        occupied,
-        tuple(identity_ids),
-        first_seen,
-        last_seen,
-        counts,
-        first_positions,
-        last_positions,
-        tuple(record_ids),
-        versions,
-        relevance,
-    )
-    return tuple(cloned)
+) -> tuple[ConfirmedIdentity, ...]:
+    stored = replace(confirmed, identity_prototype=_hard_identity(confirmed.identity_prototype))
+    return tuple(_clone_confirmed(item) for item in confirmed_store) + (stored,)
 
 
 def _update_confirmed(
-    chunks: tuple[ConfirmedChunk, ...], confirmed: ConfirmedIdentity
-) -> tuple[ConfirmedChunk, ...]:
-    if confirmed.semantic_record_id is None:
-        raise ValueError("Confirmed update requires a semantic record link")
-    cloned = [_clone_chunk(chunk) for chunk in chunks]
-    locations = [
-        (chunk_index, slot)
-        for chunk_index, chunk in enumerate(cloned)
-        for slot, identity_id in enumerate(chunk.identity_ids)
-        if identity_id == confirmed.identity_id
-    ]
-    if len(locations) != 1:
-        raise KeyError(f"Confirmed identity not found exactly once: {confirmed.identity_id}")
-    chunk_index, slot = locations[0]
-    chunk = cloned[chunk_index]
-    prototypes = chunk.prototypes.detach().clone()
-    last_seen = chunk.last_seen.detach().clone()
-    counts = chunk.observation_counts.detach().clone()
-    last_positions = chunk.last_seen_position_ids.detach().clone()
-    versions = chunk.prototype_versions.detach().clone()
-    relevance = chunk.relevance.detach().clone()
-    record_ids = list(chunk.semantic_record_ids)
-    prototypes[slot] = _hard_identity(confirmed.identity_prototype)
-    last_seen[slot] = confirmed.last_seen
-    counts[slot] = confirmed.observation_count
-    last_positions[slot] = confirmed.last_seen_position_id
-    versions[slot] = confirmed.prototype_version
-    relevance[slot] = confirmed.relevance
-    record_ids[slot] = confirmed.semantic_record_id
-    cloned[chunk_index] = ConfirmedChunk(
-        prototypes,
-        chunk.occupied.detach().clone(),
-        tuple(chunk.identity_ids),
-        chunk.first_seen.detach().clone(),
-        last_seen,
-        counts,
-        chunk.first_seen_position_ids.detach().clone(),
-        last_positions,
-        tuple(record_ids),
-        versions,
-        relevance,
+    confirmed_store: tuple[ConfirmedIdentity, ...], confirmed: ConfirmedIdentity
+) -> tuple[ConfirmedIdentity, ...]:
+    stored = replace(confirmed, identity_prototype=_hard_identity(confirmed.identity_prototype))
+    return tuple(
+        stored if item.identity_id == confirmed.identity_id else _clone_confirmed(item)
+        for item in confirmed_store
     )
-    return tuple(cloned)
 
 
 def _select_match(
@@ -1691,8 +1410,6 @@ def _select_match(
     threshold: float,
     ambiguity_margin: float,
 ) -> _Match:
-    if scores.ndim != 1 or scores.shape[0] != len(entry_ids):
-        raise ValueError("match scores and IDs must align")
     ordered = sorted(
         (
             (float(score.item()), entry_id)
@@ -1725,14 +1442,11 @@ def _relevance_ema(old: float, observation: float, decay: float) -> float:
 
 
 def _hard_identity(identity: Tensor) -> Tensor:
-    _validate_identity_tensor(identity, "identity observation")
     return _normalize_identity(identity.detach().to(device="cpu", dtype=torch.float32, copy=True))
 
 
 def _normalize_identity(identity: Tensor) -> Tensor:
     norm = torch.linalg.vector_norm(identity.float())
-    if not bool(torch.isfinite(norm)):
-        raise ValueError("identity prototype norm must be finite")
     if float(norm.item()) <= 1.0e-8:
         output = torch.zeros(IDENTITY_DIM, dtype=torch.float32, device="cpu")
         output[0] = 1.0
@@ -1748,43 +1462,9 @@ def _clone_confirmed(confirmed: ConfirmedIdentity) -> ConfirmedIdentity:
     return replace(confirmed, identity_prototype=confirmed.identity_prototype.detach().clone())
 
 
-def _clone_chunk(chunk: ConfirmedChunk) -> ConfirmedChunk:
-    return ConfirmedChunk(
-        prototypes=chunk.prototypes.detach().clone(),
-        occupied=chunk.occupied.detach().clone(),
-        identity_ids=tuple(chunk.identity_ids),
-        first_seen=chunk.first_seen.detach().clone(),
-        last_seen=chunk.last_seen.detach().clone(),
-        observation_counts=chunk.observation_counts.detach().clone(),
-        first_seen_position_ids=chunk.first_seen_position_ids.detach().clone(),
-        last_seen_position_ids=chunk.last_seen_position_ids.detach().clone(),
-        semantic_record_ids=tuple(chunk.semantic_record_ids),
-        prototype_versions=chunk.prototype_versions.detach().clone(),
-        relevance=chunk.relevance.detach().clone(),
-    )
-
-
-def _clone_hot_cache(entry: HotCacheEntry) -> HotCacheEntry:
-    return replace(entry, identity_prototype=entry.identity_prototype.detach().clone())
-
-
-def _clone_runtime_state(state: IdentityBankRuntimeState) -> IdentityBankRuntimeState:
-    return replace(
-        state,
-        candidates=tuple(_clone_candidate(candidate) for candidate in state.candidates),
-        confirmed_chunks=tuple(_clone_chunk(chunk) for chunk in state.confirmed_chunks),
-        hot_cache=tuple(_clone_hot_cache(entry) for entry in state.hot_cache),
-        audit_log=tuple(state.audit_log),
-    )
-
-
 def _replace_candidate(
     state: IdentityBankRuntimeState, candidate: CandidateIdentity, item: _Observation
 ) -> IdentityBankRuntimeState:
-    matches = [value for value in state.candidates if value.candidate_id == candidate.candidate_id]
-    if len(matches) != 1:
-        raise KeyError(f"Candidate not found exactly once: {candidate.candidate_id}")
-    old = matches[0]
     candidates = tuple(
         _clone_candidate(candidate if value.candidate_id == candidate.candidate_id else value)
         for value in state.candidates
@@ -1792,142 +1472,15 @@ def _replace_candidate(
     return replace(
         state,
         candidates=candidates,
-        audit_log=state.audit_log
-        + (
-            _audit(
-                "candidate_updated",
-                item,
-                (
-                    ("candidate_id", candidate.candidate_id),
-                    ("old_prototype_checksum", _tensor_checksum(old.identity_prototype)),
-                    ("new_prototype_checksum", _tensor_checksum(candidate.identity_prototype)),
-                    ("reliable_streak", candidate.reliable_streak),
-                ),
-            ),
-        ),
         version=state.version + 1,
     )
 
 
 def _candidate_by_id(state: IdentityBankRuntimeState, candidate_id: str) -> CandidateIdentity:
-    matches = tuple(
-        candidate for candidate in state.candidates if candidate.candidate_id == candidate_id
-    )
-    if len(matches) != 1:
-        raise KeyError(f"Candidate not found: {candidate_id}")
-    return _clone_candidate(matches[0])
-
-
-def _audit(
-    action: str,
-    item: _Observation,
-    details: tuple[tuple[str, AuditValue], ...] = (),
-) -> IdentityBankAuditEntry:
-    return IdentityBankAuditEntry(action, item.timestamp, item.position_id, details)
-
-
-def _tensor_checksum(tensor: Tensor) -> str:
-    raw = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy().tobytes()
-    return hashlib.sha256(raw).hexdigest()[:16]
-
-
-def _validate_identity_tensor(tensor: Tensor, name: str) -> None:
-    if tensor.shape != (IDENTITY_DIM,) or not torch.is_floating_point(tensor):
-        raise ValueError(f"{name} must be floating [256]")
-    if tensor.device.type != "meta" and not bool(torch.isfinite(tensor).all()):
-        raise ValueError(f"{name} must be finite")
-
-
-def _validate_authoritative_identity(tensor: Tensor, name: str) -> None:
-    if (
-        tensor.device.type != "cpu"
-        or tensor.dtype != torch.float32
-        or tensor.requires_grad
-        or tensor.grad_fn is not None
-    ):
-        raise ValueError(f"{name} must be detached CPU FP32")
-    _validate_unit_identity(tensor, name)
-
-
-def _validate_unit_identity(tensor: Tensor, name: str) -> None:
-    norm = torch.linalg.vector_norm(tensor.float())
-    if not torch.allclose(norm, torch.ones_like(norm), atol=_UNIT_ATOL, rtol=_UNIT_RTOL):
-        raise ValueError(f"{name} must have unit L2 norm")
-
-
-def _validate_probability(value: float, name: str) -> None:
-    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-        raise ValueError(f"{name} must stay within [0, 1]")
-
-
-def _validate_seen_metadata(
-    first_seen: float,
-    last_seen: float,
-    first_position: int,
-    last_position: int,
-    name: str,
-) -> None:
-    if (
-        not math.isfinite(first_seen)
-        or not math.isfinite(last_seen)
-        or first_seen < 0.0
-        or last_seen < first_seen
-        or type(first_position) is not int
-        or type(last_position) is not int
-        or first_position < 0
-        or last_position < first_position
-    ):
-        raise ValueError(f"{name} first/last seen metadata is invalid")
-
-
-def _validate_cross_bank_owner(
-    identity_state: IdentityBankRuntimeState, state_state: StateBankRuntimeState
-) -> None:
-    if (
-        identity_state.video_id != state_state.video_id
-        or identity_state.trajectory_id != state_state.trajectory_id
-    ):
-        raise ValueError("Identity Bank and State Bank owner identifiers must agree")
-    if identity_state.released != state_state.released:
-        raise ValueError("Identity Bank and State Bank release state must agree")
-
-
-def _require_live_state(state: IdentityBankRuntimeState) -> None:
-    if not isinstance(state, IdentityBankRuntimeState):
-        raise TypeError("Identity Bank operation requires IdentityBankRuntimeState")
-    if state.released:
-        raise ValueError("released Identity Bank runtime cannot be used")
-
-
-def _parse_dtype(name: str) -> torch.dtype:
-    mapping = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
-    if name not in mapping:
-        raise ValueError(f"unsupported Hot Cache dtype: {name}")
-    return mapping[name]
-
-
-def _dtype_name(dtype: torch.dtype) -> str:
-    mapping = {torch.float32: "float32", torch.float16: "float16", torch.bfloat16: "bfloat16"}
-    if dtype not in mapping:
-        raise ValueError(f"unsupported Hot Cache dtype: {dtype}")
-    return mapping[dtype]
-
-
-def _assert_runtime_storage_isolated(state: IdentityBankRuntimeState) -> None:
-    tensors: list[Tensor] = []
-    tensors.extend(candidate.identity_prototype for candidate in state.candidates)
-    for chunk in state.confirmed_chunks:
-        tensors.extend(
-            (
-                chunk.prototypes,
-                chunk.occupied,
-                chunk.first_seen,
-                chunk.last_seen,
-                chunk.observation_counts,
-                chunk.first_seen_position_ids,
-                chunk.last_seen_position_ids,
-                chunk.prototype_versions,
-            )
+    return _clone_candidate(
+        next(
+            candidate
+            for candidate in state.candidates
+            if candidate.candidate_id == candidate_id
         )
-    tensors.extend(entry.identity_prototype for entry in state.hot_cache)
-    assert_tensors_disjoint(tensors, "Identity Bank runtime tensors must not share storage")
+    )

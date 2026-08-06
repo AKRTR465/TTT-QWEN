@@ -487,22 +487,6 @@ def _read_metadata(tensors: Mapping[str, Tensor]) -> str:
     return bytes(int(value) for value in raw.tolist()).decode("utf-8")
 
 
-def _read_sidecar_metadata(path: Path) -> tuple[str, str] | None:
-    sidecar = path.with_suffix(".json")
-    if not sidecar.is_file():
-        return None
-    raw = json.loads(sidecar.read_text(encoding="utf-8"))
-    fingerprint = raw.get("fingerprint") if isinstance(raw, Mapping) else None
-    storage_dtype = raw.get("storage_dtype") if isinstance(raw, Mapping) else None
-    if storage_dtype is None:
-        # Schema-1 float32 entries predate the explicit storage dtype. They are byte-compatible
-        # with the current runtime and must remain readable by the strict A2 cache path.
-        storage_dtype = "float32"
-    if not isinstance(fingerprint, str) or storage_dtype not in {"float32", "float16"}:
-        raise ValueError("cache metadata sidecar is missing fingerprint or storage dtype")
-    return fingerprint, storage_dtype
-
-
 def _replace_idempotent(source: Path, target: Path) -> None:
     """Publish one entry atomically while tolerating duplicate writers."""
 
@@ -514,45 +498,6 @@ def _replace_idempotent(source: Path, target: Path) -> None:
         # cache entry is immutable by fingerprint, so an existing target is an acceptable winner.
         if not target.is_file():
             raise
-
-
-def _validate_cached_chunk(chunk: CachedChunk) -> None:
-    if chunk.frames.ndim != 4 or chunk.frames.shape[1] != 3:
-        raise ValueError("cached frames must be [F, 3, H, W]")
-    if chunk.frames.dtype != torch.uint8:
-        raise TypeError("cached frames must use uint8")
-    if chunk.frames.shape[0] < 2 or chunk.frames.shape[0] % 2:
-        raise ValueError("cached frames must contain an even number of tubelet frames")
-    if (
-        chunk.frame_timestamps.shape != (chunk.frames.shape[0],)
-        or chunk.frame_timestamps.dtype != torch.float64
-    ):
-        raise ValueError("cached frame timestamps must align with frames")
-    if (
-        chunk.pixel_values_videos.ndim != 2
-        or chunk.pixel_values_videos.shape[1] != 1536
-        or chunk.pixel_values_videos.dtype != torch.float32
-    ):
-        raise ValueError("cached Qwen pixels must be float32 [N, 1536]")
-    if chunk.video_grid_thw.shape != (1, 3) or chunk.video_grid_thw.dtype != torch.int64:
-        raise ValueError("cached video grid must be integer [1, 3]")
-    if (
-        chunk.tubelet_timestamps.ndim != 2
-        or chunk.tubelet_timestamps.shape[0] != 1
-        or chunk.tubelet_timestamps.dtype != torch.float64
-    ):
-        raise ValueError("cached tubelet timestamps must be [1, T]")
-    if chunk.tubelet_valid_mask.shape != chunk.tubelet_timestamps.shape:
-        raise ValueError("cached tubelet validity must align with timestamps")
-    if chunk.tubelet_valid_mask.dtype != torch.bool:
-        raise TypeError("cached tubelet validity must use bool")
-    if (
-        chunk.tubelet_position_ids.shape != chunk.tubelet_timestamps.shape
-        or chunk.tubelet_position_ids.dtype != torch.int64
-    ):
-        raise ValueError("cached tubelet positions must align with timestamps")
-    if int(chunk.video_grid_thw[0, 0].item()) != chunk.frames.shape[0] // 2:
-        raise ValueError("cached video grid temporal dimension must equal tubelets")
 
 
 def _tensor_bytes(chunk: CachedChunk) -> int:
@@ -576,12 +521,9 @@ def _clone_cached_chunk(chunk: CachedChunk) -> CachedChunk:
 
 
 __all__ = [
-    "CACHE_METADATA_SCHEMA_VERSION",
     "CACHE_SCHEMA_VERSION",
     "CachedChunk",
     "PreprocessCache",
-    "PreprocessCacheMissError",
-    "PreprocessCacheMissPolicy",
     "PreprocessCacheMode",
     "PreprocessCacheStorageDtype",
     "PreprocessFingerprint",

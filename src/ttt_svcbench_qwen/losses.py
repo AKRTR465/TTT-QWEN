@@ -93,11 +93,6 @@ class O1StateTarget:
     targets: Tensor
     slot_mask: Tensor
 
-    def __post_init__(self) -> None:
-        _validate_dense_binary_target(
-            self.row_indices, self.logits, self.targets, self.slot_mask, 6, "O1"
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class O2StateTarget:
@@ -108,39 +103,6 @@ class O2StateTarget:
     score_targets: Tensor
     slot_mask: Tensor
 
-    def __post_init__(self) -> None:
-        _validate_row_indices(self.row_indices, self.identity_predictions.shape[0], "O2")
-        if (
-            self.identity_predictions.ndim != 3
-            or self.identity_predictions.shape[-1] != 256
-            or not torch.is_floating_point(self.identity_predictions)
-            or self.identity_targets.shape != self.identity_predictions.shape
-            or not torch.is_floating_point(self.identity_targets)
-        ):
-            raise ValueError("O2 identities must be aligned floating [R, N, 256]")
-        shape = self.identity_predictions.shape[:2]
-        if (
-            self.score_logits.shape != (*shape, 2)
-            or self.score_targets.shape != self.score_logits.shape
-            or not torch.is_floating_point(self.score_logits)
-            or not torch.is_floating_point(self.score_targets)
-        ):
-            raise ValueError("O2 score logits/targets must be floating [R, N, 2]")
-        if self.slot_mask.shape != shape or self.slot_mask.dtype != torch.bool:
-            raise ValueError("O2 slot_mask must be bool [R, N]")
-        tensors = (
-            self.row_indices,
-            self.identity_predictions,
-            self.identity_targets,
-            self.score_logits,
-            self.score_targets,
-            self.slot_mask,
-        )
-        _require_same_device(tensors, "O2 State target")
-        _require_probability_targets(self.score_targets, "O2 score targets")
-        _require_unit_norm(self.identity_predictions, self.slot_mask, "O2 identity predictions")
-        _require_unit_norm(self.identity_targets, self.slot_mask, "O2 identity targets")
-
 
 @dataclass(frozen=True, slots=True)
 class E1StateTarget:
@@ -148,11 +110,6 @@ class E1StateTarget:
     logits: Tensor
     targets: Tensor
     time_mask: Tensor
-
-    def __post_init__(self) -> None:
-        _validate_dense_binary_target(
-            self.row_indices, self.logits, self.targets, self.time_mask, 3, "E1"
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,60 +123,12 @@ class E2StateTarget:
     phase_targets: Tensor
     time_mask: Tensor
 
-    def __post_init__(self) -> None:
-        _validate_row_indices(self.row_indices, self.event_logits.shape[0], "E2")
-        if (
-            self.event_logits.ndim != 3
-            or self.event_logits.shape[-1] != 4
-            or not torch.is_floating_point(self.event_logits)
-            or self.event_targets.shape != self.event_logits.shape
-            or not torch.is_floating_point(self.event_targets)
-            or self.phase_logits.shape != self.event_logits.shape
-            or not torch.is_floating_point(self.phase_logits)
-        ):
-            raise ValueError("E2 event/phase tensors must be floating [R, T, 4]")
-        shape = self.event_logits.shape[:2]
-        if self.phase_targets.shape != shape or self.phase_targets.dtype != torch.int64:
-            raise ValueError("E2 phase_targets must be int64 [R, T]")
-        if self.time_mask.shape != shape or self.time_mask.dtype != torch.bool:
-            raise ValueError("E2 time_mask must be bool [R, T]")
-        tensors = (
-            self.row_indices,
-            self.event_logits,
-            self.event_targets,
-            self.phase_logits,
-            self.phase_targets,
-            self.time_mask,
-        )
-        _require_same_device(tensors, "E2 State target")
-        _require_probability_targets(self.event_targets, "E2 event targets")
-        if self.phase_targets.device.type != "meta":
-            valid = self.time_mask
-            if bool(torch.any((self.phase_targets[valid] < 0) | (self.phase_targets[valid] >= 4))):
-                raise ValueError("valid E2 phase targets must be within [0, 4)")
-            if bool(torch.any(~valid & (self.phase_targets != -100))):
-                raise ValueError("masked E2 phase targets must use -100")
-
 
 @dataclass(frozen=True, slots=True)
 class OperatorLossInput:
     logits: Tensor
     targets: Tensor
     valid_mask: Tensor
-
-    def __post_init__(self) -> None:
-        batch_size = self.logits.shape[0] if self.logits.ndim == 2 else -1
-        if self.logits.shape != (batch_size, 9) or not torch.is_floating_point(self.logits):
-            raise ValueError("operator logits must be floating [B, 9]")
-        if self.targets.shape != (batch_size,) or self.targets.dtype != torch.int64:
-            raise ValueError("operator targets must be int64 [B]")
-        if self.valid_mask.shape != (batch_size,) or self.valid_mask.dtype != torch.bool:
-            raise ValueError("operator valid_mask must be bool [B]")
-        _require_same_device((self.logits, self.targets, self.valid_mask), "operator loss input")
-        if self.targets.device.type != "meta" and bool(
-            torch.any(self.valid_mask & ((self.targets < 0) | (self.targets >= 9)))
-        ):
-            raise ValueError("valid operator targets must be within [0, 9)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,28 +137,6 @@ class RetrievalLossInput:
     targets: Tensor
     present_mask: Tensor
     label_mask: Tensor
-
-    def __post_init__(self) -> None:
-        if self.logits.ndim != 2 or not torch.is_floating_point(self.logits):
-            raise ValueError("retrieval logits must be floating [B, N]")
-        if self.targets.shape != self.logits.shape or not torch.is_floating_point(self.targets):
-            raise ValueError("retrieval targets must be floating [B, N]")
-        if (
-            self.present_mask.shape != self.logits.shape
-            or self.label_mask.shape != self.logits.shape
-            or self.present_mask.dtype != torch.bool
-            or self.label_mask.dtype != torch.bool
-        ):
-            raise ValueError("retrieval masks must be bool [B, N]")
-        _require_same_device(
-            (self.logits, self.targets, self.present_mask, self.label_mask),
-            "retrieval loss input",
-        )
-        _require_probability_targets(self.targets, "retrieval targets")
-        if self.logits.device.type != "meta" and bool(
-            torch.any(self.label_mask & ~self.present_mask)
-        ):
-            raise ValueError("retrieval labels cannot target padded records")
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,78 +150,6 @@ class TimeLossInput:
     span_end_targets: Tensor
     token_valid_mask: Tensor
 
-    def __post_init__(self) -> None:
-        batch_size = self.mode_logits.shape[0] if self.mode_logits.ndim == 2 else -1
-        if self.mode_logits.shape != (batch_size, 4) or not torch.is_floating_point(
-            self.mode_logits
-        ):
-            raise ValueError("time mode logits must be floating [B, 4]")
-        if self.mode_targets.shape != (batch_size,) or self.mode_targets.dtype != torch.int64:
-            raise ValueError("time mode targets must be int64 [B]")
-        if self.mode_valid_mask.shape != (batch_size,) or self.mode_valid_mask.dtype != torch.bool:
-            raise ValueError("time mode valid_mask must be bool [B]")
-        if (
-            self.span_start_logits.ndim != 2
-            or self.span_start_logits.shape != self.span_end_logits.shape
-            or self.span_start_logits.shape[0] != batch_size
-            or not torch.is_floating_point(self.span_start_logits)
-            or not torch.is_floating_point(self.span_end_logits)
-        ):
-            raise ValueError("time span logits must be aligned floating [B, L]")
-        for target, name in (
-            (self.span_start_targets, "span_start_targets"),
-            (self.span_end_targets, "span_end_targets"),
-        ):
-            if target.shape != (batch_size,) or target.dtype != torch.int64:
-                raise ValueError(f"time {name} must be int64 [B]")
-        if (
-            self.token_valid_mask.shape != self.span_start_logits.shape
-            or self.token_valid_mask.dtype != torch.bool
-        ):
-            raise ValueError("time token_valid_mask must be bool [B, L]")
-        tensors = (
-            self.mode_logits,
-            self.mode_targets,
-            self.mode_valid_mask,
-            self.span_start_logits,
-            self.span_end_logits,
-            self.span_start_targets,
-            self.span_end_targets,
-            self.token_valid_mask,
-        )
-        _require_same_device(tensors, "time loss input")
-        if self.mode_targets.device.type == "meta":
-            return
-        if bool(
-            torch.any(self.mode_valid_mask & ((self.mode_targets < 0) | (self.mode_targets >= 4)))
-        ):
-            raise ValueError("valid time mode targets must be within [0, 4)")
-        start_ignored = self.span_start_targets == -100
-        end_ignored = self.span_end_targets == -100
-        if not torch.equal(start_ignored, end_ignored):
-            raise ValueError("time span start/end targets must be ignored together")
-        span_valid = ~start_ignored
-        width = self.span_start_logits.shape[1]
-        if bool(
-            torch.any(
-                span_valid
-                & (
-                    (self.span_start_targets < 0)
-                    | (self.span_start_targets >= width)
-                    | (self.span_end_targets < 0)
-                    | (self.span_end_targets >= width)
-                    | (self.span_start_targets > self.span_end_targets)
-                )
-            )
-        ):
-            raise ValueError("valid time spans must satisfy 0 <= start <= end < L")
-        safe_start = self.span_start_targets.clamp_min(0)
-        safe_end = self.span_end_targets.clamp_min(0)
-        start_present = torch.gather(self.token_valid_mask, 1, safe_start.unsqueeze(1)).squeeze(1)
-        end_present = torch.gather(self.token_valid_mask, 1, safe_end.unsqueeze(1)).squeeze(1)
-        if bool(torch.any(span_valid & (~start_present | ~end_present))):
-            raise ValueError("time span targets must point to valid query tokens")
-
 
 @dataclass(frozen=True, slots=True)
 class StateLossInput:
@@ -347,38 +162,6 @@ class StateLossInput:
     retrieval: RetrievalLossInput | None = None
     time: TimeLossInput | None = None
 
-    def __post_init__(self) -> None:
-        if type(self.batch_size) is not int or self.batch_size <= 0:
-            raise ValueError("State loss batch_size must be a positive integer")
-        components = (self.o1, self.o2, self.e1, self.e2, self.operator, self.retrieval, self.time)
-        if all(component is None for component in components):
-            raise ValueError("State loss requires at least one explicit supervised input")
-        row_sets: list[set[int]] = []
-        for target in (self.o1, self.o2, self.e1, self.e2):
-            if target is None:
-                continue
-            rows = target.row_indices.tolist()
-            if any(row < 0 or row >= self.batch_size for row in rows):
-                raise ValueError("State task row index is outside batch_size")
-            row_set = set(rows)
-            if any(row_set & existing for existing in row_sets):
-                raise ValueError("each State row may supervise exactly one observation head")
-            row_sets.append(row_set)
-        for component, name in (
-            (self.operator, "operator"),
-            (self.retrieval, "retrieval"),
-            (self.time, "time"),
-        ):
-            if component is not None and _component_batch_size(component) != self.batch_size:
-                raise ValueError(f"State {name} batch size does not match batch_size")
-        reference = _state_reference(self)
-        for supervised_component in components:
-            if (
-                supervised_component is not None
-                and _component_reference(supervised_component).device != reference.device
-            ):
-                raise ValueError("all State loss inputs must share one device")
-
 
 @dataclass(frozen=True, slots=True)
 class TimeLossOutput:
@@ -388,14 +171,6 @@ class TimeLossOutput:
     total: Tensor
     per_row_total: Tensor
     row_valid_mask: Tensor
-
-    def __post_init__(self) -> None:
-        _require_fp32_scalar(self.total, "time total")
-        batch_size = self.mode.per_row.shape[0]
-        if self.per_row_total.shape != (batch_size,) or self.per_row_total.dtype != torch.float32:
-            raise ValueError("time per_row_total must be FP32 [B]")
-        if self.row_valid_mask.shape != (batch_size,) or self.row_valid_mask.dtype != torch.bool:
-            raise ValueError("time row_valid_mask must be bool [B]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,21 +190,6 @@ class StateLossOutput:
     operator_weight: float = _OPERATOR_WEIGHT
     retrieval_weight: float = _RETRIEVAL_WEIGHT
     time_weight: float = _TIME_WEIGHT
-
-    def __post_init__(self) -> None:
-        _require_fp32_scalar(self.total, "State total")
-        batch_size = self.task.per_row.shape[0]
-        if self.per_row_total.shape != (batch_size,) or self.per_row_total.dtype != torch.float32:
-            raise ValueError("State per_row_total must be FP32 [B]")
-        if self.row_valid_mask.shape != (batch_size,) or self.row_valid_mask.dtype != torch.bool:
-            raise ValueError("State row_valid_mask must be bool [B]")
-        if (
-            self.task_weight,
-            self.operator_weight,
-            self.retrieval_weight,
-            self.time_weight,
-        ) != (1.0, 1.0, 1.0, 1.0):
-            raise ValueError("P14 State weights are frozen at one")
 
 
 def compute_state_loss(inputs: StateLossInput) -> StateLossOutput:
@@ -519,20 +279,6 @@ class ReaderCountMetricInput:
     target_counts: Tensor
     valid_mask: Tensor
 
-    def __post_init__(self) -> None:
-        batch_size = self.predicted_counts.shape[0] if self.predicted_counts.ndim == 1 else -1
-        for tensor, name in (
-            (self.predicted_counts, "predicted_counts"),
-            (self.target_counts, "target_counts"),
-        ):
-            if tensor.shape != (batch_size,) or tensor.dtype != torch.int64:
-                raise ValueError(f"Reader {name} must be int64 [B]")
-        if self.valid_mask.shape != (batch_size,) or self.valid_mask.dtype != torch.bool:
-            raise ValueError("Reader count valid_mask must be bool [B]")
-        _require_same_device(
-            (self.predicted_counts, self.target_counts, self.valid_mask), "Reader count metric"
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class AnswerLossInput:
@@ -540,38 +286,6 @@ class AnswerLossInput:
     labels: Tensor
     number_token_mask: Tensor
     reader_counts: ReaderCountMetricInput | None = None
-
-    def __post_init__(self) -> None:
-        if (
-            self.logits.ndim != 3
-            or self.logits.shape[0] <= 0
-            or self.logits.shape[1] < 2
-            or self.logits.shape[2] <= 1
-            or not torch.is_floating_point(self.logits)
-        ):
-            raise ValueError("answer logits must be floating [B, L>=2, V>1]")
-        shape = self.logits.shape[:2]
-        if self.labels.shape != shape or self.labels.dtype != torch.int64:
-            raise ValueError("answer labels must be int64 [B, L]")
-        if self.number_token_mask.shape != shape or self.number_token_mask.dtype != torch.bool:
-            raise ValueError("answer number_token_mask must be bool [B, L]")
-        _require_same_device(
-            (self.logits, self.labels, self.number_token_mask), "Answer loss input"
-        )
-        if self.logits.device.type != "meta":
-            supervised = self.labels != -100
-            vocab_size = self.logits.shape[-1]
-            if bool(torch.any(supervised & ((self.labels < 0) | (self.labels >= vocab_size)))):
-                raise ValueError("supervised answer labels must be within vocabulary")
-            if bool(torch.any(self.number_token_mask & ~supervised)):
-                raise ValueError("number_token_mask must be a subset of supervised labels")
-            if bool(torch.any(self.number_token_mask[:, 0])):
-                raise ValueError("the first label cannot be predicted by causal shift")
-        if self.reader_counts is not None:
-            if self.reader_counts.predicted_counts.shape[0] != self.logits.shape[0]:
-                raise ValueError("Reader count metric batch size must match Answer loss")
-            if self.reader_counts.predicted_counts.device != self.logits.device:
-                raise ValueError("Reader count metric must share the Answer device")
 
 
 @dataclass(frozen=True, slots=True)
@@ -669,10 +383,6 @@ class OuterLossInput:
     answer_after: AnswerLossOutput
     state_after: StateLossOutput
 
-    def __post_init__(self) -> None:
-        if self.answer_after.loss.value.device != self.state_after.total.device:
-            raise ValueError("after-update Answer and State losses must share one device")
-
 
 @dataclass(frozen=True, slots=True)
 class OuterLossOutput:
@@ -680,17 +390,6 @@ class OuterLossOutput:
     state_after: Tensor
     outer: Tensor
     total: Tensor
-
-    def __post_init__(self) -> None:
-        for value, name in (
-            (self.answer_after, "outer answer_after"),
-            (self.state_after, "outer state_after"),
-            (self.outer, "outer loss"),
-            (self.total, "total loss"),
-        ):
-            _require_fp32_scalar(value, name)
-        if not torch.equal(self.outer, self.total):
-            raise ValueError("Outer total must contain only Answer and State Query losses")
 
 
 def compute_outer_loss(inputs: OuterLossInput) -> OuterLossOutput:
@@ -952,58 +651,6 @@ def _invalid_time_output(batch_size: int, reference: Tensor) -> TimeLossOutput:
     )
 
 
-def _validate_dense_binary_target(
-    row_indices: Tensor,
-    logits: Tensor,
-    targets: Tensor,
-    mask: Tensor,
-    width: int,
-    name: str,
-) -> None:
-    rows = logits.shape[0] if logits.ndim == 3 else -1
-    _validate_row_indices(row_indices, rows, name)
-    if logits.shape != (rows, logits.shape[1], width) or not torch.is_floating_point(logits):
-        raise ValueError(f"{name} logits must be floating [R, N, {width}]")
-    if targets.shape != logits.shape or not torch.is_floating_point(targets):
-        raise ValueError(f"{name} targets must match logits as floating [R, N, {width}]")
-    if mask.shape != logits.shape[:2] or mask.dtype != torch.bool:
-        raise ValueError(f"{name} mask must be bool [R, N]")
-    _require_same_device((row_indices, logits, targets, mask), f"{name} State target")
-    _require_probability_targets(targets, f"{name} targets")
-
-
-def _validate_row_indices(indices: Tensor, rows: int, name: str) -> None:
-    if indices.shape != (rows,) or indices.dtype != torch.int64:
-        raise ValueError(f"{name} row_indices must be int64 [R]")
-    if indices.device.type != "meta" and len(set(indices.tolist())) != rows:
-        raise ValueError(f"{name} row_indices must be unique")
-
-
-def _require_unit_norm(values: Tensor, mask: Tensor, name: str) -> None:
-    if values.device.type == "meta":
-        return
-    selected = values[mask]
-    if not selected.numel():
-        return
-    norms = torch.linalg.vector_norm(selected.float(), dim=-1)
-    norm_tolerance = max(
-        _NORM_ATOL,
-        2.0 * float(torch.finfo(selected.dtype).eps),
-    )
-    if not torch.allclose(
-        norms,
-        torch.ones_like(norms),
-        atol=norm_tolerance,
-        rtol=0.0,
-    ):
-        raise ValueError(f"{name} must be unit L2 normalized")
-
-
-def _require_probability_targets(values: Tensor, name: str) -> None:
-    if values.device.type != "meta" and bool(torch.any((values < 0.0) | (values > 1.0))):
-        raise ValueError(f"{name} must stay within [0, 1]")
-
-
 def _state_reference(inputs: StateLossInput) -> Tensor:
     for component in (
         inputs.o1,
@@ -1042,13 +689,3 @@ def _component_batch_size(component: object) -> int:
 
 def _differentiable_zero(reference: Tensor) -> Tensor:
     return reference.float().sum() * 0.0
-
-
-def _require_fp32_scalar(value: Tensor, name: str) -> None:
-    if value.ndim != 0 or value.dtype != torch.float32:
-        raise ValueError(f"{name} must be an FP32 scalar tensor")
-
-
-def _require_same_device(tensors: tuple[Tensor, ...], name: str) -> None:
-    if tensors and any(tensor.device != tensors[0].device for tensor in tensors[1:]):
-        raise ValueError(f"{name} tensors must share one device")

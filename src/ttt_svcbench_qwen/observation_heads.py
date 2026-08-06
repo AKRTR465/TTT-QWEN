@@ -629,7 +629,6 @@ class GatedCausalTCNBlock(nn.Module):  # type: ignore[misc]
 class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
     def __init__(self, config: E1Config) -> None:
         super().__init__()
-        _validate_e1_config(config)
         self.config = config
         self.input_norm = nn.LayerNorm(config.input_dim, eps=config.layer_norm_eps)
         self.input_projection = nn.Linear(config.input_dim, config.channels, bias=True)
@@ -661,27 +660,17 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
         prior_states: Sequence[E1RuntimeState | None] | None = None,
         detach_runtime_state: bool = True,
     ) -> E1SoftOutput:
-        if type(detach_runtime_state) is not bool:
-            raise TypeError("detach_runtime_state must be a bool")
-        safe_hidden, normalized_timestamps = _validate_temporal_head_inputs(
-            self,
+        safe_hidden, normalized_timestamps = _prepare_temporal_head_inputs(
             hidden,
             valid_mask,
             timestamps,
-            position_ids,
-            name="E1",
         )
         owners = _normalize_stream_owners(video_ids, trajectory_ids, hidden.shape[0], "E1")
-        _validate_query_signatures(query_signatures, hidden, owners[0], "E1")
-        states = _normalize_stream_states(prior_states, hidden.shape[0], E1RuntimeState, "E1")
-        _validate_stream_prior_states(states, owners, query_signatures, hidden, "E1")
+        states = _normalize_stream_states(prior_states, hidden.shape[0])
         projected = self.input_projection(self.input_norm(safe_hidden))
         projected = torch.where(valid_mask.unsqueeze(-1), projected, 0.0)
         output_rows: list[Tensor] = []
         next_states: list[E1RuntimeState] = []
-        valid_counts: list[int] = []
-        overlap_counts: list[int] = []
-        state_lengths: list[int] = []
         count_features: list[Tensor] = []
         for row in range(hidden.shape[0]):
             state = states[row] or self._empty_state(
@@ -690,13 +679,10 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
                 query_signatures[row],
             )
             count = int(valid_mask[row].sum().item())
-            valid_counts.append(count)
             if count == 0:
                 next_state = _clone_e1_state(state, detach=detach_runtime_state)
                 output_rows.append(hidden.new_zeros((1, hidden.shape[1], 3)))
                 next_states.append(next_state)
-                overlap_counts.append(0)
-                state_lengths.append(int(next_state.projected_history.shape[0]))
                 count_features.append(projected[row].new_zeros((self.config.channels,)))
                 continue
             current_positions = position_ids[row, :count]
@@ -723,19 +709,11 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
             )
             output_rows.append(F.pad(current_logits, (0, 0, 0, hidden.shape[1] - count), value=0.0))
             next_states.append(next_state)
-            overlap_counts.append(overlap_count)
-            state_lengths.append(int(next_state.projected_history.shape[0]))
             count_features.append(encoded[0, -1])
         logits = torch.cat(output_rows, dim=0)
         logits = torch.where(valid_mask.unsqueeze(-1), logits, 0.0)
         probabilities = torch.sigmoid(logits.float()).to(dtype=logits.dtype)
         probabilities = torch.where(valid_mask.unsqueeze(-1), probabilities, 0.0)
-        audit = StreamReplayAudit(
-            head="e1",
-            valid_counts=tuple(valid_counts),
-            overlap_replay_counts=tuple(overlap_counts),
-            state_lengths=tuple(state_lengths),
-        )
         return E1SoftOutput(
             logits=logits,
             probabilities=probabilities,
@@ -743,7 +721,6 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
             timestamps=normalized_timestamps,
             position_ids=position_ids.clone(),
             next_states=tuple(next_states),
-            audit=audit,
             count_prediction=self.count_head(torch.stack(count_features, dim=0)),
         )
 
@@ -772,8 +749,6 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
         current_timestamps: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, int]:
         if state.total_seen == 0:
-            if int(current_positions[0].item()) != 0:
-                raise ValueError("a fresh E1 trajectory must start at position zero")
             return (
                 state.projected_history,
                 state.timestamps,
@@ -781,28 +756,13 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
                 0,
             )
         first = int(current_positions[0].item())
-        last = int(current_positions[-1].item())
         cached_first = int(state.position_ids[0].item())
         cached_last = int(state.position_ids[-1].item())
         retain_count = int(state.position_ids.shape[0])
         overlap_count = 0
         if first <= cached_last:
-            required_first = max(0, first - (self.config.receptive_field - 1))
-            if first < cached_first or cached_first > required_first:
-                raise ValueError("E1 overlap rewind lacks its complete causal history")
-            if last < cached_last:
-                raise ValueError("E1 overlap cannot discard an unobserved cached suffix")
             retain_count = first - cached_first
             overlap_count = cached_last - first + 1
-            if overlap_count > self.config.overlap_tubelets:
-                raise ValueError("E1 overlap exceeds the configured replay window")
-            cached_overlap = state.timestamps[retain_count : retain_count + overlap_count]
-            if not timestamps_match(current_timestamps[:overlap_count], cached_overlap):
-                raise ValueError("E1 overlap timestamps must match cached positions")
-        elif first != cached_last + 1:
-            raise ValueError("E1 position IDs cannot contain gaps")
-        if retain_count and not bool(current_timestamps[0] > state.timestamps[retain_count - 1]):
-            raise ValueError("E1 current timestamps must follow retained history")
         return (
             state.projected_history[:retain_count],
             state.timestamps[:retain_count],
@@ -839,7 +799,6 @@ class E1PointEventDecoder(nn.Module):  # type: ignore[misc]
 class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
     def __init__(self, config: E2Config) -> None:
         super().__init__()
-        _validate_e2_config(config)
         self.config = config
         self.input_norm = nn.LayerNorm(config.input_dim, eps=config.layer_norm_eps)
         self.gru = nn.GRU(
@@ -871,27 +830,17 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
         prior_states: Sequence[E2RuntimeState | None] | None = None,
         detach_runtime_state: bool = True,
     ) -> E2SoftOutput:
-        if type(detach_runtime_state) is not bool:
-            raise TypeError("detach_runtime_state must be a bool")
-        safe_hidden, normalized_timestamps = _validate_temporal_head_inputs(
-            self,
+        safe_hidden, normalized_timestamps = _prepare_temporal_head_inputs(
             hidden,
             valid_mask,
             timestamps,
-            position_ids,
-            name="E2",
         )
         owners = _normalize_stream_owners(video_ids, trajectory_ids, hidden.shape[0], "E2")
-        _validate_query_signatures(query_signatures, hidden, owners[0], "E2")
-        states = _normalize_stream_states(prior_states, hidden.shape[0], E2RuntimeState, "E2")
-        _validate_stream_prior_states(states, owners, query_signatures, hidden, "E2")
+        states = _normalize_stream_states(prior_states, hidden.shape[0])
         normalized = self.input_norm(safe_hidden)
         event_rows: list[Tensor] = []
         phase_rows: list[Tensor] = []
         next_states: list[E2RuntimeState] = []
-        valid_counts: list[int] = []
-        overlap_counts: list[int] = []
-        state_lengths: list[int] = []
         count_features: list[Tensor] = []
         for row in range(hidden.shape[0]):
             state = states[row] or self._empty_state(
@@ -900,14 +849,11 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
                 query_signatures[row],
             )
             count = int(valid_mask[row].sum().item())
-            valid_counts.append(count)
             if count == 0:
                 next_state = _clone_e2_state(state, detach=detach_runtime_state)
                 event_rows.append(hidden.new_zeros((1, hidden.shape[1], 4)))
                 phase_rows.append(hidden.new_zeros((1, hidden.shape[1], 4)))
                 next_states.append(next_state)
-                overlap_counts.append(0)
-                state_lengths.append(int(next_state.checkpoint_hidden.shape[0]))
                 count_features.append(state.hidden[-1])
                 continue
             current_positions = position_ids[row, :count]
@@ -945,8 +891,6 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
             event_rows.append(F.pad(event_logits, (0, 0, 0, hidden.shape[1] - count), value=0.0))
             phase_rows.append(F.pad(phase_logits, (0, 0, 0, hidden.shape[1] - count), value=0.0))
             next_states.append(next_state)
-            overlap_counts.append(overlap)
-            state_lengths.append(int(next_state.checkpoint_hidden.shape[0]))
             count_features.append(recurrent_hidden[-1, 0])
         event_logits = torch.cat(event_rows, dim=0)
         phase_logits = torch.cat(phase_rows, dim=0)
@@ -958,12 +902,6 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
         )
         event_probabilities = torch.where(valid_mask.unsqueeze(-1), event_probabilities, 0.0)
         phase_probabilities = torch.where(valid_mask.unsqueeze(-1), phase_probabilities, 0.0)
-        audit = StreamReplayAudit(
-            head="e2",
-            valid_counts=tuple(valid_counts),
-            overlap_replay_counts=tuple(overlap_counts),
-            state_lengths=tuple(state_lengths),
-        )
         return E2SoftOutput(
             event_logits=event_logits,
             phase_logits=phase_logits,
@@ -973,7 +911,6 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
             timestamps=normalized_timestamps,
             position_ids=position_ids.clone(),
             next_states=tuple(next_states),
-            audit=audit,
             count_prediction=self.count_head(torch.stack(count_features, dim=0)),
         )
 
@@ -1006,8 +943,6 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
         current_timestamps: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, int]:
         if state.total_seen == 0:
-            if int(current_positions[0].item()) != 0:
-                raise ValueError("a fresh E2 trajectory must start at position zero")
             return (
                 state.hidden,
                 state.checkpoint_hidden,
@@ -1016,7 +951,6 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
                 0,
             )
         first = int(current_positions[0].item())
-        last = int(current_positions[-1].item())
         cached_first = int(state.position_ids[0].item())
         cached_last = int(state.position_ids[-1].item())
         retain_count = int(state.position_ids.shape[0])
@@ -1024,19 +958,10 @@ class E2IntervalEventDecoder(nn.Module):  # type: ignore[misc]
         initial_hidden = state.hidden
         if first <= cached_last:
             predecessor = first - 1
-            if first < cached_first + 1 or last < cached_last:
-                raise ValueError("E2 overlap rewind exceeds its five-checkpoint window")
             predecessor_index = predecessor - cached_first
             retain_count = predecessor_index + 1
             initial_hidden = state.checkpoint_hidden[predecessor_index]
             overlap_count = cached_last - first + 1
-            cached_overlap = state.timestamps[retain_count : retain_count + overlap_count]
-            if not timestamps_match(current_timestamps[:overlap_count], cached_overlap):
-                raise ValueError("E2 overlap timestamps must match cached positions")
-        elif first != cached_last + 1:
-            raise ValueError("E2 position IDs cannot contain gaps")
-        if retain_count and not bool(current_timestamps[0] > state.timestamps[retain_count - 1]):
-            raise ValueError("E2 current timestamps must follow retained checkpoints")
         return (
             initial_hidden,
             state.checkpoint_hidden[:retain_count],
@@ -1079,7 +1004,6 @@ class ObservationHeads(nn.Module):  # type: ignore[misc]
     def __init__(self, config: ProjectConfig) -> None:
         super().__init__()
         self.config = config.observation_heads
-        _validate_observation_heads_config(self.config)
         self.o1 = O1CurrentCountDecoder(self.config.o1)
         self.o2 = O2IdentityDecoder(self.config.o2)
         self.e1 = E1PointEventDecoder(self.config.e1)
@@ -1097,26 +1021,13 @@ class ObservationHeads(nn.Module):  # type: ignore[misc]
         e2_prior_states: Sequence[E2RuntimeState | None] | None = None,
         detach_runtime_state: bool = True,
     ) -> ObservationOutputs:
-        if not isinstance(spatial, SpatialEncoderOutput) or not isinstance(
-            temporal, TemporalEncoderOutput
-        ):
-            raise TypeError("ObservationHeads requires typed spatial and temporal outputs")
         batch_size = spatial.slots.shape[0]
-        if temporal.hidden.shape[0] != batch_size:
-            raise ValueError("spatial and temporal outputs must share batch size")
         owners = _normalize_stream_owners(
             video_ids,
             trajectory_ids,
             batch_size,
             "ObservationHeads",
         )
-        if owners[0] != temporal.cache.video_ids or owners[1] != temporal.cache.trajectory_ids:
-            raise ValueError("observation owners must exactly match temporal cache owners")
-        _validate_query(q_target, spatial.slots, 512, "ObservationHeads")
-        if temporal.cache.query_signatures.shape != q_target.shape or not torch.equal(
-            temporal.cache.query_signatures, q_target.detach()
-        ):
-            raise ValueError("observation query must match temporal cache query signature")
         row_has_time = temporal.valid_mask.any(dim=1)
         effective_slot_mask = spatial.slot_valid_mask & row_has_time.unsqueeze(1)
         observation_timestamps = torch.full(
@@ -1177,8 +1088,6 @@ class ObservationHeads(nn.Module):  # type: ignore[misc]
     def set_online_frozen(self, frozen: bool = True) -> ObservationHeads:
         """Freeze decoder parameters without disabling gradients to decoder inputs."""
 
-        if type(frozen) is not bool:
-            raise TypeError("online frozen flag must be a bool")
         for parameter in self.parameters():
             parameter.requires_grad_(not frozen)
         if frozen:
@@ -1191,106 +1100,16 @@ class ObservationHeads(nn.Module):  # type: ignore[misc]
 
 
 def build_observation_heads(config: ProjectConfig | None = None) -> ObservationHeads:
-    if config is None:
-        raise ValueError("build_observation_heads requires a validated ProjectConfig")
     return ObservationHeads(config)
 
 
-def _require_float_shape(tensor: Tensor, last_dim: int, name: str) -> None:
-    if tensor.ndim != 3 or tensor.shape[-1] != last_dim or not torch.is_floating_point(tensor):
-        raise ValueError(f"{name} must be floating [B, N, {last_dim}]")
-
-
-def _validate_soft_axis_output(
-    logits: Tensor,
-    probabilities: Tensor,
-    valid_mask: Tensor,
-    timestamps: Tensor,
-    position_ids: Tensor,
-    *,
-    last_dim: int,
-    name: str,
-) -> None:
-    _require_float_shape(logits, last_dim, f"{name} logits")
-    if (
-        probabilities.shape != logits.shape
-        or not torch.is_floating_point(probabilities)
-        or probabilities.dtype != logits.dtype
-        or probabilities.device != logits.device
-    ):
-        raise ValueError(f"{name} probabilities must match logits")
-    shape = logits.shape[:2]
-    if (
-        valid_mask.shape != shape
-        or valid_mask.dtype != torch.bool
-        or valid_mask.device != logits.device
-    ):
-        raise ValueError(f"{name} valid_mask must be bool [B, N]")
-    if (
-        timestamps.shape != shape
-        or timestamps.dtype not in (torch.float32, torch.float64)
-        or timestamps.device != logits.device
-    ):
-        raise ValueError(f"{name} timestamps must be FP32/FP64 [B, N]")
-    if (
-        position_ids.shape != shape
-        or position_ids.dtype != torch.int64
-        or position_ids.device != logits.device
-    ):
-        raise ValueError(f"{name} position_ids must be int64 [B, N]")
-    if logits.device.type == "meta":
-        return
-    if not bool(torch.isfinite(logits).all()) or not bool(torch.isfinite(probabilities).all()):
-        raise ValueError(f"{name} outputs must be finite")
-    if bool(torch.any((probabilities < 0.0) | (probabilities > 1.0))):
-        raise ValueError(f"{name} probabilities must stay within [0, 1]")
-    if bool(torch.any(logits[~valid_mask] != 0.0)) or bool(
-        torch.any(probabilities[~valid_mask] != 0.0)
-    ):
-        raise ValueError(f"invalid {name} outputs must be zero")
-    if bool(torch.any(timestamps[~valid_mask] != -1.0)):
-        raise ValueError(f"invalid {name} timestamps must use -1")
-    if bool(torch.any(position_ids[~valid_mask] != -1)):
-        raise ValueError(f"invalid {name} position IDs must use -1")
-    valid_times = timestamps[valid_mask]
-    if valid_times.numel() and (
-        not bool(torch.isfinite(valid_times).all()) or bool(torch.any(valid_times < 0.0))
-    ):
-        raise ValueError(f"valid {name} timestamps must be finite and non-negative")
-    if bool(torch.any(position_ids[valid_mask] < 0)):
-        raise ValueError(f"valid {name} position IDs must be non-negative")
-
-
-def _validate_spatial_head_inputs(
-    module: nn.Module,
+def _prepare_spatial_head_inputs(
     slots: Tensor,
     valid_mask: Tensor,
     observation_timestamps: Tensor,
     observation_position_ids: Tensor,
-    *,
-    name: str,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    _require_float_shape(slots, 768, f"{name} slots")
-    batch_size, slot_count = slots.shape[:2]
-    if (
-        valid_mask.shape != (batch_size, slot_count)
-        or valid_mask.dtype != torch.bool
-        or valid_mask.device != slots.device
-    ):
-        raise ValueError(f"{name} slot_valid_mask must be bool [B, K]")
-    if (
-        observation_timestamps.shape != (batch_size,)
-        or observation_timestamps.dtype not in (torch.float32, torch.float64)
-        or observation_timestamps.device != slots.device
-    ):
-        raise ValueError(f"{name} observation_timestamps must be FP32/FP64 [B]")
-    if (
-        observation_position_ids.shape != (batch_size,)
-        or observation_position_ids.dtype != torch.int64
-        or observation_position_ids.device != slots.device
-    ):
-        raise ValueError(f"{name} observation_position_ids must be int64 [B]")
-    _validate_module_dtype_device(module, slots, name)
+    slot_count = slots.shape[1]
     expanded = observation_timestamps.unsqueeze(1).expand(-1, slot_count)
     expanded = torch.where(valid_mask, expanded, torch.full_like(expanded, -1.0))
     expanded_positions = observation_position_ids.unsqueeze(1).expand(-1, slot_count)
@@ -1300,118 +1119,21 @@ def _validate_spatial_head_inputs(
         torch.full_like(expanded_positions, -1),
     )
     safe_slots = torch.where(valid_mask.unsqueeze(-1), slots, 0.0)
-    if slots.device.type != "meta":
-        if not bool(torch.isfinite(safe_slots).all()):
-            raise ValueError(f"valid {name} slots must be finite")
-        valid_times = expanded[valid_mask]
-        if valid_times.numel() and (
-            not bool(torch.isfinite(valid_times).all()) or bool(torch.any(valid_times < 0.0))
-        ):
-            raise ValueError(f"valid {name} observation timestamps must be legal")
-        if bool(torch.any(expanded_positions[valid_mask] < 0)):
-            raise ValueError(f"valid {name} observation position IDs must be legal")
     return safe_slots, expanded.clone(), expanded_positions.clone()
 
 
-def _validate_temporal_head_inputs(
-    module: nn.Module,
+def _prepare_temporal_head_inputs(
     hidden: Tensor,
     valid_mask: Tensor,
     timestamps: Tensor,
-    position_ids: Tensor,
-    *,
-    name: str,
 ) -> tuple[Tensor, Tensor]:
-    _require_float_shape(hidden, 768, f"{name} hidden")
-    batch_size, time_count = hidden.shape[:2]
-    if (
-        valid_mask.shape != (batch_size, time_count)
-        or valid_mask.dtype != torch.bool
-        or valid_mask.device != hidden.device
-    ):
-        raise ValueError(f"{name} valid_mask must be bool [B, T]")
-    if (
-        time_count > 1
-        and hidden.device.type != "meta"
-        and bool(torch.any(valid_mask[:, 1:] & ~valid_mask[:, :-1]))
-    ):
-        raise ValueError(f"{name} valid_mask must be a valid prefix")
-    if (
-        timestamps.shape != (batch_size, time_count)
-        or timestamps.dtype not in (torch.float32, torch.float64)
-        or timestamps.device != hidden.device
-    ):
-        raise ValueError(f"{name} timestamps must be FP32/FP64 [B, T]")
-    if (
-        position_ids.shape != (batch_size, time_count)
-        or position_ids.dtype != torch.int64
-        or position_ids.device != hidden.device
-    ):
-        raise ValueError(f"{name} position_ids must be int64 [B, T]")
-    _validate_module_dtype_device(module, hidden, name)
     safe_hidden = torch.where(valid_mask.unsqueeze(-1), hidden, 0.0)
     normalized_timestamps = torch.where(
         valid_mask,
         timestamps.to(dtype=torch.float64),
         torch.full_like(timestamps, -1.0, dtype=torch.float64),
     )
-    if hidden.device.type != "meta":
-        if not bool(torch.isfinite(safe_hidden).all()):
-            raise ValueError(f"valid {name} hidden states must be finite")
-        if bool(torch.any(timestamps[~valid_mask] != -1.0)) or bool(
-            torch.any(position_ids[~valid_mask] != -1)
-        ):
-            raise ValueError(f"invalid {name} temporal metadata must use -1")
-        for row in range(batch_size):
-            count = int(valid_mask[row].sum().item())
-            if not count:
-                continue
-            valid_times = normalized_timestamps[row, :count]
-            valid_positions = position_ids[row, :count]
-            if (
-                not bool(torch.isfinite(valid_times).all())
-                or bool(torch.any(valid_times < 0.0))
-                or bool(torch.any(valid_positions < 0))
-            ):
-                raise ValueError(f"valid {name} temporal metadata must be legal")
-            if count > 1 and (
-                bool(torch.any(valid_times[1:] <= valid_times[:-1]))
-                or bool(torch.any(valid_positions[1:] != valid_positions[:-1] + 1))
-            ):
-                raise ValueError(f"valid {name} temporal metadata must increase strictly")
     return safe_hidden, normalized_timestamps
-
-
-def _validate_module_dtype_device(module: nn.Module, inputs: Tensor, name: str) -> None:
-    for parameter in module.parameters():
-        if parameter.dtype != inputs.dtype or parameter.device != inputs.device:
-            raise ValueError(f"{name} module and inputs must share dtype/device")
-
-
-def _validate_count_prediction(prediction: Tensor, reference: Tensor, name: str) -> None:
-    if (
-        prediction.shape != (reference.shape[0],)
-        or not torch.is_floating_point(prediction)
-        or prediction.dtype != reference.dtype
-        or prediction.device != reference.device
-    ):
-        raise ValueError(f"{name} count_prediction must match logits as floating [B]")
-    if prediction.device.type != "meta" and (
-        not bool(torch.isfinite(prediction).all()) or bool(torch.any(prediction < 0.0))
-    ):
-        raise ValueError(f"{name} count_prediction must be finite and non-negative")
-
-
-def _validate_query(query: Tensor, reference: Tensor, query_dim: int, name: str) -> None:
-    if (
-        query.shape != (reference.shape[0], query_dim)
-        or not torch.is_floating_point(query)
-        or query.dtype != reference.dtype
-        or query.device != reference.device
-    ):
-        raise ValueError(f"{name} q_target must match inputs as floating [B, {query_dim}]")
-    if query.device.type != "meta" and not bool(torch.isfinite(query).all()):
-        raise ValueError(f"{name} q_target must be finite")
 
 
 def _normalize_stream_owners(
@@ -1422,68 +1144,16 @@ def _normalize_stream_owners(
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     videos = tuple(video_ids)
     trajectories = tuple(trajectory_ids)
-    if (
-        len(videos) != batch_size
-        or any(not value for value in videos)
-        or len(set(videos)) != batch_size
-    ):
-        raise ValueError(f"{name} requires unique non-empty video_ids")
-    if len(trajectories) != batch_size or any(not value for value in trajectories):
-        raise ValueError(f"{name} requires one non-empty trajectory_id per row")
     return videos, trajectories
-
-
-def _validate_query_signatures(
-    signatures: Tensor,
-    reference: Tensor,
-    video_ids: tuple[str, ...],
-    name: str,
-) -> None:
-    if (
-        signatures.shape != (len(video_ids), 512)
-        or not torch.is_floating_point(signatures)
-        or signatures.dtype != reference.dtype
-        or signatures.device != reference.device
-    ):
-        raise ValueError(f"{name} query_signatures must match inputs as floating [B, 512]")
-    if signatures.device.type != "meta" and not bool(torch.isfinite(signatures).all()):
-        raise ValueError(f"{name} query_signatures must be finite")
 
 
 def _normalize_stream_states[StateT: (E1RuntimeState, E2RuntimeState)](
     states: Sequence[StateT | None] | None,
     batch_size: int,
-    state_class: type[StateT],
-    name: str,
 ) -> tuple[StateT | None, ...]:
     if states is None:
         return (None,) * batch_size
-    normalized = tuple(states)
-    if len(normalized) != batch_size or any(
-        state is not None and not isinstance(state, state_class) for state in normalized
-    ):
-        raise ValueError(f"{name} requires one {state_class.__name__} or None per batch row")
-    return normalized
-
-
-def _validate_stream_prior_states(
-    states: Sequence[E1RuntimeState | None] | Sequence[E2RuntimeState | None],
-    owners: tuple[tuple[str, ...], tuple[str, ...]],
-    signatures: Tensor,
-    reference: Tensor,
-    name: str,
-) -> None:
-    for row, state in enumerate(states):
-        if state is None:
-            continue
-        if state.video_id != owners[0][row] or state.trajectory_id != owners[1][row]:
-            raise ValueError(f"{name} runtime owner must match its exact batch row")
-        anchor = state.projected_history if isinstance(state, E1RuntimeState) else state.hidden
-        if anchor.dtype != reference.dtype or anchor.device != reference.device:
-            raise ValueError(f"{name} runtime and inputs must share dtype/device")
-        if not torch.equal(state.query_signature, signatures[row].detach()):
-            raise ValueError(f"{name} runtime query signature drift requires reset")
-    _assert_stream_state_storage_isolated(states, name)
+    return tuple(states)
 
 
 def _runtime_tensor(tensor: Tensor, detach: bool) -> Tensor:
@@ -1516,163 +1186,3 @@ def _clone_e2_state(state: E2RuntimeState, *, detach: bool) -> E2RuntimeState:
         differentiable=not detach,
     )
 
-
-def _validate_stream_state_fields(
-    state: E1RuntimeState | E2RuntimeState,
-    anchor: Tensor,
-    anchor_name: str,
-    length: int,
-    name: str,
-) -> None:
-    if (
-        state.query_signature.shape != (512,)
-        or not torch.is_floating_point(state.query_signature)
-        or state.query_signature.dtype != anchor.dtype
-        or state.query_signature.device != anchor.device
-    ):
-        raise ValueError(f"{name} query_signature must match {anchor_name} as floating [512]")
-    if (
-        state.timestamps.shape != (length,)
-        or state.timestamps.dtype != torch.float64
-        or state.timestamps.device != anchor.device
-    ):
-        raise ValueError(f"{name} runtime timestamps must be float64 [L]")
-    if (
-        state.position_ids.shape != (length,)
-        or state.position_ids.dtype != torch.int64
-        or state.position_ids.device != anchor.device
-    ):
-        raise ValueError(f"{name} runtime position_ids must be int64 [L]")
-    if type(state.total_seen) is not int or state.total_seen < 0:
-        raise ValueError(f"{name} runtime total_seen must be a non-negative integer")
-    if type(state.differentiable) is not bool:
-        raise TypeError(f"{name} runtime differentiable must be a bool")
-    if not state.differentiable and any(
-        tensor.requires_grad for tensor in _stream_state_tensors(state)
-    ):
-        raise ValueError(f"non-differentiable {name} runtime tensors must be detached")
-
-
-def _stream_state_tensors(state: E1RuntimeState | E2RuntimeState) -> tuple[Tensor, ...]:
-    values = (getattr(state, entry.name) for entry in fields(state))
-    return tuple(value for value in values if isinstance(value, Tensor))
-
-
-def _assert_stream_state_storage_isolated(
-    states: Sequence[E1RuntimeState | None] | Sequence[E2RuntimeState | None],
-    name: str,
-) -> None:
-    assert_storage_disjoint(
-        tuple(_stream_state_tensors(state) for state in states if state is not None),
-        f"{name} runtime batch rows must not share mutable storage",
-    )
-
-
-def _validate_observation_heads_config(config: ObservationHeadsConfig) -> None:
-    expected: dict[str, object] = {
-        "temporal_input_conditioning": "inherited_query_conditioned_h_t",
-        "raw_logits": True,
-        "debug_probabilities": True,
-        "output_valid_mask": True,
-        "output_timestamps": True,
-        "output_position_ids": True,
-        "invalid_output_policy": "zero_tensors_negative_one_metadata",
-        "online_frozen": True,
-        "online_forward_no_grad": False,
-        "detach_inputs": False,
-        "hard_state_mutation": False,
-    }
-    _validate_config_fields(config, expected, "Observation Heads")
-
-
-def _validate_o1_config(config: O1Config) -> None:
-    expected: dict[str, object] = {
-        "input_dim": 768,
-        "query_dim": 512,
-        "film_dim": 1536,
-        "hidden_dims": (1024, 1024),
-        "output_dim": 6,
-        "layer_norm_eps": 1.0e-5,
-        "activation": "silu",
-        "film_mode": "one_plus_scale_and_shift",
-        "output_names": O1SoftOutput.LOGIT_NAMES,
-        "dropout": 0.0,
-        "linear_bias": True,
-        "parameter_count": 2_632_710,
-    }
-    _validate_config_fields(config, expected, "O1")
-
-
-def _validate_o2_config(config: O2Config) -> None:
-    expected: dict[str, object] = {
-        "input_dim": 768,
-        "hidden_dims": (1024, 1024),
-        "identity_dim": 256,
-        "score_dim": 2,
-        "layer_norm_eps": 1.0e-5,
-        "activation": "silu",
-        "dropout": 0.0,
-        "linear_bias": True,
-        "identity_normalization": "l2_fp32_unit_basis_fallback",
-        "normalization_eps": 1.0e-8,
-        "score_names": O2SoftOutput.SCORE_NAMES,
-        "parameter_count": 2_631_171,
-    }
-    _validate_config_fields(config, expected, "O2")
-
-
-def _validate_e1_config(config: E1Config) -> None:
-    expected: dict[str, object] = {
-        "input_dim": 768,
-        "channels": 512,
-        "num_layers": 5,
-        "kernel_size": 3,
-        "dilations": (1, 2, 4, 8, 16),
-        "output_dim": 3,
-        "layer_norm_eps": 1.0e-5,
-        "activation": "silu_filter_sigmoid_gate",
-        "strict_causal": True,
-        "batch_norm": False,
-        "dropout": 0.0,
-        "convolution_bias": True,
-        "causal_padding": "left",
-        "receptive_field": 63,
-        "streaming_state_mode": "projected_history",
-        "overlap_tubelets": 4,
-        "history_tubelets": 66,
-        "state_owner_keys": ("video_id", "trajectory_id", "query_signature"),
-        "detach_runtime_default": True,
-        "output_names": E1SoftOutput.LOGIT_NAMES,
-        "parameter_count": 9_717_252,
-    }
-    _validate_config_fields(config, expected, "E1")
-
-
-def _validate_e2_config(config: E2Config) -> None:
-    expected: dict[str, object] = {
-        "input_dim": 768,
-        "hidden_dim": 768,
-        "num_layers": 2,
-        "event_output_dim": 4,
-        "phase_output_dim": 4,
-        "layer_norm_eps": 1.0e-5,
-        "bidirectional": False,
-        "batch_first": True,
-        "bias": True,
-        "dropout": 0.0,
-        "streaming_state_mode": "hidden_with_rollback_checkpoints",
-        "overlap_tubelets": 4,
-        "checkpoint_tubelets": 5,
-        "state_owner_keys": ("video_id", "trajectory_id", "query_signature"),
-        "detach_runtime_default": True,
-        "event_names": E2SoftOutput.EVENT_NAMES,
-        "phase_names": E2SoftOutput.PHASE_NAMES,
-        "parameter_count": 7_293_449,
-    }
-    _validate_config_fields(config, expected, "E2")
-
-
-def _validate_config_fields(config: object, expected: dict[str, object], name: str) -> None:
-    for field_name, required in expected.items():
-        if getattr(config, field_name) != required:
-            raise ValueError(f"P8 requires {name} {field_name}={required!r}")

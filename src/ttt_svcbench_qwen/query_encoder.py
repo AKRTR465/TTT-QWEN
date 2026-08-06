@@ -1016,31 +1016,18 @@ _RANGE_PATTERNS = (
 )
 
 
-def _parse_time_candidate(question: str) -> tuple[_TimeCandidate | None, str | None]:
-    if _NEGATIVE_TIME_PATTERN.search(question):
-        return None, "negative_time_value"
-    if _UNSUPPORTED_TIME_UNIT_PATTERN.search(question):
-        return None, "unsupported_time_unit"
-    candidates: list[_TimeCandidate] = []
+def _parse_time_candidate(question: str) -> _TimeCandidate | None:
+    """First-match-wins regex window extraction; no match falls back to the operator default."""
+
     for pattern in _RANGE_PATTERNS:
-        for match in pattern.finditer(question):
+        match = pattern.search(question)
+        if match is not None:
             start_unit = match.group("start_unit") or match.group("end_unit")
-            end_unit = match.group("end_unit")
             start = _to_seconds(float(match.group("start")), start_unit)
-            end = _to_seconds(float(match.group("end")), end_unit)
-            candidates.append(
-                _TimeCandidate(
-                    mode=TimeWindowMode.EXPLICIT_RANGE,
-                    values_seconds=(start, end),
-                    char_span=match.span(),
-                    start_component_span=(
-                        match.start("start"),
-                        match.end("start_unit")
-                        if match.group("start_unit")
-                        else match.end("start"),
-                    ),
-                    end_component_span=(match.start("end"), match.end("end_unit")),
-                )
+            end = _to_seconds(float(match.group("end")), match.group("end_unit"))
+            return _TimeCandidate(
+                mode=TimeWindowMode.EXPLICIT_RANGE,
+                values_seconds=(start, end),
             )
     for pattern in _RECENT_PATTERNS:
         for match in pattern.finditer(question):
@@ -1051,46 +1038,11 @@ def _parse_time_candidate(question: str) -> tuple[_TimeCandidate | None, str | N
                 _to_seconds(float(component.group("value")), component.group("unit"))
                 for component in components
             )
-            body_start = match.start("body")
-            first = components[0]
-            last = components[-1]
-            candidates.append(
-                _TimeCandidate(
-                    mode=TimeWindowMode.RECENT,
-                    values_seconds=(duration,),
-                    char_span=match.span(),
-                    start_component_span=(
-                        body_start + first.start(),
-                        body_start + first.end(),
-                    ),
-                    end_component_span=(
-                        body_start + last.start(),
-                        body_start + last.end(),
-                    ),
-                )
+            return _TimeCandidate(
+                mode=TimeWindowMode.RECENT,
+                values_seconds=(duration,),
             )
-    unique = {
-        (candidate.mode, candidate.char_span, candidate.values_seconds): candidate
-        for candidate in candidates
-    }
-    candidates = list(unique.values())
-    if len(candidates) > 1:
-        return None, "ambiguous_time_expression"
-    all_components = tuple(_TIME_COMPONENT_PATTERN.finditer(question))
-    if not candidates:
-        if all_components:
-            return None, "unsupported_time_syntax"
-        return None, None
-    candidate = candidates[0]
-    if any(
-        not (
-            candidate.char_span[0] <= component.start()
-            and component.end() <= candidate.char_span[1]
-        )
-        for component in all_components
-    ):
-        return None, "ambiguous_time_expression"
-    return candidate, None
+    return None
 
 
 def _to_seconds(value: float, unit: str) -> float:
@@ -1100,101 +1052,35 @@ def _to_seconds(value: float, unit: str) -> float:
     return value
 
 
-def _select_numeric_token_span(
-    row: int,
-    candidate: _TimeCandidate,
-    logits: TimeResolverLogits,
-    tokens: QuestionTokenBatch,
-) -> tuple[tuple[int, int] | None, str | None]:
-    offsets = tokens.offset_mapping[row]
-    valid_width = tokens.spans[row].end
-    start_index = int(torch.argmax(logits.span_start_logits[row, :valid_width]).item())
-    end_index = int(torch.argmax(logits.span_end_logits[row, :valid_width]).item())
-    if start_index > end_index:
-        return None, "pointer_order_invalid"
-    if bool(tokens.padding_mask[row, start_index]) or bool(tokens.padding_mask[row, end_index]):
-        return None, "pointer_selected_padding"
-    start_candidates = _tokens_overlapping(offsets, valid_width, candidate.start_component_span)
-    end_candidates = _tokens_overlapping(offsets, valid_width, candidate.end_component_span)
-    if not start_candidates or not end_candidates:
-        return None, "numeric_expression_has_no_token_alignment"
-    if start_index not in start_candidates or end_index not in end_candidates:
-        return None, "pointer_outside_numeric_expression"
-    selected_char_start = int(offsets[start_index, 0].item())
-    selected_char_end = int(offsets[end_index, 1].item())
-    required_char_start = candidate.start_component_span[0]
-    required_char_end = candidate.end_component_span[1]
-    if selected_char_start > required_char_start or selected_char_end < required_char_end:
-        return None, "pointer_does_not_cover_numeric_expression"
-    return (start_index, end_index + 1), None
-
-
-def _time_values_match(actual: tuple[float, ...], expected: tuple[float, ...]) -> bool:
-    return actual == expected
-
-
-def _tokens_overlapping(
-    offsets: Tensor,
-    valid_width: int,
-    char_span: tuple[int, int],
-) -> tuple[int, ...]:
-    char_start, char_end = char_span
-    indices = []
-    for index in range(valid_width):
-        token_start, token_end = (int(value) for value in offsets[index].tolist())
-        if token_end > token_start and token_end > char_start and token_start < char_end:
-            indices.append(index)
-    return tuple(indices)
-
-
 def _build_time_window(
     mode: TimeWindowMode,
     query_time: float,
     values: tuple[float, ...],
-) -> tuple[TimeWindow | None, str | None]:
+) -> TimeWindow:
+    """Always return a window; endpoints are clamped into [0, query_time] and ordered."""
+
+    upper = max(query_time, 0.0)
     if mode is TimeWindowMode.NOW:
-        if values:
-            return None, "now_mode_cannot_consume_numeric_window"
-        return TimeWindow(mode, query_time, None, query_time, True), None
+        return TimeWindow(mode, upper, None, upper, True)
     if mode is TimeWindowMode.HISTORY:
-        if values:
-            return None, "history_mode_cannot_consume_numeric_window"
-        return TimeWindow(mode, query_time, 0.0, query_time, True), None
+        return TimeWindow(mode, upper, 0.0, upper, True)
     if mode is TimeWindowMode.RECENT:
-        if len(values) != 1:
-            return None, "recent_requires_one_duration"
-        duration = values[0]
-        if duration <= 0.0:
-            return None, "recent_duration_must_be_positive"
-        if duration > query_time:
-            return None, "recent_window_starts_before_video"
-        return TimeWindow(
-            mode,
-            query_time,
-            query_time - duration,
-            query_time,
-            True,
-        ), None
-    if len(values) != 2:
-        return None, "explicit_range_requires_two_endpoints"
-    start, end = values
-    if start > end:
-        return None, "explicit_range_is_reversed"
-    if end > query_time:
-        return None, "explicit_range_ends_after_query_time"
-    return TimeWindow(mode, query_time, start, end, True), None
+        duration = values[0] if values else upper
+        start = min(max(upper - duration, 0.0), upper)
+        return TimeWindow(mode, upper, start, upper, True)
+    if len(values) >= 2:
+        start, end = sorted(values[:2])
+    else:
+        start, end = 0.0, upper
+    start = min(max(start, 0.0), upper)
+    end = min(max(end, start), upper)
+    return TimeWindow(mode, upper, start, end, True)
 
 
 def _failed_time_resolution(
     query_time: float,
     mode: TimeWindowMode,
-    confidence: float,
     status: TimeResolutionStatus,
-    reason: str,
-    *,
-    numeric_span: tuple[int, int] | None = None,
-    parsed_values: tuple[float, ...] = (),
-    used_default: bool = False,
 ) -> TimeResolution:
     return TimeResolution(
         window=TimeWindow(
@@ -1205,9 +1091,4 @@ def _failed_time_resolution(
             valid=False,
         ),
         status=status,
-        reason=reason,
-        mode_confidence=confidence,
-        numeric_span=numeric_span,
-        parsed_values_seconds=parsed_values,
-        used_operator_default=used_default,
     )
