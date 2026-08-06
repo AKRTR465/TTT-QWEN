@@ -20,7 +20,6 @@ from ttt_svcbench_qwen.config import (
     E2Config,
     O1Config,
     O2Config,
-    ObservationHeadsConfig,
     ProjectConfig,
 )
 from ttt_svcbench_qwen.state_encoder import SpatialEncoderOutput, TemporalEncoderOutput

@@ -7,7 +7,6 @@ Forbidden: identity matching, retrieval, Reader arithmetic, gradients in runtime
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -17,14 +16,9 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from ttt_svcbench_qwen.config import (
-    ProjectConfig,
-    SemanticProjectorConfig,
-    StateBankConfig,
-)
+from ttt_svcbench_qwen.config import ProjectConfig, SemanticProjectorConfig
 from ttt_svcbench_qwen.identity_bank import CandidateIdentity, ConfirmedIdentity
 from ttt_svcbench_qwen.observation_heads import E1SoftOutput, E2SoftOutput, O1SoftOutput
-from ttt_svcbench_qwen.tensor_contracts import assert_storage_disjoint, tensor_storage_key
 
 if TYPE_CHECKING:
     from ttt_svcbench_qwen.query_encoder import Operator
@@ -35,16 +29,6 @@ class HeadType(StrEnum):
     O2 = "o2"
     E1 = "e1"
     E2 = "e2"
-
-
-class StateRecordKind(StrEnum):
-    """Distinguish lifecycle subtypes that share one coarse observation head."""
-
-    O1_AGGREGATE = "o1_aggregate"
-    O2_CANDIDATE = "o2_candidate"
-    O2_CONFIRMED = "o2_confirmed"
-    E1_AGGREGATE = "e1_aggregate"
-    E2_AGGREGATE = "e2_aggregate"
 
 
 class E2Phase(StrEnum):
@@ -76,6 +60,7 @@ class O1SlotState:
     last_position_id: int
     confidence: float
 
+
 @dataclass(frozen=True, slots=True)
 class O1Payload:
     current_visible_count: int
@@ -89,6 +74,7 @@ class O1Payload:
     update_count: int = 0
     last_spatial_overflow_count: int = 0
 
+
 @dataclass(frozen=True, slots=True)
 class E1Payload:
     event_kind: E1EventKind
@@ -101,6 +87,7 @@ class E1Payload:
     last_timestamp: float = -1.0
     last_position_id: int = -1
 
+
 @dataclass(frozen=True, slots=True)
 class E2Payload:
     event_kind: E2EventKind
@@ -111,6 +98,7 @@ class E2Payload:
     current_start: float | None = None
     last_timestamp: float = -1.0
     last_position_id: int = -1
+
 
 type StatePayload = O1Payload | CandidateIdentity | ConfirmedIdentity | E1Payload | E2Payload
 type AuditValue = str | int | float | bool | None
@@ -128,6 +116,7 @@ class StateRecord:
     valid: bool
     confidence: float
     payload: StatePayload
+
 
 @dataclass(frozen=True, slots=True)
 class RetrievalHistoryRecord:
@@ -1489,24 +1478,5 @@ def _select_semantics(semantics: Tensor, shape: torch.Size, row: int) -> Tensor:
     return semantics
 
 
-def _float_close(left: float, right: float) -> bool:
-    scale = max(abs(left), abs(right), 1.0)
-    return abs(left - right) <= 4.0 * float(torch.finfo(torch.float32).eps) * scale
-
-
-def _same_o1_evidence(left: O1SlotState, right: O1SlotState) -> bool:
-    return (
-        left.slot_id == right.slot_id
-        and left.is_object == right.is_object
-        and left.is_target == right.is_target
-        and left.visible == right.visible
-        and left.enter == right.enter
-        and left.exit == right.exit
-        and _float_close(left.confidence, right.confidence)
-    )
-
-
 def _canonical_audit_time(state: StateBankRuntimeState, timestamp: float) -> float:
     return max(timestamp, state.audit_log[-1].timestamp if state.audit_log else 0.0)
-
-

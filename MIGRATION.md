@@ -29,7 +29,7 @@
 | src（39 → 31 文件） | 44,533 | 20,957 | **−23,576（−52.9%）** |
 | tests（50 → 24 文件） | 25,318 | 11,171 | **−14,147（−55.9%）** |
 | 文档（9 → 1 份） | 2,322 | 115 | **−2,207（−95.0%）** |
-| 脚本（30 → 6） | ~4,000 | ~1,100 | **−2,900（−72.5%）** |
+| 脚本（30 → 7） | ~4,000 | ~1,430 | **−2,570（−64.3%）** |
 | 配置（14 → 6） | ~1,500 | ~850 | −650（−43.3%） |
 | **合计** | **~77,673** | **~34,193** | **−43,480（−56.0%）** |
 
@@ -212,7 +212,7 @@
 
 ## 6. 脚本 / 配置 / 目录
 
-**脚本 30 → 6**（含核验后的削减目标）：
+**脚本 30 → 7**（含核验后的削减目标）：
 
 | 保留 | LOC | 说明 |
 |---|---|---|
@@ -220,7 +220,7 @@
 | `h200/train_fullprefix256.sh` | 32→18 | 只留 a2 分支 |
 | `h200/train_a5_fast_state_warmup.sh` | 49→25 | |
 | `h200/train_a5_associative_lttt_finalonly.sh` | 53→26 | |
-| ~~`h200/train_a2_a5.sh`~~ | **删除** | **改判为删除。** 它是未文档化的便捷串联脚本：README 与 `docs/production-a2-a5.md` **都不提它**，且它 `:125` 指向 `a5_meta_ttt_k8_fullprefix256_4gpu.yaml`（2 epoch、无 `qwen_outer_trainability`），与 §2.1.1 认定的 M3 正式配置不同。保留它就等于保留第二条 A5-main 分支 |
+| `h200/train_a2_a5.sh` | 331→331 | **保留（执行期修正，见 §16.1）。** 我先前判它可删，是错的：三个主线脚本**全部**通过它转发到 `launch_4gpu.sh`（`train_fullprefix256.sh:32`、`train_a5_fast_state_warmup.sh:49`、`train_a5_associative_lttt_finalonly.sh:53` 都是 `exec bash train_a2_a5.sh`）。它是共享的启动器主体，删掉等于删掉 A2 启动路径。只把它 `:125` 的 a5 默认配置改指向存活的 M3 配置 |
 | `h200/prewarm_preprocess_cache.sh` | 198→100 | 保留 `shard_XX.exit` 与失败计数（L128/134-137） |
 | `preprocess_cache.py` | 442→250 | 保留 `prewarm --summary` |
 | `prepare_svcbench_episodes.py` | 366→250 | 保留 L59 `run_config.json`（记录 fold 0 / seed 42 / truncation_horizon 8 / world_size） |
@@ -506,6 +506,34 @@ A5 streamed 路径把它们当系数读回：`compose_one_from_audit` 读 `term.
 1. per-video Bank 隔离的替代测试（约 25 行）—— §14.I 已给出规格，需实现；
 2. `tests/support/runtime_factories.py` 的重写（296 → 240）—— §14.H，必须在第 4 步之前完成，
    否则整套测试在 collection 阶段就 TypeError。
+
+---
+
+## 16. 执行期发现的计划错误（迁移过程中实测修正）
+
+按本报告执行时发现的、报告本身写错的地方。记录在此，因为它们都是"看文档判断"会犯而"实际跑一遍"才会暴露的错。
+
+1. **`scripts/h200/train_a2_a5.sh` 不可删（§6 已就地更正）。**
+   我依据"README 与 docs 都不提它"判它为未文档化的便捷脚本。实际上三个主线脚本全部
+   `exec bash train_a2_a5.sh`，它再 `exec bash launch_4gpu.sh` —— 它是共享启动器主体。
+   删掉后 `train_fullprefix256.sh a2`（M1 的唯一入口）立即失效。
+   **教训**：判断脚本是否 dead 必须看它是否被 `exec`/`source`，只看"文档里有没有提"会漏掉转发层。
+
+2. **`runtime_metrics` shim 是 35 行而非 12 行。** 保留 4 个调用形状 + 类型注解 + docstring 之后就是这个体量；
+   12 行的估算没有算上 `RuntimeTraceMode` 别名与 `@contextmanager` 的样板。
+
+3. **`json_contract.py` 维持 40 行，不缩到 20。** 执行者给出的理由成立且比我的更强：把 `string_value`
+   的 isinstance 检查换成 `str(value)` 会把缺失键（None）静默映射成字符串 `"None"`，
+   把 `integer_value` 换成 `int(value)` 会把 `3.7` 静默变成 `3`、`True` 变成 `1`。
+   这是"改错值"而不是"报错"，属于必须保留的纠正类检查。
+
+4. **`data.py` 落在 258 行而非 155。** 差额来自被指令保留的泄漏擦除、GroupKFold 与 `RuntimeQueryInput`；
+   155 的估算把它们算进了可删部分。
+
+5. **验收工具的选择**：`ruff --select F821` **查不出**本次迁移的主要破坏形态。删掉一个 Enum 成员或
+   dataclass 字段之后，`RetrievalReason.OWNER_MISMATCH` 这类跨文件引用是属性访问而非未定义名字，
+   F821 完全静默。**`mypy --follow-imports=skip` 的 `[attr-defined]` 与 `[call-arg]` 两类才是真正的验收门**
+   —— 它一次就精确列出了 31 处跨文件破坏及行号。任何按本报告执行的人都应该用它做每一步的 gate。
 
 ---
 
