@@ -542,7 +542,32 @@ A5 streamed 路径把它们当系数读回：`compose_one_from_audit` 读 `term.
    `make_stream_audit` 和已失效的 `confidence_gate_applied` kwarg）后，collection 错误 22→21、收集到的测试
    46→55。§14.H 把它列为"第 4 步之前必须先做"是对的。
 
-7. **验收工具的选择**：`ruff --select F821` **查不出**本次迁移的主要破坏形态。删掉一个 Enum 成员或
+7. **最危险的一处验证陷阱：venv 里的 editable 安装会把测试静默指向旧仓库。**
+   原仓库 venv 的 `site-packages/_editable_impl_ttt_svcbench_qwen.pth` 指向**原仓库**的 `src`。
+   因此在新仓库根目录直接跑 `python -m pytest`，导入的是原仓库那份**未改动的旧代码**。实测确认：
+
+   | 命令 | 实际导入 |
+   |---|---|
+   | `python -c "import ttt_svcbench_qwen as m; print(m.__file__)"` | `.../ttt-svcbench-qwen/src/...`（**旧仓库**）|
+   | `PYTHONPATH=<新仓库>/src python -c "同上"` | `.../re-ttt-qwen/src/...`（新仓库）|
+
+   后果很严重：任何未加 `PYTHONPATH` 前缀的 `pytest` 结果**完全无意义**，而且"绿"会误导人 ——
+   一个执行者报告"我这个文件对旧包 18/21 通过、对新包 21/21 通过"，两者结论相反。
+   最坏情况是有人据此把测试改成匹配旧 API。
+   **所有验证命令必须显式加 `PYTHONPATH=<新仓库>/src`**；`_audit/verify.sh` 已经这样做。
+
+8. **`make_stream_audit` 我删错了一次。**
+   我 grep 的是 `make_stream_replay` 与 `StreamReplayAudit`，没有 grep 真正的函数名 `make_stream_audit`，
+   于是误判"零调用者"。实际它有 **13 处调用**，分布在 4 个测试文件。
+   方向仍然正确（`E1RuntimeState`/`E2RuntimeState` 已无 `audit` 字段，工厂确实该删），
+   但必须同时删掉那 13 处 `audit=make_stream_audit(...)` kwarg。
+   **教训**：判断"零调用者"必须 grep 精确标识符；近似名字的 grep 会给出假阴性。
+
+9. **`mypy --follow-imports=skip` 逐文件跑会漏掉跨模块的删除。**
+   一个执行者报告它那半个文件"开始时 mypy 已经是干净的"，但它其实有两个已删除符号的导入错误 ——
+   `--follow-imports=skip` 会跳过跨模块属性检查。**必须对整个包跑一次**，不能只跑单文件。
+
+10. **验收工具的选择**：`ruff --select F821` **查不出**本次迁移的主要破坏形态。删掉一个 Enum 成员或
    dataclass 字段之后，`RetrievalReason.OWNER_MISMATCH` 这类跨文件引用是属性访问而非未定义名字，
    F821 完全静默。**`mypy --follow-imports=skip` 的 `[attr-defined]` 与 `[call-arg]` 两类才是真正的验收门**
    —— 它一次就精确列出了 31 处跨文件破坏及行号。任何按本报告执行的人都应该用它做每一步的 gate。
