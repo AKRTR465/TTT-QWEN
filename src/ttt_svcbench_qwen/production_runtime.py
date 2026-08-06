@@ -1509,6 +1509,11 @@ class ProductionA2LossStep:
             raw = self.runner(batch, training=True)
         finally:
             self.materializer.video.end_prefetch()
+        # The A2 episode runner always populates these three heads; narrow once here so the
+        # weak-target builder and the gradient anchors below see non-optional types.
+        raw_observations = cast(ObservationOutputs, raw.observations)
+        raw_query = cast(QueryEncoderOutput, raw.query)
+        raw_retrieval = cast(RetrieverOutput, raw.retrieval)
         mapped = map_teacher_forced_targets(
             composed_input=cast(ComposedInput, raw.composed_input),
             source_input_ids=raw.source_input_ids,
@@ -1524,9 +1529,9 @@ class ProductionA2LossStep:
             )
         )
         weak = self.weak_builder(
-            raw.observations,
-            raw.query,
-            raw.retrieval,
+            raw_observations,
+            raw_query,
+            raw_retrieval,
             batch.supervision.official_weak,
             dedup=raw.o2_dedup,
         )
@@ -1536,9 +1541,9 @@ class ProductionA2LossStep:
             (weak,),
             gradient_anchors=(
                 OfficialWeakGradientAnchors(
-                    q_target=raw.query.q_target,
-                    q_operator=raw.query.q_operator,
-                    q_time=raw.query.q_time,
+                    q_target=raw_query.q_target,
+                    q_operator=raw_query.q_operator,
+                    q_time=raw_query.q_time,
                 ),
             ),
         )
