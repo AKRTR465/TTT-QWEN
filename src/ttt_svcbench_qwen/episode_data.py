@@ -15,6 +15,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 
 from torch.utils.data import Dataset, Sampler
 
@@ -1221,7 +1222,7 @@ def _number_list(row: Mapping[str, object], key: str) -> tuple[float, ...]:
 
 
 def _number_pair(value: object, name: str) -> tuple[float, float]:
-    left, right = value  # type: ignore[misc]
+    left, right = cast(tuple[object, object], value)
     return (number_value(left, name), number_value(right, name))
 
 

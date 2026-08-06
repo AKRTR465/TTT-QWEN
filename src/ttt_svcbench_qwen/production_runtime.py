@@ -715,7 +715,7 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
             state_embedding_payload=_state_embedding_payload(prefill, input_ids),
             **kwargs,
         )
-        sequences = getattr(generated, "sequences", generated)
+        sequences = cast(Tensor, getattr(generated, "sequences", generated))
         new_tokens = sequences[:, input_ids.shape[1] :]
         decode = cast(Any, self.tokenizer).batch_decode
         texts = decode(new_tokens, skip_special_tokens=True)

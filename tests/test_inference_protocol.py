@@ -9,6 +9,10 @@ from typing import cast
 import pytest
 import torch
 from torch import Tensor
+from ttt_svcbench_qwen.associative_ttt import (
+    AssociativeTTTIntermediates,
+    FastAssociativeContext,
+)
 
 from tests.support import make_test_model as build_model
 from tests.support.runtime_factories import (
@@ -17,10 +21,6 @@ from tests.support.runtime_factories import (
     make_query_output,
     make_spatial_output,
     make_temporal_cache,
-)
-from ttt_svcbench_qwen.associative_ttt import (
-    AssociativeTTTIntermediates,
-    FastAssociativeContext,
 )
 from ttt_svcbench_qwen.config import AuditLevel, ProjectConfig, load_config
 from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter, build_fast_ttt_adapter

@@ -10,16 +10,16 @@ import pytest
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from ttt_svcbench_qwen.associative_ttt import (
+    AssociativeTTTIntermediates,
+    FastAssociativeContext,
+)
 
 import ttt_svcbench_qwen.meta_trainer as meta_trainer_module
 from tests.support.runtime_factories import (
     make_e1_state,
     make_e2_state,
     make_temporal_cache,
-)
-from ttt_svcbench_qwen.associative_ttt import (
-    AssociativeTTTIntermediates,
-    FastAssociativeContext,
 )
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.data import RuntimeQueryInput, assert_runtime_payload_safe

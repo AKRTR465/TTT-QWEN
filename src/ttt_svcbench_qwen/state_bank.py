@@ -1408,7 +1408,9 @@ def _clone_retrieval_record(record: RetrievalHistoryRecord) -> RetrievalHistoryR
 
 
 def _find_record_index(state: StateBankRuntimeState, record_id: str) -> int:
-    return next(index for index, record in enumerate(state.records) if record.record_id == record_id)
+    return next(
+        index for index, record in enumerate(state.records) if record.record_id == record_id
+    )
 
 
 def _next_available_record_id(state: StateBankRuntimeState) -> tuple[str, int]:
