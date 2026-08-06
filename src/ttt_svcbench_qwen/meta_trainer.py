@@ -21,20 +21,20 @@ from typing import Protocol, cast
 import torch
 from torch import Tensor, nn
 
-from ttt_svcbench_qwen.associative_ttt import (
-    ASSOCIATIVE_CONTRACT,
-    AssociativeTTTIntermediates,
-)
 from ttt_svcbench_qwen.config import ProjectConfig
 from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.fast_ttt import (
+    ASSOCIATIVE_CONTRACT,
+    AssociativeTTTIntermediates,
     FastMemoryState,
     FastTTTForwardAudit,
     MemoryWriteBatch,
-    SlotGeometryProbe,
+    MemoryWriteResult,
     SlotStateView,
+    apply_memory_writes,
     deferred_fast_vjp_loss,
     make_query_proxy_fast_state,
+    truncate_memory_states,
 )
 from ttt_svcbench_qwen.input_composer import ComposedInput, map_teacher_forced_targets
 from ttt_svcbench_qwen.losses import (
@@ -48,12 +48,6 @@ from ttt_svcbench_qwen.losses import (
     compute_answer_loss,
     compute_outer_loss,
     compute_state_loss,
-)
-from ttt_svcbench_qwen.memory_write import (
-    MemoryTruncateAudit,
-    MemoryWriteResult,
-    apply_memory_writes,
-    truncate_memory_state,
 )
 from ttt_svcbench_qwen.model import (
     BatchRuntimeState,

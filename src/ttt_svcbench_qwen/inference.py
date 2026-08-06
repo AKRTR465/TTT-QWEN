@@ -282,8 +282,8 @@ class PerVideoRuntimeManager:
 
         with self._lock:
             runtime = self._require_live_runtime()
-            fast = runtime.fast_weights
-            lifecycle = self._lifecycle
+            fast = cast(FastMemoryState, runtime.fast_weights)
+            lifecycle = cast(PrefillLifecycle, self._lifecycle)
             causal = chunk.causal_prefix(query_time)
             if causal is None:
                 return ChunkExecution(None, runtime)
@@ -339,7 +339,7 @@ class PerVideoRuntimeManager:
 
         with self._lock:
             runtime = self._require_live_runtime()
-            fast = runtime.fast_weights
+            fast = cast(FastMemoryState, runtime.fast_weights)
             owner = RuntimeOwner((runtime.video_id,), (runtime.trajectory_id,))
             observation = replace(
                 observation,
@@ -389,7 +389,6 @@ class PerVideoRuntimeManager:
                     ("reader_status", reader_result.status.value),
                     ("selected_record_count", len(reader_result.selected_record_ids)),
                     ("prefill_count", lifecycle_audit.prefill_count),
-                    ("decode_count", lifecycle_audit.decode_count),
                     ("final_write_version", fast.write_version),
                     ("final_write_count", fast.write_count),
                     ("final_skip_count", fast.skip_count),
@@ -409,7 +408,7 @@ class PerVideoRuntimeManager:
 
         with self._lock:
             runtime = self._require_live_runtime()
-            fast = runtime.fast_weights
+            fast = cast(FastMemoryState, runtime.fast_weights)
             causal = chunk.causal_prefix(query_time)
             if causal is None:
                 raise RuntimeError("Query observation contains no causal frame")
@@ -445,7 +444,7 @@ class PerVideoRuntimeManager:
 
     def _release_locked(self) -> TrajectoryRuntimeState:
         runtime = self._require_live_runtime()
-        temporal_cache = runtime.temporal_cache
+        temporal_cache = cast(TemporalCache, runtime.temporal_cache)
         released_bank = self.state_bank.release(runtime.state_bank)
         released_identity = self.identity_bank.release(runtime.identity_bank)
         if runtime.retrieval_history is not None:
@@ -528,7 +527,7 @@ def run_inference(
             attempt=request.attempt,
             max_new_tokens=request.max_new_tokens,
         )
-        released_state = manager.release()
+        released_state = cast(TrajectoryRuntimeState, manager.release())
         return replace(
             result,
             runtime_state=released_state,
@@ -745,7 +744,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         model_input=state_materialized,
     )
     processor = bundle.processor
-    apply_template = getattr(processor, "apply_chat_template", None)
+    apply_template = processor.apply_chat_template
     prompt = apply_template(
         [_user_message(query.question)], tokenize=False, add_generation_prompt=True
     )

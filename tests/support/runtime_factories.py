@@ -12,11 +12,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from ttt_svcbench_qwen.observation_heads import (
-    E1RuntimeState,
-    E2RuntimeState,
-    StreamReplayAudit,
-)
+from ttt_svcbench_qwen.observation_heads import E1RuntimeState, E2RuntimeState
 from ttt_svcbench_qwen.query_encoder import (
     OPERATOR_TO_HEAD_TYPE,
     Operator,
@@ -195,23 +191,6 @@ def make_e2_state(
     )
 
 
-def make_stream_audit(
-    head: str,
-    batch_size: int,
-    width: int,
-    *,
-    state_length: int | None = None,
-) -> StreamReplayAudit:
-    """Build a no-overlap stream audit; ``state_length`` defaults to ``width``."""
-    resolved = width if state_length is None else state_length
-    return StreamReplayAudit(
-        head,
-        (width,) * batch_size,
-        (0,) * batch_size,
-        (resolved,) * batch_size,
-    )
-
-
 def make_query_output(
     operators: tuple[Operator, ...],
     *,
@@ -230,7 +209,6 @@ def make_query_output(
         raw_indices=raw_indices,
         hard_operators=operators,
         head_types=tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in operators),
-        confidence_gate_applied=False,
     )
     time_logits = TimeResolverLogits(
         mode_logits=torch.zeros((batch_size, 4)),

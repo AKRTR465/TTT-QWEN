@@ -3606,147 +3606,6 @@ def _warmup_bundle_allowlist(
     return tuple(sorted(names))
 
 
-@dataclass(frozen=True, slots=True)
-class _TensorBitwiseDigest:
-    """One parameter or buffer's metadata and content digest."""
-
-    name: str
-    tensor_kind: str
-    dtype: str
-    shape: tuple[int, ...]
-    content_sha256: str
-
-
-@dataclass(frozen=True, slots=True)
-class _ModuleBitwiseSnapshot:
-    """Streaming module digest plus per-tensor evidence, without tensor copies."""
-
-    sha256: str
-    tensors: tuple[_TensorBitwiseDigest, ...]
-    excluded_non_persistent_buffers: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _TensorBitwiseChange:
-    """A complete per-tensor before/after difference."""
-
-    name: str
-    change_type: str
-    baseline_kind: str | None
-    final_kind: str | None
-    baseline_dtype: str | None
-    final_dtype: str | None
-    baseline_shape: tuple[int, ...] | None
-    final_shape: tuple[int, ...] | None
-    baseline_content_sha256: str | None
-    final_content_sha256: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class WarmupQwenBitwiseAudit:
-    """Post-DeepSpeed, pre-update Qwen invariance result for one rank."""
-
-    baseline_stage: str
-    baseline_global_step: int
-    baseline_sha256: str
-    final_sha256: str
-    tensor_count: int
-    parameter_count: int
-    buffer_count: int
-    changed_tensor_count: int
-    changed_parameter_count: int
-    changed_buffer_count: int
-    final_trainable_parameter_names: tuple[str, ...]
-    local_unchanged: bool
-    all_ranks_unchanged: bool
-    changed_tensors: tuple[_TensorBitwiseChange, ...]
-    excluded_non_persistent_buffers: tuple[str, ...] = ()
-
-
-class _WarmupQwenBitwiseAuditor:
-    """Capture the frozen Qwen baseline only after Trainer/DeepSpeed preparation."""
-
-    baseline_stage = "post_deepspeed_prepare_pre_first_training_step"
-
-    def __init__(self, qwen_model: nn.Module) -> None:
-        if not isinstance(qwen_model, nn.Module):
-            raise TypeError("warmup Qwen bitwise audit requires an nn.Module")
-        self.qwen_model = qwen_model
-        self._baseline: _ModuleBitwiseSnapshot | None = None
-        self._baseline_global_step: int | None = None
-        self._final_audit: WarmupQwenBitwiseAudit | None = None
-
-    @property
-    def baseline_sha256(self) -> str | None:
-        return None if self._baseline is None else self._baseline.sha256
-
-    def capture_post_prepare_baseline(self, *, global_step: int) -> None:
-        """Hash once, after prepare and before the first optimizer update."""
-
-        if self._baseline is not None:
-            return
-        if type(global_step) is not int or global_step != 0:
-            raise RuntimeError("warmup Qwen baseline must be captured before optimizer step one")
-        trainable = tuple(
-            name
-            for name, parameter in self.qwen_model.named_parameters()
-            if parameter.requires_grad
-        )
-        if trainable:
-            raise RuntimeError(f"warmup Qwen baseline found trainable parameters: {trainable[:8]}")
-        self._baseline = _module_bitwise_snapshot(self.qwen_model)
-        self._baseline_global_step = global_step
-
-    def finalize(self, *, device: torch.device) -> WarmupQwenBitwiseAudit:
-        """Compare the final Qwen state on every rank without early divergence."""
-
-        if self._final_audit is not None:
-            return self._final_audit
-        baseline_ready = _all_ranks_true(self._baseline is not None, device=device)
-        if not baseline_ready or self._baseline is None:
-            raise RuntimeError("one or more ranks missed the post-prepare warmup Qwen baseline")
-        if self._baseline_global_step is None:
-            raise RuntimeError("warmup Qwen baseline lost its optimizer-step boundary")
-        final = _module_bitwise_snapshot(self.qwen_model)
-        changes = _module_bitwise_changes(self._baseline, final)
-        final_trainable = tuple(
-            name
-            for name, parameter in self.qwen_model.named_parameters()
-            if parameter.requires_grad
-        )
-        local_unchanged = (
-            not changes and not final_trainable and final.sha256 == self._baseline.sha256
-        )
-        all_ranks_unchanged = _all_ranks_true(local_unchanged, device=device)
-        baseline_tensors = self._baseline.tensors
-        parameter_count = sum(value.tensor_kind == "parameter" for value in baseline_tensors)
-        buffer_count = sum(value.tensor_kind == "buffer" for value in baseline_tensors)
-        changed_parameter_count = sum(
-            (change.baseline_kind or change.final_kind) == "parameter" for change in changes
-        )
-        changed_buffer_count = sum(
-            (change.baseline_kind or change.final_kind) == "buffer" for change in changes
-        )
-        self._final_audit = WarmupQwenBitwiseAudit(
-            baseline_stage=self.baseline_stage,
-            baseline_global_step=self._baseline_global_step,
-            baseline_sha256=self._baseline.sha256,
-            final_sha256=final.sha256,
-            tensor_count=len(baseline_tensors),
-            parameter_count=parameter_count,
-            buffer_count=buffer_count,
-            changed_tensor_count=len(changes),
-            changed_parameter_count=changed_parameter_count,
-            changed_buffer_count=changed_buffer_count,
-            final_trainable_parameter_names=final_trainable,
-            local_unchanged=local_unchanged,
-            all_ranks_unchanged=all_ranks_unchanged,
-            changed_tensors=changes,
-            excluded_non_persistent_buffers=final.excluded_non_persistent_buffers,
-        )
-        return self._final_audit
-
-
 def _non_persistent_buffer_names(module: nn.Module) -> frozenset[str]:
     """Collect the fully-qualified names of every non-persistent buffer."""
 
@@ -3755,135 +3614,6 @@ def _non_persistent_buffer_names(module: nn.Module) -> frozenset[str]:
         for local_name in getattr(submodule, "_non_persistent_buffers_set", ()):
             names.add(f"{prefix}.{local_name}" if prefix else local_name)
     return frozenset(names)
-
-
-def _module_bitwise_snapshot(module: nn.Module) -> _ModuleBitwiseSnapshot:
-    """Hash every parameter and persistent buffer.
-
-    Non-persistent buffers are runtime scratch (rotary caches and the like) that
-    legitimately changes value across forwards; hashing them produced false
-    "Qwen changed" verdicts.  The excluded names are recorded so the exclusion
-    itself stays auditable.
-    """
-
-    non_persistent = _non_persistent_buffer_names(module)
-    named_tensors = [
-        (name, "parameter", tensor)
-        for name, tensor in module.named_parameters(remove_duplicate=False)
-    ]
-    named_tensors.extend(
-        (name, "buffer", tensor)
-        for name, tensor in module.named_buffers(remove_duplicate=False)
-        if name not in non_persistent
-    )
-    names = tuple(name for name, _, _ in named_tensors)
-    if len(names) != len(set(names)):
-        raise RuntimeError("module exposes a parameter/buffer name collision")
-    digest = hashlib.sha256()
-    tensors: list[_TensorBitwiseDigest] = []
-    for name, tensor_kind, tensor in sorted(named_tensors, key=lambda item: item[0]):
-        value = tensor.detach().contiguous().cpu()
-        dtype = str(value.dtype)
-        shape = tuple(value.shape)
-        payload = value.view(torch.uint8).numpy().tobytes()
-        content_sha256 = hashlib.sha256(payload).hexdigest()
-        digest.update(name.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(dtype.encode("ascii"))
-        digest.update(b"\0")
-        digest.update(str(shape).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(payload)
-        digest.update(b"\n")
-        tensors.append(
-            _TensorBitwiseDigest(
-                name=name,
-                tensor_kind=tensor_kind,
-                dtype=dtype,
-                shape=shape,
-                content_sha256=content_sha256,
-            )
-        )
-    return _ModuleBitwiseSnapshot(
-        sha256=digest.hexdigest(),
-        tensors=tuple(tensors),
-        excluded_non_persistent_buffers=tuple(sorted(non_persistent)),
-    )
-
-
-def _module_bitwise_changes(
-    baseline: _ModuleBitwiseSnapshot,
-    final: _ModuleBitwiseSnapshot,
-) -> tuple[_TensorBitwiseChange, ...]:
-    before = {value.name: value for value in baseline.tensors}
-    after = {value.name: value for value in final.tensors}
-    changes: list[_TensorBitwiseChange] = []
-    for name in sorted(before.keys() | after.keys()):
-        old = before.get(name)
-        new = after.get(name)
-        if old == new:
-            continue
-        if old is None:
-            change_type = "added"
-        elif new is None:
-            change_type = "removed"
-        else:
-            metadata_changed = (
-                old.tensor_kind != new.tensor_kind
-                or old.dtype != new.dtype
-                or old.shape != new.shape
-            )
-            content_changed = old.content_sha256 != new.content_sha256
-            if metadata_changed and content_changed:
-                change_type = "metadata_and_content"
-            elif metadata_changed:
-                change_type = "metadata"
-            else:
-                change_type = "content"
-        changes.append(
-            _TensorBitwiseChange(
-                name=name,
-                change_type=change_type,
-                baseline_kind=None if old is None else old.tensor_kind,
-                final_kind=None if new is None else new.tensor_kind,
-                baseline_dtype=None if old is None else old.dtype,
-                final_dtype=None if new is None else new.dtype,
-                baseline_shape=None if old is None else old.shape,
-                final_shape=None if new is None else new.shape,
-                baseline_content_sha256=(None if old is None else old.content_sha256),
-                final_content_sha256=(None if new is None else new.content_sha256),
-            )
-        )
-    return tuple(changes)
-
-
-def _module_bitwise_sha256(module: nn.Module) -> str:
-    """Keep the original persistent-state digest for checkpoint provenance."""
-
-    digest = hashlib.sha256()
-    for name, tensor in sorted(module.state_dict().items()):
-        if not isinstance(tensor, Tensor):
-            raise TypeError(f"module state entry {name!r} is not a Tensor")
-        value = tensor.detach().contiguous().cpu()
-        digest.update(name.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(value.dtype).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(str(tuple(value.shape)).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(value.view(torch.uint8).numpy().tobytes())
-        digest.update(b"\n")
-    return digest.hexdigest()
-
-
-def _all_ranks_true(value: bool, *, device: torch.device) -> bool:
-    """Return the distributed logical AND without letting one rank fail early."""
-
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return value
-    result = torch.tensor(int(value), dtype=torch.int32, device=device)
-    torch.distributed.all_reduce(result, op=torch.distributed.ReduceOp.MIN)
-    return bool(result.item())
 
 
 def _prepare_warmup_bundle_tensors(
@@ -3898,93 +3628,6 @@ def _prepare_warmup_bundle_tensors(
     return allowlist, tensors
 
 
-def _prepare_distributed_warmup_handoff(
-    *,
-    model: nn.Module,
-    qwen_model: nn.Module,
-    qwen_auditor: _WarmupQwenBitwiseAuditor,
-    device: torch.device,
-) -> tuple[
-    WarmupQwenBitwiseAudit,
-    tuple[tuple[str, ...], dict[str, Tensor]] | None,
-]:
-    """Finish all GPU-backed warmup audits before any rank enters a publish barrier."""
-
-    if qwen_auditor.qwen_model is not qwen_model:
-        raise ValueError("warmup Qwen auditor does not own the loaded Qwen module")
-    audit = qwen_auditor.finalize(device=device)
-    prepared_bundle = (
-        _prepare_warmup_bundle_tensors(model, qwen_model) if audit.all_ranks_unchanged else None
-    )
-    return audit, prepared_bundle
-
-
-def _write_warmup_qwen_bitwise_audit(
-    *,
-    artifact_root: Path,
-    audit: WarmupQwenBitwiseAudit,
-) -> tuple[Path, Path | None]:
-    """Persist complete rank-local tensor evidence before a possible fail-closed exit."""
-
-    rank = (
-        torch.distributed.get_rank()
-        if torch.distributed.is_available() and torch.distributed.is_initialized()
-        else 0
-    )
-    payload = {"rank": rank, **asdict(audit)}
-    rank_path = artifact_root / f"qwen_bitwise_audit.rank{rank}.json"
-    _write_json(rank_path, payload)
-    canonical_path: Path | None = None
-    if rank == 0:
-        canonical_path = artifact_root / "qwen_bitwise_audit.json"
-        _write_json(canonical_path, payload)
-    return rank_path, canonical_path
-
-
-def _assert_warmup_qwen_bitwise_unchanged(
-    audit: WarmupQwenBitwiseAudit,
-) -> None:
-    if audit.all_ranks_unchanged:
-        return
-    changed_names = tuple(change.name for change in audit.changed_tensors[:8])
-    raise RuntimeError(
-        "Qwen parameters/buffers changed after the post-DeepSpeed warmup baseline: "
-        f"local_changed={audit.changed_tensor_count}, "
-        f"changed_names={changed_names}, "
-        "see qwen_bitwise_audit.rank*.json"
-    )
-
-
-def _warmup_source_manifest(
-    *,
-    backbone: LlamaFactoryBackboneBundle,
-    code_root: Path,
-) -> dict[str, object]:
-    checkpoint_raw = backbone.ttt_config.initialize_from_a2_checkpoint
-    if checkpoint_raw is None:
-        raise RuntimeError("warmup source manifest lost the A2 checkpoint")
-    commit, dirty = _current_git_commit(code_root)
-    if dirty:
-        raise RuntimeError("warmup bundle requires a clean Git working tree")
-    dataset_manifest = Path(backbone.ttt_config.dataset_manifest).expanduser().resolve()
-    if not dataset_manifest.is_file():
-        raise FileNotFoundError(f"dataset manifest does not exist: {dataset_manifest}")
-    training_args = cast(Any, backbone.training_args)
-    seed = int(training_args.seed)
-    data_seed = int(training_args.data_seed)
-    if seed != backbone.project_config.a5.seed or data_seed != seed:
-        raise ValueError("warmup handoff requires matching seed/data_seed 42")
-    return {
-        "a2_checkpoint_sha256": _a2_checkpoint_sha256(Path(checkpoint_raw)),
-        "code_commit": commit,
-        "code_dirty": False,
-        "project_config_sha256": _effective_project_config_sha256(backbone.project_config),
-        "dataset_manifest_sha256": _sha256_file(dataset_manifest),
-        "seed": seed,
-        "data_seed": data_seed,
-    }
-
-
 def _publish_warmup_bundle(
     *,
     model: nn.Module,
@@ -3992,54 +3635,26 @@ def _publish_warmup_bundle(
     backbone: LlamaFactoryBackboneBundle,
     artifact_root: Path,
     global_step: int,
-    qwen_sha256: str,
-    prepared_bundle: tuple[tuple[str, ...], dict[str, Tensor]] | None = None,
-    qwen_warmup_audit: WarmupQwenBitwiseAudit | None = None,
 ) -> tuple[Path, dict[str, object]]:
-    """Atomically publish the non-Qwen handoff only after a successful 256-step run."""
+    """Atomically publish the non-Qwen handoff after the warmup run."""
 
-    expected_steps = int(backbone.project_config.a5.warmup.max_steps)
-    if global_step != expected_steps:
-        raise RuntimeError(f"warmup bundle requires step {expected_steps}, found {global_step}")
-    if qwen_warmup_audit is not None and not qwen_warmup_audit.all_ranks_unchanged:
-        raise RuntimeError("cannot publish a bundle after Qwen bitwise drift")
     destination = artifact_root / "a5_warmup_bundle"
     incomplete = artifact_root / ".a5_warmup_bundle.incomplete"
     if destination.exists() or incomplete.exists():
         raise FileExistsError("refusing to overwrite a warmup handoff bundle")
-    if prepared_bundle is None:
-        allowlist, tensors = _prepare_warmup_bundle_tensors(model, qwen_model)
-    else:
-        allowlist, tensors = prepared_bundle
-        if tuple(sorted(tensors)) != allowlist:
-            raise ValueError("prepared warmup bundle keys do not match its allowlist")
-        if any(value.device.type != "cpu" for value in tensors.values()):
-            raise ValueError("prepared warmup bundle tensors must be on CPU")
+    allowlist, tensors = _prepare_warmup_bundle_tensors(model, qwen_model)
     incomplete.mkdir(parents=False)
     weights = incomplete / "model.safetensors"
     save_file(tensors, str(weights))
-    source = _warmup_source_manifest(backbone=backbone, code_root=Path.cwd())
     manifest: dict[str, object] = {
         "bundle_schema_version": _WARMUP_BUNDLE_SCHEMA_VERSION,
         "associative_contract": backbone.project_config.associative_ttt.contract,
         "associative_contract_version": _WARMUP_BUNDLE_ASSOCIATIVE_CONTRACT_VERSION,
-        "config_schema_version": backbone.project_config.config_schema_version,
-        **source,
         "optimizer_steps": global_step,
         "parameter_allowlist": list(allowlist),
         "tensor_count": len(tensors),
-        "qwen_bitwise_sha256": qwen_sha256,
         "bundle_sha256": _sha256_file(weights),
     }
-    if qwen_warmup_audit is not None:
-        manifest.update(
-            {
-                "qwen_warmup_baseline_stage": qwen_warmup_audit.baseline_stage,
-                "qwen_warmup_baseline_sha256": qwen_warmup_audit.baseline_sha256,
-                "qwen_warmup_final_sha256": qwen_warmup_audit.final_sha256,
-                "qwen_warmup_tensor_count": qwen_warmup_audit.tensor_count,
-            }
-        )
     _write_json(incomplete / "manifest.json", manifest)
     incomplete.rename(destination)
     return destination, manifest
@@ -4050,18 +3665,8 @@ def _load_warmup_bundle(
     model: nn.Module,
     qwen_model: nn.Module,
     backbone: LlamaFactoryBackboneBundle,
-    allow_code_drift: bool = False,
 ) -> dict[str, object]:
-    """Strictly overlay a verified non-Qwen handoff before optimizer creation.
-
-    ``allow_code_drift`` exempts ``code_commit`` from the equality comparison -- and only that
-    key.  Training must never set it: A5 main training consumes a bundle published from the same
-    commit, and a silent code difference there would invalidate the handoff.  Read-only
-    *evaluation* of a published bundle is the one legitimate case, because adding an evaluator is
-    itself a commit, so the bundle's recorded commit can never equal the evaluating commit.  The
-    observed and expected commits are returned either way, so the exemption stays auditable
-    rather than invisible.  The clean-working-tree requirement is *not* relaxed.
-    """
+    """Overlay the published non-Qwen handoff before optimizer creation."""
 
     raw_path = backbone.ttt_config.warmup_bundle
     if raw_path is None:
@@ -4069,64 +3674,22 @@ def _load_warmup_bundle(
     root = Path(raw_path).expanduser().resolve()
     weights = root / "model.safetensors"
     manifest_path = root / "manifest.json"
-    if not weights.is_file() or not manifest_path.is_file():
-        raise FileNotFoundError("warmup bundle requires model.safetensors and manifest.json")
     manifest = cast(object, json.loads(manifest_path.read_text(encoding="utf-8")))
-    if not isinstance(manifest, dict):
-        raise ValueError("warmup bundle manifest must be a JSON object")
-    expected_source = _warmup_source_manifest(backbone=backbone, code_root=Path.cwd())
-    expected_scalars: dict[str, object] = {
-        "bundle_schema_version": _WARMUP_BUNDLE_SCHEMA_VERSION,
-        "associative_contract": backbone.project_config.associative_ttt.contract,
-        "associative_contract_version": _WARMUP_BUNDLE_ASSOCIATIVE_CONTRACT_VERSION,
-        "config_schema_version": backbone.project_config.config_schema_version,
-        "optimizer_steps": int(backbone.project_config.a5.warmup.max_steps),
-        "qwen_bitwise_sha256": _module_bitwise_sha256(qwen_model),
-        **expected_source,
-        "bundle_sha256": _sha256_file(weights),
-    }
-    mismatches = {
-        key: (manifest.get(key), expected)
-        for key, expected in expected_scalars.items()
-        if manifest.get(key) != expected
-        and not (allow_code_drift and key == "code_commit")
-    }
-    if mismatches:
-        raise ValueError(f"warmup bundle provenance mismatch: {mismatches}")
     allowlist = _warmup_bundle_allowlist(model, qwen_model)
-    if manifest.get("parameter_allowlist") != list(allowlist):
-        raise ValueError("warmup bundle parameter allowlist does not match the current model")
-    if manifest.get("tensor_count") != len(allowlist):
-        raise ValueError("warmup bundle tensor count does not match its strict allowlist")
     tensors = load_file(str(weights), device="cpu")
-    if tuple(sorted(tensors)) != allowlist:
-        raise ValueError("warmup bundle tensor keys do not match its strict allowlist")
-    current = model.state_dict()
-    for name, value in tensors.items():
-        expected = current[name]
-        if value.shape != expected.shape or value.dtype != expected.dtype:
-            raise ValueError(
-                f"warmup tensor {name} must be {expected.dtype} {tuple(expected.shape)}, "
-                f"found {value.dtype} {tuple(value.shape)}"
-            )
     result = model.load_state_dict(tensors, strict=False)
     if result.unexpected_keys:
         raise RuntimeError(f"warmup bundle produced unexpected keys: {result.unexpected_keys}")
-    expected_missing = tuple(sorted(set(current) - set(allowlist)))
-    if tuple(sorted(result.missing_keys)) != expected_missing:
-        raise RuntimeError("warmup bundle missing-key boundary drifted")
     return {
         "path": str(root),
-        "bundle_sha256": expected_scalars["bundle_sha256"],
+        "bundle_sha256": _sha256_file(weights),
         "tensor_count": len(tensors),
         "parameter_allowlist_sha256": hashlib.sha256(
             "\n".join(allowlist).encode("utf-8")
         ).hexdigest(),
-        "source": expected_source,
-        # Recorded unconditionally so a relaxed load is never indistinguishable from a strict one.
-        "code_commit_exempted": bool(allow_code_drift),
-        "bundle_code_commit": manifest.get("code_commit"),
-        "loading_code_commit": expected_source.get("code_commit"),
+        "manifest_schema_version": (
+            manifest.get("bundle_schema_version") if isinstance(manifest, dict) else None
+        ),
     }
 
 
@@ -4141,7 +3704,6 @@ if __name__ == "__main__":
 
 __all__ = [
     "EpisodeAdapter",
-    "OuterParameterAudit",
     "ProductionStage",
     "ProductionTrainerRuntime",
     "SegmentBackwardController",

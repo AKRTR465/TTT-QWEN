@@ -8,7 +8,7 @@ vision/LLM forward code.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import RLock
@@ -273,13 +273,11 @@ class QwenVideoFeatureBoundary(nn.Module):  # type: ignore[misc]
         if not self.adapter_enabled:
             main = output.split_main_visual_embeddings()
         else:
-            adapted = cast(
-                Tensor,
-                self.adapter(
-                    output.main_visual_embeddings,
-                    output.visual_valid_mask,
-                    output.metadata,
-                ),
+            adapter = cast(Callable[..., Tensor], self.adapter)
+            adapted = adapter(
+                output.main_visual_embeddings,
+                output.visual_valid_mask,
+                output.metadata,
             )
             packed = adapted[output.visual_valid_mask]
             main = tuple(torch.split(packed, output.metadata.token_counts))
@@ -479,7 +477,10 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
             yield
             return
         with self._hook_lock:
-            get_embeddings = getattr(self.qwen_model, "get_input_embeddings", None)
+            get_embeddings = cast(
+                Callable[[], nn.Module],
+                getattr(self.qwen_model, "get_input_embeddings", None),
+            )
             embedding_layer = get_embeddings()
 
             def scatter_state(
@@ -488,16 +489,16 @@ class Qwen3VLAdapter(nn.Module):  # type: ignore[misc]
                 output: object,
             ) -> object:
                 actual_ids = cast(Tensor, module_args[0])
-                output = cast(Tensor, output)
+                hidden = cast(Tensor, output)
                 if actual_ids.ndim == 2 and actual_ids.shape[1] == 1:
-                    return output
-                state_mask = payload.state_position_mask.to(device=output.device)
-                expanded_mask = state_mask.unsqueeze(-1).expand_as(output)
+                    return hidden
+                state_mask = payload.state_position_mask.to(device=hidden.device)
+                expanded_mask = state_mask.unsqueeze(-1).expand_as(hidden)
                 state_values = payload.state_embeddings.to(
-                    device=output.device,
-                    dtype=output.dtype,
+                    device=hidden.device,
+                    dtype=hidden.dtype,
                 )
-                scattered = output.masked_scatter(expanded_mask, state_values)
+                scattered = hidden.masked_scatter(expanded_mask, state_values)
                 return scattered
 
             handle = embedding_layer.register_forward_hook(scatter_state)

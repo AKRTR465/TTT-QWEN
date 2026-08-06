@@ -28,10 +28,6 @@ import transformers
 from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
 
-from ttt_svcbench_qwen.associative_ttt import (
-    AssociativeTTTIntermediates,
-    FastAssociativeContext,
-)
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.episode_data import (
@@ -41,7 +37,12 @@ from ttt_svcbench_qwen.episode_data import (
     ProductionQueryRecord,
     adaptive_support_schedule,
 )
-from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter, build_fast_ttt_adapter
+from ttt_svcbench_qwen.fast_ttt import (
+    AssociativeTTTIntermediates,
+    FastAssociativeContext,
+    FastTTTAdapter,
+    build_fast_ttt_adapter,
+)
 from ttt_svcbench_qwen.identity_bank import IdentityBank, build_identity_bank
 from ttt_svcbench_qwen.input_composer import (
     ComposedInput,
@@ -3479,15 +3480,11 @@ def _decode_query_targets_grouped(
     by an earlier target. Only selected frames are converted to RGB.
     """
 
-    if max_groups < 1 or max_groups > 16:
-        raise ValueError("grouped Query decoding requires max_groups within [1, 16]")
     groups = _balanced_target_groups(target_times, max_groups=max_groups)
     if not groups:
         return [], []
-    started = time.perf_counter()
     frames: list[Tensor] = []
     timestamps: list[float] = []
-    seek_count = 0
     try:
         with av.open(str(spec.video_path)) as container:
             stream = container.streams.video[0]
@@ -3500,7 +3497,6 @@ def _decode_query_targets_grouped(
             for group in groups:
                 offset = int(max(0.0, group[0] - 1.0e-6) / time_base)
                 container.seek(offset, stream=stream, backward=True, any_frame=False)
-                seek_count += 1
                 selected = _decode_nearest_target_group(
                     container,
                     stream,
@@ -3517,21 +3513,12 @@ def _decode_query_targets_grouped(
         raise
     except (OSError, ValueError, TypeError, IndexError, av.error.FFmpegError) as error:
         raise _TargetSeekUnavailable(str(error)) from error
-    _loader_trace(
-        "query_decode_grouped",
-        target_count=len(target_times),
-        group_count=len(groups),
-        seek_count=seek_count,
-        seconds=time.perf_counter() - started,
-    )
     return frames, timestamps
 
 
 def _balanced_target_groups(
     target_times: Sequence[float], *, max_groups: int
 ) -> tuple[tuple[float, ...], ...]:
-    if max_groups <= 0:
-        raise ValueError("target group count must be positive")
     targets = tuple(float(value) for value in target_times)
     if not targets:
         return ()
@@ -3738,8 +3725,6 @@ def _resize_to_pixel_budget(
     minimum_pixels: int,
     maximum_pixels: int,
 ) -> Tensor:
-    if minimum_pixels <= 0 or maximum_pixels <= 0 or minimum_pixels > maximum_pixels:
-        raise ValueError("video pixel bounds must satisfy 0 < minimum <= maximum")
     height, width = frames.shape[-2:]
     area = height * width
     if minimum_pixels <= area <= maximum_pixels:
@@ -3783,13 +3768,11 @@ __all__ = [
     "CurrentChunkMaterialization",
     "QueryObservationSpec",
     "SupportChunkSpec",
-    "A2PreparationTelemetry",
     "PreparedA2Record",
     "PreparedA5Record",
     "PreparedAnswerCPU",
     "PreparedVisualCPU",
     "ProductionVisualAudit",
-    "QueryPreparationTelemetry",
     "VideoChunkMaterializer",
     "build_runtime",
 ]

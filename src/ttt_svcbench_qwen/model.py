@@ -482,9 +482,12 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
         temporal: TemporalEncoderOutput | None = None
         observations: ObservationOutputs | None = None
         if self.feature_flags.bank_enabled:
-            spatial = self.components.spatial_encoder(adapted, query, request)
-            temporal = self.components.temporal_encoder(adapted, query, request)
-            observations = self.components.observation_heads(spatial, temporal, query, request)
+            spatial_stage = cast(SpatialStage, self.components.spatial_encoder)
+            temporal_stage = cast(TemporalStage, self.components.temporal_encoder)
+            heads_stage = cast(ObservationStage, self.components.observation_heads)
+            spatial = spatial_stage(adapted, query, request)
+            temporal = temporal_stage(adapted, query, request)
+            observations = heads_stage(spatial, temporal, query, request)
 
         runtime_state = request.runtime_state
         bank_states = request.bank_states
@@ -502,7 +505,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
                     retrieval_history = tensorized_retrieval_view(
                         request.runtime_state.retrieval_histories
                     )
-            write = self.components.bank_writer(
+            write = cast(BankWriter, self.components.bank_writer)(
                 observations,
                 spatial,
                 temporal,
@@ -549,8 +552,8 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
         reader_results: tuple[ReaderResult, ...] = ()
         resampler_output: StateResamplerOutput | None = None
         if self.feature_flags.reader_enabled or self.feature_flags.state_tokens_enabled:
-            retrieval = self.components.retriever(
-                self.components.state_bank,
+            retrieval = cast(RetrieverStage, self.components.retriever)(
+                cast(StructuredStateBank, self.components.state_bank),
                 observation.retrieval_history,
                 observation.query,
                 video_ids=request.owner.video_ids,
@@ -558,8 +561,8 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
             )
         if self.feature_flags.reader_enabled:
             reader_results = tuple(
-                self.components.reader.read_bank(
-                    self.components.state_bank,
+                cast(ReaderStage, self.components.reader).read_bank(
+                    cast(StructuredStateBank, self.components.state_bank),
                     observation.bank_states,
                     observation.query,
                     video_ids=request.owner.video_ids,
@@ -567,7 +570,10 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
                 )
             )
         if self.feature_flags.state_tokens_enabled:
-            resampler_output = self.components.resampler(observation.query.q_target, retrieval)
+            resampler_output = cast(ResamplerStage, self.components.resampler)(
+                observation.query.q_target,
+                retrieval,
+            )
         state_tokens = None if resampler_output is None else resampler_output.state_tokens
         state_valid = None if resampler_output is None else resampler_output.state_token_valid_mask
         composed = self.components.composer(
@@ -687,7 +693,7 @@ class StateTTTModel(nn.Module):  # type: ignore[misc]
         consumer = getattr(fast_adapter, "consume_associative_intermediates", None)
         if consumer is None:
             return None
-        return cast(AssociativeTTTIntermediates, consumer())
+        return cast("AssociativeTTTIntermediates | None", consumer())
 
 
 def _bind_associative_context(
