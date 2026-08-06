@@ -16,7 +16,6 @@ from tests.support.runtime_factories import (
     make_e2_state,
     make_query_output,
     make_spatial_output,
-    make_stream_audit,
     make_temporal_cache,
 )
 from ttt_svcbench_qwen.associative_ttt import (
@@ -416,7 +415,6 @@ def _typed_observations(
         timestamps=temporal.timestamps.clone(),
         position_ids=temporal.position_ids.clone(),
         next_states=(e1_state,),
-        audit=make_stream_audit("e1", 1, 2),
     )
     event_logits = torch.full((1, 2, 4), 5.0)
     phase_logits = torch.zeros((1, 2, 4))
@@ -429,7 +427,6 @@ def _typed_observations(
         timestamps=temporal.timestamps.clone(),
         position_ids=temporal.position_ids.clone(),
         next_states=(e2_state,),
-        audit=make_stream_audit("e2", 1, 2),
     )
     return ObservationOutputs(o1=o1, o2=o2, e1=e1, e2=e2)
 

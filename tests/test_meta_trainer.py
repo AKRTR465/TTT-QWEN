@@ -15,7 +15,6 @@ import ttt_svcbench_qwen.meta_trainer as meta_trainer_module
 from tests.support.runtime_factories import (
     make_e1_state,
     make_e2_state,
-    make_stream_audit,
     make_temporal_cache,
 )
 from ttt_svcbench_qwen.associative_ttt import (
@@ -428,7 +427,6 @@ class _ObservationStage:
                     _e1_state(request.owner, row, temporal.position_ids)
                     for row in range(batch_size)
                 ),
-                audit=make_stream_audit("e1", batch_size, width),
             ),
             e2=E2SoftOutput(
                 event_logits=e2_event_logits,
@@ -442,7 +440,6 @@ class _ObservationStage:
                     _e2_state(request.owner, row, temporal.position_ids)
                     for row in range(batch_size)
                 ),
-                audit=make_stream_audit("e2", batch_size, width),
             ),
         )
         self.outputs.append(output)

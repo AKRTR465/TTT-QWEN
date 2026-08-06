@@ -13,7 +13,6 @@ from tests.support.runtime_factories import (
     make_e1_state,
     make_e2_state,
     make_state_record,
-    make_stream_audit,
 )
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.identity_bank import ConfirmedChunk, IdentityBankRuntimeState
@@ -214,7 +213,6 @@ def _typed_predictions(
         timestamps=temporal_times,
         position_ids=temporal_positions,
         next_states=tuple(_fresh_e1(row) for row in range(batch_size)),
-        audit=make_stream_audit("e1", batch_size, temporal_width, state_length=0),
     )
     e2_events = _leaf((batch_size, temporal_width, 4))
     e2_phases = _leaf((batch_size, temporal_width, 4))
@@ -227,7 +225,6 @@ def _typed_predictions(
         timestamps=temporal_times,
         position_ids=temporal_positions,
         next_states=tuple(_fresh_e2(row) for row in range(batch_size)),
-        audit=make_stream_audit("e2", batch_size, temporal_width, state_length=0),
     )
     observations = ObservationOutputs(o1=o1, o2=o2, e1=e1, e2=e2)
 
@@ -1189,7 +1186,6 @@ def test_e1_dense_targets_follow_the_two_position_hard_fsm_contract() -> None:
         timestamps=timestamps.unsqueeze(0),
         position_ids=torch.arange(3, dtype=torch.int64).unsqueeze(0),
         next_states=(_fresh_e1(0),),
-        audit=make_stream_audit("e1", 1, 3, state_length=0),
     )
     bank = build_state_bank(load_config())
     state = bank.reset("video-e1", "trajectory-e1")

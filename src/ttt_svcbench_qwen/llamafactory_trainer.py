@@ -2183,51 +2183,6 @@ def _run_main(argv: list[str] | None = None) -> int:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
     )
-    visual_cost_index: Mapping[str, VisualCostRecord] | None = None
-    raw_cost_index = backbone.ttt_config.visual_cost_index
-    if raw_cost_index is not None:
-        minimum_pixels, maximum_pixels = _video_pixel_bounds(backbone)
-        balance = backbone.project_config.loss.official_weak_balance
-        model_name = str(getattr(backbone.model_args, "model_name_or_path", "unknown-model"))
-        revision = str(getattr(backbone.model_args, "revision", "unknown-revision"))
-        parameter = next(backbone.model.parameters())
-        expected_fingerprint = make_visual_cost_fingerprint(
-            manifest_sha256=hashlib.sha256(Path(manifest_path).read_bytes()).hexdigest(),
-            model_revision=f"{model_name}@{revision}",
-            transformers_version=transformers.__version__,
-            processor=(
-                f"{type(backbone.processor).__module__}.{type(backbone.processor).__qualname__}"
-            ),
-            minimum_pixels=minimum_pixels,
-            maximum_pixels=maximum_pixels,
-            dtype=str(parameter.dtype).removeprefix("torch."),
-            visual_batch_size=backbone.ttt_config.support_visual_batch_size,
-            cache_mode=backbone.ttt_config.preprocess_cache_mode,
-            loss_mode="ema_answer_ref",
-            loss_group_weight=balance.group_weight,
-            loss_scale_min=balance.scale_min,
-            loss_scale_max=balance.scale_max,
-            loss_epsilon=balance.epsilon,
-            gpu_model=(
-                torch.cuda.get_device_name(torch.cuda.current_device())
-                if torch.cuda.is_available()
-                else "cpu"
-            ),
-            query_decode_strategy="grouped_seek",
-            query_decode_max_groups=backbone.ttt_config.query_decode_max_groups,
-            state_query_visual_mode=backbone.ttt_config.state_query_visual_mode,
-            state_query_max_frames=backbone.ttt_config.state_query_max_frames,
-            answer_query_visual_mode=backbone.ttt_config.answer_query_visual_mode,
-            answer_query_max_frames=backbone.ttt_config.answer_query_max_frames,
-            query_sample_fps=backbone.ttt_config.query_sample_fps,
-        )
-        visual_cost_index = load_visual_cost_index(
-            raw_cost_index,
-            expected_fingerprint=expected_fingerprint,
-            require_runtime_measurements=(
-                backbone.ttt_config.visual_cost_mode == "exact_tokens_then_runtime"
-            ),
-        )
     warmup_bundle_audit: dict[str, object] | None = None
     if configured_stage is ProductionStage.A5 and same_stage_resume is None:
         checkpoint = backbone.ttt_config.initialize_from_a2_checkpoint
@@ -2293,7 +2248,6 @@ def _run_main(argv: list[str] | None = None) -> int:
                 dataset,
                 rank,
                 world_size,
-                visual_cost_index=visual_cost_index,
                 query_sample_fps=backbone.ttt_config.query_sample_fps,
                 state_query_visual_mode=backbone.ttt_config.state_query_visual_mode,
                 state_query_max_frames=backbone.ttt_config.state_query_max_frames,

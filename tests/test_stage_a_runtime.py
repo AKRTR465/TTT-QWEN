@@ -14,7 +14,6 @@ from tests.support.runtime_factories import (
     make_e2_state,
     make_query_output,
     make_spatial_output,
-    make_stream_audit,
     make_temporal_cache,
 )
 from ttt_svcbench_qwen.config import load_config
@@ -158,7 +157,6 @@ def _observations(
         timestamps=timestamps,
         position_ids=positions,
         next_states=e1_states,
-        audit=make_stream_audit("e1", batch_size, width),
     )
     event_logits = torch.full((batch_size, width, 4), 5.0, requires_grad=True)
     phase_logits = torch.zeros((batch_size, width, 4), requires_grad=True)
@@ -171,7 +169,6 @@ def _observations(
         timestamps=timestamps.clone(),
         position_ids=positions.clone(),
         next_states=e2_states,
-        audit=make_stream_audit("e2", batch_size, width),
     )
     return ObservationOutputs(o1=o1, o2=o2, e1=e1, e2=e2)
 

@@ -28,7 +28,6 @@ from ttt_svcbench_qwen.model import (
     StateTTTModel,
     TrajectoryRuntimeState,
     VisualStageOutput,
-    assert_training_number_agreement,
 )
 from ttt_svcbench_qwen.query_encoder import Operator
 from ttt_svcbench_qwen.state_bank import (
@@ -632,16 +631,3 @@ def test_qwen_kwargs_cannot_override_composer_or_native_visual_fields() -> None:
     assert suite.events == []
 
 
-def test_training_number_agreement_blocks_reader_mismatch_or_missing_target() -> None:
-    results = (
-        SimpleNamespace(exact_count=2),
-        SimpleNamespace(exact_count=0),
-        SimpleNamespace(exact_count=None),
-        SimpleNamespace(exact_count=-3),
-    )
-
-    with pytest.raises(ValueError, match="authoritative Reader"):
-        assert_training_number_agreement(results, (2, 7, None, -3))
-    with pytest.raises(ValueError, match="authoritative Reader"):
-        assert_training_number_agreement(results, (2, 0, None, None))
-    assert_training_number_agreement(results, (2, 0, None, -3))
