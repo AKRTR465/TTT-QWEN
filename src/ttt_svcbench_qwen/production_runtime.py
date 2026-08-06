@@ -1545,7 +1545,6 @@ class _PrefetchCollatorBase:
         preprocess_cache: PreprocessCache | None,
         context: str,
     ) -> None:
-        _require_latest_qwen_processor(processor, context=context)
         self.processor = processor
         self.tokenizer = tokenizer
         self.config = config
@@ -1778,7 +1777,6 @@ class ProductionEpisodeMaterializer:
         self.tokenizer = backbone.tokenizer
         self.processor = backbone.processor
         self._episode_nonce = 0
-        _require_latest_qwen_processor(self.processor, context="production Qwen training")
 
     def a2(self, source: PreparedA2Record) -> StageATrainingBatch:
         record = source.record
@@ -2052,57 +2050,6 @@ class ProductionEpisodeMaterializer:
         return _resolve_video_path(source_dataset, relative_path)
 
 
-class _A2ProgressTrace:
-    """Rank-local, opt-in lifecycle trace for distributed A2 deadlock diagnosis."""
-
-    def __init__(self, path: Path | None, *, rank: int) -> None:
-        self.path = path
-        self.rank = rank
-        self.call_index = 0
-
-    @classmethod
-    def from_environment(cls) -> _A2ProgressTrace:
-        rank = int(os.environ.get("RANK", "0"))
-        if os.environ.get("TTT_A2_PROGRESS_TRACE") != "1":
-            return cls(None, rank=rank)
-        run_root = os.environ.get("RUN_ROOT")
-        if not run_root:
-            raise ValueError("TTT_A2_PROGRESS_TRACE=1 requires RUN_ROOT")
-        directory = Path(run_root) / "samples" / f"rank_{rank}"
-        directory.mkdir(parents=True, exist_ok=True)
-        return cls(directory / "a2_progress.jsonl", rank=rank)
-
-    @property
-    def enabled(self) -> bool:
-        return self.path is not None
-
-    def begin(self, record: A2QueryRecord) -> int:
-        self.call_index += 1
-        self.emit(
-            self.call_index,
-            "forward_begin",
-            query_id=record.query.runtime.query_id,
-            task_class=record.task_class,
-            query_time=record.query.runtime.query_time,
-            video_id=record.video_id,
-        )
-        return self.call_index
-
-    def emit(self, call_index: int, event: str, **fields: object) -> None:
-        if self.path is None:
-            return
-        payload = {
-            "monotonic_seconds": time.monotonic(),
-            "rank": self.rank,
-            "pid": os.getpid(),
-            "call_index": call_index,
-            "event": event,
-            **fields,
-        }
-        with self.path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-
-
 class ProductionA2LossStep:
     def __init__(
         self,
@@ -2110,75 +2057,24 @@ class ProductionA2LossStep:
         materializer: ProductionEpisodeMaterializer,
         graph_anchor_parameters: Sequence[nn.Parameter],
         config: ProjectConfig,
-        visual_runtime: ProductionQwenRuntime,
-        support_visual_batch_size: int,
         outer_composer: OfficialWeakOuterLossComposer,
     ):
         self.runner = runner
         self.materializer = materializer
         self.weak_builder = OfficialWeakTargetBuilder()
-        self.progress = _A2ProgressTrace.from_environment()
-        self._active_progress_call: int | None = None
         self.graph_anchor_parameters = tuple(
             parameter for parameter in graph_anchor_parameters if parameter.requires_grad
         )
         self.outer_composer = outer_composer
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
         self.last_weak_audit: OfficialWeakLossAudit | None = None
-        self.visual_runtime = visual_runtime
-        self.support_visual_batch_size = support_visual_batch_size
-        self._backward_started_at: float | None = None
 
     def __call__(self, _model: nn.Module, inputs: Mapping[str, object]) -> Tensor:
-        prefetched = inputs.get("prepared_a2")
-        if not isinstance(prefetched, PreparedA2Record):
-            raise TypeError("A2 Trainer batch must contain PreparedA2Record")
-        _loader_trace(
-            "dataloader_wait",
-            prepared=True,
-        )
+        prefetched = cast(PreparedA2Record, inputs["prepared_a2"])
         source = prefetched
         record = prefetched.record
-        _loader_trace(
-            "forward_arrival",
-            query_id=record.query.runtime.query_id,
-            seconds=max(
-                0.0,
-                time.monotonic() - prefetched.preparation.ready_monotonic_seconds,
-            ),
-        )
-        call_index = self.progress.begin(record)
-        self._active_progress_call = call_index
         batch = self.materializer.a2(source)
-        if not isinstance(batch.model_inputs, StageAEpisodeInputs):
-            raise TypeError("A2 materializer must return StageAEpisodeInputs")
-        model_inputs = batch.model_inputs
-        if self.support_visual_batch_size > 1:
-            support_requests = model_inputs.observation_requests[:-1]
-            with torch.no_grad():
-                prepared_supports = self.visual_runtime.prepare_support_batch(
-                    tuple(request.video_input for request in support_requests),
-                    batch_size=self.support_visual_batch_size,
-                )
-            model_inputs = replace(
-                model_inputs,
-                observation_requests=tuple(
-                    replace(request, video_input=prepared)
-                    for request, prepared in zip(
-                        support_requests,
-                        prepared_supports,
-                        strict=True,
-                    )
-                )
-                + (model_inputs.observation_requests[-1],),
-            )
-            batch = replace(batch, model_inputs=model_inputs)
-        self.progress.emit(
-            call_index,
-            "materialized",
-            support_count=len(model_inputs.observation_requests) - 1,
-            dataloader_prefetched=True,
-        )
+        model_inputs = cast(StageAEpisodeInputs, batch.model_inputs)
         support_specs = tuple(
             request.video_input
             for request in model_inputs.observation_requests
@@ -2189,34 +2085,18 @@ class ProductionA2LossStep:
             raw = self.runner(batch, training=True)
         finally:
             self.materializer.video.end_prefetch()
-        self.progress.emit(call_index, "forward_complete")
-        raw.audit.validate()
-        if (
-            not isinstance(raw.composed_input, ComposedInput)
-            or raw.observations is None
-            or raw.query is None
-            or raw.retrieval is None
-        ):
-            raise TypeError("A2 production forward did not return typed State/Qwen outputs")
         mapped = map_teacher_forced_targets(
-            composed_input=raw.composed_input,
+            composed_input=cast(ComposedInput, raw.composed_input),
             source_input_ids=raw.source_input_ids,
             source_attention_mask=raw.source_attention_mask,
             source_labels=batch.supervision.answer.base_labels,
             source_number_token_mask=batch.supervision.answer.base_number_token_mask,
         )
-        device = raw.answer_logits.device
-        count_valid = raw.reader_count_valid_mask
         answer = compute_answer_loss(
             AnswerLossInput(
                 logits=raw.answer_logits,
                 labels=mapped.labels,
                 number_token_mask=mapped.number_token_mask,
-                reader_counts=ReaderCountMetricInput(
-                    predicted_counts=raw.reader_counts,
-                    target_counts=batch.supervision.answer.target_counts.to(device),
-                    valid_mask=count_valid,
-                ),
             )
         )
         weak = self.weak_builder(
@@ -2257,32 +2137,7 @@ class ProductionA2LossStep:
                 * 0.0
             )
             total = total + graph_anchor
-        if total.ndim != 0 or not total.requires_grad:
-            raise ValueError("A2 production loss must be one differentiable scalar")
-        self.progress.emit(call_index, "loss_ready")
-
-        def trace_backward_start(gradient: Tensor) -> Tensor:
-            self.progress.emit(call_index, "backward_begin")
-            self._backward_started_at = time.perf_counter()
-            return gradient
-
-        if self.progress.enabled:
-            total.register_hook(trace_backward_start)
         return total
-
-    def mark_backward_returned(self) -> None:
-        call_index = self._active_progress_call
-        if call_index is None:
-            raise RuntimeError("A2 backward returned without an active loss call")
-        self.progress.emit(call_index, "backward_return")
-        if self._backward_started_at is not None:
-            _loader_trace(
-                "backward",
-                stage="a2",
-                seconds=time.perf_counter() - self._backward_started_at,
-            )
-            self._backward_started_at = None
-        self._active_progress_call = None
 
 
 class ProductionA5EpisodeAdapter:
@@ -2290,10 +2145,7 @@ class ProductionA5EpisodeAdapter:
         self.materializer = materializer
 
     def __call__(self, inputs: Mapping[str, object]) -> tuple[MetaTTTEpisode, float]:
-        prepared = inputs.get("prepared_a5")
-        if not isinstance(prepared, PreparedA5Record):
-            raise TypeError("A5 Trainer batch must contain PreparedA5Record")
-        _loader_trace("dataloader_wait", prepared=True, stage="a5")
+        prepared = cast(PreparedA5Record, inputs["prepared_a5"])
         episode = self.materializer.a5(prepared)
         self._begin_prefetch(episode)
         return episode, prepared.record.loss_weight
@@ -2575,24 +2427,20 @@ def build_inference_runtime_bundle(
     from ttt_svcbench_qwen.inference import OnlineTTTUpdater, PerVideoRuntimeManager
 
     root = Path(model_root).resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"Qwen model root does not exist: {root}")
     config = load_config(config_path)
-    processor = _require_latest_qwen_processor(
-        transformers.AutoProcessor.from_pretrained(root, local_files_only=True),
-        context="inference runtime",
+    processor = cast(
+        Any, transformers.AutoProcessor.from_pretrained(root, local_files_only=True)
     )
     tokenizer = processor.tokenizer
-    model_type = getattr(transformers, "Qwen3VLForConditionalGeneration", None)
-    if model_type is None:
-        raise RuntimeError("installed transformers has no Qwen3VLForConditionalGeneration")
-    qwen_model = model_type.from_pretrained(
-        root,
-        dtype=dtype,
-        local_files_only=True,
+    model_type = cast(Any, transformers).Qwen3VLForConditionalGeneration
+    qwen_model = cast(
+        nn.Module,
+        model_type.from_pretrained(
+            root,
+            dtype=dtype,
+            local_files_only=True,
+        ),
     )
-    if not isinstance(qwen_model, nn.Module):
-        raise TypeError("Qwen loader returned a non-module")
     qwen_model.to(device=torch.device(device))
     qwen_model.eval()
     materializer = VideoChunkMaterializer(
@@ -2618,7 +2466,6 @@ def build_inference_runtime_bundle(
         fast_adapter=stack.fast,
         state_bank=stack.state_bank,
         identity_bank=stack.identity_bank,
-        audit_level=config.inference.audit_level,
     )
     return StateTTTRuntimeBundle(
         config=config,
@@ -2796,12 +2643,8 @@ def _prepare_answer_cpu(
     This keeps the token contract while removing the second resize/normalization/patchify pass.
     """
 
-    started = time.perf_counter()
-    decode_seconds = 0.0
-    processor_seconds = 0.0
-    _loader_trace("query_prepare", query_id=query.runtime.query_id)
     answer_text = query.answer.answer if query.answer.answer is not None else str(query.weak.count)
-    typed_processor = _require_latest_qwen_processor(processor, context="Query preprocessing")
+    typed_processor = cast(Any, processor)
     fingerprint = (
         _build_preprocess_fingerprint(
             spec,
@@ -2821,33 +2664,20 @@ def _prepare_answer_cpu(
     if cached is not None:
         materialized = _materialized_from_cached(spec, cached)
         frames = materialized.frames
-        _loader_trace("query_cache_hit", query_id=query.runtime.query_id)
     else:
-        _loader_trace("query_cache_miss", query_id=query.runtime.query_id)
-        decode_started = time.perf_counter()
         frames, timestamps = _decode_uniform_interval(spec, spec.sampling_fps)
-        decode_seconds = time.perf_counter() - decode_started
-        _loader_trace(
-            "query_decode",
-            query_id=query.runtime.query_id,
-            frame_count=len(frames),
-            strategy="grouped_seek",
-            max_groups=spec.decode_max_groups,
-            seconds=decode_seconds,
-        )
         frames = _resize_to_pixel_budget(
             frames,
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
         )
-        processor_started = time.perf_counter()
         pixels, grid = _process_video_once(typed_processor, frames)
-        processor_seconds = time.perf_counter() - processor_started
         materialized = _build_materialized_query(spec, frames, timestamps, pixels, grid, config)
         if preprocess_cache is not None and preprocess_cache.writable:
-            if fingerprint is None:
-                raise RuntimeError("writable Answer Query cache requires a fingerprint")
-            preprocess_cache.put(fingerprint, _cached_from_materialized(materialized))
+            preprocess_cache.put(
+                cast(PreprocessFingerprint, fingerprint),
+                _cached_from_materialized(materialized),
+            )
 
     prompt_messages = [_user_message(query.runtime.question)]
     full_messages = [*prompt_messages, {"role": "assistant", "content": answer_text}]
@@ -2865,16 +2695,9 @@ def _prepare_answer_cpu(
     )
     prompt_ids, _ = _tokenize_text_only(tokenizer, prompt_expanded)
     full_ids, full_mask = _tokenize_text_only(tokenizer, full_expanded)
-    prompt_grid = materialized.video_grid_thw
-    if not torch.equal(materialized.video_grid_thw, prompt_grid):
-        raise ValueError("prompt/full processor calls produced different current video grids")
     full_ids = full_ids.to(torch.int64)
     prompt_ids = prompt_ids.to(torch.int64)
     prompt_length = int(prompt_ids.shape[1])
-    if full_ids.shape[1] <= prompt_length or not torch.equal(
-        full_ids[:, :prompt_length], prompt_ids
-    ):
-        raise ValueError("Qwen chat template full sequence does not preserve its prompt prefix")
     labels = torch.full_like(full_ids, -100)
     labels[:, prompt_length:] = full_ids[:, prompt_length:]
     number_mask = torch.zeros_like(labels, dtype=torch.bool)
@@ -2892,23 +2715,6 @@ def _prepare_answer_cpu(
         answer_provenance=(provenance,),
         count_provenance=(TargetProvenance.OFFICIAL_WEAK,),
     )
-    total_seconds = time.perf_counter() - started
-    spatial_merge_area = config.video_preprocessing.spatial_merge_size**2
-    patch_count = int(materialized.pixel_values_videos.shape[0])
-    if patch_count % spatial_merge_area:
-        raise ValueError("Query patch count is not divisible by the spatial merge area")
-    visual_token_count = patch_count // spatial_merge_area
-    _loader_trace(
-        "query_prepare_done",
-        query_id=query.runtime.query_id,
-        seconds=total_seconds,
-        frame_count=int(materialized.frame_timestamps.shape[0]),
-        patch_count=patch_count,
-        visual_token_count=visual_token_count,
-        decode_seconds=decode_seconds,
-        processor_seconds=processor_seconds,
-        cache_stats=(preprocess_cache.stats() if preprocess_cache else {}),
-    )
     prepared_visual = _compact_materialized_chunk(materialized)
     return PreparedAnswerCPU(
         spec=spec,
@@ -2916,14 +2722,6 @@ def _prepare_answer_cpu(
         base_attention_mask=full_mask,
         target_labels=target_labels,
         materialized_query=prepared_visual,
-        preparation=QueryPreparationTelemetry(
-            decode_seconds=decode_seconds,
-            processor_seconds=processor_seconds,
-            total_seconds=total_seconds,
-            frame_count=prepared_visual.frame_count,
-            patch_count=prepared_visual.patch_count,
-            visual_token_count=visual_token_count,
-        ),
     )
 
 
@@ -3063,20 +2861,8 @@ def _build_materialized_query(
     )
 
 
-def _require_latest_qwen_processor(processor: object, *, context: str) -> Any:
-    typed = cast(Any, processor)
-    if not callable(getattr(typed, "apply_chat_template", None)):
-        raise TypeError(f"{context} requires Qwen3-VL apply_chat_template")
-    if not callable(getattr(typed, "video_processor", None)):
-        raise TypeError(f"{context} requires the Qwen3-VL video_processor")
-    if not callable(getattr(typed, "tokenizer", None)):
-        raise TypeError(f"{context} requires the Qwen3-VL tokenizer")
-    return typed
-
-
 def _process_video_once(processor: Any, frames: Tensor) -> tuple[Tensor, Tensor]:
     video_processor = processor.video_processor
-    started = time.perf_counter()
     raw = video_processor(
         videos=[frames],
         do_sample_frames=False,
@@ -3087,13 +2873,6 @@ def _process_video_once(processor: Any, frames: Tensor) -> tuple[Tensor, Tensor]
     grid = _processor_tensor(raw, "video_grid_thw").to(torch.int64)
     if pixels.ndim == 3 and pixels.shape[0] == 1:
         pixels = pixels.squeeze(0)
-    if pixels.ndim != 2 or not torch.is_floating_point(pixels):
-        raise ValueError("direct Qwen video processor returned invalid pixel tensor")
-    _loader_trace(
-        "processor",
-        seconds=time.perf_counter() - started,
-        pixel_tokens=int(pixels.shape[0]),
-    )
     return pixels.contiguous(), grid.contiguous()
 
 
@@ -3129,30 +2908,22 @@ def _expand_qwen_video_placeholders(
     if len(indices) % merge_size:
         indices.extend([indices[-1]] * (merge_size - len(indices) % merge_size))
     timestamps = list(processor._calculate_timestamps(indices, 24, merge_size))
-    if not timestamps:
-        raise ValueError("Qwen video placeholder expansion received no frame timestamps")
     timestamps = (timestamps + [timestamps[-1]] * temporal)[:temporal]
     placeholder = "".join(
         f"<{float(t):.1f} seconds>{vision_start}" + ("<|placeholder|>" * frame_seqlen) + vision_end
         for t in timestamps
     )
     wrapped = f"{vision_start}{video_token}{vision_end}"
-    if wrapped not in text:
-        raise ValueError("Qwen chat template did not emit the expected video placeholder")
     text = text.replace(wrapped, placeholder, 1)
     return text.replace("<|placeholder|>", video_token)
 
 
 def _resolve_video_path(source_dataset: str, relative_path: str) -> Path:
-    root = os.environ.get("SVCBENCH_VIDEO_ROOT")
-    if not root:
-        raise ValueError("SVCBENCH_VIDEO_ROOT is required for production materialization")
+    root = os.environ.get("SVCBENCH_VIDEO_ROOT", "")
     root_path = Path(root).resolve()
     direct = (root_path / relative_path).resolve()
     nested = (root_path / source_dataset / relative_path).resolve()
     for candidate in (direct, nested):
-        if not candidate.is_relative_to(root_path):
-            raise ValueError("production video path escaped SVCBENCH_VIDEO_ROOT")
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(
@@ -3172,16 +2943,11 @@ def _user_message(question: str) -> dict[str, object]:
 
 
 def _processor_tensor(raw: object, key: str) -> Tensor:
-    if not isinstance(raw, Mapping) or not isinstance(raw.get(key), Tensor):
-        raise TypeError(f"Qwen processor output is missing Tensor {key}")
-    return cast(Tensor, raw[key])
+    return cast(Tensor, cast(Mapping[str, Any], raw)[key])
 
 
 def _token_ids(tokenizer: object, text: str) -> tuple[int, ...]:
-    encode = getattr(tokenizer, "encode", None)
-    if not callable(encode):
-        raise TypeError("production tokenizer must expose encode()")
-    values = encode(text, add_special_tokens=False)
+    values = cast(Any, tokenizer).encode(text, add_special_tokens=False)
     return tuple(int(value) for value in values)
 
 
@@ -3209,16 +2975,11 @@ def _video_pixel_bounds(backbone: LlamaFactoryBackboneBundle) -> tuple[int, int]
         maximum = 262_144
     if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum <= 0:
         minimum = 16 * 16
-    if minimum > maximum:
-        raise ValueError("LLaMA-Factory video_min_pixels cannot exceed video_max_pixels")
     return minimum, maximum
 
 
 def _module_device(module: nn.Module) -> torch.device:
-    parameter = next(module.parameters(), None)
-    if parameter is None:
-        raise ValueError("production module exposes no parameters/device")
-    return parameter.device
+    return next(module.parameters()).device
 
 
 def _sample_fps_for(spec: ObservationSpec, config: ProjectConfig) -> float:
@@ -3261,27 +3022,8 @@ def _decode_uniform_interval(
             # streaming decoder still converts/retains only target frames; host memory therefore
             # remains bounded by ``maximum_frames``.
             frames, timestamps = _decode_targets_streaming(spec, target_times)
-    if not frames:
-        raise ValueError(f"current chunk {spec.chunk_id} contains no causal decoded frame")
-    padded_single_frame = len(frames) == 1
-    if padded_single_frame:
-        # Qwen's temporal patch size is two.  Very early SVCBench Queries (0.1s)
-        # can causally expose only the first decoded frame, so repeat that frame
-        # inside the current chunk instead of reading a future frame.
-        frames.append(frames[0].clone())
-        timestamps.append(timestamps[0])
-    elif len(frames) % 2:
-        # Sparse/VFR sources can expose fewer unique frames than the nominal 2 FPS budget.
-        # Drop one endpoint rather than duplicating an observation inside a normal interval.
-        frames.pop()
-        timestamps.pop()
-    if len(frames) < 2:
-        raise ValueError(f"current chunk {spec.chunk_id} has no complete temporal tubelet")
-    selected_frames = torch.stack(frames).contiguous()
-    selected_times = torch.tensor(timestamps, dtype=torch.float64)
-    if not padded_single_frame and bool(torch.any(selected_times[1:] <= selected_times[:-1])):
-        raise RuntimeError("sampled current-chunk timestamps are not strictly increasing")
-    return selected_frames, selected_times
+    frames, timestamps = _finalize_decoded_frames(frames, timestamps, spec)
+    return torch.stack(frames).contiguous(), torch.tensor(timestamps, dtype=torch.float64)
 
 
 def _decode_coalesced_intervals(
@@ -3297,8 +3039,6 @@ def _decode_coalesced_intervals(
     if not specs:
         return {}
     path = specs[0].video_path
-    if any(spec.video_path != path for spec in specs):
-        raise ValueError("coalesced intervals must refer to one video")
     target_map = {spec.chunk_id: _uniform_target_times(spec, sample_fps) for spec in specs}
     frame_map: dict[str, list[Tensor]] = {spec.chunk_id: [] for spec in specs}
     time_map: dict[str, list[float]] = {spec.chunk_id: [] for spec in specs}
@@ -3368,8 +3108,6 @@ def _uniform_target_times(spec: ObservationSpec, sample_fps: float) -> list[floa
         max(2, int(math.floor((spec.end_time - spec.start_time) * sample_fps))),
     )
     desired -= desired % 2
-    if desired < 2:
-        raise ValueError(f"current chunk {spec.chunk_id} has no complete temporal tubelet")
     return cast(
         list[float],
         torch.linspace(spec.start_time, spec.end_time, desired, dtype=torch.float64).tolist(),
@@ -3385,12 +3123,6 @@ def _llamafactory_uniform_frame_indices(
 ) -> tuple[int, ...]:
     """Mirror LLaMA-Factory commit 523f801 ``_get_video_sample_indices`` exactly."""
 
-    if total_frames < 0 or video_maxlen <= 0:
-        raise ValueError("LLaMA-Factory frame counts/cap must be non-negative and positive")
-    if not math.isfinite(duration) or duration < 0.0:
-        raise ValueError("LLaMA-Factory sampling duration must be finite and non-negative")
-    if not math.isfinite(video_fps) or video_fps <= 0.0:
-        raise ValueError("LLaMA-Factory sampling FPS must be finite and positive")
     if total_frames == 0:
         return tuple(range(video_maxlen))
     sample_frames = max(1, math.floor(duration * video_fps))
@@ -3444,8 +3176,6 @@ def _llamafactory_query_target_times(
 def _finalize_decoded_frames(
     frames: list[Tensor], timestamps: list[float], spec: ObservationSpec
 ) -> tuple[list[Tensor], list[float]]:
-    if not frames:
-        raise ValueError(f"current chunk {spec.chunk_id} contains no causal decoded frame")
     padded_single_frame = len(frames) == 1
     if padded_single_frame:
         frames.append(frames[0].clone())
@@ -3453,12 +3183,6 @@ def _finalize_decoded_frames(
     elif len(frames) % 2:
         frames.pop()
         timestamps.pop()
-    if len(frames) < 2:
-        raise ValueError(f"current chunk {spec.chunk_id} has no complete temporal tubelet")
-    if not padded_single_frame and any(
-        right <= left for left, right in zip(timestamps, timestamps[1:], strict=False)
-    ):
-        raise RuntimeError("sampled current-chunk timestamps are not strictly increasing")
     return frames, timestamps
 
 

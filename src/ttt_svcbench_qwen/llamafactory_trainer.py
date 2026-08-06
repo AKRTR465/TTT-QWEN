@@ -3278,50 +3278,10 @@ def _state_group_for_name(lowered: str) -> str:
     return "state_shared"
 
 
-@dataclass(frozen=True, slots=True)
-class WarmupOuterTrainabilityAudit:
-    qwen_parameter_count: int
-    qwen_trainable_count: int
-    fast_slow_parameter_count: int
-    fast_slow_trainable_count: int
-    w0_parameter_count: int
-    w0_trainable_count: int
-    state_parameter_count: int
-    state_trainable_count: int
-    associative_parameter_count: int
-    associative_trainable_count: int
-
-    def __post_init__(self) -> None:
-        if any(
-            count <= 0
-            for count in (
-                self.qwen_parameter_count,
-                self.fast_slow_parameter_count,
-                self.w0_parameter_count,
-                self.state_parameter_count,
-                self.associative_parameter_count,
-            )
-        ):
-            raise ValueError("Memory/State warmup trainability audit found an empty group")
-        if any(
-            count != 0
-            for count in (
-                self.qwen_trainable_count,
-                self.fast_slow_trainable_count,
-                self.w0_trainable_count,
-            )
-        ):
-            raise ValueError("Memory/State warmup left a frozen group trainable")
-        if self.state_trainable_count != self.state_parameter_count:
-            raise ValueError("Memory/State warmup must train every state parameter")
-        if self.associative_trainable_count != self.associative_parameter_count:
-            raise ValueError("Memory/State warmup must train every Associative parameter")
-
-
 def _configure_fast_state_warmup_trainability(
     model: nn.Module,
     qwen_model: nn.Module,
-) -> WarmupOuterTrainabilityAudit:
+) -> None:
     """Freeze Qwen/W0/slow projections and train only memory interface plus state modules."""
 
     qwen_ids = {id(parameter) for parameter in qwen_model.parameters()}
@@ -3339,58 +3299,12 @@ def _configure_fast_state_warmup_trainability(
             group = "fast_slow"
         else:
             group = _state_group_for_name(lowered)
-        previous = grouped.get(parameter_id)
-        if previous is not None:
-            if previous[0] != group:
-                raise ValueError(
-                    "aliased warmup parameter crossed trainability groups: "
-                    f"{previous[0]}/{group}"
-                )
+        if parameter_id in grouped:
             continue
         grouped[parameter_id] = (group, parameter)
-    if not qwen_ids <= set(grouped):
-        raise RuntimeError("Memory/State warmup lost Qwen parameters from the outer model")
     allowed_groups = _A5_WARMUP_TRAINABLE_GROUPS
     for group, parameter in grouped.values():
         parameter.requires_grad_(group in allowed_groups)
-
-    def parameter_count(groups: frozenset[str]) -> tuple[int, int]:
-        values = tuple(
-            parameter
-            for group, parameter in grouped.values()
-            if group in groups
-        )
-        return (
-            sum(parameter.numel() for parameter in values),
-            sum(parameter.numel() for parameter in values if parameter.requires_grad),
-        )
-
-    qwen_count, qwen_trainable = parameter_count(frozenset({"qwen"}))
-    fast_slow_count, fast_slow_trainable = parameter_count(frozenset({"fast_slow"}))
-    w0_count, w0_trainable = parameter_count(frozenset({"w0"}))
-    state_count, state_trainable = parameter_count(
-        frozenset(
-            {
-                "state_shared",
-                "state_task",
-                "state_router_time",
-                "state_retrieval",
-            }
-        )
-    )
-    associative_count, associative_trainable = parameter_count(frozenset({"associative"}))
-    return WarmupOuterTrainabilityAudit(
-        qwen_parameter_count=qwen_count,
-        qwen_trainable_count=qwen_trainable,
-        fast_slow_parameter_count=fast_slow_count,
-        fast_slow_trainable_count=fast_slow_trainable,
-        w0_parameter_count=w0_count,
-        w0_trainable_count=w0_trainable,
-        state_parameter_count=state_count,
-        state_trainable_count=state_trainable,
-        associative_parameter_count=associative_count,
-        associative_trainable_count=associative_trainable,
-    )
 
 
 def _reset_a2_to_a5_associative(model: nn.Module) -> None:
@@ -3400,84 +3314,11 @@ def _reset_a2_to_a5_associative(model: nn.Module) -> None:
     adapters[0].reset_associative_projections()
 
 
-def _memory_gradient_probes(
-    model: nn.Module,
-    expected_groups: tuple[str, ...],
-) -> tuple[GradientProbe, ...]:
-    """Split the pooled ``associative`` group into read-path and write-path witnesses.
-
-    The write-path parameters reach the loss only through the Query deferred VJP,
-    so their gradient norm is the sole direct evidence that the delta-rule write
-    is being trained.  Pooled with ``p_context`` and ``memory_alpha`` — both of
-    which are also fed by the read path — that signal is unrecoverable from the
-    group norm alone.  ``w0`` is the reference denominator because the failure
-    mode this exists to catch is W0's static-adapter gradient dominating the
-    write path by orders of magnitude rather than the write path being exactly
-    zero.
-    """
-
-    if "associative" not in expected_groups:
-        return ()
-    adapters = tuple(module for module in model.modules() if isinstance(module, FastTTTAdapter))
-    if len(adapters) != 1:
-        raise RuntimeError("memory gradient probes require exactly one FastTTTAdapter")
-    adapter = adapters[0]
-    reference = "w0" if "w0" in expected_groups else None
-    return (
-        GradientProbe(
-            name="memory_write",
-            group_name="associative",
-            parameters=tuple(adapter.collect_memory_write_parameters()),
-            reference_group=reference,
-        ),
-        GradientProbe(
-            name="memory_read",
-            group_name="associative",
-            parameters=tuple(adapter.collect_memory_read_parameters()),
-            reference_group=reference,
-        ),
-    )
-
-
 def _reset_a2_to_a5_balance(model: nn.Module) -> None:
     balancer = getattr(model, "official_weak_balancer", None)
     if not isinstance(balancer, OfficialWeakOuterLossComposer):
         raise RuntimeError("A5 outer model lost the official-weak EMA reset boundary")
     balancer.reset_ema()
-
-
-def _a5_global_sample_sequence_sha256(
-    dataset: object,
-    sampler_factory: TrainSamplerFactory | None,
-    *,
-    epoch_count: float,
-    world_size: int = 4,
-) -> tuple[str, int]:
-    """Hash the exact active-world-size global A5 record sequence before training starts."""
-
-    if sampler_factory is None:
-        raise RuntimeError("A5 sample-sequence audit requires the production sampler")
-    if not math.isfinite(epoch_count) or epoch_count <= 0.0 or not epoch_count.is_integer():
-        raise ValueError("A5 sample-sequence audit requires an integer epoch count")
-    if world_size not in {4, 8}:
-        raise ValueError("A5 sample-sequence audit supports only four or eight ranks")
-    sampler = sampler_factory(dataset, 0, world_size)
-    set_epoch = getattr(sampler, "set_epoch", None)
-    if not callable(set_epoch):
-        raise TypeError("A5 sample-sequence audit requires an epoch-aware sampler")
-    digest = hashlib.sha256()
-    count = 0
-    for epoch in range(int(epoch_count)):
-        set_epoch(epoch)
-        for index in cast(Iterable[int], sampler):
-            record = cast(Any, dataset)[index]
-            if not isinstance(record, A5EpisodeRecord):
-                raise TypeError("A5 sample-sequence audit encountered a non-A5 record")
-            digest.update(f"{epoch}\t{record.episode_id}\n".encode())
-            count += 1
-    if count <= 0:
-        raise RuntimeError("A5 sample-sequence audit produced no records")
-    return digest.hexdigest(), count
 
 
 def _sha256_file(path: Path) -> str:
@@ -3486,76 +3327,6 @@ def _sha256_file(path: Path) -> str:
         while block := handle.read(8 * 1024 * 1024):
             digest.update(block)
     return digest.hexdigest()
-
-
-def _a2_checkpoint_sha256(checkpoint: Path) -> str:
-    """Hash the complete loadable A2 model payload in stable filename order."""
-
-    root = checkpoint.expanduser().resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"A2 checkpoint directory does not exist: {root}")
-    single_candidates = (root / "model.safetensors", root / "pytorch_model.bin")
-    present_single = tuple(path for path in single_candidates if path.is_file())
-    index_candidates = (
-        root / "model.safetensors.index.json",
-        root / "pytorch_model.bin.index.json",
-    )
-    present_index = tuple(path for path in index_candidates if path.is_file())
-    if len(present_single) + len(present_index) != 1:
-        raise RuntimeError("A2 checkpoint must expose exactly one model weight entrypoint")
-    if present_single:
-        files = present_single
-    else:
-        index_path = present_index[0]
-        raw = cast(object, json.loads(index_path.read_text(encoding="utf-8")))
-        weight_map = raw.get("weight_map") if isinstance(raw, dict) else None
-        if not isinstance(weight_map, dict) or not weight_map:
-            raise RuntimeError("A2 checkpoint shard index has no weight_map")
-        shard_names = tuple(
-            sorted({value for value in weight_map.values() if isinstance(value, str)})
-        )
-        if not shard_names or len(shard_names) != len(set(weight_map.values())):
-            raise RuntimeError("A2 checkpoint shard index contains invalid shard names")
-        files = (index_path, *(root / name for name in shard_names))
-    digest = hashlib.sha256()
-    for path in files:
-        if not path.is_file() or path.stat().st_size <= 0:
-            raise FileNotFoundError(f"A2 checkpoint weight file is missing or empty: {path}")
-        digest.update(path.name.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(_sha256_file(path).encode("ascii"))
-        digest.update(b"\n")
-    return digest.hexdigest()
-
-
-def _effective_project_config_sha256(project: ProjectConfig) -> str:
-    payload = json.dumps(
-        project.model_dump(mode="json"),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _current_git_commit(root: Path) -> tuple[str, bool]:
-    commit = subprocess.run(
-        ("git", "-C", str(root), "rev-parse", "HEAD"),
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    dirty = bool(
-        subprocess.run(
-            ("git", "-C", str(root), "status", "--porcelain"),
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    )
-    if not commit:
-        raise RuntimeError("Git did not return a code commit")
-    return commit, dirty
 
 
 def _warmup_bundle_allowlist(
@@ -3599,10 +3370,6 @@ def _warmup_bundle_allowlist(
     }
     if not names:
         raise RuntimeError("warmup bundle allowlist contains no non-Qwen tensors")
-    if not names <= set(model.state_dict()):
-        raise RuntimeError("warmup bundle allowlist contains non-persistent tensors")
-    if any(_is_transient_memory_name(name.casefold()) for name in names):
-        raise RuntimeError("the transient per-video memory entered the warmup bundle allowlist")
     return tuple(sorted(names))
 
 

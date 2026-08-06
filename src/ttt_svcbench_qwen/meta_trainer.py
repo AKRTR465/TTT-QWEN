@@ -12,9 +12,9 @@ differentiable runtime snapshots.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass, fields, is_dataclass, replace
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from typing import Protocol, cast
 
@@ -68,7 +68,7 @@ from ttt_svcbench_qwen.outer_loss_balance import (
     OfficialWeakOuterLossComposer,
 )
 from ttt_svcbench_qwen.query_encoder import QueryEncoderOutput
-from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase, trace_event
+from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase
 from ttt_svcbench_qwen.stage_a_targets import (
     O2DedupContext,
     OfficialWeakStateLossOutput,
@@ -77,7 +77,6 @@ from ttt_svcbench_qwen.stage_a_targets import (
     TargetProvenance,
 )
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
-from ttt_svcbench_qwen.tensor_contracts import tensor_storage_key
 from ttt_svcbench_qwen.trainer import (
     StageAEpisodeAnswerInputs,
     StageASupervisionBatch,
@@ -146,12 +145,6 @@ class MetaCausalChunk:
             or self.end_time < self.start_time
         ):
             raise ValueError("Meta-TTT chunk times must be finite and ordered")
-
-
-RawSupportVisualBatcher = Callable[
-    [tuple[MetaCausalChunk, ...], int],
-    tuple[MetaCausalChunk, ...],
-]
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,9 +405,7 @@ class MemoryWriteAudit:
     readout_shares: tuple[float, ...]
     valid_token_counts: tuple[int, ...]
     bank_record_counts: tuple[int, ...]
-    runtime_detached: bool
     next_only_verified: bool
-    slot_geometry_probes: tuple[SlotGeometryProbe | None, ...] = ()
 
     def __post_init__(self) -> None:
         batch_size = len(self.write_versions_before)
@@ -439,12 +430,6 @@ class MemoryWriteAudit:
         )
         if batch_size <= 0 or any(len(values) != batch_size for values in aligned):
             raise ValueError("memory write audit fields must align to the owner batch")
-        # Kept out of `aligned` on purpose: the probes are optional diagnostics
-        # that stub controllers legitimately omit, so they are length-checked
-        # only when present.  Without this branch a short tuple would survive
-        # here and detonate far away in the metric emission's strict zip.
-        if self.slot_geometry_probes and len(self.slot_geometry_probes) != batch_size:
-            raise ValueError("slot geometry probes must align to the owner batch")
         if self.write_versions_observed != self.write_versions_before:
             raise ValueError("current Support was not observed with its before-write memory")
         if not self.next_only_verified:
@@ -497,7 +482,6 @@ class TruncatedSegmentAudit:
     backward_applied: bool
     includes_query_backward: bool
     truncated: bool
-    truncate_audits: tuple[MemoryTruncateAudit, ...]
 
     def __post_init__(self) -> None:
         if self.training_mode not in {"meta_ttt", "outer_only", "no_write"}:
@@ -571,67 +555,6 @@ class TruncatedSegmentAudit:
             raise ValueError("every truncated segment must contribute one backward collective")
         if not self.includes_query_backward:
             raise ValueError("every A5 segment must close with one Meta Query")
-        if self.truncated != bool(self.truncate_audits):
-            raise ValueError("segment truncation flag and audits disagree")
-
-
-@dataclass(frozen=True, slots=True)
-class CounterfactualAuditRequest:
-    """One deterministic diagnostic Query selection for the current optimizer step."""
-
-    optimizer_step: int
-    query_selector: int
-    queries_per_rank: int = 1
-
-    def __post_init__(self) -> None:
-        if self.optimizer_step <= 0 or self.query_selector < 0:
-            raise ValueError("counterfactual audit request indices must be positive/non-negative")
-        if type(self.queries_per_rank) is not int or self.queries_per_rank < 1:
-            raise ValueError("counterfactual queries_per_rank must be a positive integer")
-
-
-@dataclass(frozen=True, slots=True)
-class CounterfactualReferenceAudit:
-    reference: str
-    adapted_loss: float
-    reference_loss: float
-    gain_abs: float
-    gain_rel: float
-    descent_cosine: float
-
-    def __post_init__(self) -> None:
-        if self.reference not in {"episode_zero", "segment_start"}:
-            raise ValueError("counterfactual reference is invalid")
-        if any(
-            not math.isfinite(value)
-            for value in (
-                self.adapted_loss,
-                self.reference_loss,
-                self.gain_abs,
-                self.gain_rel,
-                self.descent_cosine,
-            )
-        ):
-            raise ValueError("counterfactual audit values must be finite")
-        if self.adapted_loss < 0.0 or self.reference_loss < 0.0:
-            raise ValueError("counterfactual Query losses must be non-negative")
-        if not -1.0 <= self.descent_cosine <= 1.0:
-            raise ValueError("counterfactual descent cosine must be in [-1, 1]")
-
-
-@dataclass(frozen=True, slots=True)
-class QueryCounterfactualAudit:
-    optimizer_step: int
-    references: tuple[CounterfactualReferenceAudit, ...]
-
-    def __post_init__(self) -> None:
-        if self.optimizer_step <= 0:
-            raise ValueError("counterfactual optimizer step must be positive")
-        if tuple(item.reference for item in self.references) != (
-            "episode_zero",
-            "segment_start",
-        ):
-            raise ValueError("counterfactual Query audit must contain both ordered references")
 
 
 @dataclass(frozen=True, slots=True)
@@ -670,17 +593,12 @@ class TruncatedQueryPointAudit:
     write_versions: tuple[int, ...]
     metrics: QueryMetricSnapshot
     prefill_count: int
-    observation_immutable: bool
     proxy_gradient_norms: tuple[float, ...]
     proxy_gradient_joint_norm_raw: float
     proxy_gradient_joint_norm_clipped: float
     proxy_gradient_clip_scale: float
     proxy_gradient_clipped: bool
     proxy_gradient_max_norm: float
-    proxy_gradient_status: str
-    proxy_storage_isolated: bool
-    proxy_max_abs_value_drift: float
-    counterfactual: QueryCounterfactualAudit | None = None
 
     def __post_init__(self) -> None:
         if type(self.query_index) is not int or self.query_index < 0:
@@ -697,8 +615,6 @@ class TruncatedQueryPointAudit:
             raise ValueError("truncated Query audit exposes future observation")
         if self.prefill_count != 1:
             raise ValueError("each production Query must execute exactly one prefill")
-        if not self.observation_immutable:
-            raise ValueError("production Query answer mutated its observation")
         if not self.proxy_gradient_norms or any(
             not math.isfinite(value) or value < 0.0 for value in self.proxy_gradient_norms
         ):
@@ -718,24 +634,6 @@ class TruncatedQueryPointAudit:
             clipped=self.proxy_gradient_clipped,
             max_norm=self.proxy_gradient_max_norm,
         )
-        gradient_nonzero = any(value > 0.0 for value in self.proxy_gradient_norms)
-        if gradient_nonzero != (self.proxy_gradient_status == "nonzero"):
-            raise ValueError("Query proxy gradient status disagrees with measured norms")
-        if self.proxy_gradient_status not in {
-            "nonzero",
-            "zero_padding",
-            "zero_fast_objective_satisfied",
-            "zero_no_valid_retrieval_bag",
-            "zero_no_fast_dependent_term",
-        }:
-            raise ValueError("Query proxy gradient status is invalid")
-        if not self.proxy_storage_isolated:
-            raise ValueError("Query proxy memory matrices must use isolated storage")
-        if (
-            not math.isfinite(self.proxy_max_abs_value_drift)
-            or self.proxy_max_abs_value_drift != 0.0
-        ):
-            raise ValueError("Query proxy memory values must exactly match authoritative M_after")
 
 
 @dataclass(frozen=True, slots=True)
@@ -774,12 +672,8 @@ class TruncatedMetaTTTEpisodeAudit:
     slots_written_total: int
     bank_record_count: int
     empty_bank_count: int
-    parameter_versions_unchanged_before_outer_step: bool
     bank_context_detached: bool
     support_supervision_reachable: bool
-    training_counterfactual_executed: bool
-    diagnostic_counterfactual_executed: bool
-    counterfactual_audited_query_count: int
     segments: tuple[TruncatedSegmentAudit, ...]
     writes: tuple[MemoryWriteAudit, ...]
     queries: tuple[TruncatedQueryPointAudit, ...]
@@ -793,15 +687,6 @@ class TruncatedMetaTTTEpisodeAudit:
             raise ValueError("A5 associative valid count must be a non-negative integer")
         if self.ttt_enabled != (self.adaptation_mode == "meta_ttt"):
             raise ValueError("A5 TTT enabled audit disagrees with adaptation mode")
-        if type(self.diagnostic_counterfactual_executed) is not bool:
-            raise TypeError("diagnostic counterfactual flag must be bool")
-        if (
-            type(self.counterfactual_audited_query_count) is not int
-            or not 0 <= self.counterfactual_audited_query_count <= self.query_count
-            or self.diagnostic_counterfactual_executed
-            != (self.counterfactual_audited_query_count > 0)
-        ):
-            raise ValueError("diagnostic counterfactual Query count is invalid")
         if self.loss_weight not in (0.0, 1.0):
             raise ValueError("A5 episode audit loss weight must be deterministic zero or one")
         if self.truncation_horizon <= 0:
@@ -856,10 +741,6 @@ class TruncatedMetaTTTEpisodeAudit:
             query_offset += segment.query_count
         if query_offset != self.query_count:
             raise ValueError("A5 segment Query bundle counts drifted")
-        if not self.parameter_versions_unchanged_before_outer_step:
-            raise ValueError("outer parameters changed before the episode-level optimizer step")
-        if self.training_counterfactual_executed:
-            raise ValueError("the production A5 path must not execute no-write counterfactuals")
 
     @property
     def meta_ttt_segment_count(self) -> int:
@@ -921,8 +802,6 @@ class MetaTTTEpisodeRunner:
         runtime_resetter: EpisodeRuntimeResetter,
         query_loss_builder: MetaQueryLossBuilder | None = None,
         query_encoder_reuse: bool = False,
-        raw_support_visual_batcher: RawSupportVisualBatcher | None = None,
-        support_visual_batch_size: int = 1,
         query_activation_offload: bool = False,
         outer_composer: OfficialWeakOuterLossComposer | None = None,
         adaptation_mode: str = "meta_ttt",
@@ -939,12 +818,6 @@ class MetaTTTEpisodeRunner:
         if type(query_encoder_reuse) is not bool:
             raise TypeError("query_encoder_reuse must be bool")
         self.query_encoder_reuse = query_encoder_reuse
-        if raw_support_visual_batcher is not None and not callable(raw_support_visual_batcher):
-            raise TypeError("raw_support_visual_batcher must be callable")
-        if type(support_visual_batch_size) is not int or support_visual_batch_size <= 0:
-            raise ValueError("support_visual_batch_size must be a positive integer")
-        self.raw_support_visual_batcher = raw_support_visual_batcher
-        self.support_visual_batch_size = support_visual_batch_size
         if type(query_activation_offload) is not bool:
             raise TypeError("query_activation_offload must be bool")
         self.query_activation_offload = query_activation_offload
@@ -964,11 +837,6 @@ class MetaTTTEpisodeRunner:
             for parameter in self.fast_controller.collect_associative_parameters():
                 parameter.requires_grad_(False)
         self.last_balance_audit: OfficialWeakBalanceAudit | None = None
-        audit_config = config.a5.counterfactual_audit
-        if audit_config.enabled and (
-            audit_config.interval_steps <= 0 or audit_config.queries_per_rank <= 0
-        ):
-            raise ValueError("A5 counterfactual audit requires positive interval and query count")
 
     def run_truncated(
         self,
@@ -977,11 +845,9 @@ class MetaTTTEpisodeRunner:
         backward: Callable[[Tensor, bool], None] | None = None,
         backward_gradient_scale: float = 1.0,
         episode_loss_weight: float = 1.0,
-        counterfactual_audit: CounterfactualAuditRequest | None = None,
     ) -> TruncatedMetaTTTEpisodeOutput:
         """Run one Query-aligned deferred-VJP closure per bounded Support segment."""
 
-        self._validate_truncated_episode(episode)
         if (
             not isinstance(backward_gradient_scale, int | float)
             or not math.isfinite(float(backward_gradient_scale))
@@ -995,27 +861,9 @@ class MetaTTTEpisodeRunner:
         ):
             raise ValueError("A5 episode loss weight must be deterministic zero or one")
         episode_weight = float(episode_loss_weight)
-        audit_config = self.config.a5.counterfactual_audit
-        if counterfactual_audit is not None:
-            if not audit_config.enabled:
-                raise ValueError("counterfactual audit request requires enabled diagnostic config")
-            if not self.ttt_enabled:
-                raise ValueError("counterfactual Query audit requires Meta-TTT")
-            if not isinstance(counterfactual_audit, CounterfactualAuditRequest):
-                raise TypeError("counterfactual audit request is invalid")
-        if counterfactual_audit is None:
-            selected_query_indices: frozenset[int] = frozenset()
-        else:
-            total_queries = len(episode.query_points)
-            selected_query_indices = frozenset(
-                (counterfactual_audit.query_selector + offset) % total_queries
-                for offset in range(min(counterfactual_audit.queries_per_rank, total_queries))
-            )
         backward_fn = backward or _plain_backward
         self.model.train()
         adapted = self._reset_trajectory(episode.owner, differentiable=True)
-        tracked_parameters = _unique_parameters(tuple(self.model.parameters()))
-        versions_before = tuple(parameter._version for parameter in tracked_parameters)
         horizon = self.config.a5.truncation_horizon
         support_count = len(episode.support_chunks)
         write_audits: list[MemoryWriteAudit] = []
@@ -1073,11 +921,6 @@ class MetaTTTEpisodeRunner:
         if any(prewarm_fast_audit.write_versions):
             raise ValueError("the no-write prewarm must observe the zero-memory generation")
         adapted.runtime = _runtime_from_observation(prewarm_observation, episode.owner)
-        episode_zero_reference = (
-            _zero_reference_fast_states(adapted.fast_states)
-            if counterfactual_audit is not None and episode_weight == 1.0
-            else None
-        )
         del prewarm_observation
 
         query_offset = 0
@@ -1093,27 +936,11 @@ class MetaTTTEpisodeRunner:
             write_version_before_segment = tuple(
                 state.write_version for state in adapted.fast_states
             )
-            segment_start_reference = (
-                _snapshot_reference_fast_states(adapted.fast_states)
-                if counterfactual_audit is not None and episode_weight == 1.0
-                else None
-            )
             queries = episode.query_points[query_offset : query_offset + segment_query_count]
             query_roles = episode.query_roles[query_offset : query_offset + segment_query_count]
             query_weights = episode.query_weights[query_offset : query_offset + segment_query_count]
             raw_segment = episode.support_chunks[support_offset : support_offset + segment_length]
             active_segment = raw_segment
-            if self.raw_support_visual_batcher is not None and self.support_visual_batch_size > 1:
-                with _seeded_rng(
-                    episode.seed + support_offset + 1,
-                    adapted.fast_states,
-                ):
-                    prepared_segment = self.raw_support_visual_batcher(
-                        raw_segment,
-                        self.support_visual_batch_size,
-                    )
-                self._validate_prepared_segment(raw_segment, prepared_segment)
-                active_segment = prepared_segment
             segment_retained_writes = 0
             segment_pre_write_cosine_sum = 0.0
             segment_pre_write_cosine_count = 0
@@ -1252,11 +1079,9 @@ class MetaTTTEpisodeRunner:
                         calibration_lifecycle,
                     )
 
-                proxy_pairs = tuple(
+                proxy_states = tuple(
                     make_query_proxy_fast_state(state) for state in authoritative_fast_states
                 )
-                proxy_states = tuple(state for state, _ in proxy_pairs)
-                proxy_audits = tuple(audit for _, audit in proxy_pairs)
                 query_trajectory = _Trajectory(
                     _fork_retrieval_runtime(query_runtime_snapshot).with_fast_states(proxy_states)
                 )
@@ -1279,7 +1104,6 @@ class MetaTTTEpisodeRunner:
                         with_grad=True,
                         prepared_query=prepared_query,
                     )
-                    observation_versions = _tensor_version_signature(observation)
                     output = self._answer(
                         query,
                         observation,
@@ -1287,7 +1111,6 @@ class MetaTTTEpisodeRunner:
                         fast_states=proxy_states,
                         with_grad=True,
                     )
-                immutable = observation_versions == _tensor_version_signature(observation)
                 objective = self._query_objective(query, output, dedup=query_dedup)
                 balanced_outer: OuterLossOutput | None = None
                 gradient_statistics: Tensor | None = None
@@ -1317,71 +1140,6 @@ class MetaTTTEpisodeRunner:
                     max_norm=self.config.a5.query_meta_gradient.max_norm,
                     epsilon=self.config.a5.query_meta_gradient.epsilon,
                 )
-                query_counterfactual: QueryCounterfactualAudit | None = None
-                if (
-                    global_query_index in selected_query_indices
-                    and episode_weight == 1.0
-                    and counterfactual_audit is not None
-                ):
-                    if episode_zero_reference is None or segment_start_reference is None:
-                        raise RuntimeError(
-                            "counterfactual reference memory states were not captured"
-                        )
-                    adapted_audit_loss = float(
-                        (query_weight * objective.outer.outer).detach().float().item()
-                    )
-                    reference_items: list[CounterfactualReferenceAudit] = []
-                    for reference_name, reference_states in (
-                        ("episode_zero", episode_zero_reference),
-                        ("segment_start", segment_start_reference),
-                    ):
-                        reference_loss = self._counterfactual_query_loss(
-                            query=query,
-                            query_weight=query_weight,
-                            query_runtime_snapshot=query_runtime_snapshot,
-                            reference_states=reference_states,
-                            balance_audit=balance_audit,
-                            seed=episode.seed + 10_000 + global_query_index,
-                            dedup=query_dedup,
-                        )
-                        gain_abs = reference_loss - adapted_audit_loss
-                        reference_items.append(
-                            CounterfactualReferenceAudit(
-                                reference=reference_name,
-                                adapted_loss=adapted_audit_loss,
-                                reference_loss=reference_loss,
-                                gain_abs=gain_abs,
-                                gain_rel=gain_abs / max(abs(reference_loss), 1.0e-6),
-                                descent_cosine=_query_descent_cosine(
-                                    authoritative_fast_states,
-                                    reference_states,
-                                    captured_gradients,
-                                ),
-                            )
-                        )
-                    query_counterfactual = QueryCounterfactualAudit(
-                        optimizer_step=counterfactual_audit.optimizer_step,
-                        references=tuple(reference_items),
-                    )
-                    trace_event(
-                        "a5_diagnostic_counterfactual",
-                        optimizer_step=counterfactual_audit.optimizer_step,
-                        query_index=global_query_index,
-                        query_role=query_role,
-                        support_count=segment_length,
-                        segment_index=segment_index,
-                        references=tuple(
-                            {
-                                "reference": item.reference,
-                                "adapted_loss": item.adapted_loss,
-                                "reference_loss": item.reference_loss,
-                                "gain_abs": item.gain_abs,
-                                "gain_rel": item.gain_rel,
-                                "descent_cosine": item.descent_cosine,
-                            }
-                            for item in reference_items
-                        ),
-                    )
                 if accumulated_gradients is None:
                     accumulated_gradients = clipped_gradients
                     raw_accumulated_gradients = captured_gradients
@@ -1412,9 +1170,6 @@ class MetaTTTEpisodeRunner:
                         balance_audit,
                     )
                     self.last_balance_audit = balance_audit
-                maximum_proxy_drift = max(
-                    audit.max_abs_value_drift for audit in proxy_audits
-                )
                 query_audits.append(
                     TruncatedQueryPointAudit(
                         query_index=global_query_index,
@@ -1429,7 +1184,6 @@ class MetaTTTEpisodeRunner:
                         write_versions=write_versions,
                         metrics=objective.metrics,
                         prefill_count=query_lifecycle.audit().prefill_count,
-                        observation_immutable=immutable,
                         proxy_gradient_norms=proxy_gradient_norms,
                         proxy_gradient_joint_norm_raw=cotangent_clip_audit.raw_joint_norm,
                         proxy_gradient_joint_norm_clipped=(
@@ -1438,16 +1192,6 @@ class MetaTTTEpisodeRunner:
                         proxy_gradient_clip_scale=cotangent_clip_audit.clip_scale,
                         proxy_gradient_clipped=cotangent_clip_audit.clipped,
                         proxy_gradient_max_norm=cotangent_clip_audit.max_norm,
-                        proxy_gradient_status=_proxy_gradient_status(
-                            proxy_gradient_norms,
-                            objective.metrics,
-                            episode_weight=episode_weight,
-                        ),
-                        proxy_storage_isolated=all(
-                            audit.storage_isolated for audit in proxy_audits
-                        ),
-                        proxy_max_abs_value_drift=maximum_proxy_drift,
-                        counterfactual=query_counterfactual,
                     )
                 )
                 for state in proxy_states:
@@ -1457,7 +1201,6 @@ class MetaTTTEpisodeRunner:
                     captured_gradients,
                     clipped_gradients,
                     cotangent_clip_audit,
-                    query_counterfactual,
                     gradient_statistics,
                     query_loss,
                     objective,
@@ -1468,8 +1211,6 @@ class MetaTTTEpisodeRunner:
                     query_trajectory,
                     activation_scope,
                     proxy_states,
-                    proxy_audits,
-                    proxy_pairs,
                     balanced_outer,
                 )
 
@@ -1487,7 +1228,7 @@ class MetaTTTEpisodeRunner:
                 accumulated_gradients,
             )
             backward_fn(deferred_vjp, False)
-            truncate_audits = self._truncate_trajectory(adapted)
+            adapted.fast_states = truncate_memory_states(adapted.fast_states)
             segment_writes = write_audits[segment_write_start:]
             segment_write_attempts = sum(len(audit.did_write) for audit in segment_writes)
             segment_write_count = sum(sum(audit.did_write) for audit in segment_writes)
@@ -1536,39 +1277,7 @@ class MetaTTTEpisodeRunner:
                     backward_applied=True,
                     includes_query_backward=True,
                     truncated=True,
-                    truncate_audits=truncate_audits,
                 )
-            )
-            trace_event(
-                "a5_query_aligned_segment_released",
-                video_ids=episode.owner.video_ids,
-                trajectory_ids=episode.owner.trajectory_ids,
-                segment_index=segment_index,
-                segment_count=len(episode.segment_lengths),
-                query_roles=query_roles,
-                query_count=segment_query_count,
-                support_count=segment_length,
-                query_weights=query_weights,
-                diagnostic_query_count=episode.diagnostic_query_count,
-                training_mode=segment_training_mode,
-                ttt_enabled=self.ttt_enabled,
-                write_version_delta=max(write_versions) - max(write_version_before_segment),
-                write_attempt_count=segment_write_attempts,
-                write_count=segment_write_count,
-                skip_count=segment_write_attempts - segment_write_count,
-                skip_reason_counts=tuple(sorted(segment_skip_reasons.items())),
-                raw_query_cotangent_sum_norm=raw_query_cotangent_sum_norm,
-                clipped_query_cotangent_sum_norm=clipped_query_cotangent_sum_norm,
-                deferred_vjp_norm=deferred_vjp_norm,
-                cuda_allocated_bytes=(
-                    torch.cuda.memory_allocated(device) if device.type == "cuda" else 0
-                ),
-                cuda_reserved_bytes=(
-                    torch.cuda.memory_reserved(device) if device.type == "cuda" else 0
-                ),
-                offload_live_bytes=(
-                    query_offload_budget.claimed_bytes if query_offload_budget is not None else 0
-                ),
             )
             support_offset += segment_length
             query_offset += segment_query_count
@@ -1584,7 +1293,6 @@ class MetaTTTEpisodeRunner:
             raise RuntimeError("A5 supervised segments did not consume every Support")
         if query_offset != len(episode.query_points):
             raise RuntimeError("A5 supervised Query bundles did not consume every Query")
-        versions_after = tuple(parameter._version for parameter in tracked_parameters)
         attempted = sum(len(audit.did_write) for audit in write_audits)
         written = sum(sum(audit.did_write) for audit in write_audits)
         detached_query = query_loss_detached.detach().clone()
@@ -1599,27 +1307,6 @@ class MetaTTTEpisodeRunner:
         )
 
         query_count = len(episode.query_points)
-        trace_event(
-            "a5_memory_numerical_audit",
-            video_ids=episode.owner.video_ids,
-            trajectory_ids=episode.owner.trajectory_ids,
-            support_count=support_count,
-            query_count=query_count,
-            adaptation_mode=self.adaptation_mode,
-            ttt_enabled=self.ttt_enabled,
-            associative_contract=ASSOCIATIVE_CONTRACT,
-            associative_valid_count=written,
-            readout_target_cosine_mean=readout_target_cosine_mean,
-            post_write_cosine_mean=post_write_cosine_mean,
-            readout_share_mean=readout_share_mean,
-            memory_norm_max=memory_norm_max,
-            write_norm_mean=write_norm_mean,
-            eta_sum_mean=eta_sum_mean,
-            renormalized_fraction=renormalized_fraction,
-            slots_written_total=slots_written_total,
-            bank_record_count=bank_record_count,
-            empty_bank_count=empty_bank_count,
-        )
         episode_audit = TruncatedMetaTTTEpisodeAudit(
             associative_contract=ASSOCIATIVE_CONTRACT,
             adaptation_mode=self.adaptation_mode,
@@ -1653,16 +1340,8 @@ class MetaTTTEpisodeRunner:
             slots_written_total=slots_written_total,
             bank_record_count=bank_record_count,
             empty_bank_count=empty_bank_count,
-            parameter_versions_unchanged_before_outer_step=versions_before == versions_after,
             bank_context_detached=True,
             support_supervision_reachable=False,
-            training_counterfactual_executed=False,
-            diagnostic_counterfactual_executed=any(
-                query.counterfactual is not None for query in query_audits
-            ),
-            counterfactual_audited_query_count=sum(
-                query.counterfactual is not None for query in query_audits
-            ),
             segments=tuple(segment_audits),
             writes=tuple(write_audits),
             queries=tuple(query_audits),
@@ -1675,30 +1354,6 @@ class MetaTTTEpisodeRunner:
             audit=episode_audit,
         )
 
-    def _validate_truncated_episode(self, episode: MetaTTTEpisode) -> None:
-        stage = self.config.a5
-        if episode.prewarm_chunk is None:
-            raise ValueError("A5 production requires an explicit S0 no-update prewarm chunk")
-        if not episode.query_points:
-            raise ValueError("A5 production requires at least one Meta Query")
-        if len(episode.segment_query_counts) != len(episode.segment_lengths):
-            raise ValueError("A5 production requires one Query bundle per Support segment")
-        if any(length > stage.truncation_horizon for length in episode.segment_lengths):
-            raise ValueError("A5 production segment exceeds the configured truncation horizon")
-        if episode.seed != stage.seed:
-            raise ValueError("A5 episode seed must equal the fixed Stage C seed")
-
-    @staticmethod
-    def _truncate_trajectory(
-        trajectory: _Trajectory,
-    ) -> tuple[MemoryTruncateAudit, ...]:
-        pairs = tuple(truncate_memory_state(state) for state in trajectory.fast_states)
-        trajectory.fast_states = tuple(state for state, _ in pairs)
-        values = tuple(state.m for state in trajectory.fast_states)
-        if len({tensor_storage_key(value) for value in values}) != len(values):
-            raise ValueError("truncated batched memory states must remain storage-isolated")
-        return tuple(audit for _, audit in pairs)
-
     def _reset_trajectory(
         self,
         owner: RuntimeOwner,
@@ -1706,9 +1361,6 @@ class MetaTTTEpisodeRunner:
         differentiable: bool,
     ) -> _Trajectory:
         runtime = self.runtime_resetter(owner)
-        if not isinstance(runtime, BatchRuntimeState):
-            raise TypeError("Meta-TTT runtime resetter must return BatchRuntimeState")
-        runtime.validate_for(owner)
         fast_states = tuple(
             self.fast_controller.reset_fast_state(differentiable=differentiable)
             for _ in owner.video_ids
@@ -1789,26 +1441,6 @@ class MetaTTTEpisodeRunner:
             )
         return PreparedQueryOutput.bind(query_input, output)
 
-    @staticmethod
-    def _validate_prepared_segment(
-        source: tuple[MetaCausalChunk, ...],
-        prepared: tuple[MetaCausalChunk, ...],
-    ) -> None:
-        if len(prepared) != len(source):
-            raise ValueError("raw visual batcher changed the K-segment length")
-        for before, after in zip(source, prepared, strict=True):
-            if (
-                before.start_time != after.start_time
-                or before.end_time != after.end_time
-                or before.query_input != after.query_input
-                or before.request.owner != after.request.owner
-                or before.request.query_input != after.request.query_input
-                or before.request.inference != after.request.inference
-                or before.request.runtime_state is not after.request.runtime_state
-                or before.request.bank_states is not after.request.bank_states
-            ):
-                raise ValueError("raw visual batcher may replace only request.video_input")
-
     def _answer(
         self,
         query: MetaTTTQueryPoint,
@@ -1827,67 +1459,6 @@ class MetaTTTEpisodeRunner:
                 self.model.prepare_answer(request, lifecycle),
                 lifecycle,
             )
-
-    def _counterfactual_query_loss(
-        self,
-        *,
-        query: MetaTTTQueryPoint,
-        query_weight: float,
-        query_runtime_snapshot: BatchRuntimeState,
-        reference_states: tuple[FastMemoryState, ...],
-        balance_audit: OfficialWeakBalanceAudit | None,
-        seed: int,
-        dedup: O2DedupContext | None = None,
-    ) -> float:
-        """Evaluate one no-grad memory reference without committing any runtime state."""
-
-        reference = _Trajectory(
-            _fork_retrieval_runtime(query_runtime_snapshot).with_fast_states(reference_states)
-        )
-        lifecycle = PrefillLifecycle(query.chunk.request.owner)
-        if not isinstance(self.fast_controller, nn.Module):
-            raise TypeError("counterfactual audit requires an nn.Module fast controller")
-        with (
-            _temporarily_clear_module_parameter_gradients(self.fast_controller),
-            _seeded_rng(seed, reference_states),
-            torch.no_grad(),
-        ):
-            prepared_query = (
-                self._prepare_query(query.chunk, reference, with_grad=False)
-                if self.query_encoder_reuse
-                else None
-            )
-            observation, _ = self._observe(
-                query.chunk,
-                reference,
-                lifecycle,
-                seed=seed,
-                with_grad=False,
-                prepared_query=prepared_query,
-            )
-            output = self._answer(
-                query,
-                observation,
-                lifecycle,
-                fast_states=reference.fast_states,
-                with_grad=False,
-            )
-            objective = self._query_objective(query, output, dedup=dedup)
-            if balance_audit is not None:
-                outer = self.outer_composer.compose_one_from_audit(
-                    objective.answer,
-                    cast(OfficialWeakStateLossOutput, objective.state),
-                    query_count=1,
-                    audit=balance_audit,
-                )
-                objective = replace(objective, outer=outer)
-            value = query_weight * objective.outer.outer
-        scalar = float(value.detach().float().item())
-        if not math.isfinite(scalar) or scalar < 0.0:
-            raise ValueError("counterfactual Query loss must be finite and non-negative")
-        if lifecycle.audit().prefill_count != 1:
-            raise ValueError("counterfactual reference must execute exactly one prefill")
-        return scalar
 
     def _query_objective(
         self,
@@ -2014,9 +1585,7 @@ def _make_memory_write_audit(
         readout_shares=observed_fast_audit.readout_share_norms,
         valid_token_counts=observed_fast_audit.valid_token_counts,
         bank_record_counts=observed_fast_audit.bank_record_counts,
-        runtime_detached=not _contains_grad_tensor(runtime),
         next_only_verified=next_only,
-        slot_geometry_probes=tuple(result.slot_geometry for result in results),
     )
 
 
@@ -2050,28 +1619,6 @@ def _query_metrics(
     return QueryMetricSnapshot(metrics=(*common, *state_metrics))
 
 
-def _proxy_gradient_status(
-    norms: tuple[float, ...],
-    metrics: QueryMetricSnapshot,
-    *,
-    episode_weight: float,
-) -> str:
-    """Classify a zero Query-to-memory cotangent without changing the loss path."""
-
-    if any(value > 0.0 for value in norms):
-        return "nonzero"
-    if episode_weight == 0.0:
-        return "zero_padding"
-    values = dict(metrics.metrics)
-    task = values.get("state/task")
-    valid_bags = values.get("retrieval/valid_bag_rows")
-    if task is not None and abs(task) <= 1.0e-12:
-        return "zero_fast_objective_satisfied"
-    if valid_bags is not None and valid_bags <= 0.0:
-        return "zero_no_valid_retrieval_bag"
-    return "zero_no_fast_dependent_term"
-
-
 def _weak_term_float(term: object) -> float | None:
     value = getattr(term, "value", None)
     valid_rows = getattr(term, "valid_rows", None)
@@ -2093,107 +1640,7 @@ def _runtime_from_observation(
     owner: RuntimeOwner,
 ) -> BatchRuntimeState:
     runtime = observation.runtime_state
-    if not isinstance(runtime, BatchRuntimeState):
-        raise TypeError("Meta-TTT observation must return BatchRuntimeState")
-    runtime.validate_for(owner)
-    if tuple(observation.bank_states) != runtime.bank_states:
-        raise ValueError("Meta-TTT observation Bank states disagree with runtime rows")
     return runtime
-
-
-def _snapshot_reference_fast_states(
-    states: Sequence[FastMemoryState],
-) -> tuple[FastMemoryState, ...]:
-    """Copy numeric memory state into isolated leaves with no edge to the Support graph."""
-
-    snapshots: list[FastMemoryState] = []
-    for state in states:
-        snapshots.append(
-            FastMemoryState(
-                m=state.m.detach().clone().requires_grad_(True),
-                write_version=state.write_version,
-                write_count=state.write_count,
-                skip_count=state.skip_count,
-                differentiable=False,
-            )
-        )
-    return tuple(snapshots)
-
-
-def _zero_reference_fast_states(
-    states: Sequence[FastMemoryState],
-) -> tuple[FastMemoryState, ...]:
-    """Build the exact M=0 counterfactual reference for each batch row."""
-
-    return tuple(
-        FastMemoryState(
-            m=torch.zeros_like(state.m.detach()).requires_grad_(True),
-            write_version=0,
-            write_count=0,
-            skip_count=0,
-            differentiable=False,
-        )
-        for state in states
-    )
-
-
-@contextmanager
-def _temporarily_clear_module_parameter_gradients(
-    module: nn.Module,
-) -> Iterator[None]:
-    """Permit a read-only online-state binding without losing accumulated outer gradients."""
-
-    parameters = tuple(module.parameters())
-    saved_gradients = tuple(parameter.grad for parameter in parameters)
-    for parameter in parameters:
-        parameter.grad = None
-    try:
-        yield
-    finally:
-        for parameter, gradient in zip(parameters, saved_gradients, strict=True):
-            if parameter.grad is not None:
-                raise RuntimeError(
-                    "read-only counterfactual forward unexpectedly produced module gradients"
-                )
-            parameter.grad = gradient
-
-
-def _query_descent_cosine(
-    adapted_states: Sequence[FastMemoryState],
-    reference_states: Sequence[FastMemoryState],
-    gradients: Sequence[Tensor],
-) -> float:
-    adapted = tuple(value for state in adapted_states for value in state.fast_parameters)
-    references = tuple(value for state in reference_states for value in state.fast_parameters)
-    captured = tuple(gradients)
-    if not adapted or len(adapted) != len(references) or len(adapted) != len(captured):
-        raise ValueError("counterfactual cosine tensors must be non-empty and aligned")
-    dot = 0.0
-    gradient_squared = 0.0
-    delta_squared = 0.0
-    for current, reference, gradient in zip(adapted, references, captured, strict=True):
-        if current.shape != reference.shape or current.shape != gradient.shape:
-            raise ValueError("counterfactual cosine tensor shapes drifted")
-        negative_gradient = -gradient.detach().float()
-        delta = current.detach().float() - reference.detach().float()
-        dot += float((negative_gradient * delta).sum(dtype=torch.float64).item())
-        gradient_squared += float(negative_gradient.square().sum(dtype=torch.float64).item())
-        delta_squared += float(delta.square().sum(dtype=torch.float64).item())
-    denominator = math.sqrt(gradient_squared * delta_squared)
-    cosine = 0.0 if denominator == 0.0 else dot / denominator
-    if not math.isfinite(cosine):
-        raise ValueError("counterfactual descent cosine is non-finite")
-    return max(-1.0, min(1.0, cosine))
-
-
-def _unique_parameters(parameters: Sequence[nn.Parameter]) -> tuple[nn.Parameter, ...]:
-    result: list[nn.Parameter] = []
-    seen: set[int] = set()
-    for parameter in parameters:
-        if id(parameter) not in seen:
-            result.append(parameter)
-            seen.add(id(parameter))
-    return tuple(result)
 
 
 def _plain_backward(loss: Tensor, retain_graph: bool = False) -> None:
@@ -2336,24 +1783,6 @@ def _reanchor_query_signature(current: Tensor, reference: Tensor) -> Tensor:
     return reference.detach() + (current - current.detach())
 
 
-def _contains_grad_tensor(value: object, seen: set[int] | None = None) -> bool:
-    active = set() if seen is None else seen
-    if id(value) in active:
-        return False
-    active.add(id(value))
-    if isinstance(value, Tensor):
-        return value.requires_grad or value.grad_fn is not None
-    if isinstance(value, Mapping):
-        return any(_contains_grad_tensor(item, active) for item in value.values())
-    if isinstance(value, tuple | list):
-        return any(_contains_grad_tensor(item, active) for item in value)
-    if is_dataclass(value) and not isinstance(value, type):
-        return any(
-            _contains_grad_tensor(getattr(value, field.name), active) for field in fields(value)
-        )
-    return False
-
-
 def _fork_retrieval_runtime(runtime: BatchRuntimeState) -> BatchRuntimeState:
     """Isolate mutable retrieval rings while retaining functional Bank/FSM state."""
 
@@ -2363,46 +1792,3 @@ def _fork_retrieval_runtime(runtime: BatchRuntimeState) -> BatchRuntimeState:
             for row, history in zip(runtime.rows, runtime.retrieval_histories, strict=True)
         )
     )
-
-
-def _contains_tensor(value: object, seen: set[int] | None = None) -> bool:
-    active = set() if seen is None else seen
-    if id(value) in active:
-        return False
-    active.add(id(value))
-    if isinstance(value, Tensor):
-        return True
-    if isinstance(value, Mapping):
-        return any(_contains_tensor(item, active) for item in value.values())
-    if isinstance(value, tuple | list):
-        return any(_contains_tensor(item, active) for item in value)
-    if is_dataclass(value) and not isinstance(value, type):
-        return any(_contains_tensor(getattr(value, field.name), active) for field in fields(value))
-    return False
-
-
-def _tensor_version_signature(value: object) -> tuple[tuple[int, int], ...]:
-    found: list[tuple[int, int]] = []
-    _collect_tensor_versions(value, found, set())
-    return tuple(sorted(found))
-
-
-def _collect_tensor_versions(
-    value: object,
-    found: list[tuple[int, int]],
-    seen: set[int],
-) -> None:
-    if id(value) in seen:
-        return
-    seen.add(id(value))
-    if isinstance(value, Tensor):
-        found.append((id(value), value._version))
-    elif isinstance(value, Mapping):
-        for item in value.values():
-            _collect_tensor_versions(item, found, seen)
-    elif isinstance(value, tuple | list):
-        for item in value:
-            _collect_tensor_versions(item, found, seen)
-    elif is_dataclass(value) and not isinstance(value, type):
-        for field in fields(value):
-            _collect_tensor_versions(getattr(value, field.name), found, seen)

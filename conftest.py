@@ -19,7 +19,6 @@ def h200_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "MODEL": "/tmp/qwen3vl8b",
         "DATASET_DIR": "/tmp/svcbench",
         "DATASET_NAME": "svcbench_qwen3vl_sft",
-        "VISUAL_COST_INDEX": "/tmp/visual_cost_index.json",
     }.items():
         monkeypatch.setenv(key, value)
     yield

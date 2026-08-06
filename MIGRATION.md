@@ -530,7 +530,19 @@ A5 streamed 路径把它们当系数读回：`compose_one_from_audit` 读 `term.
 4. **`data.py` 落在 258 行而非 155。** 差额来自被指令保留的泄漏擦除、GroupKFold 与 `RuntimeQueryInput`；
    155 的估算把它们算进了可删部分。
 
-5. **验收工具的选择**：`ruff --select F821` **查不出**本次迁移的主要破坏形态。删掉一个 Enum 成员或
+5. **`conftest.py` 的 `h200_env` fixture 不可删（§5 写错了）。** §5 说它"只服务待删的
+   `test_h200_operational_tools.py`"。实测：`tests/test_production_factory.py` 有 **12 个测试**用它
+   （`:658/:713/:746/:862/:874/:895/:1341/:1365/:1406/:1439/:1462/:1495`），而 §14.L 又明确要求保留其中
+   读主线 M1 配置的那几个。因此 fixture 保留，只删掉其中已死的 `VISUAL_COST_INDEX` 键
+   （A2 配置改用 `proxy` 后该环境变量不再被任何代码读取）。
+   **教训**：判断 fixture 是否孤立必须 grep 它的名字，不能从"它看起来服务于哪个文件"推断。
+
+6. **`tests/support/runtime_factories.py` 的连带面比 §14.H 说的更大，方向完全正确。** 它只导入了一个已删符号
+   （`StreamReplayAudit`），却让 **9 个测试文件**在 collection 阶段就失败。修掉这一个文件（296→274，删掉零调用者的
+   `make_stream_audit` 和已失效的 `confidence_gate_applied` kwarg）后，collection 错误 22→21、收集到的测试
+   46→55。§14.H 把它列为"第 4 步之前必须先做"是对的。
+
+7. **验收工具的选择**：`ruff --select F821` **查不出**本次迁移的主要破坏形态。删掉一个 Enum 成员或
    dataclass 字段之后，`RetrievalReason.OWNER_MISMATCH` 这类跨文件引用是属性访问而非未定义名字，
    F821 完全静默。**`mypy --follow-imports=skip` 的 `[attr-defined]` 与 `[call-arg]` 两类才是真正的验收门**
    —— 它一次就精确列出了 31 处跨文件破坏及行号。任何按本报告执行的人都应该用它做每一步的 gate。

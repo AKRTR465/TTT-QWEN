@@ -28,6 +28,7 @@ from ttt_svcbench_qwen.data import (
 )
 from ttt_svcbench_qwen.fast_ttt import (
     MEMORY_DIM,
+    AssociativeTTTIntermediates,
     FastMemoryState,
     FastTTTAdapter,
     apply_memory_writes,
@@ -46,7 +47,7 @@ from ttt_svcbench_qwen.model import (
     TrajectoryRuntimeState,
 )
 from ttt_svcbench_qwen.state_bank import StructuredStateBank, TensorizedRetrievalHistory
-from ttt_svcbench_qwen.state_encoder import TemporalCache
+from ttt_svcbench_qwen.state_encoder import SpatialEncoderOutput, TemporalCache
 from ttt_svcbench_qwen.state_reader import ReaderResult
 
 type AuditValue = str | int | float | bool | None
@@ -163,9 +164,11 @@ class OnlineTTTUpdater:
         current_end_time: float,
     ) -> TTTUpdateOutcome:
         del current_end_time
-        intermediates = observation.soft_intermediates.fast_associative
-        spatial = observation.soft_intermediates.spatial
-        fast_state = runtime_state.fast_weights
+        intermediates = cast(
+            AssociativeTTTIntermediates, observation.soft_intermediates.fast_associative
+        )
+        spatial = cast(SpatialEncoderOutput, observation.soft_intermediates.spatial)
+        fast_state = cast(FastMemoryState, runtime_state.fast_weights)
         with torch.no_grad():
             batch = self.fast_adapter.prepare_write(intermediates, spatial)
             result = apply_memory_writes(fast_states=(fast_state,), batch=batch)[0]
@@ -744,7 +747,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         model_input=state_materialized,
     )
     processor = bundle.processor
-    apply_template = processor.apply_chat_template
+    apply_template = getattr(processor, "apply_chat_template")
     prompt = apply_template(
         [_user_message(query.question)], tokenize=False, add_generation_prompt=True
     )

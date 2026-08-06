@@ -5,14 +5,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from ttt_svcbench_qwen.associative_ttt import (
+from ttt_svcbench_qwen.config import load_config
+from ttt_svcbench_qwen.fast_ttt import (
     ASSOCIATIVE_CONTRACT,
     ASSOCIATIVE_CONTRACT_VERSION,
-    AssociativeTTTIntermediates,
     build_fast_associative_context,
+    build_fast_ttt_adapter,
 )
-from ttt_svcbench_qwen.config import load_config
-from ttt_svcbench_qwen.fast_ttt import build_fast_ttt_adapter
 
 
 def _view(embeddings: torch.Tensor, present: torch.Tensor, valid: torch.Tensor) -> object:
@@ -25,6 +24,17 @@ def _view(embeddings: torch.Tensor, present: torch.Tensor, valid: torch.Tensor) 
     )
 
 
+def _empty_context(query: torch.Tensor) -> object:
+    return build_fast_associative_context(
+        query,
+        _view(
+            torch.zeros(1, 0, 512),
+            torch.zeros(1, 0, dtype=torch.bool),
+            torch.zeros(1, 0, dtype=torch.bool),
+        ),
+    )
+
+
 def test_contract_identity_is_the_slot_memory_v3() -> None:
     config = load_config()
     assert ASSOCIATIVE_CONTRACT == "bank_conditioned_slot_memory_v3"
@@ -32,7 +42,6 @@ def test_contract_identity_is_the_slot_memory_v3() -> None:
     # mechanism it names is unchanged); the revision counter is what bundle
     # provenance pins, so uncentered-era bundles refuse to load.
     assert ASSOCIATIVE_CONTRACT_VERSION == 4
-    assert config.associative_ttt.contract == ASSOCIATIVE_CONTRACT
     assert config.associative_ttt.key_dim == 768
     assert config.associative_ttt.bank_embedding_dim == 512
 
@@ -65,29 +74,15 @@ def test_adapter_key_is_bank_conditioned_and_write_targets_are_detached() -> Non
         adapter.p_context.weight.fill_(0.01)
     visual = torch.randn(1, 2, 4096, requires_grad=True)
     mask = torch.ones(1, 2, dtype=torch.bool)
-    first = build_fast_associative_context(
-        torch.zeros(1, 512),
-        _view(
-            torch.zeros(1, 0, 512),
-            torch.zeros(1, 0, dtype=torch.bool),
-            torch.zeros(1, 0, dtype=torch.bool),
-        ),
-    )
-    second_query = torch.arange(512, dtype=torch.float32).unsqueeze(0)
-    second = build_fast_associative_context(
-        second_query,
-        _view(
-            torch.zeros(1, 0, 512),
-            torch.zeros(1, 0, dtype=torch.bool),
-            torch.zeros(1, 0, dtype=torch.bool),
-        ),
-    )
+    first = _empty_context(torch.zeros(1, 512))
+    second = _empty_context(torch.arange(512, dtype=torch.float32).unsqueeze(0))
     with adapter.use_associative_context(first):
         adapter(visual, mask)
     first_items = adapter.consume_associative_intermediates()
     with adapter.use_associative_context(second):
         adapter(visual, mask)
     second_items = adapter.consume_associative_intermediates()
+    assert first_items is not None and second_items is not None
     assert not torch.equal(first_items.keys, second_items.keys)
 
     slots = torch.randn(1, 4, 768, requires_grad=True)
@@ -116,23 +111,3 @@ def test_adapter_key_is_bank_conditioned_and_write_targets_are_detached() -> Non
         allow_unused=True,
     )[0]
     assert slot_grad is None
-
-
-def test_intermediates_contract_rejects_shape_and_alignment_drift() -> None:
-    keys = torch.zeros(1, 2, 768)
-    with pytest.raises(ValueError, match="must align"):
-        AssociativeTTTIntermediates(
-            keys=keys,
-            predictions=torch.zeros(1, 3, 768),
-            valid_mask=torch.ones(1, 2, dtype=torch.bool),
-            bank_record_counts=torch.zeros(1, dtype=torch.int64),
-            bank_versions=(0,),
-        )
-    with pytest.raises(ValueError, match="bank_versions"):
-        AssociativeTTTIntermediates(
-            keys=keys,
-            predictions=keys.clone(),
-            valid_mask=torch.ones(1, 2, dtype=torch.bool),
-            bank_record_counts=torch.zeros(1, dtype=torch.int64),
-            bank_versions=(0, 1),
-        )
