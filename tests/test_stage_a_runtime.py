@@ -1,0 +1,472 @@
+from __future__ import annotations
+
+import inspect
+from collections.abc import Sequence
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import Tensor
+
+from tests.support.runtime_factories import (
+    make_e1_state,
+    make_e2_state,
+    make_query_output,
+    make_spatial_output,
+    make_stream_audit,
+    make_temporal_cache,
+)
+from ttt_svcbench_qwen.config import load_config
+from ttt_svcbench_qwen.identity_bank import IdentityDecisionStatus, build_identity_bank
+from ttt_svcbench_qwen.model import BatchRuntimeState, ObservationChunkRequest, RuntimeOwner
+from ttt_svcbench_qwen.observation_heads import (
+    E1RuntimeState,
+    E1SoftOutput,
+    E2RuntimeState,
+    E2SoftOutput,
+    O1SoftOutput,
+    O2SoftOutput,
+    ObservationOutputs,
+)
+from ttt_svcbench_qwen.query_encoder import (
+    Operator,
+    QueryEncoderOutput,
+)
+from ttt_svcbench_qwen.stage_a_runtime import (
+    StageABankWriter,
+    StageASoftWriteOutput,
+    StageAWriteAudit,
+)
+from ttt_svcbench_qwen.state_bank import (
+    RETRIEVAL_HEAD_ORDER,
+    HeadType,
+    build_state_bank,
+    tensorized_retrieval_view,
+)
+from ttt_svcbench_qwen.state_encoder import (
+    SpatialEncoderOutput,
+    TemporalCache,
+    TemporalEncoderOutput,
+)
+from ttt_svcbench_qwen.state_reader import DeterministicStateReader, ReaderResult
+from ttt_svcbench_qwen.state_retriever import build_state_retriever
+
+
+class _NumberTokenizer:
+    name_or_path = "synthetic-number-tokenizer"
+    vocab_size = 256
+
+    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        assert add_special_tokens is False
+        return [ord(value) for value in text]
+
+    def decode(
+        self,
+        token_ids: Sequence[int],
+        *,
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> str:
+        assert skip_special_tokens is False
+        assert clean_up_tokenization_spaces is False
+        return "".join(chr(value) for value in token_ids)
+
+
+def _cache(owner: RuntimeOwner, hidden: Tensor, query: Tensor) -> TemporalCache:
+    return make_temporal_cache(
+        hidden=hidden,
+        video_ids=owner.video_ids,
+        trajectory_ids=owner.trajectory_ids,
+        query_signatures=query,
+    )
+
+
+def _spatial(owner: RuntimeOwner, slots: Tensor) -> SpatialEncoderOutput:
+    return make_spatial_output(slots, video_ids=owner.video_ids)
+
+
+def _stream_states(
+    owner: RuntimeOwner, query: Tensor, width: int
+) -> tuple[tuple[E1RuntimeState, ...], tuple[E2RuntimeState, ...]]:
+    rows = range(len(owner.video_ids))
+    return (
+        tuple(
+            make_e1_state(
+                video_id=owner.video_ids[row],
+                trajectory_id=owner.trajectory_ids[row],
+                query_signature=query[row].detach().clone(),
+                total_seen=width,
+            )
+            for row in rows
+        ),
+        tuple(
+            make_e2_state(
+                video_id=owner.video_ids[row],
+                trajectory_id=owner.trajectory_ids[row],
+                query_signature=query[row].detach().clone(),
+                total_seen=width,
+            )
+            for row in rows
+        ),
+    )
+
+
+def _observations(
+    owner: RuntimeOwner,
+    spatial: SpatialEncoderOutput,
+    temporal: TemporalEncoderOutput,
+    query: Tensor,
+) -> ObservationOutputs:
+    batch_size, slots = spatial.slot_valid_mask.shape
+    width = temporal.valid_mask.shape[1]
+    slot_times = torch.full((batch_size, slots), float(width - 1), dtype=torch.float64)
+    slot_positions = torch.full((batch_size, slots), width - 1, dtype=torch.int64)
+    o1_logits = torch.full((batch_size, slots, 6), 5.0, requires_grad=True)
+    o1_probabilities = torch.sigmoid(o1_logits)
+    o1 = O1SoftOutput(
+        logits=o1_logits,
+        probabilities=o1_probabilities,
+        soft_count=(o1_probabilities[..., :3].prod(dim=-1) * spatial.slot_valid_mask).sum(dim=1),
+        valid_mask=spatial.slot_valid_mask.clone(),
+        timestamps=slot_times,
+        position_ids=slot_positions,
+    )
+    identities = torch.nn.functional.normalize(
+        torch.randn((batch_size, slots, 256), requires_grad=True), dim=-1
+    )
+    score_logits = torch.empty((batch_size, slots, 2), requires_grad=True)
+    with torch.no_grad():
+        score_logits[..., 0] = 5.0
+        score_logits[..., 1] = -5.0
+    o2 = O2SoftOutput(
+        identity=identities,
+        score_logits=score_logits,
+        score_probabilities=torch.sigmoid(score_logits),
+        valid_mask=spatial.slot_valid_mask.clone(),
+        timestamps=slot_times.clone(),
+        position_ids=slot_positions.clone(),
+    )
+    e1_states, e2_states = _stream_states(owner, query, width)
+    timestamps = temporal.timestamps.clone()
+    positions = temporal.position_ids.clone()
+    e1_logits = torch.full((batch_size, width, 3), 5.0, requires_grad=True)
+    e1 = E1SoftOutput(
+        logits=e1_logits,
+        probabilities=torch.sigmoid(e1_logits),
+        valid_mask=temporal.valid_mask.clone(),
+        timestamps=timestamps,
+        position_ids=positions,
+        next_states=e1_states,
+        audit=make_stream_audit("e1", batch_size, width),
+    )
+    event_logits = torch.full((batch_size, width, 4), 5.0, requires_grad=True)
+    phase_logits = torch.zeros((batch_size, width, 4), requires_grad=True)
+    e2 = E2SoftOutput(
+        event_logits=event_logits,
+        phase_logits=phase_logits,
+        event_probabilities=torch.sigmoid(event_logits),
+        phase_probabilities=torch.softmax(phase_logits, dim=-1),
+        valid_mask=temporal.valid_mask.clone(),
+        timestamps=timestamps.clone(),
+        position_ids=positions.clone(),
+        next_states=e2_states,
+        audit=make_stream_audit("e2", batch_size, width),
+    )
+    return ObservationOutputs(o1=o1, o2=o2, e1=e1, e2=e2)
+
+
+def _query(owner: RuntimeOwner) -> QueryEncoderOutput:
+    batch_size = len(owner.video_ids)
+    return make_query_output(
+        (
+            Operator.O1_SNAP,
+            Operator.O2_UNIQUE,
+            Operator.E1_ACTION,
+            Operator.E2_PERIODIC,
+        ),
+        q_target=torch.nn.functional.normalize(torch.randn((batch_size, 512)), dim=-1),
+    )
+
+
+def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient() -> None:
+    torch.manual_seed(15)
+    owner = RuntimeOwner(
+        ("video-o1", "video-o2", "video-e1", "video-e2"),
+        ("trajectory-o1", "trajectory-o2", "trajectory-e1", "trajectory-e2"),
+    )
+    query = _query(owner)
+    slots = torch.randn((4, 2, 768), requires_grad=True)
+    hidden = torch.randn((4, 3, 768), requires_grad=True)
+    spatial = _spatial(owner, slots)
+    temporal = TemporalEncoderOutput(
+        hidden=hidden,
+        timestamps=torch.arange(3, dtype=torch.float64).expand(4, -1).clone(),
+        position_ids=torch.arange(3, dtype=torch.int64).expand(4, -1).clone(),
+        valid_mask=torch.ones((4, 3), dtype=torch.bool),
+        cache=_cache(owner, hidden, query.q_target),
+    )
+    observations = _observations(owner, spatial, temporal, query.q_target)
+    state_bank = build_state_bank(load_config())
+    writer = StageABankWriter(state_bank, build_identity_bank(load_config()))
+    runtime = writer.reset(owner)
+    pre_write_view = tensorized_retrieval_view(
+        runtime.retrieval_histories,
+        guard_current_version=False,
+    )
+    result = writer(
+        observations,
+        spatial,
+        temporal,
+        query,
+        ObservationChunkRequest(
+            owner=owner,
+            video_input="synthetic",
+            query_input="synthetic",
+            runtime_state=runtime,
+            bank_states=runtime.state_bank_states,
+            inference=False,
+        ),
+    )
+
+    assert isinstance(result.runtime_state, BatchRuntimeState)
+    assert result.runtime_state.next_chunk_index == 1
+    assert isinstance(result.audit, StageAWriteAudit)
+    assert result.audit.head_types == (HeadType.O1, HeadType.O2, HeadType.E1, HeadType.E2)
+    assert len(result.audit.identity_decisions) == 4
+    assert result.audit.identity_decisions[0] == ()
+    assert result.audit.identity_decisions[1]
+    assert result.audit.identity_decisions[2:] == ((), ())
+    assert isinstance(result.soft_write, StageASoftWriteOutput)
+    assert all(state.records for state in result.bank_states)
+    assert all(
+        not record.semantic_embedding.requires_grad and record.semantic_embedding.grad_fn is None
+        for state in result.bank_states
+        for record in state.records
+    )
+
+    soft = result.soft_write
+    assert all(
+        not source.requires_grad and source.grad_fn is None
+        for source in (
+            soft.o1_sources,
+            soft.o2_sources,
+            soft.e1_sources,
+            soft.e2_sources,
+        )
+    )
+    soft_loss = (
+        soft.o1_semantics.square().sum()
+        + soft.o2_semantics.square().sum()
+        + soft.e1_semantics.square().sum()
+        + soft.e2_semantics.square().sum()
+    )
+    soft_loss.backward()
+    projector_grads = tuple(
+        parameter.grad for parameter in state_bank.semantic_projector.parameters()
+    )
+    assert all(value is not None and torch.isfinite(value).all() for value in projector_grads)
+    assert any(
+        float(value.abs().sum().item()) > 0.0 for value in projector_grads if value is not None
+    )
+
+    retriever = build_state_retriever(load_config())
+    pre_write_retrieval = retriever(
+        state_bank,
+        pre_write_view,
+        query,
+        video_ids=owner.video_ids,
+        trajectory_ids=owner.trajectory_ids,
+    )
+    assert pre_write_retrieval.n_state.tolist() == [0, 0, 0, 0]
+    history_view = tensorized_retrieval_view(result.runtime_state.retrieval_histories)
+    history_retrieval = retriever(
+        state_bank,
+        history_view,
+        query,
+        video_ids=owner.video_ids,
+        trajectory_ids=owner.trajectory_ids,
+    )
+    assert history_retrieval.n_state.tolist() == [
+        history.count for history in result.runtime_state.retrieval_histories
+    ]
+    assert all(
+        set(history_view.head_codes[row][history_view.present_mask[row]].tolist())
+        == set(range(4))
+        for row in range(len(result.bank_states))
+    )
+    assert not history_view.sources.requires_grad and history_view.sources.grad_fn is None
+    reader_results = DeterministicStateReader(_NumberTokenizer()).read_bank(
+        state_bank,
+        result.bank_states,
+        query,
+        video_ids=owner.video_ids,
+        trajectory_ids=owner.trajectory_ids,
+    )
+    assert len(reader_results) == 4
+    assert all(isinstance(value, ReaderResult) for value in reader_results)
+    assert tuple(value.operator for value in reader_results) == query.hard_operators
+
+
+def test_stage_a_soft_write_masks_carried_slots_without_new_temporal_positions() -> None:
+    owner = RuntimeOwner(("video",), ("trajectory",))
+    slots = torch.randn((1, 2, 768), requires_grad=True)
+    hidden = torch.zeros((1, 1, 768), requires_grad=True)
+    query = torch.randn((1, 512))
+    spatial = _spatial(owner, slots)
+    temporal_mask = torch.zeros((1, 1), dtype=torch.bool)
+    temporal = TemporalEncoderOutput(
+        hidden=hidden,
+        timestamps=torch.full((1, 1), -1.0, dtype=torch.float64),
+        position_ids=torch.full((1, 1), -1, dtype=torch.int64),
+        valid_mask=temporal_mask,
+        cache=_cache(owner, hidden, query),
+    )
+    slot_mask = torch.zeros_like(spatial.slot_valid_mask)
+    observations = SimpleNamespace(
+        o1=SimpleNamespace(valid_mask=slot_mask),
+        o2=SimpleNamespace(valid_mask=slot_mask.clone()),
+        e1=SimpleNamespace(valid_mask=temporal_mask),
+        e2=SimpleNamespace(valid_mask=temporal_mask.clone()),
+    )
+    writer = StageABankWriter(
+        build_state_bank(load_config()),
+        build_identity_bank(load_config()),
+    )
+
+    soft = writer._project_soft(spatial, temporal, observations)  # type: ignore[arg-type]
+
+    assert not bool(soft.o1_present_mask.any().item())
+    assert not bool(soft.o2_present_mask.any().item())
+    assert torch.count_nonzero(soft.o1_semantics) == 0
+    assert torch.count_nonzero(soft.o2_semantics) == 0
+    assert torch.count_nonzero(soft.o1_sources) == 0
+    assert torch.count_nonzero(soft.o2_sources) == 0
+
+    nonfinite = replace(
+        soft,
+        o1_sources=torch.full_like(soft.o1_sources, float("nan")),
+    )
+    with pytest.raises(ValueError, match="retrieval sources must be finite"):
+        nonfinite.validate_commit_boundary()
+
+
+def test_all_head_history_is_written_before_o2_candidates_promote() -> None:
+    torch.manual_seed(20260720)
+    owner = RuntimeOwner(
+        ("video-o1", "video-o2", "video-e1", "video-e2"),
+        ("trajectory-o1", "trajectory-o2", "trajectory-e1", "trajectory-e2"),
+    )
+    query = _query(owner)
+    slots = torch.randn((4, 2, 768))
+    hidden = torch.randn((4, 3, 768))
+    spatial = _spatial(owner, slots)
+    temporal = TemporalEncoderOutput(
+        hidden=hidden,
+        timestamps=torch.arange(3, dtype=torch.float64).expand(4, -1).clone(),
+        position_ids=torch.arange(3, dtype=torch.int64).expand(4, -1).clone(),
+        valid_mask=torch.ones((4, 3), dtype=torch.bool),
+        cache=_cache(owner, hidden, query.q_target),
+    )
+    observations = _observations(owner, spatial, temporal, query.q_target)
+    state_bank = build_state_bank(load_config())
+    writer = StageABankWriter(state_bank, build_identity_bank(load_config()))
+    runtime = writer.reset(owner)
+    request = ObservationChunkRequest(
+        owner=owner,
+        video_input="synthetic",
+        query_input="synthetic",
+        runtime_state=runtime,
+        bank_states=runtime.state_bank_states,
+        inference=False,
+    )
+    first = writer(observations, spatial, temporal, query, request)
+    first_view = tensorized_retrieval_view(first.runtime_state.retrieval_histories)
+    first_o2_count = int(
+        (
+            first_view.present_mask[1]
+            & (first_view.head_codes[1] == RETRIEVAL_HEAD_ORDER.index(HeadType.O2))
+        ).sum()
+    )
+    assert first_o2_count == 2
+    assert all(
+        decision.status is IdentityDecisionStatus.CANDIDATE_CREATED
+        for decision in first.audit.identity_decisions[1]
+    )
+
+    second_observations = replace(
+        observations,
+        o1=replace(
+            observations.o1,
+            timestamps=observations.o1.timestamps + 3.0,
+            position_ids=observations.o1.position_ids + 3,
+        ),
+        o2=replace(
+            observations.o2,
+            timestamps=observations.o2.timestamps + 3.0,
+            position_ids=observations.o2.position_ids + 3,
+        ),
+        e1=replace(
+            observations.e1,
+            timestamps=observations.e1.timestamps + 3.0,
+            position_ids=observations.e1.position_ids + 3,
+        ),
+        e2=replace(
+            observations.e2,
+            timestamps=observations.e2.timestamps + 3.0,
+            position_ids=observations.e2.position_ids + 3,
+        ),
+    )
+    second = writer(
+        second_observations,
+        spatial,
+        temporal,
+        query,
+        replace(
+            request,
+            runtime_state=first.runtime_state,
+            bank_states=first.bank_states,
+        ),
+    )
+
+    assert all(
+        decision.status is IdentityDecisionStatus.PROMOTED
+        for decision in second.audit.identity_decisions[1]
+    )
+    second_view = tensorized_retrieval_view(second.runtime_state.retrieval_histories)
+    o2_history_count = int(
+        (
+            second_view.present_mask[1]
+            & (second_view.head_codes[1] == RETRIEVAL_HEAD_ORDER.index(HeadType.O2))
+        ).sum()
+    )
+    assert o2_history_count == 4
+    assert bool(
+        torch.all(
+            second_view.sequence_ids[1][
+                second_view.present_mask[1]
+                & (second_view.head_codes[1] == RETRIEVAL_HEAD_ORDER.index(HeadType.O2))
+            ]
+            >= 0
+        )
+    )
+    assert [len(second.bank_states[index].records) for index in (0, 2, 3)] == [1, 1, 1]
+    assert [second.runtime_state.retrieval_histories[index].count for index in (0, 2, 3)] == [
+        10,
+        10,
+        10,
+    ]
+
+
+def test_stage_a_runtime_has_no_fast_or_optimizer_state() -> None:
+    owner = RuntimeOwner(("video",), ("trajectory",))
+    writer = StageABankWriter(build_state_bank(load_config()), build_identity_bank(load_config()))
+    runtime = writer.reset(owner)
+    assert all(row.fast_weights is None for row in runtime.rows)
+
+
+def test_tensor_ring_chunk_write_has_no_per_slot_python_materialization() -> None:
+    source = inspect.getsource(StageABankWriter._append_all_head_retrieval_history_tensorized)
+    assert ".item(" not in source
+    assert ".tolist(" not in source
+    assert source.count("append_many(") == 1
