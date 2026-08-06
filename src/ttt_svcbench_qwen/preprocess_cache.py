@@ -1,16 +1,9 @@
-"""Disk and process-local cache for causal video preprocessing.
-
-The cache stops at the Qwen video-processor boundary.  It intentionally contains no labels,
-model parameters, State Bank values, or Fast-TTT runtime state.  A cache entry is therefore safe
-to share between A2/A5 workers and across epochs as long as its preprocessing fingerprint still
-matches the current video and configuration.
-"""
+"""Disk and process-local cache for causal video preprocessing."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import time
 from collections import OrderedDict
@@ -25,10 +18,8 @@ import torch
 from safetensors.torch import load_file, save_file
 from torch import Tensor
 
-# Keep the fingerprint schema stable for the existing float32 A2 cache. The sidecar format may
-# evolve independently because it is validated after the digest has selected an entry.
+# Keep the fingerprint schema stable for the existing float32 A2 cache.
 CACHE_SCHEMA_VERSION = 1
-CACHE_METADATA_SCHEMA_VERSION = 2
 type PreprocessCacheStorageDtype = Literal["float32", "float16"]
 
 
@@ -36,15 +27,6 @@ class PreprocessCacheMode(StrEnum):
     DISABLED = "disabled"
     READ_WRITE = "read_write"
     READONLY = "readonly"
-
-
-class PreprocessCacheMissPolicy(StrEnum):
-    DECODE = "decode"
-    ERROR = "error"
-
-
-class PreprocessCacheMissError(RuntimeError):
-    """A strict cache run encountered an absent, stale, or corrupt entry."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,31 +50,6 @@ class PreprocessFingerprint:
     observation_role: str = "support"
     frame_sampling: str = "uniform"
     cache_schema_version: int = CACHE_SCHEMA_VERSION
-
-    def __post_init__(self) -> None:
-        if not self.source_dataset or not self.relative_video_path:
-            raise ValueError("preprocess fingerprint dataset/path must be non-empty")
-        if self.video_file_size < 0 or self.video_file_mtime_ns < 0:
-            raise ValueError("preprocess fingerprint video stat must be non-negative")
-        if (
-            not math.isfinite(self.start_time)
-            or not math.isfinite(self.end_time)
-            or self.start_time < 0.0
-            or self.end_time <= self.start_time
-        ):
-            raise ValueError("preprocess fingerprint interval is invalid")
-        if self.maximum_frames < 2 or self.sample_fps <= 0.0:
-            raise ValueError("preprocess fingerprint frame settings are invalid")
-        if (
-            self.observation_role
-            not in {
-                "support",
-                "state_query",
-                "answer_query",
-            }
-            or not self.frame_sampling
-        ):
-            raise ValueError("preprocess fingerprint observation role/policy is invalid")
 
     def canonical_json(self) -> str:
         values = asdict(self)
@@ -171,43 +128,22 @@ class PreprocessCache:
         max_bytes: int = 200 * 1024**3,
         memory_entries: int = 2,
         mode: PreprocessCacheMode | str = PreprocessCacheMode.READ_WRITE,
-        miss_policy: PreprocessCacheMissPolicy | str = PreprocessCacheMissPolicy.DECODE,
         namespace: str | None = None,
         storage_dtype: PreprocessCacheStorageDtype = "float32",
     ) -> None:
-        if type(max_bytes) is not int or max_bytes <= 0:
-            raise ValueError("preprocess cache max_bytes must be a positive integer")
-        if type(memory_entries) is not int or memory_entries < 0:
-            raise ValueError("preprocess cache memory_entries must be non-negative")
         self.mode = PreprocessCacheMode(mode)
-        self.miss_policy = PreprocessCacheMissPolicy(miss_policy)
-        if storage_dtype not in {"float32", "float16"}:
-            raise ValueError("preprocess cache storage_dtype must be float32 or float16")
         self.storage_dtype: PreprocessCacheStorageDtype = storage_dtype
-        if self.mode is not PreprocessCacheMode.DISABLED and root is None:
-            raise ValueError("enabled preprocess cache requires a root directory")
-        if (
-            self.mode is PreprocessCacheMode.DISABLED
-            and self.miss_policy is PreprocessCacheMissPolicy.ERROR
-        ):
-            raise ValueError("disabled preprocess cache cannot use miss_policy=error")
         self.root = None if root is None else Path(root).expanduser().resolve()
         self.max_bytes = max_bytes
         self.memory_entries = memory_entries
         if namespace is not None:
             namespace = namespace.strip().replace("\\", "/").strip("/")
-            if not namespace or any(part in {".", ".."} for part in namespace.split("/")):
-                raise ValueError("preprocess cache namespace must be a safe non-empty path")
         self.namespace = namespace
         self._memory: OrderedDict[str, CachedChunk] = OrderedDict()
-        self._memory_sizes: dict[str, int] = {}
         self.hit_count = 0
         self.miss_count = 0
-        if self.enabled and self.root is not None:
-            if self.mode is PreprocessCacheMode.READ_WRITE:
-                self.root.mkdir(parents=True, exist_ok=True)
-            elif not self.root.is_dir():
-                raise FileNotFoundError(f"readonly preprocess cache does not exist: {self.root}")
+        if self.enabled and self.root is not None and self.mode is PreprocessCacheMode.READ_WRITE:
+            self.root.mkdir(parents=True, exist_ok=True)
 
     @property
     def enabled(self) -> bool:
@@ -216,21 +152,6 @@ class PreprocessCache:
     @property
     def writable(self) -> bool:
         return self.mode is PreprocessCacheMode.READ_WRITE
-
-    def payload_size(self, fingerprint: PreprocessFingerprint) -> int:
-        """Return the bytes read for one cached tensor payload, or zero when absent."""
-
-        key = fingerprint.digest
-        memory_size = self._memory_sizes.get(key)
-        if memory_size is not None:
-            return int(memory_size)
-        path = self._path_for(fingerprint)
-        if path is None:
-            return 0
-        try:
-            return path.stat().st_size
-        except OSError:
-            return 0
 
     def get(self, fingerprint: PreprocessFingerprint) -> CachedChunk | None:
         if not self.enabled:
@@ -243,46 +164,29 @@ class PreprocessCache:
             return _clone_cached_chunk(cached)
         path = self._path_for(fingerprint)
         if path is None or not path.is_file():
-            return self._miss(fingerprint, "entry_missing")
+            self.miss_count += 1
+            return None
         try:
             tensors = load_file(str(path), device="cpu")
-            embedded_metadata = _read_metadata(tensors)
-            sidecar_metadata = _read_sidecar_metadata(path)
-            if sidecar_metadata is not None:
-                sidecar_fingerprint, sidecar_dtype = sidecar_metadata
-                if sidecar_fingerprint != embedded_metadata:
-                    return self._miss(fingerprint, "sidecar_mismatch")
-                if sidecar_dtype != self.storage_dtype:
-                    return self._miss(fingerprint, "storage_dtype_mismatch")
-                metadata = sidecar_fingerprint
-            else:
-                metadata = embedded_metadata
-            if metadata != fingerprint.canonical_json():
-                return self._miss(fingerprint, "fingerprint_mismatch")
-            cached = _cached_chunk_from_tensors(tensors, storage_dtype=self.storage_dtype)
-        except PreprocessCacheMissError:
-            raise
-        except Exception:  # corrupt/partially replaced entries follow the configured miss policy
-            return self._miss(fingerprint, "entry_corrupt")
+            if _read_metadata(tensors) != fingerprint.canonical_json():
+                self.miss_count += 1
+                return None
+            cached = _cached_chunk_from_tensors(tensors)
+        except Exception:  # corrupt/partially replaced entries are a silent miss
+            self.miss_count += 1
+            return None
         if self.mode is PreprocessCacheMode.READ_WRITE:
             with suppress(OSError):
                 os.utime(path, None)
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return self._miss(fingerprint, "entry_stat_failed")
-        self._remember(key, cached, size)
+        self._remember(key, cached)
         self.hit_count += 1
         return _clone_cached_chunk(cached)
 
     def put(self, fingerprint: PreprocessFingerprint, chunk: CachedChunk) -> None:
-        if not self.enabled:
+        if not self.enabled or not self.writable:
             return
-        if not self.writable:
-            raise PermissionError("readonly preprocess cache forbids put()")
-        _validate_cached_chunk(chunk)
         key = fingerprint.digest
-        self._remember(key, chunk, _tensor_bytes(chunk))
+        self._remember(key, chunk)
         path = self._path_for(fingerprint)
         if path is None:
             return
@@ -300,36 +204,15 @@ class PreprocessCache:
                 metadata={"fingerprint": fingerprint.canonical_json()},
             )
             _replace_idempotent(temporary, path)
-            metadata_temporary = path.with_name(
-                f".{path.stem}.{os.getpid()}.{time.time_ns()}.json.tmp"
-            )
-            metadata_temporary.write_text(
-                json.dumps(
-                    {
-                        "fingerprint": fingerprint.canonical_json(),
-                        "cache_schema_version": CACHE_METADATA_SCHEMA_VERSION,
-                        "storage_dtype": self.storage_dtype,
-                    },
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
-            _replace_idempotent(metadata_temporary, self._metadata_path(path))
         finally:
             if temporary.exists():
                 temporary.unlink()
-            if "metadata_temporary" in locals() and metadata_temporary.exists():
-                metadata_temporary.unlink()
 
     def stats(self) -> dict[str, object]:
         return {
             "enabled": self.enabled,
-            "mode": self.mode.value,
-            "miss_policy": self.miss_policy.value,
             "hit_count": self.hit_count,
             "miss_count": self.miss_count,
-            "memory_entries": len(self._memory),
-            "storage_dtype": self.storage_dtype,
         }
 
     def disk_size_bytes(self) -> int:
@@ -354,7 +237,7 @@ class PreprocessCache:
         """
 
         if not self.writable:
-            raise PermissionError("cache prune requires read_write mode")
+            return 0
         if self.root is None or not self.root.exists():
             return 0
         entries: list[tuple[float, int, Path]] = []
@@ -383,18 +266,6 @@ class PreprocessCache:
             removed += 1
         return removed
 
-    def _miss(
-        self,
-        fingerprint: PreprocessFingerprint,
-        reason: str,
-    ) -> CachedChunk | None:
-        self.miss_count += 1
-        if self.miss_policy is PreprocessCacheMissPolicy.ERROR:
-            raise PreprocessCacheMissError(
-                f"strict preprocess cache miss for {fingerprint.digest}: {reason}"
-            )
-        return None
-
     def _path_for(self, fingerprint: PreprocessFingerprint) -> Path | None:
         if self.root is None:
             return None
@@ -407,15 +278,13 @@ class PreprocessCache:
     def _metadata_path(path: Path) -> Path:
         return path.with_suffix(".json")
 
-    def _remember(self, key: str, chunk: CachedChunk, size: int) -> None:
+    def _remember(self, key: str, chunk: CachedChunk) -> None:
         if self.memory_entries == 0:
             return
         self._memory[key] = _clone_cached_chunk(chunk)
-        self._memory_sizes[key] = max(0, int(size))
         self._memory.move_to_end(key)
         while len(self._memory) > self.memory_entries:
-            old_key, _ = self._memory.popitem(last=False)
-            self._memory_sizes.pop(old_key, None)
+            self._memory.popitem(last=False)
 
 
 def _cached_chunk_tensors(
@@ -442,30 +311,9 @@ def _cached_chunk_tensors(
     }
 
 
-def _cached_chunk_from_tensors(
-    tensors: Mapping[str, Tensor],
-    *,
-    storage_dtype: PreprocessCacheStorageDtype,
-) -> CachedChunk:
-    required = {
-        "frames",
-        "frame_timestamps",
-        "pixel_values_videos",
-        "video_grid_thw",
-        "tubelet_timestamps",
-        "tubelet_valid_mask",
-        "tubelet_position_ids",
-    }
-    missing = required.difference(tensors)
-    if missing:
-        raise KeyError(f"cache entry is missing tensors: {sorted(missing)}")
-    expected_dtype = torch.float32 if storage_dtype == "float32" else torch.float16
+def _cached_chunk_from_tensors(tensors: Mapping[str, Tensor]) -> CachedChunk:
     pixels = tensors["pixel_values_videos"]
-    if pixels.dtype != expected_dtype:
-        raise TypeError(
-            f"cached Qwen pixels use {pixels.dtype}, expected storage dtype {expected_dtype}"
-        )
-    chunk = CachedChunk(
+    return CachedChunk(
         frames=tensors["frames"],
         frame_timestamps=tensors["frame_timestamps"],
         # The disk dtype is an I/O/storage contract only. Runtime materialization remains FP32,
@@ -476,8 +324,6 @@ def _cached_chunk_from_tensors(
         tubelet_valid_mask=tensors["tubelet_valid_mask"],
         tubelet_position_ids=tensors["tubelet_position_ids"],
     )
-    _validate_cached_chunk(chunk)
-    return chunk
 
 
 def _read_metadata(tensors: Mapping[str, Tensor]) -> str:
@@ -498,10 +344,6 @@ def _replace_idempotent(source: Path, target: Path) -> None:
         # cache entry is immutable by fingerprint, so an existing target is an acceptable winner.
         if not target.is_file():
             raise
-
-
-def _tensor_bytes(chunk: CachedChunk) -> int:
-    return sum(value.numel() * value.element_size() for value in _chunk_tensors(chunk))
 
 
 def _chunk_tensors(chunk: CachedChunk) -> tuple[Tensor, ...]:

@@ -8,7 +8,7 @@ Forbidden: hard thresholds, integer accumulation, Bank/FSM mutation, or input de
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from typing import ClassVar
 
 import torch
@@ -24,11 +24,6 @@ from ttt_svcbench_qwen.config import (
     ProjectConfig,
 )
 from ttt_svcbench_qwen.state_encoder import SpatialEncoderOutput, TemporalEncoderOutput
-from ttt_svcbench_qwen.tensor_contracts import (
-    assert_storage_disjoint,
-    assert_tensors_disjoint,
-    timestamps_match,
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,15 +38,6 @@ class O1SoftOutput:
         "exit",
         "confidence",
     )
-    HARD_STATE_FIELD_NAMES: ClassVar[tuple[str, ...]] = (
-        "current_visible_count",
-        "baseline_count",
-        "enter",
-        "exit",
-        "visible",
-        "timestamp",
-        "confidence",
-    )
 
     logits: Tensor
     probabilities: Tensor
@@ -59,32 +45,6 @@ class O1SoftOutput:
     valid_mask: Tensor
     timestamps: Tensor
     position_ids: Tensor
-
-    def __post_init__(self) -> None:
-        _validate_soft_axis_output(
-            self.logits,
-            self.probabilities,
-            self.valid_mask,
-            self.timestamps,
-            self.position_ids,
-            last_dim=6,
-            name="O1",
-        )
-        if (
-            self.soft_count.shape != (self.logits.shape[0],)
-            or not torch.is_floating_point(self.soft_count)
-            or self.soft_count.dtype != self.logits.dtype
-            or self.soft_count.device != self.logits.device
-        ):
-            raise ValueError("O1 soft_count must match logits as floating [B]")
-        if self.logits.device.type != "meta":
-            if not bool(torch.isfinite(self.soft_count).all()) or bool(
-                torch.any(self.soft_count < 0.0)
-            ):
-                raise ValueError("O1 soft_count must be finite and non-negative")
-            max_count = self.valid_mask.sum(dim=1).to(dtype=self.soft_count.dtype)
-            if bool(torch.any(self.soft_count > max_count + 1.0e-5)):
-                raise ValueError("O1 soft_count cannot exceed the valid slot count")
 
     @property
     def count_prediction(self) -> Tensor:
@@ -105,89 +65,18 @@ class O2SoftOutput:
     relevance: Tensor = field(default_factory=lambda: torch.empty(0))
 
     def __post_init__(self) -> None:
-        _require_float_shape(self.identity, 256, "O2 identity")
-        _validate_soft_axis_output(
-            self.score_logits,
-            self.score_probabilities,
-            self.valid_mask,
-            self.timestamps,
-            self.position_ids,
-            last_dim=2,
-            name="O2 score",
-        )
-        if self.identity.shape[:2] != self.score_logits.shape[:2]:
-            raise ValueError("O2 identity and score must share batch and slot dimensions")
         if self.count_prediction.numel() == 0:
             object.__setattr__(
                 self,
                 "count_prediction",
                 (self.score_probabilities[..., 0] * self.valid_mask).sum(dim=1),
             )
-        _validate_count_prediction(self.count_prediction, self.score_logits, "O2")
         if self.relevance.numel() == 0 and self.valid_mask.numel():
             object.__setattr__(
                 self,
                 "relevance",
                 0.5 * self.valid_mask.to(dtype=self.score_logits.dtype),
             )
-        if (
-            self.relevance.shape != self.valid_mask.shape
-            or not torch.is_floating_point(self.relevance)
-            or self.relevance.device != self.score_logits.device
-        ):
-            raise ValueError("O2 relevance must be floating [B, N] on the score device")
-        if self.relevance.device.type != "meta":
-            if not bool(torch.isfinite(self.relevance).all()):
-                raise ValueError("O2 relevance must be finite")
-            if bool(torch.any((self.relevance < 0.0) | (self.relevance > 1.0))):
-                raise ValueError("O2 relevance must lie in [0, 1]")
-            if bool(torch.any(self.relevance[~self.valid_mask] != 0.0)):
-                raise ValueError("invalid O2 relevance entries must be zero")
-        if (
-            self.identity.dtype != self.score_logits.dtype
-            or self.identity.device != self.score_logits.device
-        ):
-            raise ValueError("O2 identity and score must share dtype/device")
-        if self.identity.device.type != "meta":
-            if not bool(torch.isfinite(self.identity).all()):
-                raise ValueError("O2 identity must be finite")
-            if bool(torch.any(self.identity[~self.valid_mask] != 0.0)):
-                raise ValueError("invalid O2 identities must be zero")
-            valid_identity = self.identity[self.valid_mask]
-            if valid_identity.numel():
-                norms = torch.linalg.vector_norm(valid_identity.float(), dim=-1)
-                norm_tolerance = max(
-                    5.0e-4,
-                    2.0 * float(torch.finfo(valid_identity.dtype).eps),
-                )
-                if not torch.allclose(
-                    norms,
-                    torch.ones_like(norms),
-                    atol=norm_tolerance,
-                    rtol=0.0,
-                ):
-                    raise ValueError("valid O2 identities must have unit L2 norm")
-
-
-@dataclass(frozen=True, slots=True)
-class StreamReplayAudit:
-    head: str
-    valid_counts: tuple[int, ...]
-    overlap_replay_counts: tuple[int, ...]
-    state_lengths: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        batch_size = len(self.valid_counts)
-        if (
-            self.head not in {"e1", "e2"}
-            or batch_size <= 0
-            or len(self.overlap_replay_counts) != batch_size
-            or len(self.state_lengths) != batch_size
-        ):
-            raise ValueError("stream audit fields must align to one E1/E2 batch")
-        values = (*self.valid_counts, *self.overlap_replay_counts, *self.state_lengths)
-        if any(type(value) is not int or value < 0 for value in values):
-            raise ValueError("stream audit counters must be non-negative integers")
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,44 +91,6 @@ class E1RuntimeState:
     position_ids: Tensor
     total_seen: int
     differentiable: bool = False
-
-    def __post_init__(self) -> None:
-        if not self.video_id or not self.trajectory_id:
-            raise ValueError("E1 runtime owner identifiers must be non-empty")
-        if (
-            self.projected_history.ndim != 2
-            or self.projected_history.shape[1] != 512
-            or self.projected_history.shape[0] > 66
-            or not torch.is_floating_point(self.projected_history)
-        ):
-            raise ValueError("E1 projected_history must be floating [L<=66, 512]")
-        length = int(self.projected_history.shape[0])
-        _validate_stream_state_fields(self, self.projected_history, "history", length, "E1")
-        if self.projected_history.device.type == "meta":
-            return
-        if not bool(torch.isfinite(self.query_signature).all()) or not bool(
-            torch.isfinite(self.projected_history).all()
-        ):
-            raise ValueError("E1 runtime floating tensors must be finite")
-        expected_length = min(self.total_seen, 66)
-        if length != expected_length:
-            raise ValueError("E1 runtime history length must match total_seen and capacity")
-        if length:
-            if (
-                not bool(torch.isfinite(self.timestamps).all())
-                or bool(torch.any(self.timestamps < 0.0))
-                or int(self.position_ids[-1].item()) + 1 != self.total_seen
-                or int(self.position_ids[0].item()) != self.total_seen - length
-            ):
-                raise ValueError("E1 runtime metadata must be finite contiguous history")
-            if length > 1 and (
-                bool(torch.any(self.timestamps[1:] <= self.timestamps[:-1]))
-                or bool(torch.any(self.position_ids[1:] != self.position_ids[:-1] + 1))
-            ):
-                raise ValueError("E1 runtime metadata must increase strictly")
-        assert_tensors_disjoint(
-            _stream_state_tensors(self), "E1 runtime fields must use independent storage"
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,29 +107,15 @@ class E1SoftOutput:
     timestamps: Tensor
     position_ids: Tensor
     next_states: tuple[E1RuntimeState, ...]
-    audit: StreamReplayAudit
     count_prediction: Tensor = field(default_factory=lambda: torch.empty(0))
 
     def __post_init__(self) -> None:
-        _validate_soft_axis_output(
-            self.logits,
-            self.probabilities,
-            self.valid_mask,
-            self.timestamps,
-            self.position_ids,
-            last_dim=3,
-            name="E1",
-        )
-        if len(self.next_states) != self.logits.shape[0] or self.audit.head != "e1":
-            raise ValueError("E1 output requires one next state and an E1 audit per batch row")
         if self.count_prediction.numel() == 0:
             object.__setattr__(
                 self,
                 "count_prediction",
                 (self.probabilities[..., 1] * self.valid_mask).sum(dim=1),
             )
-        _validate_count_prediction(self.count_prediction, self.logits, "E1")
-        _assert_stream_state_storage_isolated(self.next_states, "E1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,53 +131,6 @@ class E2RuntimeState:
     position_ids: Tensor
     total_seen: int
     differentiable: bool = False
-
-    def __post_init__(self) -> None:
-        if not self.video_id or not self.trajectory_id:
-            raise ValueError("E2 runtime owner identifiers must be non-empty")
-        if self.hidden.shape != (2, 768) or not torch.is_floating_point(self.hidden):
-            raise ValueError("E2 hidden must be floating [2, 768]")
-        if (
-            self.checkpoint_hidden.ndim != 3
-            or self.checkpoint_hidden.shape[1:] != (2, 768)
-            or self.checkpoint_hidden.shape[0] > 5
-            or not torch.is_floating_point(self.checkpoint_hidden)
-            or self.checkpoint_hidden.dtype != self.hidden.dtype
-            or self.checkpoint_hidden.device != self.hidden.device
-        ):
-            raise ValueError("E2 checkpoint_hidden must match hidden as [L<=5, 2, 768]")
-        length = int(self.checkpoint_hidden.shape[0])
-        _validate_stream_state_fields(self, self.hidden, "hidden", length, "E2")
-        if self.hidden.device.type == "meta":
-            return
-        if (
-            not bool(torch.isfinite(self.hidden).all())
-            or not bool(torch.isfinite(self.checkpoint_hidden).all())
-            or not bool(torch.isfinite(self.query_signature).all())
-        ):
-            raise ValueError("E2 runtime floating tensors must be finite")
-        expected_length = min(self.total_seen, 5)
-        if length != expected_length:
-            raise ValueError("E2 checkpoint length must match total_seen and capacity")
-        if length:
-            if (
-                not bool(torch.isfinite(self.timestamps).all())
-                or bool(torch.any(self.timestamps < 0.0))
-                or int(self.position_ids[-1].item()) + 1 != self.total_seen
-                or int(self.position_ids[0].item()) != self.total_seen - length
-                or not torch.equal(self.hidden, self.checkpoint_hidden[-1])
-            ):
-                raise ValueError("E2 runtime checkpoint metadata/hidden is inconsistent")
-            if length > 1 and (
-                bool(torch.any(self.timestamps[1:] <= self.timestamps[:-1]))
-                or bool(torch.any(self.position_ids[1:] != self.position_ids[:-1] + 1))
-            ):
-                raise ValueError("E2 runtime metadata must increase strictly")
-        elif bool(torch.any(self.hidden != 0.0)):
-            raise ValueError("a fresh E2 runtime must have zero hidden state")
-        assert_tensors_disjoint(
-            _stream_state_tensors(self), "E2 runtime fields must use independent storage"
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,53 +156,15 @@ class E2SoftOutput:
     timestamps: Tensor
     position_ids: Tensor
     next_states: tuple[E2RuntimeState, ...]
-    audit: StreamReplayAudit
     count_prediction: Tensor = field(default_factory=lambda: torch.empty(0))
 
     def __post_init__(self) -> None:
-        _validate_soft_axis_output(
-            self.event_logits,
-            self.event_probabilities,
-            self.valid_mask,
-            self.timestamps,
-            self.position_ids,
-            last_dim=4,
-            name="E2 event",
-        )
-        _validate_soft_axis_output(
-            self.phase_logits,
-            self.phase_probabilities,
-            self.valid_mask,
-            self.timestamps,
-            self.position_ids,
-            last_dim=4,
-            name="E2 phase",
-        )
-        if self.event_logits.shape != self.phase_logits.shape:
-            raise ValueError("E2 event and phase logits must have identical shapes")
-        if len(self.next_states) != self.event_logits.shape[0] or self.audit.head != "e2":
-            raise ValueError("E2 output requires one next state and an E2 audit per batch row")
         if self.count_prediction.numel() == 0:
             object.__setattr__(
                 self,
                 "count_prediction",
                 (self.event_probabilities[..., 3] * self.valid_mask).sum(dim=1),
             )
-        _validate_count_prediction(self.count_prediction, self.event_logits, "E2")
-        if self.event_logits.device.type != "meta":
-            valid_phase = self.phase_probabilities[self.valid_mask]
-            sum_tolerance = max(
-                5.0e-4,
-                2.0 * float(torch.finfo(self.phase_probabilities.dtype).eps),
-            )
-            if valid_phase.numel() and not torch.allclose(
-                valid_phase.float().sum(dim=-1),
-                torch.ones(valid_phase.shape[0], device=valid_phase.device),
-                atol=sum_tolerance,
-                rtol=0.0,
-            ):
-                raise ValueError("valid E2 phase probabilities must sum to one")
-        _assert_stream_state_storage_isolated(self.next_states, "E2")
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,24 +173,6 @@ class ObservationOutputs:
     o2: O2SoftOutput
     e1: E1SoftOutput
     e2: E2SoftOutput
-
-    def __post_init__(self) -> None:
-        if (
-            self.o1.valid_mask.shape != self.o2.valid_mask.shape
-            or not torch.equal(self.o1.valid_mask, self.o2.valid_mask)
-            or not torch.equal(self.o1.timestamps, self.o2.timestamps)
-            or not torch.equal(self.o1.position_ids, self.o2.position_ids)
-        ):
-            raise ValueError("O1/O2 outputs must share slot mask and metadata")
-        if (
-            self.e1.valid_mask.shape != self.e2.valid_mask.shape
-            or not torch.equal(self.e1.valid_mask, self.e2.valid_mask)
-            or not torch.equal(self.e1.timestamps, self.e2.timestamps)
-            or not torch.equal(self.e1.position_ids, self.e2.position_ids)
-        ):
-            raise ValueError("E1/E2 outputs must share tubelet mask and metadata")
-        if self.o1.logits.shape[0] != self.e1.logits.shape[0]:
-            raise ValueError("all observation heads must share one batch size")
 
 
 class CumulativeCountHead(nn.Module):  # type: ignore[misc]
@@ -451,8 +185,6 @@ class CumulativeCountHead(nn.Module):  # type: ignore[misc]
         self.output = nn.Linear(256, 1, bias=True)
 
     def forward(self, features: Tensor) -> Tensor:
-        if features.ndim != 2:
-            raise ValueError("cumulative count features must be [B, D]")
         logits = self.output(F.silu(self.hidden(self.norm(features)))).squeeze(-1)
         return F.softplus(logits.float()).to(dtype=logits.dtype)
 
@@ -460,7 +192,6 @@ class CumulativeCountHead(nn.Module):  # type: ignore[misc]
 class O1CurrentCountDecoder(nn.Module):  # type: ignore[misc]
     def __init__(self, config: O1Config) -> None:
         super().__init__()
-        _validate_o1_config(config)
         self.config = config
         self.slot_norm = nn.LayerNorm(config.input_dim, eps=config.layer_norm_eps)
         self.film_projection = nn.Linear(config.query_dim, config.film_dim, bias=True)
@@ -476,15 +207,12 @@ class O1CurrentCountDecoder(nn.Module):  # type: ignore[misc]
         observation_timestamps: Tensor,
         observation_position_ids: Tensor,
     ) -> O1SoftOutput:
-        safe_slots, expanded_timestamps, expanded_positions = _validate_spatial_head_inputs(
-            self,
+        safe_slots, expanded_timestamps, expanded_positions = _prepare_spatial_head_inputs(
             slots,
             slot_valid_mask,
             observation_timestamps,
             observation_position_ids,
-            name="O1",
         )
-        _validate_query(q_target, slots, self.config.query_dim, "O1")
         scale, shift = self.film_projection(q_target).chunk(2, dim=-1)
         conditioned = self.slot_norm(safe_slots) * (1.0 + scale.unsqueeze(1))
         conditioned = conditioned + shift.unsqueeze(1)
@@ -513,7 +241,6 @@ class O1CurrentCountDecoder(nn.Module):  # type: ignore[misc]
 class O2IdentityDecoder(nn.Module):  # type: ignore[misc]
     def __init__(self, config: O2Config) -> None:
         super().__init__()
-        _validate_o2_config(config)
         self.config = config
         self.slot_norm = nn.LayerNorm(config.input_dim, eps=config.layer_norm_eps)
         self.trunk_1 = nn.Linear(config.input_dim, config.hidden_dims[0], bias=True)
@@ -538,19 +265,16 @@ class O2IdentityDecoder(nn.Module):  # type: ignore[misc]
         *,
         q_target: Tensor | None = None,
     ) -> O2SoftOutput:
-        safe_slots, expanded_timestamps, expanded_positions = _validate_spatial_head_inputs(
-            self,
+        safe_slots, expanded_timestamps, expanded_positions = _prepare_spatial_head_inputs(
             slots,
             slot_valid_mask,
             observation_timestamps,
             observation_position_ids,
-            name="O2",
         )
         hidden = F.silu(self.trunk_1(self.slot_norm(safe_slots)))
         hidden = F.silu(self.trunk_2(hidden))
         if q_target is None:
             q_target = hidden.new_zeros((hidden.shape[0], 512))
-        _validate_query(q_target, hidden, 512, "O2")
         valid_weights = slot_valid_mask.unsqueeze(-1).to(dtype=hidden.dtype)
         pooled = (hidden * valid_weights).sum(dim=1) / valid_weights.sum(dim=1).clamp_min(1.0)
         count_prediction = self.count_head(torch.cat((pooled, q_target), dim=-1))

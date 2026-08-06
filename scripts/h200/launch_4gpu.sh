@@ -171,7 +171,7 @@ if [[ "$STAGE" == "a2" ]]; then
   CONFIG="${YAML:-configs/h200/a2_qwen3vl8b_fullprefix256_4gpu.yaml}"
 else
   TASK_NAME="a5_k8_fullprefix256_8b_${WORLD_SIZE}h200"
-  CONFIG="${YAML:-configs/h200/a5_meta_ttt_k8_fullprefix256_4gpu.yaml}"
+  CONFIG="${YAML:-configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml}"
 fi
 if [[ "${TTT_PREFLIGHT_ONLY:-0}" == "1" ]]; then
   TASK_NAME="${TASK_NAME}_preflight"

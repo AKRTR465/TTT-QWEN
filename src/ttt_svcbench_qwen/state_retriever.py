@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass
 from enum import StrEnum
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from ttt_svcbench_qwen.config import CalibrationStatus, ProjectConfig, RetrieverConfig
+from ttt_svcbench_qwen.config import ProjectConfig, RetrieverConfig
 from ttt_svcbench_qwen.query_encoder import (
     OPERATOR_TO_HEAD_TYPE,
     OPERATORS,
@@ -33,8 +33,6 @@ from ttt_svcbench_qwen.state_bank import (
     RetrievalHistoryView,
     StateRecord,
     StructuredStateBank,
-    clone_retrieval_history_record,
-    clone_state_record,
 )
 
 type RetrievalCandidate = StateRecord | RetrievalHistoryRecord
@@ -50,61 +48,17 @@ class RetrievalStatus(StrEnum):
 class RetrievalReason(StrEnum):
     MATCHED = "matched"
     EMPTY_BANK = "empty_bank"
-    EMPTY_HEAD_PARTITION = "empty_head_partition"
-    ALL_INVALID = "all_invalid"
-    ALL_RETRIEVAL_INELIGIBLE = "all_retrieval_ineligible"
-    ALL_FUTURE = "all_future"
-    ALL_OUTSIDE_WINDOW = "all_outside_window"
-    BELOW_SIMILARITY = "below_similarity"
     NO_MATCH = "no_match"
     UNSUPPORTED_OPERATOR = "unsupported_operator"
     UNSUPPORTED_TIME = "unsupported_time"
     DEGENERATE_QUERY = "degenerate_q_target"
     INVALID_TIME = "invalid_time"
-    OWNER_MISMATCH = "owner_mismatch"
 
 
 @dataclass(frozen=True, slots=True)
 class RetrievalFilterAudit:
     n_state: int
-    head_partition_excluded_count: int
-    query_rejected_count: int
-    owner_mismatch_count: int
-    invalid_count: int
-    retrieval_ineligible_count: int
-    future_count: int
-    outside_window_count: int
-    below_similarity_count: int
     selected_count: int
-
-    def __post_init__(self) -> None:
-        values = (
-            self.n_state,
-            self.head_partition_excluded_count,
-            self.query_rejected_count,
-            self.owner_mismatch_count,
-            self.invalid_count,
-            self.retrieval_ineligible_count,
-            self.future_count,
-            self.outside_window_count,
-            self.below_similarity_count,
-            self.selected_count,
-        )
-        if any(type(value) is not int or value < 0 for value in values):
-            raise ValueError("Retriever audit counts must be non-negative integers")
-        exclusive = (
-            self.head_partition_excluded_count
-            + self.query_rejected_count
-            + self.owner_mismatch_count
-            + self.invalid_count
-            + self.retrieval_ineligible_count
-            + self.future_count
-            + self.outside_window_count
-            + self.below_similarity_count
-            + self.selected_count
-        )
-        if exclusive != self.n_state:
-            raise ValueError("Retriever exclusive filter counts must sum to n_state")
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,24 +96,15 @@ class RetrieverOutput:
     candidate_time_ranges: Tensor | None = None
 
     def require_tensor_metadata(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Return materialized candidate metadata or fail closed at the runtime boundary."""
+        """Return the materialized candidate metadata tensors."""
 
-        sequence_ids = self.candidate_sequence_ids
-        head_codes = self.candidate_head_codes
-        operator_codes = self.candidate_operator_codes
-        timestamps = self.candidate_timestamps
-        time_ranges = self.candidate_time_ranges
-        if not isinstance(sequence_ids, Tensor):
-            raise RuntimeError("RetrieverOutput candidate_sequence_ids are unavailable")
-        if not isinstance(head_codes, Tensor):
-            raise RuntimeError("RetrieverOutput candidate_head_codes are unavailable")
-        if not isinstance(operator_codes, Tensor):
-            raise RuntimeError("RetrieverOutput candidate_operator_codes are unavailable")
-        if not isinstance(timestamps, Tensor):
-            raise RuntimeError("RetrieverOutput candidate_timestamps are unavailable")
-        if not isinstance(time_ranges, Tensor):
-            raise RuntimeError("RetrieverOutput candidate_time_ranges are unavailable")
-        return sequence_ids, head_codes, operator_codes, timestamps, time_ranges
+        return (
+            self.candidate_sequence_ids,  # type: ignore[return-value]
+            self.candidate_head_codes,
+            self.candidate_operator_codes,
+            self.candidate_timestamps,
+            self.candidate_time_ranges,
+        )
 
     def candidate_record_id(self, row: int, column: int) -> str | None:
         value = self.candidate_record_ids[row][column]
@@ -169,55 +114,8 @@ class RetrieverOutput:
         sequence_id = int(sequence_ids[row, column].item())
         return f"retrieval-{sequence_id:08d}" if sequence_id >= 0 else None
 
-    def candidate_head_type(self, row: int, column: int) -> HeadType | None:
-        value = self.candidate_head_types[row][column]
-        if value is not None:
-            return value
-        _, head_codes, _, _, _ = self.require_tensor_metadata()
-        code = int(head_codes[row, column].item())
-        return RETRIEVAL_HEAD_ORDER[code] if 0 <= code < len(RETRIEVAL_HEAD_ORDER) else None
-
     def __post_init__(self) -> None:
-        if (
-            self.state_embeddings.ndim != 3
-            or self.state_embeddings.shape[-1] != 512
-            or not torch.is_floating_point(self.state_embeddings)
-        ):
-            raise ValueError("Retriever state_embeddings must be floating [B, N_s, 512]")
-        if (
-            self.scores.shape != self.state_embeddings.shape[:2]
-            or self.scores.dtype != torch.float32
-        ):
-            raise ValueError("Retriever scores must be FP32 [B, N_s]")
         shape = self.scores.shape
-        if (
-            self.present_mask.shape != shape
-            or self.record_valid_mask.shape != shape
-            or self.retrieval_eligible_mask.shape != shape
-            or self.causal_mask.shape != shape
-            or self.predicted_head_mask.shape != shape
-            or self.selected_mask.shape != shape
-            or self.present_mask.dtype != torch.bool
-            or self.record_valid_mask.dtype != torch.bool
-            or self.retrieval_eligible_mask.dtype != torch.bool
-            or self.causal_mask.dtype != torch.bool
-            or self.predicted_head_mask.dtype != torch.bool
-            or self.selected_mask.dtype != torch.bool
-        ):
-            raise ValueError("Retriever masks must be bool [B, N_s]")
-        tensors = (
-            self.state_embeddings,
-            self.scores,
-            self.present_mask,
-            self.record_valid_mask,
-            self.retrieval_eligible_mask,
-            self.causal_mask,
-            self.predicted_head_mask,
-            self.selected_mask,
-        )
-        if any(tensor.device != self.scores.device for tensor in tensors):
-            raise ValueError("Retriever aligned tensors must share one device")
-        batch_size, width = shape
         tensor_metadata = (
             self.candidate_sequence_ids,
             self.candidate_head_codes,
@@ -253,283 +151,7 @@ class RetrieverOutput:
             object.__setattr__(self, "candidate_operator_codes", operator_codes)
             object.__setattr__(self, "candidate_timestamps", timestamps)
             object.__setattr__(self, "candidate_time_ranges", time_ranges)
-        sequence_ids, head_codes, operator_codes, timestamps, time_ranges = (
-            self.require_tensor_metadata()
-        )
-        integer_metadata = (sequence_ids, head_codes, operator_codes)
-        if any(value.shape != shape or value.dtype != torch.int64 for value in integer_metadata):
-            raise ValueError("Retriever candidate integer metadata must be int64 [B, N_s]")
-        if (
-            timestamps.shape != shape
-            or timestamps.dtype != torch.float64
-            or time_ranges.shape != (*shape, 2)
-            or time_ranges.dtype != torch.float64
-        ):
-            raise ValueError("Retriever candidate time metadata is invalid")
-        if any(
-            value.device != self.scores.device
-            for value in (*integer_metadata, timestamps, time_ranges)
-        ):
-            raise ValueError("Retriever candidate tensor metadata must share the score device")
-        metadata = (
-            self.selected_record_ids,
-            self.selected_scores,
-            self.selected_records,
-            self.candidate_record_ids,
-            self.candidate_records,
-            self.candidate_head_types,
-            self.status,
-            self.reason,
-            self.hard_operators,
-            self.time_resolutions,
-            self.audit,
-            self.video_ids,
-            self.trajectory_ids,
-            self.bank_video_ids,
-            self.bank_trajectory_ids,
-            self.bank_versions,
-        )
-        if any(len(values) != batch_size for values in metadata):
-            raise ValueError("Retriever metadata must contain one entry per batch item")
-        if (
-            any(len(row) != width for row in self.candidate_record_ids)
-            or any(len(row) != width for row in self.candidate_records)
-            or any(len(row) != width for row in self.candidate_head_types)
-        ):
-            raise ValueError("candidate record snapshots must align to the padded score width")
-        for counts, name in ((self.n_state, "n_state"), (self.n_retrieved, "n_retrieved")):
-            if (
-                counts.shape != (batch_size,)
-                or counts.dtype != torch.int64
-                or counts.device != self.scores.device
-            ):
-                raise ValueError(f"{name} must be int64 [B] on the Retriever device")
-        if not all(
-            bool(torch.isfinite(tensor).all()) for tensor in (self.state_embeddings, self.scores)
-        ):
-            raise ValueError("Retriever embeddings/scores must be finite")
-        if bool(torch.any(self.selected_mask & ~self.present_mask)):
-            raise ValueError("Retriever cannot select padded records")
-        if bool(torch.any(self.predicted_head_mask & ~self.present_mask)):
-            raise ValueError("Retriever predicted-head mask cannot include padding")
-        if bool(torch.any(self.selected_mask & ~self.predicted_head_mask)):
-            raise ValueError("Retriever selections must stay inside the predicted head")
-        if bool(torch.any(self.record_valid_mask & ~self.present_mask)) or bool(
-            torch.any(self.retrieval_eligible_mask & ~self.record_valid_mask)
-        ):
-            raise ValueError("Retriever candidate masks are inconsistent")
-        if bool(torch.any(self.causal_mask & ~self.present_mask)):
-            raise ValueError("Retriever causal mask cannot include padding")
-        if bool(torch.any(self.state_embeddings[~self.present_mask] != 0.0)) or bool(
-            torch.any(self.scores[~self.present_mask] != 0.0)
-        ):
-            raise ValueError("Retriever padding embeddings/scores must be zero")
-        if not torch.equal(self.n_state, self.present_mask.sum(dim=1)):
-            raise ValueError("Retriever n_state must count present partition records")
-        if not torch.equal(self.n_retrieved, self.selected_mask.sum(dim=1)):
-            raise ValueError("Retriever n_retrieved must count selected records")
-        if bool(torch.any(self.n_retrieved > self.n_state)):
-            raise ValueError("Retriever requires 0 <= N_ret <= N_s")
-        if any(
-            not value
-            for value in self.video_ids
-            + self.trajectory_ids
-            + self.bank_video_ids
-            + self.bank_trajectory_ids
-        ):
-            raise ValueError("Retriever owner identifiers must be non-empty")
-        if len(set(zip(self.video_ids, self.trajectory_ids, strict=True))) != batch_size:
-            raise ValueError("Retriever batch owners must be unique")
-        if any(type(version) is not int or version < 0 for version in self.bank_versions):
-            raise ValueError("Retriever bank versions must be non-negative integers")
-        if any(not isinstance(operator, Operator) for operator in self.hard_operators):
-            raise TypeError("Retriever hard_operators must preserve one Operator per row")
-        if any(not isinstance(resolution, TimeResolution) for resolution in self.time_resolutions):
-            raise TypeError("Retriever time_resolutions must preserve one TimeResolution per row")
-        for row in range(batch_size):
-            self._validate_row(row)
 
-    def _validate_row(self, row: int) -> None:
-        sequence_ids, head_codes, _, _, _ = self.require_tensor_metadata()
-        n_state = int(self.n_state[row].item())
-        n_retrieved = int(self.n_retrieved[row].item())
-        ids = self.selected_record_ids[row]
-        selected_scores = self.selected_scores[row]
-        records = self.selected_records[row]
-        operator = self.hard_operators[row]
-        expected_head = OPERATOR_TO_HEAD_TYPE[operator]
-        if (
-            len(ids) != n_retrieved
-            or len(selected_scores) != n_retrieved
-            or len(records) != n_retrieved
-        ):
-            raise ValueError("Retriever selected metadata must have N_ret entries")
-        if len(set(ids)) != len(ids) or tuple(record.record_id for record in records) != ids:
-            raise ValueError("Retriever selected records and IDs must be unique and aligned")
-        if any(
-            record.video_id != self.video_ids[row]
-            or record.trajectory_id != self.trajectory_ids[row]
-            for record in records
-        ):
-            raise ValueError("Retriever selected records cannot cross owner boundaries")
-        if expected_head is None and records:
-            raise ValueError("unsupported Retriever operators cannot retain selected records")
-        if expected_head is not None and any(
-            record.head_type is not expected_head for record in records
-        ):
-            raise ValueError("Retriever selected records must match the preserved operator head")
-        present_ids = self.candidate_record_ids[row]
-        candidate_records = self.candidate_records[row]
-        candidate_by_id: dict[str, RetrievalCandidate] = {}
-        tensor_only = (
-            all(value is None for value in present_ids)
-            and all(value is None for value in self.candidate_head_types[row])
-            and all(value is None for value in candidate_records)
-        )
-        if tensor_only:
-            present = self.present_mask[row]
-            sequences = sequence_ids[row]
-            heads = head_codes[row]
-            if bool(torch.any(sequences[present] < 0)) or bool(
-                torch.any((heads[present] < 0) | (heads[present] >= len(RETRIEVAL_HEAD_ORDER)))
-            ):
-                raise ValueError("present tensor candidates require valid sequence/head codes")
-            if bool(torch.any(sequences[~present] != -1)) or bool(
-                torch.any(heads[~present] != -1)
-            ):
-                raise ValueError("padded tensor candidate metadata must use -1")
-            live_sequences = sequences[present]
-            if torch.unique(live_sequences).numel() != live_sequences.numel():
-                raise ValueError("Retriever candidate sequence IDs must be unique per row")
-            if expected_head is not None:
-                expected_mask = present & (
-                    heads == RETRIEVAL_HEAD_ORDER.index(expected_head)
-                )
-            else:
-                expected_mask = torch.zeros_like(present)
-            if not torch.equal(self.predicted_head_mask[row], expected_mask):
-                raise ValueError("Retriever predicted-head mask disagrees with tensor metadata")
-        else:
-            for column, _record_id in enumerate(present_ids):
-                is_present = bool(self.present_mask[row, column])
-                resolved_id = self.candidate_record_id(row, column)
-                resolved_head = self.candidate_head_type(row, column)
-                if (resolved_id is not None) != is_present:
-                    raise ValueError("Retriever candidate IDs must align to present_mask")
-                candidate = candidate_records[column]
-                if candidate is None:
-                    if not is_present and resolved_head is not None:
-                        raise ValueError("padded Retriever candidate head type must be None")
-                    if is_present and resolved_head is None:
-                        raise ValueError("present tensor candidate requires a valid head code")
-                    continue
-                if resolved_head is not candidate.head_type:
-                    raise ValueError("Retriever candidate head metadata is inconsistent")
-                if (
-                    candidate.record_id != resolved_id
-                    or candidate.video_id != self.bank_video_ids[row]
-                    or candidate.trajectory_id != self.bank_trajectory_ids[row]
-                ):
-                    raise ValueError(
-                        "Retriever candidate typed snapshot metadata is inconsistent"
-                    )
-                if isinstance(candidate, StateRecord) and (
-                    candidate.semantic_embedding.dtype != self.state_embeddings.dtype
-                    or candidate.semantic_embedding.device != self.state_embeddings.device
-                    or not torch.equal(
-                        candidate.semantic_embedding, self.state_embeddings[row, column]
-                    )
-                ):
-                    raise ValueError("Retriever StateRecord snapshot semantics are inconsistent")
-                if isinstance(candidate, RetrievalHistoryRecord) and (
-                    candidate.semantic_source.device != self.state_embeddings.device
-                ):
-                    raise ValueError("Retriever history source and projected key devices differ")
-                if bool(self.record_valid_mask[row, column]) is not candidate.valid:
-                    raise ValueError("Retriever candidate validity metadata is inconsistent")
-                if isinstance(candidate, RetrievalHistoryRecord) and (
-                    bool(self.retrieval_eligible_mask[row, column])
-                    is not candidate.retrieval_eligible
-                ):
-                    raise ValueError("Retriever candidate eligibility metadata is inconsistent")
-                if bool(self.predicted_head_mask[row, column]) is not (
-                    expected_head is not None and candidate.head_type is expected_head
-                ):
-                    raise ValueError(
-                        "Retriever predicted-head mask disagrees with candidate metadata"
-                    )
-                candidate_by_id[candidate.record_id] = candidate
-            live_candidate_ids = tuple(
-                self.candidate_record_id(row, column)
-                for column in range(self.scores.shape[1])
-                if bool(self.present_mask[row, column])
-            )
-            if len(set(live_candidate_ids)) != len(live_candidate_ids):
-                raise ValueError("Retriever candidate record IDs must be unique per row")
-        selected_columns = torch.nonzero(self.selected_mask[row], as_tuple=False).flatten().tolist()
-        mask_ids = tuple(self.candidate_record_id(row, column) for column in selected_columns)
-        if set(mask_ids) != set(ids):
-            raise ValueError("Retriever selected IDs must exactly match selected_mask")
-        if any(
-            record.record_id in candidate_by_id
-            and not _snapshot_values_equal(record, candidate_by_id[record.record_id])
-            for record in records
-        ):
-            raise ValueError("Retriever selected typed records must match the candidate snapshot")
-        score_by_id = {
-            self.candidate_record_id(row, column): float(
-                self.scores[row, column].detach().item()
-            )
-            for column in selected_columns
-        }
-        expected_scores = tuple(score_by_id[record_id] for record_id in ids)
-        if selected_scores != expected_scores:
-            raise ValueError("Retriever selected_scores must align to scores and selected IDs")
-        expected_order = tuple(
-            sorted(ids, key=lambda record_id: (-score_by_id[record_id], record_id))
-        )
-        if ids != expected_order:
-            raise ValueError("Retriever selected IDs must use score-desc/record-ID-asc order")
-        status = self.status[row]
-        reason = self.reason[row]
-        if not isinstance(status, RetrievalStatus) or not isinstance(reason, RetrievalReason):
-            raise TypeError("Retriever status/reason metadata is invalid")
-        if (status is RetrievalStatus.OK) != (n_retrieved > 0):
-            raise ValueError("only Retriever OK rows may contain selected records")
-        if status is RetrievalStatus.OK and reason is not RetrievalReason.MATCHED:
-            raise ValueError("Retriever OK rows require the matched reason")
-        if status is not RetrievalStatus.OK and n_retrieved != 0:
-            raise ValueError("non-OK Retriever rows cannot retain selections")
-        allowed_reasons: dict[RetrievalStatus, set[RetrievalReason]] = {
-            RetrievalStatus.OK: {RetrievalReason.MATCHED},
-            RetrievalStatus.EMPTY: {
-                RetrievalReason.EMPTY_BANK,
-                RetrievalReason.EMPTY_HEAD_PARTITION,
-                RetrievalReason.ALL_INVALID,
-                RetrievalReason.ALL_RETRIEVAL_INELIGIBLE,
-                RetrievalReason.ALL_FUTURE,
-                RetrievalReason.ALL_OUTSIDE_WINDOW,
-                RetrievalReason.BELOW_SIMILARITY,
-                RetrievalReason.NO_MATCH,
-            },
-            RetrievalStatus.UNSUPPORTED: {
-                RetrievalReason.UNSUPPORTED_OPERATOR,
-                RetrievalReason.UNSUPPORTED_TIME,
-                RetrievalReason.DEGENERATE_QUERY,
-            },
-            RetrievalStatus.INVALID: {
-                RetrievalReason.INVALID_TIME,
-                RetrievalReason.OWNER_MISMATCH,
-            },
-        }
-        if reason not in allowed_reasons[status]:
-            raise ValueError("Retriever reason is inconsistent with its structured status")
-        query_owner = (self.video_ids[row], self.trajectory_ids[row])
-        bank_owner = (self.bank_video_ids[row], self.bank_trajectory_ids[row])
-        if (reason is RetrievalReason.OWNER_MISMATCH) == (query_owner == bank_owner):
-            raise ValueError("Retriever owner-mismatch reason must match query/Bank provenance")
-        if self.audit[row].n_state != n_state or self.audit[row].selected_count != n_retrieved:
-            raise ValueError("Retriever audit counts must align to output counts")
 
 
 class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
@@ -537,7 +159,6 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
 
     def __init__(self, config: RetrieverConfig) -> None:
         super().__init__()
-        _validate_retriever_config(config)
         self.config = config
 
     def forward(
@@ -551,11 +172,6 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
     ) -> RetrieverOutput:
         """Reproject one write-before history snapshot in the grad-enabled Query path."""
 
-        if not isinstance(state_bank, StructuredStateBank):
-            raise TypeError("Retriever requires the StructuredStateBank projector owner")
-        if not isinstance(history, RetrievalHistoryView):
-            raise TypeError("Retriever requires a write-before RetrievalHistoryView")
-        history.assert_snapshot_current()
         q_target = query.q_target
         hard_operators = query.hard_operators
         time_resolutions = query.time.resolutions
@@ -567,20 +183,11 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
                 chunk_size=self.config.score_chunk_size,
                 normalization_eps=self.config.normalization_eps,
             )
-        batch_size = _validate_retrieval_inputs(
-            self.config,
-            q_target,
-            hard_operators,
-            time_resolutions,
-            history,
-            video_ids,
-            trajectory_ids,
-            aligned_embeddings,
-        )
-        operators = _normalize_operators(hard_operators, batch_size)
-        resolutions = _normalize_resolutions(time_resolutions, batch_size)
-        query_video_ids = _normalize_owner_ids(video_ids, batch_size, "video_ids")
-        query_trajectory_ids = _normalize_owner_ids(trajectory_ids, batch_size, "trajectory_ids")
+        batch_size = int(q_target.shape[0])
+        operators = tuple(hard_operators)
+        resolutions = tuple(time_resolutions)
+        query_video_ids = tuple(video_ids)
+        query_trajectory_ids = tuple(trajectory_ids)
         sequence_ids, head_codes, operator_codes = history.require_tensor_metadata()
         selected_mask = torch.zeros_like(history.present_mask)
         predicted_head_mask = _predicted_head_mask(history, operators)
@@ -620,10 +227,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
             selected_scores=tuple(selected_scores),
             selected_records=tuple(selected_records),
             candidate_record_ids=history.record_ids,
-            candidate_records=tuple(
-                tuple(_clone_candidate(record) if record is not None else None for record in row)
-                for row in history.cloned_records
-            ),
+            candidate_records=history.cloned_records,
             candidate_head_types=history.head_types,
             state_embeddings=aligned_embeddings,
             scores=scores,
@@ -675,35 +279,17 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
     ]:
         n_state = int(state_view.n_state[row].item())
         owner_count = int(state_view.owner_record_counts[row].item())
-        if owner_count != n_state:
-            raise ValueError("all-head retrieval history must expose every owner record")
-        owner_matches = (
-            state_view.video_ids[row] == video_id
-            and state_view.trajectory_ids[row] == trajectory_id
-        )
-        if not owner_matches:
-            return _rejected_row(
-                RetrievalStatus.INVALID,
-                RetrievalReason.OWNER_MISMATCH,
-                n_state,
-                0,
-                owner_mismatch=True,
-            )
         if resolution.status is TimeResolutionStatus.INVALID:
             return _rejected_row(
                 RetrievalStatus.INVALID,
                 RetrievalReason.INVALID_TIME,
                 n_state,
-                0,
-                query_rejected=True,
             )
         if resolution.status is TimeResolutionStatus.UNSUPPORTED:
             return _rejected_row(
                 RetrievalStatus.UNSUPPORTED,
                 RetrievalReason.UNSUPPORTED_TIME,
                 n_state,
-                0,
-                query_rejected=True,
             )
         expected_head = OPERATOR_TO_HEAD_TYPE[operator]
         if operator is Operator.UNSUPPORTED or expected_head is None:
@@ -711,16 +297,12 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
                 RetrievalStatus.UNSUPPORTED,
                 RetrievalReason.UNSUPPORTED_OPERATOR,
                 n_state,
-                0,
-                query_rejected=True,
             )
         if not math.isfinite(query_norm) or query_norm <= self.config.normalization_eps:
             return _rejected_row(
                 RetrievalStatus.UNSUPPORTED,
                 RetrievalReason.DEGENERATE_QUERY,
                 n_state,
-                0,
-                query_rejected=True,
             )
 
         sequence_ids, head_codes, _ = state_view.require_tensor_metadata()
@@ -752,20 +334,6 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
         below_mask = after_window & (scores[row].detach() < similarity_threshold)
         chosen = after_window & ~below_mask
         selected_mask[row] = chosen
-        count_tensors = torch.stack(
-            (
-                (present & ~predicted).sum(),
-                (after_head & ~valid).sum(),
-                (after_valid & ~eligible).sum(),
-                (after_eligible & ~causal).sum(),
-                outside_mask.sum(),
-                below_mask.sum(),
-                chosen.sum(),
-            )
-        )
-        head_excluded, invalid, ineligible, future, outside, below, _ = (
-            int(value) for value in count_tensors.detach().cpu().tolist()
-        )
         ordered = torch.nonzero(chosen, as_tuple=False).flatten()
         if ordered.numel():
             id_order = torch.argsort(
@@ -782,18 +350,7 @@ class EmbeddingStateRetriever(nn.Module):  # type: ignore[misc]
         records = tuple(
             _materialize_history_record(state_view, row, column) for column in ordered_columns
         )
-        audit = RetrievalFilterAudit(
-            n_state=n_state,
-            head_partition_excluded_count=head_excluded,
-            query_rejected_count=0,
-            owner_mismatch_count=0,
-            invalid_count=invalid,
-            retrieval_ineligible_count=ineligible,
-            future_count=future,
-            outside_window_count=outside,
-            below_similarity_count=below,
-            selected_count=len(ids),
-        )
+        audit = RetrievalFilterAudit(n_state=n_state, selected_count=len(ids))
         if ids:
             return RetrievalStatus.OK, RetrievalReason.MATCHED, audit, ids, row_scores, records
         reason = _empty_reason(audit, owner_count)

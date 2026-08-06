@@ -7,8 +7,6 @@ Forbidden: q_target retrieval, labels in runtime, ANN, silent overwrite, or cach
 
 from __future__ import annotations
 
-import hashlib
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -19,7 +17,6 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from ttt_svcbench_qwen.config import ProjectConfig
-from ttt_svcbench_qwen.tensor_contracts import assert_tensors_disjoint
 
 if TYPE_CHECKING:
     from ttt_svcbench_qwen.observation_heads import O2SoftOutput
@@ -31,10 +28,6 @@ if TYPE_CHECKING:
 
 IDENTITY_DIM = 256
 SEMANTIC_DIM = 512
-_UNIT_ATOL = 5.0e-4
-_UNIT_RTOL = 5.0e-4
-
-type AuditValue = str | int | float | bool | None
 
 
 class IdentityDecisionStatus(StrEnum):
@@ -71,33 +64,6 @@ class CandidateIdentity:
     semantic_record_id: str | None = None
     relevance: float = 0.5
 
-    def __post_init__(self) -> None:
-        _validate_identity_tensor(self.identity_prototype, "candidate identity prototype")
-        if not self.candidate_id:
-            raise ValueError("candidate_id must be non-empty")
-        _validate_probability(self.relevance, "candidate relevance")
-        if (
-            type(self.observation_count) is not int
-            or self.observation_count < 1
-            or type(self.ttl_remaining) is not int
-            or self.ttl_remaining < 0
-            or type(self.reliable_streak) is not int
-            or self.reliable_streak < 0
-        ):
-            raise ValueError("candidate counts/TTL/streak are invalid")
-        _validate_probability(self.confidence, "candidate confidence")
-        _validate_seen_metadata(
-            self.first_seen,
-            self.last_seen,
-            self.first_seen_position_id,
-            self.last_seen_position_id,
-            "candidate",
-        )
-        if type(self.last_reliable_chunk_index) is not int or self.last_reliable_chunk_index < 0:
-            raise ValueError("candidate reliable chunk index is invalid")
-        if self.semantic_record_id is not None and not self.semantic_record_id:
-            raise ValueError("candidate semantic_record_id cannot be empty")
-
 
 @dataclass(frozen=True, slots=True)
 class ConfirmedIdentity:
@@ -112,161 +78,6 @@ class ConfirmedIdentity:
     last_seen_position_id: int = 0
     relevance: float = 0.5
 
-    def __post_init__(self) -> None:
-        _validate_identity_tensor(self.identity_prototype, "confirmed identity prototype")
-        _validate_probability(self.relevance, "confirmed relevance")
-        if (
-            not self.identity_id
-            or type(self.observation_count) is not int
-            or self.observation_count < 1
-        ):
-            raise ValueError("confirmed identity metadata is invalid")
-        _validate_seen_metadata(
-            self.first_seen,
-            self.last_seen,
-            self.first_seen_position_id,
-            self.last_seen_position_id,
-            "confirmed",
-        )
-        if type(self.prototype_version) is not int or self.prototype_version < 0:
-            raise ValueError("confirmed prototype_version must be non-negative")
-        if self.semantic_record_id is not None and not self.semantic_record_id:
-            raise ValueError("confirmed semantic_record_id cannot be empty")
-
-
-@dataclass(frozen=True, slots=True)
-class ConfirmedChunk:
-    """One authoritative fixed-capacity CPU FP32 allocation."""
-
-    prototypes: Tensor
-    occupied: Tensor
-    identity_ids: tuple[str | None, ...]
-    first_seen: Tensor
-    last_seen: Tensor
-    observation_counts: Tensor
-    first_seen_position_ids: Tensor
-    last_seen_position_ids: Tensor
-    semantic_record_ids: tuple[str | None, ...]
-    prototype_versions: Tensor
-    relevance: Tensor
-
-    def __post_init__(self) -> None:
-        capacity = len(self.identity_ids)
-        if capacity <= 0 or len(self.semantic_record_ids) != capacity:
-            raise ValueError("Confirmed chunk metadata must have a positive aligned capacity")
-        expected_vectors = (capacity, IDENTITY_DIM)
-        if (
-            self.prototypes.shape != expected_vectors
-            or self.prototypes.dtype != torch.float32
-            or self.prototypes.device.type != "cpu"
-            or self.prototypes.requires_grad
-            or self.prototypes.grad_fn is not None
-        ):
-            raise ValueError("Confirmed prototypes must be detached CPU FP32 [capacity, 256]")
-        expected = (capacity,)
-        tensors = (
-            self.occupied,
-            self.first_seen,
-            self.last_seen,
-            self.observation_counts,
-            self.first_seen_position_ids,
-            self.last_seen_position_ids,
-            self.prototype_versions,
-            self.relevance,
-        )
-        if any(tensor.shape != expected or tensor.device.type != "cpu" for tensor in tensors):
-            raise ValueError("Confirmed chunk fields must be aligned CPU vectors")
-        if self.relevance.dtype != torch.float32:
-            raise ValueError("Confirmed relevance must be CPU float32")
-        if self.occupied.dtype != torch.bool:
-            raise ValueError("Confirmed occupied mask must be bool")
-        if self.first_seen.dtype != torch.float64 or self.last_seen.dtype != torch.float64:
-            raise ValueError("Confirmed timestamps must be CPU float64")
-        integer_tensors = (
-            self.observation_counts,
-            self.first_seen_position_ids,
-            self.last_seen_position_ids,
-            self.prototype_versions,
-        )
-        if any(tensor.dtype != torch.int64 for tensor in integer_tensors):
-            raise ValueError("Confirmed integer metadata must be int64")
-        occupied_indices = torch.nonzero(self.occupied, as_tuple=False).flatten().tolist()
-        for index in range(capacity):
-            occupied = index in occupied_indices
-            identity_id = self.identity_ids[index]
-            record_id = self.semantic_record_ids[index]
-            if occupied != (identity_id is not None and record_id is not None):
-                raise ValueError("Confirmed occupancy, identity ID, and record link must agree")
-            if not occupied:
-                continue
-            if not identity_id or not record_id:
-                raise ValueError("Confirmed live IDs cannot be empty")
-            prototype = self.prototypes[index]
-            _validate_unit_identity(prototype, "Confirmed authoritative prototype")
-            first = float(self.first_seen[index].item())
-            last = float(self.last_seen[index].item())
-            first_position = int(self.first_seen_position_ids[index].item())
-            last_position = int(self.last_seen_position_ids[index].item())
-            _validate_seen_metadata(first, last, first_position, last_position, "confirmed slot")
-            if int(self.observation_counts[index].item()) < 1:
-                raise ValueError("Confirmed observation count must be positive")
-            if int(self.prototype_versions[index].item()) < 0:
-                raise ValueError("Confirmed prototype version must be non-negative")
-            if not 0.0 <= float(self.relevance[index].item()) <= 1.0:
-                raise ValueError("Confirmed relevance must lie in [0, 1]")
-
-    @property
-    def capacity(self) -> int:
-        return int(self.prototypes.shape[0])
-
-    @property
-    def size(self) -> int:
-        return int(self.occupied.sum().item())
-
-
-@dataclass(frozen=True, slots=True)
-class HotCacheEntry:
-    identity_id: str
-    identity_prototype: Tensor
-    last_accessed_position_id: int
-    prototype_version: int = 0
-
-    def __post_init__(self) -> None:
-        _validate_identity_tensor(self.identity_prototype, "Hot Cache identity prototype")
-        if (
-            not self.identity_id
-            or type(self.last_accessed_position_id) is not int
-            or self.last_accessed_position_id < 0
-            or type(self.prototype_version) is not int
-            or self.prototype_version < 0
-        ):
-            raise ValueError("Hot Cache metadata is invalid")
-        if self.identity_prototype.requires_grad or self.identity_prototype.grad_fn is not None:
-            raise ValueError("Hot Cache prototypes must be detached")
-
-
-@dataclass(frozen=True, slots=True)
-class IdentityBankAuditEntry:
-    action: str
-    timestamp: float
-    position_id: int
-    details: tuple[tuple[str, AuditValue], ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.action:
-            raise ValueError("Identity Bank audit action must be non-empty")
-        if (
-            not math.isfinite(self.timestamp)
-            or self.timestamp < 0.0
-            or type(self.position_id) is not int
-            or self.position_id < 0
-        ):
-            raise ValueError("Identity Bank audit time/position is invalid")
-        keys = tuple(key for key, _ in self.details)
-        if any(not key for key in keys) or len(keys) != len(set(keys)):
-            raise ValueError("Identity Bank audit detail keys must be unique and non-empty")
-        if any(isinstance(value, Tensor) for _, value in self.details):
-            raise TypeError("Identity Bank audit cannot retain tensors")
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,120 +85,18 @@ class IdentityBankRuntimeState:
     video_id: str = "unowned-video"
     trajectory_id: str = "unowned-trajectory"
     candidates: tuple[CandidateIdentity, ...] = ()
-    confirmed_chunks: tuple[ConfirmedChunk, ...] = ()
-    hot_cache: tuple[HotCacheEntry, ...] = ()
-    candidate_capacity: int = 64
-    hot_cache_capacity: int = 256
+    confirmed: tuple[ConfirmedIdentity, ...] = ()
     next_candidate_sequence: int = 0
     next_identity_sequence: int = 0
     issued_candidate_ids: tuple[str, ...] = ()
     issued_identity_ids: tuple[str, ...] = ()
-    candidate_overflow_count: int = 0
     candidate_expired_count: int = 0
     candidate_low_confidence_pruned_count: int = 0
-    match_conflict_count: int = 0
     signal_conflict_count: int = 0
     last_chunk_index: int = -1
     last_committed_position_id: int = -1
-    hot_cache_requested: bool = True
-    hot_cache_enabled: bool = False
-    hot_cache_device: str | None = None
-    hot_cache_dtype: str = "bfloat16"
-    hot_cache_disabled_reason: str | None = "not_initialized"
-    audit_log: tuple[IdentityBankAuditEntry, ...] = ()
     released: bool = False
     version: int = 0
-
-    def __post_init__(self) -> None:
-        if not self.video_id or not self.trajectory_id:
-            raise ValueError("Identity Bank owner identifiers must be non-empty")
-        bool_fields = (self.hot_cache_requested, self.hot_cache_enabled, self.released)
-        if any(type(value) is not bool for value in bool_fields):
-            raise TypeError("Identity Bank runtime flags must be bool")
-        counters = (
-            self.candidate_capacity,
-            self.hot_cache_capacity,
-            self.next_candidate_sequence,
-            self.next_identity_sequence,
-            self.candidate_overflow_count,
-            self.candidate_expired_count,
-            self.candidate_low_confidence_pruned_count,
-            self.match_conflict_count,
-            self.signal_conflict_count,
-            self.version,
-        )
-        if any(type(value) is not int or value < 0 for value in counters):
-            raise ValueError("Identity Bank capacities/sequences/counters must be non-negative")
-        if type(self.last_chunk_index) is not int or self.last_chunk_index < -1:
-            raise ValueError("Identity Bank last_chunk_index is invalid")
-        if type(self.last_committed_position_id) is not int or self.last_committed_position_id < -1:
-            raise ValueError("Identity Bank last_committed_position_id is invalid")
-        if self.released:
-            if (
-                self.candidates
-                or self.confirmed_chunks
-                or self.hot_cache
-                or self.candidate_capacity
-                or self.hot_cache_capacity
-                or self.audit_log
-            ):
-                raise ValueError("released Identity Bank cannot retain trajectory storage")
-            return
-        if self.candidate_capacity < 64 or self.candidate_capacity > 512:
-            raise ValueError("Candidate logical capacity must stay within [64, 512]")
-        if self.candidate_capacity % 64 or len(self.candidates) > self.candidate_capacity:
-            raise ValueError("Candidate capacity must grow in aligned chunks")
-        if self.hot_cache_capacity != 256 or len(self.hot_cache) > self.hot_cache_capacity:
-            raise ValueError("Hot Cache capacity must stay exactly 256")
-        if not self.confirmed_chunks:
-            raise ValueError("live Identity Bank must retain its initial Confirmed allocation")
-        if any(chunk.capacity != 256 for chunk in self.confirmed_chunks):
-            raise ValueError("Confirmed store must grow in 256-slot chunks")
-        candidate_ids = tuple(candidate.candidate_id for candidate in self.candidates)
-        identity_ids = tuple(identity.identity_id for identity in self.confirmed)
-        if len(set(candidate_ids)) != len(candidate_ids) or len(set(identity_ids)) != len(
-            identity_ids
-        ):
-            raise ValueError("Identity IDs must be unique within their stores")
-        if any(candidate.semantic_record_id is None for candidate in self.candidates):
-            raise ValueError("live Candidate entries require semantic record links")
-        if any(
-            candidate.candidate_id not in self.issued_candidate_ids for candidate in self.candidates
-        ):
-            raise ValueError("Candidate ID tombstones are inconsistent")
-        if any(identity_id not in self.issued_identity_ids for identity_id in identity_ids):
-            raise ValueError("Confirmed identity ID tombstones are inconsistent")
-        if len(set(self.issued_candidate_ids)) != len(self.issued_candidate_ids) or len(
-            set(self.issued_identity_ids)
-        ) != len(self.issued_identity_ids):
-            raise ValueError("issued identity IDs cannot be reused")
-        for candidate in self.candidates:
-            _validate_authoritative_identity(candidate.identity_prototype, "Candidate prototype")
-        if self.hot_cache_enabled:
-            if self.hot_cache_device is None or self.hot_cache_disabled_reason is not None:
-                raise ValueError("enabled Hot Cache requires a device and no disabled reason")
-            for entry in self.hot_cache:
-                if str(entry.identity_prototype.device) != self.hot_cache_device:
-                    raise ValueError("Hot Cache entries must use the configured device")
-                if _dtype_name(entry.identity_prototype.dtype) != self.hot_cache_dtype:
-                    raise ValueError("Hot Cache entries must use the configured dtype")
-        elif self.hot_cache or self.hot_cache_device is not None:
-            raise ValueError("disabled Hot Cache cannot retain device storage")
-        cached_ids = tuple(entry.identity_id for entry in self.hot_cache)
-        if len(set(cached_ids)) != len(cached_ids) or any(
-            identity_id not in identity_ids for identity_id in cached_ids
-        ):
-            raise ValueError("Hot Cache must be a unique subset of Confirmed IDs")
-        if self.audit_log and any(
-            right.position_id < left.position_id
-            for left, right in zip(self.audit_log, self.audit_log[1:], strict=False)
-        ):
-            raise ValueError("Identity Bank audit positions must be monotonic")
-        _assert_runtime_storage_isolated(self)
-
-    @property
-    def confirmed_capacity(self) -> int:
-        return sum(chunk.capacity for chunk in self.confirmed_chunks)
 
     @property
     def candidate_count(self) -> int:
@@ -395,35 +104,7 @@ class IdentityBankRuntimeState:
 
     @property
     def unique_count(self) -> int:
-        return sum(chunk.size for chunk in self.confirmed_chunks)
-
-    @property
-    def audit(self) -> tuple[IdentityBankAuditEntry, ...]:
-        return self.audit_log
-
-    @property
-    def confirmed(self) -> tuple[ConfirmedIdentity, ...]:
-        records: list[ConfirmedIdentity] = []
-        for chunk in self.confirmed_chunks:
-            for index in torch.nonzero(chunk.occupied, as_tuple=False).flatten().tolist():
-                identity_id = chunk.identity_ids[index]
-                record_id = chunk.semantic_record_ids[index]
-                assert identity_id is not None and record_id is not None
-                records.append(
-                    ConfirmedIdentity(
-                        identity_id=identity_id,
-                        identity_prototype=chunk.prototypes[index].detach().clone(),
-                        first_seen=float(chunk.first_seen[index].item()),
-                        last_seen=float(chunk.last_seen[index].item()),
-                        observation_count=int(chunk.observation_counts[index].item()),
-                        semantic_record_id=record_id,
-                        prototype_version=int(chunk.prototype_versions[index].item()),
-                        first_seen_position_id=int(chunk.first_seen_position_ids[index].item()),
-                        last_seen_position_id=int(chunk.last_seen_position_ids[index].item()),
-                        relevance=float(chunk.relevance[index].item()),
-                    )
-                )
-        return tuple(records)
+        return len(self.confirmed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,33 +115,6 @@ class IdentityObservationDecision:
     status: IdentityDecisionStatus
     candidate_id: str | None = None
     identity_id: str | None = None
-    similarity: float | None = None
-    novelty: float | None = None
-    match_confidence: float | None = None
-    scanned_confirmed_count: int = 0
-    reason: str | None = None
-
-    def __post_init__(self) -> None:
-        if type(self.slot_index) is not int or self.slot_index < 0:
-            raise ValueError("identity decision slot_index must be non-negative")
-        if type(self.position_id) is not int or self.position_id < -1:
-            raise ValueError("identity decision position_id is invalid")
-        if not math.isfinite(self.timestamp) or self.timestamp < -1.0:
-            raise ValueError("identity decision timestamp is invalid")
-        if not isinstance(self.status, IdentityDecisionStatus):
-            raise TypeError("identity decision status is invalid")
-        for value, name in (
-            (self.novelty, "novelty"),
-            (self.match_confidence, "match confidence"),
-        ):
-            if value is not None:
-                _validate_probability(value, name)
-        if self.similarity is not None and (
-            not math.isfinite(self.similarity) or not -1.0001 <= self.similarity <= 1.0001
-        ):
-            raise ValueError("identity decision similarity is invalid")
-        if type(self.scanned_confirmed_count) is not int or self.scanned_confirmed_count < 0:
-            raise ValueError("identity decision scanned count must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,29 +122,6 @@ class IdentityUpdateResult:
     identity_state: IdentityBankRuntimeState
     state_bank_state: StateBankRuntimeState
     decisions: tuple[IdentityObservationDecision, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ExactMatchDecision:
-    query_index: int
-    status: ExactMatchStatus
-    identity_id: str | None
-    score: float | None
-    ambiguous_identity_ids: tuple[str, ...]
-    scanned_confirmed_count: int
-    cache_hit: bool
-
-
-@dataclass(frozen=True, slots=True)
-class ExactMatchResult:
-    state: IdentityBankRuntimeState
-    matches: tuple[ExactMatchDecision, ...]
-    search_mode: str = "exact"
-    ann_enabled: bool = False
-
-    def __post_init__(self) -> None:
-        if self.search_mode != "exact" or self.ann_enabled:
-            raise ValueError("P10 only permits full exact identity search")
 
 
 @dataclass(frozen=True, slots=True)
@@ -522,79 +153,21 @@ class IdentityBank:
         self.o2_config = config.observation_heads.o2
         self.candidate_config = config.state_bank.candidate_store
         self.confirmed_config = config.state_bank.confirmed_store
-        self._validate_config()
 
     def reset(
         self,
         video_id: str,
         trajectory_id: str,
-        *,
-        hot_device: str | torch.device | None = None,
-        hot_cache_enabled: bool | None = None,
     ) -> IdentityBankRuntimeState:
-        if not video_id or not trajectory_id:
-            raise ValueError("Identity Bank reset requires non-empty owner identifiers")
-        requested = (
-            self.confirmed_config.hot_cache_enabled
-            if hot_cache_enabled is None
-            else hot_cache_enabled
-        )
-        if type(requested) is not bool:
-            raise TypeError("hot_cache_enabled must be bool")
-        enabled, device, reason = self._resolve_hot_cache(requested, hot_device)
         return IdentityBankRuntimeState(
             video_id=video_id,
             trajectory_id=trajectory_id,
-            confirmed_chunks=(_empty_confirmed_chunk(self.confirmed_config.initial_capacity),),
-            candidate_capacity=self.candidate_config.initial_capacity,
-            hot_cache_capacity=self.confirmed_config.gpu_hot_capacity,
-            hot_cache_requested=requested,
-            hot_cache_enabled=enabled,
-            hot_cache_device=device,
-            hot_cache_dtype=self.confirmed_config.hot_cache_dtype,
-            hot_cache_disabled_reason=reason,
-        )
-
-    def snapshot(self, state: IdentityBankRuntimeState) -> IdentityBankRuntimeState:
-        _require_live_state(state)
-        return _clone_runtime_state(state)
-
-    def restore(self, snapshot: IdentityBankRuntimeState) -> IdentityBankRuntimeState:
-        _require_live_state(snapshot)
-        return _clone_runtime_state(snapshot)
-
-    def clear(self, state: IdentityBankRuntimeState) -> IdentityBankRuntimeState:
-        _require_live_state(state)
-        return IdentityBankRuntimeState(
-            video_id=state.video_id,
-            trajectory_id=state.trajectory_id,
-            confirmed_chunks=(_empty_confirmed_chunk(self.confirmed_config.initial_capacity),),
-            candidate_capacity=self.candidate_config.initial_capacity,
-            hot_cache_capacity=self.confirmed_config.gpu_hot_capacity,
-            next_candidate_sequence=state.next_candidate_sequence,
-            next_identity_sequence=state.next_identity_sequence,
-            issued_candidate_ids=state.issued_candidate_ids,
-            issued_identity_ids=state.issued_identity_ids,
-            hot_cache_requested=state.hot_cache_requested,
-            hot_cache_enabled=state.hot_cache_enabled,
-            hot_cache_device=state.hot_cache_device,
-            hot_cache_dtype=state.hot_cache_dtype,
-            hot_cache_disabled_reason=state.hot_cache_disabled_reason,
-            version=state.version + 1,
         )
 
     def release(self, state: IdentityBankRuntimeState) -> IdentityBankRuntimeState:
-        _require_live_state(state)
         return IdentityBankRuntimeState(
             video_id=state.video_id,
             trajectory_id=state.trajectory_id,
-            candidate_capacity=0,
-            hot_cache_capacity=0,
-            hot_cache_requested=state.hot_cache_requested,
-            hot_cache_enabled=False,
-            hot_cache_device=None,
-            hot_cache_dtype=state.hot_cache_dtype,
-            hot_cache_disabled_reason="released",
             released=True,
             version=state.version + 1,
         )
@@ -602,64 +175,13 @@ class IdentityBank:
     def confirmed_by_id(
         self, state: IdentityBankRuntimeState, identity_id: str
     ) -> ConfirmedIdentity:
-        _require_live_state(state)
-        if not identity_id:
-            raise ValueError("identity_id must be non-empty")
-        matches = tuple(
-            identity for identity in state.confirmed if identity.identity_id == identity_id
-        )
-        if len(matches) != 1:
-            raise KeyError(f"Confirmed identity not found: {identity_id}")
-        return _clone_confirmed(matches[0])
-
-    def exact_match(
-        self,
-        state: IdentityBankRuntimeState,
-        queries: Tensor,
-        *,
-        access_position_id: int,
-        use_hot_cache: bool = True,
-    ) -> ExactMatchResult:
-        """Scan the complete authoritative CPU store for every query.
-
-        The cache is checked only for audit and warmed after the CPU decision. A cache hit never
-        permits early acceptance and therefore cannot hide a better cold CPU match.
-        """
-
-        _require_live_state(state)
-        if type(access_position_id) is not int or access_position_id < 0:
-            raise ValueError("access_position_id must be non-negative")
-        normalized = queries.unsqueeze(0) if queries.ndim == 1 else queries
-        if normalized.ndim != 2 or normalized.shape[1] != IDENTITY_DIM:
-            raise ValueError("identity queries must be [N, 256] or [256]")
-        if not torch.is_floating_point(normalized):
-            raise ValueError("identity queries must be floating")
-        next_state = state
-        matches: list[ExactMatchDecision] = []
-        cached_ids = {entry.identity_id for entry in state.hot_cache} if use_hot_cache else set()
-        for query_index, query in enumerate(normalized):
-            hard_query = _hard_identity(query)
-            match = self._match_confirmed(state, hard_query)
-            cache_hit = match.entry_id in cached_ids if match.entry_id is not None else False
-            if match.status is ExactMatchStatus.MATCHED and match.entry_id is not None:
-                next_state = self._touch_hot_cache(
-                    next_state,
-                    match.entry_id,
-                    access_position_id,
-                    enabled=use_hot_cache,
-                )
-            matches.append(
-                ExactMatchDecision(
-                    query_index=query_index,
-                    status=match.status,
-                    identity_id=match.entry_id,
-                    score=match.score,
-                    ambiguous_identity_ids=match.ambiguous_ids,
-                    scanned_confirmed_count=state.unique_count,
-                    cache_hit=cache_hit,
-                )
+        return _clone_confirmed(
+            next(
+                identity
+                for identity in state.confirmed
+                if identity.identity_id == identity_id
             )
-        return ExactMatchResult(state=next_state, matches=tuple(matches))
+        )
 
     def update_row(
         self,
@@ -674,53 +196,20 @@ class IdentityBank:
     ) -> IdentityUpdateResult:
         """Commit one owner row exactly once for a monotonically increasing chunk index."""
 
-        from ttt_svcbench_qwen.state_bank import StateBankRuntimeState, StructuredStateBank
-
-        _require_live_state(identity_state)
-        if not isinstance(state_bank, StructuredStateBank) or not isinstance(
-            state_state, StateBankRuntimeState
-        ):
-            raise TypeError("update_row requires StructuredStateBank and StateBankRuntimeState")
-        _validate_cross_bank_owner(identity_state, state_state)
-        if type(row) is not int or row < 0 or row >= observation.identity.shape[0]:
-            raise ValueError("O2 row is out of range")
-        if type(chunk_index) is not int or chunk_index < 0:
-            raise ValueError("chunk_index must be a non-negative integer")
-        if chunk_index < identity_state.last_chunk_index:
-            raise ValueError("Identity Bank rejects out-of-order chunks")
-        width = int(observation.identity.shape[1])
-        if semantic_embeddings.shape != (width, SEMANTIC_DIM) or not torch.is_floating_point(
-            semantic_embeddings
-        ):
-            raise ValueError("O2 semantic_embeddings must be floating [K, 512]")
         observations = self._extract_observations(observation, semantic_embeddings, row)
         committed_positions = {item.position_id for item in observations}
-        if len(committed_positions) > 1:
-            raise ValueError("one O2 owner row must describe one committed position")
         committed_position = next(iter(committed_positions), None)
-        if (
-            committed_position is not None
-            and committed_position < identity_state.last_committed_position_id
-        ):
-            raise ValueError("Identity Bank rejects out-of-order committed positions")
         same_position_replay = (
             committed_position is not None
             and committed_position == identity_state.last_committed_position_id
         )
         if chunk_index == identity_state.last_chunk_index or same_position_replay:
-            replay_reason = (
-                "same_committed_position" if same_position_replay else "same_committed_chunk"
-            )
             replay_decisions = tuple(
                 IdentityObservationDecision(
                     slot_index=item.slot_index,
                     position_id=item.position_id,
                     timestamp=item.timestamp,
                     status=IdentityDecisionStatus.REPLAY_IGNORED,
-                    novelty=item.novelty,
-                    match_confidence=item.match_confidence,
-                    scanned_confirmed_count=identity_state.unique_count,
-                    reason=replay_reason,
                 )
                 for item in observations
             )
@@ -736,17 +225,6 @@ class IdentityBank:
                 next_identity = replace(
                     next_identity,
                     signal_conflict_count=next_identity.signal_conflict_count + 1,
-                    audit_log=next_identity.audit_log
-                    + (
-                        _audit(
-                            "signal_conflict",
-                            item,
-                            (
-                                ("novelty", item.novelty),
-                                ("match_confidence", item.match_confidence),
-                            ),
-                        ),
-                    ),
                     version=next_identity.version + 1,
                 )
                 decisions[item.slot_index] = self._decision(
@@ -824,8 +302,6 @@ class IdentityBank:
                 continue
             timestamp = float(observation.timestamps[row, slot_index].item())
             position_id = int(observation.position_ids[row, slot_index].item())
-            if not math.isfinite(timestamp) or timestamp < 0.0 or position_id < 0:
-                raise ValueError("valid O2 observations require legal timestamp/position metadata")
             novelty = float(observation.score_probabilities[row, slot_index, 0].float().item())
             match_confidence = float(
                 observation.score_probabilities[row, slot_index, 1].float().item()
@@ -877,9 +353,6 @@ class IdentityBank:
         for item in observations:
             match = matches[item.slot_index]
             if match.status is ExactMatchStatus.AMBIGUOUS:
-                next_identity = self._record_match_conflict(
-                    next_identity, item, "confirmed_near_tie", match.ambiguous_ids
-                )
                 decisions[item.slot_index] = self._decision(
                     item,
                     IdentityDecisionStatus.MATCH_CONFLICT,
@@ -904,9 +377,6 @@ class IdentityBank:
             )
             winners.append(ordered[0])
             for loser, loser_match in ordered[1:]:
-                next_identity = self._record_match_conflict(
-                    next_identity, loser, "one_to_one_confirmed_claim", (identity_id,)
-                )
                 decisions[loser.slot_index] = self._decision(
                     loser,
                     IdentityDecisionStatus.MATCH_CONFLICT,
@@ -945,9 +415,6 @@ class IdentityBank:
                 audit_timestamp=item.timestamp,
             )
             next_identity = self._replace_confirmed(next_identity, updated, item)
-            next_identity = self._touch_hot_cache(
-                next_identity, updated.identity_id, item.position_id, enabled=True
-            )
             decisions[item.slot_index] = self._decision(
                 item,
                 IdentityDecisionStatus.CONFIRMED_UPDATED,
@@ -982,9 +449,6 @@ class IdentityBank:
         for item in observations:
             match = matches[item.slot_index]
             if match.status is ExactMatchStatus.AMBIGUOUS:
-                next_identity = self._record_match_conflict(
-                    next_identity, item, "candidate_near_tie", match.ambiguous_ids
-                )
                 decisions[item.slot_index] = self._decision(
                     item,
                     IdentityDecisionStatus.MATCH_CONFLICT,
@@ -1009,9 +473,6 @@ class IdentityBank:
             )
             winners.append(ordered[0])
             for loser, loser_match in ordered[1:]:
-                next_identity = self._record_match_conflict(
-                    next_identity, loser, "one_to_one_candidate_claim", (candidate_id,)
-                )
                 decisions[loser.slot_index] = self._decision(
                     loser,
                     IdentityDecisionStatus.MATCH_CONFLICT,
@@ -1099,13 +560,6 @@ class IdentityBank:
     ) -> tuple[IdentityBankRuntimeState, StateBankRuntimeState, IdentityObservationDecision]:
         dynamic_match = self._match_candidates(identity_state, item.identity)
         if dynamic_match.status is not ExactMatchStatus.UNMATCHED:
-            identity_state = self._record_match_conflict(
-                identity_state,
-                item,
-                "same_chunk_candidate_claim",
-                dynamic_match.ambiguous_ids
-                or ((dynamic_match.entry_id,) if dynamic_match.entry_id is not None else ()),
-            )
             return (
                 identity_state,
                 state_state,
@@ -1120,58 +574,19 @@ class IdentityBank:
             )
         next_identity = identity_state
         next_state_bank = state_state
-        if len(next_identity.candidates) >= next_identity.candidate_capacity:
-            if next_identity.candidate_capacity < self.candidate_config.hard_limit:
-                next_identity = replace(
-                    next_identity,
-                    candidate_capacity=min(
-                        next_identity.candidate_capacity + self.candidate_config.growth_chunk,
-                        self.candidate_config.hard_limit,
-                    ),
-                    audit_log=next_identity.audit_log
-                    + (
-                        _audit(
-                            "candidate_capacity_grow",
-                            item,
-                            (
-                                (
-                                    "new_capacity",
-                                    min(
-                                        next_identity.candidate_capacity
-                                        + self.candidate_config.growth_chunk,
-                                        self.candidate_config.hard_limit,
-                                    ),
-                                ),
-                            ),
-                        ),
-                    ),
-                    version=next_identity.version + 1,
-                )
-            else:
-                next_identity = replace(
-                    next_identity,
-                    candidate_overflow_count=next_identity.candidate_overflow_count + 1,
-                    audit_log=next_identity.audit_log
-                    + (
-                        _audit(
-                            "candidate_overflow_rejected",
-                            item,
-                            (("hard_limit", self.candidate_config.hard_limit),),
-                        ),
-                    ),
-                    version=next_identity.version + 1,
-                )
-                return (
-                    next_identity,
-                    next_state_bank,
-                    self._decision(
-                        item,
-                        IdentityDecisionStatus.OVERFLOW_REJECTED,
-                        next_identity.unique_count,
-                        reason="candidate_hard_limit_reached",
-                    ),
-                )
+        if len(next_identity.candidates) >= self.candidate_config.hard_limit:
+            return (
+                next_identity,
+                next_state_bank,
+                self._decision(
+                    item,
+                    IdentityDecisionStatus.OVERFLOW_REJECTED,
+                    next_identity.unique_count,
+                    reason="candidate_hard_limit_reached",
+                ),
+            )
         candidate_id = f"candidate-{next_identity.next_candidate_sequence:08d}"
+
         draft = CandidateIdentity(
             candidate_id=candidate_id,
             identity_prototype=item.identity,
@@ -1199,14 +614,6 @@ class IdentityBank:
             candidates=next_identity.candidates + (_clone_candidate(linked),),
             next_candidate_sequence=next_identity.next_candidate_sequence + 1,
             issued_candidate_ids=next_identity.issued_candidate_ids + (candidate_id,),
-            audit_log=next_identity.audit_log
-            + (
-                _audit(
-                    "candidate_created",
-                    item,
-                    (("candidate_id", candidate_id), ("record_id", linked.semantic_record_id)),
-                ),
-            ),
             version=next_identity.version + 1,
         )
         return (

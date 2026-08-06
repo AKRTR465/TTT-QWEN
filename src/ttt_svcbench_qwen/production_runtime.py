@@ -88,7 +88,6 @@ from ttt_svcbench_qwen.outer_loss_balance import (
 from ttt_svcbench_qwen.preprocess_cache import (
     CachedChunk,
     PreprocessCache,
-    PreprocessCacheMissPolicy,
     PreprocessCacheMode,
     PreprocessCacheStorageDtype,
     PreprocessFingerprint,
@@ -2318,7 +2317,6 @@ def _build_runtime_preprocess_cache(
     config: ProductionTTTConfig,
 ) -> PreprocessCache | None:
     mode = PreprocessCacheMode(config.preprocess_cache_mode)
-    miss_policy = PreprocessCacheMissPolicy(config.preprocess_cache_miss_policy)
     if mode is PreprocessCacheMode.DISABLED:
         return None
     env_name = config.preprocess_cache_root_env
@@ -2356,7 +2354,6 @@ def _build_runtime_preprocess_cache(
         max_bytes=int(max_gb * 1024**3),
         memory_entries=2,
         mode=mode,
-        miss_policy=miss_policy,
         namespace=namespace,
         storage_dtype=cache_dtype,
     )

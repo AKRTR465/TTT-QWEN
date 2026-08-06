@@ -8,7 +8,6 @@ Forbidden: hard counting, semantic overflow inference, Bank mutation, or optimiz
 from __future__ import annotations
 
 import math
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -22,11 +21,6 @@ from ttt_svcbench_qwen.config import (
     TemporalEncoderConfig,
 )
 from ttt_svcbench_qwen.qwen_adapter import MergedVideoMetadata
-from ttt_svcbench_qwen.tensor_contracts import (
-    assert_storage_disjoint,
-    assert_tensors_disjoint,
-    timestamps_match,
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,43 +32,6 @@ class RestoredMergedGrid:
     spatial_valid_mask: Tensor
     tubelet_valid_mask: Tensor
     grid_shapes: tuple[tuple[int, int, int], ...]
-
-    def __post_init__(self) -> None:
-        if (
-            self.tokens.ndim != 5
-            or self.tokens.shape[-1] != 4096
-            or not torch.is_floating_point(self.tokens)
-        ):
-            raise ValueError("restored grid tokens must be floating [B, T, H, W, 4096]")
-        if (
-            self.geometry_valid_mask.shape != self.tokens.shape[:4]
-            or self.geometry_valid_mask.dtype != torch.bool
-        ):
-            raise ValueError("geometry_valid_mask must be bool [B, T, H, W]")
-        if (
-            self.spatial_valid_mask.shape != self.tokens.shape[:4]
-            or self.spatial_valid_mask.dtype != torch.bool
-        ):
-            raise ValueError("spatial_valid_mask must be bool [B, T, H, W]")
-        if (
-            self.tubelet_valid_mask.shape != self.tokens.shape[:2]
-            or self.tubelet_valid_mask.dtype != torch.bool
-        ):
-            raise ValueError("tubelet_valid_mask must be bool [B, T]")
-        if len(self.grid_shapes) != self.tokens.shape[0]:
-            raise ValueError("restored grid requires one shape per batch row")
-        if any(len(shape) != 3 or min(shape) <= 0 for shape in self.grid_shapes):
-            raise ValueError("restored grid shapes must contain positive (T, H, W) values")
-        if (
-            self.tokens.device != self.geometry_valid_mask.device
-            or self.tokens.device != self.spatial_valid_mask.device
-            or self.tokens.device != self.tubelet_valid_mask.device
-        ):
-            raise ValueError("restored grid tensors must share one device")
-        if self.tokens.device.type != "meta":
-            expected_spatial = self.geometry_valid_mask & self.tubelet_valid_mask[:, :, None, None]
-            if not torch.equal(self.spatial_valid_mask, expected_spatial):
-                raise ValueError("spatial mask must combine geometry and tubelet validity")
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,100 +47,6 @@ class SpatialSlotRuntimeState:
     processed_tubelets: int
     differentiable: bool = False
 
-    def __post_init__(self) -> None:
-        if not self.video_id:
-            raise ValueError("spatial slot runtime requires a non-empty video_id")
-        if self.slots.ndim != 2 or not 1 <= self.slots.shape[0] <= 64 or self.slots.shape[1] != 768:
-            raise ValueError("runtime slots must be [K_a, 768] with 1 <= K_a <= 64")
-        if not torch.is_floating_point(self.slots):
-            raise TypeError("runtime slots must use a floating dtype")
-        if (
-            self.slot_valid_mask.shape != self.slots.shape[:1]
-            or self.slot_valid_mask.dtype != torch.bool
-        ):
-            raise ValueError("runtime slot_valid_mask must be bool [K_a]")
-        if self.slot_confidence.shape != self.slots.shape[:1] or not torch.is_floating_point(
-            self.slot_confidence
-        ):
-            raise ValueError("runtime slot_confidence must be floating [K_a]")
-        if (
-            self.slots.device != self.slot_valid_mask.device
-            or self.slots.device != self.slot_confidence.device
-            or self.slots.dtype != self.slot_confidence.dtype
-        ):
-            raise ValueError("runtime slot tensors must share dtype/device")
-        if self.slots.device.type != "meta" and not bool(self.slot_valid_mask.any()):
-            raise ValueError("spatial runtime requires at least one valid slot")
-        assert_tensors_disjoint(
-            (self.slots, self.slot_confidence),
-            "runtime slots and confidence must use distinct storage",
-        )
-        if self.slots.device.type != "meta":
-            if not bool(torch.isfinite(self.slots).all()):
-                raise ValueError("runtime slots must be finite")
-            if not bool(torch.isfinite(self.slot_confidence).all()):
-                raise ValueError("runtime slot confidence must be finite")
-            if bool(torch.any((self.slot_confidence < 0.0) | (self.slot_confidence > 1.0))):
-                raise ValueError("runtime slot confidence must stay within [0, 1]")
-            if bool(torch.any(self.slot_confidence[~self.slot_valid_mask] != 0.0)):
-                raise ValueError("invalid runtime slots must have zero confidence")
-        counters = (
-            self.active_slot_overflow_count,
-            self.overflow_event_count,
-            self.processed_tubelets,
-        )
-        if any(type(value) is not int for value in counters):
-            raise TypeError("spatial runtime counters must be exact integers")
-        if min(counters) < 0:
-            raise ValueError("spatial runtime counters must be non-negative")
-        if type(self.differentiable) is not bool:
-            raise TypeError("spatial runtime differentiable must be a bool")
-        if not self.differentiable and (
-            self.slots.requires_grad or self.slot_confidence.requires_grad
-        ):
-            raise ValueError("non-differentiable spatial runtime tensors must be detached")
-
-
-@dataclass(frozen=True, slots=True)
-class SpatialEncoderAudit:
-    """Detached structural evidence for one spatial encoder call."""
-
-    grid_shapes: tuple[tuple[int, int, int], ...]
-    visual_token_counts: tuple[int, ...]
-    valid_tubelet_counts: tuple[int, ...]
-    required_slot_counts: tuple[int, ...]
-    excess_slot_counts: tuple[int, ...]
-    overflow_events: tuple[bool, ...]
-    overflow_policy: str
-    stage_refinement_calls: tuple[int, int]
-
-    def __post_init__(self) -> None:
-        batch_size = len(self.grid_shapes)
-        fields = (
-            self.visual_token_counts,
-            self.valid_tubelet_counts,
-            self.required_slot_counts,
-            self.excess_slot_counts,
-            self.overflow_events,
-        )
-        if batch_size <= 0 or any(len(field) != batch_size for field in fields):
-            raise ValueError("spatial audit fields must align to one non-empty batch")
-        counters = (
-            *self.visual_token_counts,
-            *self.valid_tubelet_counts,
-            *self.required_slot_counts,
-            *self.excess_slot_counts,
-            *self.stage_refinement_calls,
-        )
-        if any(type(value) is not int for value in counters):
-            raise TypeError("spatial audit counters must be exact integers")
-        if min(counters) < 0:
-            raise ValueError("spatial audit counters must be non-negative")
-        if any(type(value) is not bool for value in self.overflow_events):
-            raise TypeError("spatial audit overflow flags must be bool")
-        if not self.overflow_policy:
-            raise ValueError("spatial audit requires an overflow policy")
-
 
 @dataclass(frozen=True, slots=True)
 class SpatialEncoderOutput:
@@ -192,49 +55,6 @@ class SpatialEncoderOutput:
     active_slot_overflow_count: Tensor
     slot_confidence: Tensor | None = None
     next_states: tuple[SpatialSlotRuntimeState, ...] | None = None
-    audit: SpatialEncoderAudit | None = None
-
-    def __post_init__(self) -> None:
-        if self.slots.ndim != 3 or not 1 <= self.slots.shape[1] <= 64 or self.slots.shape[2] != 768:
-            raise ValueError("slots must be [B, K_a, 768] with 1 <= K_a <= 64")
-        if not torch.is_floating_point(self.slots):
-            raise TypeError("slots must use a floating dtype")
-        expected_mask = self.slots.shape[:2]
-        if self.slot_valid_mask.shape != expected_mask or self.slot_valid_mask.dtype != torch.bool:
-            raise ValueError("slot_valid_mask must be bool [B, K_a]")
-        if self.active_slot_overflow_count.shape != (self.slots.shape[0],):
-            raise ValueError("active_slot_overflow_count must be [B]")
-        if self.active_slot_overflow_count.dtype not in (torch.int32, torch.int64):
-            raise TypeError("active_slot_overflow_count must use an integer dtype")
-        if (
-            self.slots.device != self.slot_valid_mask.device
-            or self.slots.device != self.active_slot_overflow_count.device
-        ):
-            raise ValueError("spatial output tensors must share one device")
-        if self.slots.device.type != "meta":
-            if not bool(torch.isfinite(self.slots).all()):
-                raise ValueError("spatial output slots must be finite")
-            if bool(torch.any(self.active_slot_overflow_count < 0)):
-                raise ValueError("spatial output overflow counts must be non-negative")
-        if self.slot_confidence is not None:
-            if (
-                self.slot_confidence.shape != expected_mask
-                or self.slot_confidence.dtype != self.slots.dtype
-                or self.slot_confidence.device != self.slots.device
-            ):
-                raise ValueError("slot_confidence must match slots as floating [B, K_a]")
-            if self.slots.device.type != "meta":
-                if not bool(torch.isfinite(self.slot_confidence).all()):
-                    raise ValueError("slot_confidence must be finite")
-                if bool(torch.any((self.slot_confidence < 0.0) | (self.slot_confidence > 1.0))):
-                    raise ValueError("slot_confidence must stay within [0, 1]")
-                if bool(torch.any(self.slot_confidence[~self.slot_valid_mask] != 0.0)):
-                    raise ValueError("invalid slots must have zero confidence")
-        if self.next_states is not None:
-            if len(self.next_states) != self.slots.shape[0]:
-                raise ValueError("spatial output requires one next state per batch row")
-            _assert_runtime_state_storage_isolated(self.next_states)
-
 
 @dataclass(frozen=True, slots=True)
 class TemporalCache:
@@ -257,242 +77,6 @@ class TemporalCache:
     total_seen: Tensor
     differentiable: bool = False
 
-    def __post_init__(self) -> None:
-        if (
-            self.hidden.ndim != 3
-            or self.hidden.shape[-1] != 768
-            or not torch.is_floating_point(self.hidden)
-        ):
-            raise ValueError("temporal cache hidden must be [B, T_cache, 768]")
-        if self.hidden.shape[1] > 64:
-            raise ValueError("temporal cache cannot exceed 64 tubelets")
-        batch_size, cache_length = self.hidden.shape[:2]
-        shape = (batch_size, cache_length)
-        if len(self.layer_keys) != 6 or len(self.layer_values) != 6:
-            raise ValueError("temporal cache requires six independent K/V layers")
-        if len(self.replay_layer_keys) != 6 or len(self.replay_layer_values) != 6:
-            raise ValueError("temporal cache requires six replay-context K/V layers")
-        expected_kv = (batch_size, 12, cache_length, 64)
-        for layer_index, (keys, values) in enumerate(
-            zip(self.layer_keys, self.layer_values, strict=True)
-        ):
-            if (
-                keys.shape != expected_kv
-                or values.shape != expected_kv
-                or not torch.is_floating_point(keys)
-                or not torch.is_floating_point(values)
-            ):
-                raise ValueError(
-                    f"temporal cache layer {layer_index} K/V must be [B, 12, T_cache, 64]"
-                )
-            if (
-                keys.dtype != self.hidden.dtype
-                or values.dtype != self.hidden.dtype
-                or keys.device != self.hidden.device
-                or values.device != self.hidden.device
-            ):
-                raise ValueError("temporal cache hidden and all K/V must share dtype/device")
-        if self.replay_position_ids.ndim != 2:
-            raise ValueError("temporal replay position_ids must be [B, T_replay]")
-        replay_length = self.replay_position_ids.shape[1]
-        if replay_length > 3:
-            raise ValueError("temporal replay context cannot exceed three tubelets")
-        expected_replay_kv = (batch_size, 12, replay_length, 64)
-        for layer_index, (keys, values) in enumerate(
-            zip(self.replay_layer_keys, self.replay_layer_values, strict=True)
-        ):
-            if (
-                keys.shape != expected_replay_kv
-                or values.shape != expected_replay_kv
-                or not torch.is_floating_point(keys)
-                or not torch.is_floating_point(values)
-            ):
-                raise ValueError(
-                    f"temporal replay layer {layer_index} K/V must be [B, 12, T_replay, 64]"
-                )
-            if (
-                keys.dtype != self.hidden.dtype
-                or values.dtype != self.hidden.dtype
-                or keys.device != self.hidden.device
-                or values.device != self.hidden.device
-            ):
-                raise ValueError("temporal replay K/V must share hidden dtype/device")
-        if (
-            self.timestamps.shape != shape
-            or self.timestamps.dtype != torch.float64
-            or self.timestamps.device != self.hidden.device
-        ):
-            raise ValueError("temporal cache timestamps must be floating [B, T_cache]")
-        replay_shape = (batch_size, replay_length)
-        if (
-            self.replay_timestamps.shape != replay_shape
-            or self.replay_timestamps.dtype != torch.float64
-            or self.replay_timestamps.device != self.hidden.device
-        ):
-            raise ValueError("temporal replay timestamps must match cache metadata")
-        if (
-            self.position_ids.shape != shape
-            or self.position_ids.dtype != torch.int64
-            or self.position_ids.device != self.hidden.device
-        ):
-            raise ValueError("temporal cache position_ids must be int64 [B, T_cache]")
-        if (
-            self.replay_position_ids.shape != replay_shape
-            or self.replay_position_ids.dtype != torch.int64
-            or self.replay_position_ids.device != self.hidden.device
-        ):
-            raise ValueError("temporal replay position_ids must be int64 [B, T_replay]")
-        if (
-            self.valid_mask.shape != shape
-            or self.valid_mask.dtype != torch.bool
-            or self.valid_mask.device != self.hidden.device
-        ):
-            raise ValueError("temporal cache valid_mask must be bool [B, T_cache]")
-        if (
-            self.replay_valid_mask.shape != replay_shape
-            or self.replay_valid_mask.dtype != torch.bool
-            or self.replay_valid_mask.device != self.hidden.device
-        ):
-            raise ValueError("temporal replay valid_mask must be bool [B, T_replay]")
-        if len(self.video_ids) != batch_size or not all(self.video_ids):
-            raise ValueError("temporal cache requires one non-empty video_id per batch item")
-        if len(set(self.video_ids)) != batch_size:
-            raise ValueError("temporal cache cannot contain duplicate video_ids")
-        if len(self.trajectory_ids) != batch_size or not all(self.trajectory_ids):
-            raise ValueError("temporal cache requires one non-empty trajectory_id per batch item")
-        if (
-            self.query_signatures.shape != (batch_size, 512)
-            or not torch.is_floating_point(self.query_signatures)
-            or self.query_signatures.dtype != self.hidden.dtype
-            or self.query_signatures.device != self.hidden.device
-        ):
-            raise ValueError("temporal query_signatures must match hidden as [B, 512]")
-        if (
-            self.total_seen.shape != (batch_size,)
-            or self.total_seen.dtype != torch.int64
-            or self.total_seen.device != self.hidden.device
-        ):
-            raise ValueError("temporal total_seen must be int64 [B]")
-        if type(self.differentiable) is not bool:
-            raise TypeError("temporal cache differentiable must be a bool")
-        floating_cache = (
-            self.hidden,
-            self.timestamps,
-            self.replay_timestamps,
-            self.query_signatures,
-            *self.layer_keys,
-            *self.layer_values,
-            *self.replay_layer_keys,
-            *self.replay_layer_values,
-        )
-        if not self.differentiable and any(tensor.requires_grad for tensor in floating_cache):
-            raise ValueError("non-differentiable temporal cache tensors must be detached")
-        if self.hidden.device.type == "meta":
-            return
-        assert_tensors_disjoint(
-            self._storage_tensors(), "temporal cache fields must use independent storage"
-        )
-        if not bool(torch.isfinite(self.query_signatures).all()):
-            raise ValueError("temporal query signatures must be finite")
-        if bool(torch.any(self.total_seen < 0)):
-            raise ValueError("temporal total_seen must be non-negative")
-        if cache_length > 1 and bool(torch.any(self.valid_mask[:, 1:] & ~self.valid_mask[:, :-1])):
-            raise ValueError("temporal cache valid_mask must be a valid prefix")
-        if replay_length > 1 and bool(
-            torch.any(self.replay_valid_mask[:, 1:] & ~self.replay_valid_mask[:, :-1])
-        ):
-            raise ValueError("temporal replay valid_mask must be a valid prefix")
-        for tensor in (
-            self.hidden,
-            *self.layer_keys,
-            *self.layer_values,
-            *self.replay_layer_keys,
-            *self.replay_layer_values,
-        ):
-            if not bool(torch.isfinite(tensor).all()):
-                raise ValueError("temporal cache hidden and K/V must be finite")
-        for row in range(batch_size):
-            valid_count = int(self.valid_mask[row].sum().item())
-            replay_count = int(self.replay_valid_mask[row].sum().item())
-            valid_timestamps = self.timestamps[row, :valid_count]
-            valid_positions = self.position_ids[row, :valid_count]
-            replay_timestamps = self.replay_timestamps[row, :replay_count]
-            replay_positions = self.replay_position_ids[row, :replay_count]
-            if valid_count:
-                if not bool(torch.isfinite(valid_timestamps).all()) or bool(
-                    torch.any(valid_timestamps < 0.0)
-                ):
-                    raise ValueError(
-                        "valid temporal cache timestamps must be finite and non-negative"
-                    )
-                if valid_count > 1 and (
-                    bool(torch.any(valid_timestamps[1:] <= valid_timestamps[:-1]))
-                    or bool(torch.any(valid_positions[1:] != valid_positions[:-1] + 1))
-                ):
-                    raise ValueError(
-                        "temporal cache timestamps and positions must increase strictly"
-                    )
-                expected_seen = int(valid_positions[-1].item()) + 1
-                if int(self.total_seen[row].item()) != expected_seen:
-                    raise ValueError(
-                        "temporal total_seen must equal last absolute position plus one"
-                    )
-                if bool(torch.any(valid_positions < 0)):
-                    raise ValueError("valid temporal cache position_ids must be non-negative")
-            elif int(self.total_seen[row].item()) != 0:
-                raise ValueError("an empty temporal cache must have total_seen=0")
-            expected_replay_count = (
-                min(3, int(valid_positions[0].item())) if valid_count == 64 else 0
-            )
-            if replay_count != expected_replay_count:
-                raise ValueError(
-                    "temporal replay context must preserve the available three-position margin"
-                )
-            if replay_count:
-                if valid_count != 64:
-                    raise ValueError("replay context is legal only beside a full 64-token cache")
-                if (
-                    not bool(torch.isfinite(replay_timestamps).all())
-                    or bool(torch.any(replay_timestamps < 0.0))
-                    or bool(torch.any(replay_positions < 0))
-                ):
-                    raise ValueError("valid replay metadata must be finite and non-negative")
-                if replay_count > 1 and (
-                    bool(torch.any(replay_timestamps[1:] <= replay_timestamps[:-1]))
-                    or bool(torch.any(replay_positions[1:] != replay_positions[:-1] + 1))
-                ):
-                    raise ValueError("temporal replay metadata must increase strictly")
-                if int(replay_positions[-1].item()) + 1 != int(
-                    valid_positions[0].item()
-                ) or not bool(replay_timestamps[-1] < valid_timestamps[0]):
-                    raise ValueError("temporal replay context must immediately precede main cache")
-            invalid = slice(valid_count, cache_length)
-            if cache_length > valid_count:
-                if (
-                    bool(torch.any(self.hidden[row, invalid] != 0.0))
-                    or bool(torch.any(self.timestamps[row, invalid] != -1.0))
-                    or bool(torch.any(self.position_ids[row, invalid] != -1))
-                ):
-                    raise ValueError("temporal cache padding must use zero hidden and -1 metadata")
-                for keys, values in zip(self.layer_keys, self.layer_values, strict=True):
-                    if bool(torch.any(keys[row, :, invalid] != 0.0)) or bool(
-                        torch.any(values[row, :, invalid] != 0.0)
-                    ):
-                        raise ValueError("temporal cache padding K/V must be zero")
-            replay_invalid = slice(replay_count, replay_length)
-            if replay_length > replay_count:
-                if bool(torch.any(self.replay_timestamps[row, replay_invalid] != -1.0)) or bool(
-                    torch.any(self.replay_position_ids[row, replay_invalid] != -1)
-                ):
-                    raise ValueError("temporal replay padding metadata must use -1")
-                for keys, values in zip(
-                    self.replay_layer_keys, self.replay_layer_values, strict=True
-                ):
-                    if bool(torch.any(keys[row, :, replay_invalid] != 0.0)) or bool(
-                        torch.any(values[row, :, replay_invalid] != 0.0)
-                    ):
-                        raise ValueError("temporal replay padding K/V must be zero")
-
     @property
     def batch_size(self) -> int:
         return int(self.hidden.shape[0])
@@ -504,23 +88,6 @@ class TemporalCache:
     @property
     def replay_length(self) -> int:
         return int(self.replay_position_ids.shape[1])
-
-    def _storage_tensors(self) -> tuple[Tensor, ...]:
-        return (
-            self.hidden,
-            self.timestamps,
-            self.replay_timestamps,
-            self.position_ids,
-            self.replay_position_ids,
-            self.valid_mask,
-            self.replay_valid_mask,
-            self.query_signatures,
-            self.total_seen,
-            *self.layer_keys,
-            *self.layer_values,
-            *self.replay_layer_keys,
-            *self.replay_layer_values,
-        )
 
     def split(self) -> tuple[TemporalCache, ...]:
         """Return storage-isolated singleton cache states for each batch row."""
@@ -568,27 +135,9 @@ class TemporalCache:
         """Pack storage-isolated singleton states with valid-prefix padding."""
 
         normalized = tuple(states)
-        if not normalized or any(not isinstance(state, cls) for state in normalized):
-            raise TypeError("TemporalCache.pack requires at least one TemporalCache")
-        if any(state.batch_size != 1 for state in normalized):
-            raise ValueError("TemporalCache.pack accepts singleton states only")
-        assert_storage_disjoint(
-            tuple(state._storage_tensors() for state in normalized),
-            "packed temporal states must not share mutable storage",
-        )
         reference = normalized[0]
-        if any(
-            state.hidden.dtype != reference.hidden.dtype
-            or state.hidden.device != reference.hidden.device
-            or state.timestamps.dtype != reference.timestamps.dtype
-            or state.differentiable != reference.differentiable
-            for state in normalized[1:]
-        ):
-            raise ValueError("packed temporal states must share dtype/device/differentiability")
         video_ids = tuple(state.video_ids[0] for state in normalized)
         trajectory_ids = tuple(state.trajectory_ids[0] for state in normalized)
-        if len(set(video_ids)) != len(video_ids):
-            raise ValueError("packed temporal states cannot duplicate video_ids")
         max_length = max(state.cache_length for state in normalized)
         max_replay_length = max(state.replay_length for state in normalized)
 
@@ -710,104 +259,12 @@ class TemporalCache:
 
 
 @dataclass(frozen=True, slots=True)
-class TemporalEncoderAudit:
-    grid_shapes: tuple[tuple[int, int, int], ...]
-    valid_tubelet_counts: tuple[int, ...]
-    overlap_replay_counts: tuple[int, ...]
-    evicted_counts: tuple[int, ...]
-    cache_lengths: tuple[int, ...]
-    causal_window: int = 64
-
-    def __post_init__(self) -> None:
-        batch_size = len(self.grid_shapes)
-        fields = (
-            self.valid_tubelet_counts,
-            self.overlap_replay_counts,
-            self.evicted_counts,
-            self.cache_lengths,
-        )
-        if batch_size <= 0 or any(len(field) != batch_size for field in fields):
-            raise ValueError("temporal audit fields must align to one non-empty batch")
-        if any(type(value) is not int or value < 0 for field in fields for value in field):
-            raise ValueError("temporal audit counters must be non-negative integers")
-        if self.causal_window != 64:
-            raise ValueError("P7 temporal audit requires a 64-token causal window")
-
-
-@dataclass(frozen=True, slots=True)
 class TemporalEncoderOutput:
     hidden: Tensor
     timestamps: Tensor
     position_ids: Tensor
     valid_mask: Tensor
     cache: TemporalCache
-    audit: TemporalEncoderAudit | None = None
-
-    def __post_init__(self) -> None:
-        if (
-            self.hidden.ndim != 3
-            or self.hidden.shape[-1] != 768
-            or not torch.is_floating_point(self.hidden)
-        ):
-            raise ValueError("temporal hidden must be [B, T, 768]")
-        shape = self.hidden.shape[:2]
-        if (
-            self.timestamps.shape != shape
-            or self.timestamps.dtype not in (torch.float32, torch.float64)
-            or self.timestamps.device != self.hidden.device
-        ):
-            raise ValueError("temporal timestamps must be floating [B, T]")
-        if (
-            self.position_ids.shape != shape
-            or self.position_ids.dtype != torch.int64
-            or self.position_ids.device != self.hidden.device
-        ):
-            raise ValueError("temporal position_ids must be int64 [B, T]")
-        if (
-            self.valid_mask.shape != shape
-            or self.valid_mask.dtype != torch.bool
-            or self.valid_mask.device != self.hidden.device
-        ):
-            raise ValueError("temporal valid_mask must be bool [B, T]")
-        if self.cache.batch_size != self.hidden.shape[0]:
-            raise ValueError("temporal output and cache batch sizes must match")
-        if (
-            self.cache.hidden.dtype != self.hidden.dtype
-            or self.cache.hidden.device != self.hidden.device
-        ):
-            raise ValueError("temporal output and cache must share dtype/device")
-        if self.hidden.device.type != "meta":
-            if not bool(torch.isfinite(self.hidden).all()):
-                raise ValueError("temporal hidden must be finite")
-            if shape[1] > 1 and bool(torch.any(self.valid_mask[:, 1:] & ~self.valid_mask[:, :-1])):
-                raise ValueError("temporal output valid_mask must be a valid prefix")
-            if bool(torch.any(self.hidden[~self.valid_mask] != 0.0)):
-                raise ValueError("invalid temporal outputs must be zero")
-            if bool(torch.any(self.timestamps[~self.valid_mask] != -1.0)) or bool(
-                torch.any(self.position_ids[~self.valid_mask] != -1)
-            ):
-                raise ValueError("invalid temporal metadata must use -1 sentinels")
-            for row in range(shape[0]):
-                count = int(self.valid_mask[row].sum().item())
-                timestamps = self.timestamps[row, :count]
-                positions = self.position_ids[row, :count]
-                if count and (
-                    not bool(torch.isfinite(timestamps).all())
-                    or bool(torch.any(timestamps < 0.0))
-                    or bool(torch.any(positions < 0))
-                ):
-                    raise ValueError(
-                        "valid temporal output metadata must be finite and non-negative"
-                    )
-                if count > 1 and (
-                    bool(torch.any(timestamps[1:] <= timestamps[:-1]))
-                    or bool(torch.any(positions[1:] != positions[:-1] + 1))
-                ):
-                    raise ValueError("temporal output metadata must increase strictly")
-            assert_tensors_disjoint(
-                (self.hidden, self.cache.hidden),
-                "temporal output and next cache must not share mutable storage",
-            )
 
 
 class QueryConditionedSpatialPool(nn.Module):  # type: ignore[misc]
@@ -1032,7 +489,6 @@ class SpatialObjectEncoder(nn.Module):  # type: ignore[misc]
 
     def __init__(self, config: SpatialEncoderConfig) -> None:
         super().__init__()
-        _validate_spatial_config(config)
         self.config = config
         self.input_norm = nn.LayerNorm(config.input_dim, eps=config.layer_norm_eps)
         self.input_projection = nn.Linear(config.input_dim, config.hidden_dim, bias=True)
@@ -1062,9 +518,6 @@ class SpatialObjectEncoder(nn.Module):  # type: ignore[misc]
     ) -> SpatialEncoderOutput:
         """Process tubelets sequentially and return functional per-video next states."""
 
-        if type(detach_runtime_state) is not bool:
-            raise TypeError("detach_runtime_state must be a bool")
-        self._validate_module_inputs(adapted_embeddings, q_target)
         batch_size = adapted_embeddings.shape[0]
         normalized_video_ids = _normalize_video_ids(video_ids, batch_size)
         restored = restore_merged_grid(
@@ -1075,19 +528,13 @@ class SpatialObjectEncoder(nn.Module):  # type: ignore[misc]
         )
         query_mask = _normalize_query_valid_mask(q_target, query_valid_mask)
         valid_query = torch.where(query_mask.unsqueeze(1), q_target, 0.0)
-        if q_target.device.type != "meta" and not bool(torch.isfinite(valid_query).all()):
-            raise ValueError("valid q_target rows must be finite")
         query_condition = self.query_projection(valid_query)
         safe_tokens = torch.where(
             restored.spatial_valid_mask.unsqueeze(-1),
             restored.tokens,
             0.0,
         )
-        if safe_tokens.device.type != "meta" and not bool(torch.isfinite(safe_tokens).all()):
-            raise ValueError("valid adapted merger tokens must be finite")
         states = _normalize_prior_states(prior_states, batch_size)
-        self._validate_prior_states(states, normalized_video_ids, adapted_embeddings)
-        _assert_optional_runtime_state_storage_isolated(states)
 
         fresh_slots = self._initial_slots(query_condition)
         current_rows: list[Tensor] = []
@@ -1098,8 +545,6 @@ class SpatialObjectEncoder(nn.Module):  # type: ignore[misc]
         prior_processed: list[int] = []
         for row, state in enumerate(states):
             if state is None:
-                if not bool(restored.tubelet_valid_mask[row].any()):
-                    raise ValueError("a fresh spatial runtime requires at least one valid tubelet")
                 current_rows.append(fresh_slots[row])
                 mask_rows.append(
                     torch.ones(
@@ -1160,10 +605,6 @@ class SpatialObjectEncoder(nn.Module):  # type: ignore[misc]
                 current_confidence,
             )
 
-        if current.device.type != "meta" and not bool(torch.isfinite(current).all()):
-            raise ValueError("spatial encoder output slots must be finite")
-        if _FORCE_SLOT_MEAN:
-            current = _forced_slot_mean(current, current_mask)
         required = _normalize_required_slot_counts(
             required_slot_counts,
             batch_size,
@@ -1190,26 +631,12 @@ class SpatialObjectEncoder(nn.Module):  # type: ignore[misc]
             dtype=torch.int64,
             device=adapted_embeddings.device,
         )
-        audit = SpatialEncoderAudit(
-            grid_shapes=restored.grid_shapes,
-            visual_token_counts=metadata.token_counts,
-            valid_tubelet_counts=tuple(int(value) for value in valid_tubelets.tolist()),
-            required_slot_counts=tuple(int(value) for value in required.tolist()),
-            excess_slot_counts=tuple(int(value) for value in excess.tolist()),
-            overflow_events=tuple(bool(value) for value in (excess > 0).tolist()),
-            overflow_policy=self.config.overflow_policy,
-            stage_refinement_calls=(
-                self.config.refinements_per_stage * safe_tokens.shape[1],
-                self.config.refinements_per_stage * safe_tokens.shape[1],
-            ),
-        )
         return SpatialEncoderOutput(
             slots=current,
             slot_valid_mask=current_mask,
             active_slot_overflow_count=overflow_counts,
             slot_confidence=current_confidence,
             next_states=next_states,
-            audit=audit,
         )
 
     def reset_slot_state(
@@ -1223,20 +650,7 @@ class SpatialObjectEncoder(nn.Module):  # type: ignore[misc]
     ) -> SpatialSlotRuntimeState:
         """Create a reproducible first-tubelet state from shared seed, query, and fixed codes."""
 
-        if not video_id:
-            raise ValueError("reset requires a non-empty video_id")
-        if type(query_valid) is not bool or type(differentiable) is not bool:
-            raise TypeError("reset query_valid and differentiable flags must be bool")
-        if q_target.shape != (self.config.query_dim,) or not torch.is_floating_point(q_target):
-            raise ValueError(f"reset q_target must be floating [{self.config.query_dim}]")
-        if (
-            q_target.dtype != self.shared_slot_seed.dtype
-            or q_target.device != self.shared_slot_seed.device
-        ):
-            raise ValueError("reset q_target must share module dtype/device")
         safe_query = q_target if query_valid else torch.zeros_like(q_target)
-        if safe_query.device.type != "meta" and not bool(torch.isfinite(safe_query).all()):
-            raise ValueError("valid reset q_target must be finite")
         condition = self.query_projection(safe_query.unsqueeze(0))
         slots = self._initial_slots(condition)[0]
         if slot_valid_mask is None:
@@ -1246,14 +660,6 @@ class SpatialObjectEncoder(nn.Module):  # type: ignore[misc]
                 device=slots.device,
             )
         else:
-            if (
-                slot_valid_mask.shape != (self.config.active_slots,)
-                or slot_valid_mask.dtype != torch.bool
-                or slot_valid_mask.device != slots.device
-            ):
-                raise ValueError("reset slot_valid_mask must be bool [K_a] on the module device")
-            if not bool(slot_valid_mask.any()):
-                raise ValueError("reset requires at least one valid slot")
             valid_mask = slot_valid_mask
         confidence = torch.zeros(
             self.config.active_slots,
@@ -1285,50 +691,6 @@ class SpatialObjectEncoder(nn.Module):  # type: ignore[misc]
         return (
             self.shared_slot_seed[None, None, :] + query_condition[:, None, :] + codes[None, :, :]
         )
-
-    def _validate_module_inputs(self, adapted_embeddings: Tensor, q_target: Tensor) -> None:
-        if (
-            adapted_embeddings.ndim != 3
-            or adapted_embeddings.shape[0] <= 0
-            or adapted_embeddings.shape[1] <= 0
-            or adapted_embeddings.shape[2] != self.config.input_dim
-            or not torch.is_floating_point(adapted_embeddings)
-        ):
-            raise ValueError(
-                f"adapted_embeddings must be floating non-empty [B, N, {self.config.input_dim}]"
-            )
-        if q_target.shape != (
-            adapted_embeddings.shape[0],
-            self.config.query_dim,
-        ) or not torch.is_floating_point(q_target):
-            raise ValueError(f"q_target must be floating [B, {self.config.query_dim}]")
-        if (
-            q_target.dtype != adapted_embeddings.dtype
-            or q_target.device != adapted_embeddings.device
-        ):
-            raise ValueError("q_target and adapted embeddings must share dtype/device")
-        for parameter in self.parameters():
-            if (
-                parameter.dtype != adapted_embeddings.dtype
-                or parameter.device != adapted_embeddings.device
-            ):
-                raise ValueError("spatial encoder module and inputs must share dtype/device")
-
-    def _validate_prior_states(
-        self,
-        states: tuple[SpatialSlotRuntimeState | None, ...],
-        video_ids: tuple[str, ...],
-        inputs: Tensor,
-    ) -> None:
-        for row, state in enumerate(states):
-            if state is None:
-                continue
-            if state.video_id != video_ids[row]:
-                raise ValueError("spatial runtime video_id must match its batch row")
-            if state.slots.shape != (self.config.active_slots, self.config.hidden_dim):
-                raise ValueError("stale spatial runtime has the wrong slot shape")
-            if state.slots.dtype != inputs.dtype or state.slots.device != inputs.device:
-                raise ValueError("spatial runtime and encoder inputs must share dtype/device")
 
     @staticmethod
     def _make_next_state(
@@ -1365,7 +727,6 @@ class _PreparedTemporalHistory:
     retained_hidden: Tensor
     retained_timestamps: Tensor
     retained_position_ids: Tensor
-    overlap_count: int
 
 
 class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
@@ -1373,7 +734,6 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
 
     def __init__(self, config: TemporalEncoderConfig) -> None:
         super().__init__()
-        _validate_temporal_config(config)
         self.config = config
         self.spatial_pool = QueryConditionedSpatialPool(config)
         self.layers = nn.ModuleList(
@@ -1470,16 +830,6 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
                 next_replay_values.append(combined_values[:, :, replay_start:main_start])
 
             combined_hidden = torch.cat((history.retained_hidden, current), dim=1)
-            combined_main_timestamps = torch.cat(
-                (
-                    history.retained_timestamps,
-                    current_timestamps.to(dtype=torch.float64),
-                ),
-                dim=0,
-            )
-            combined_main_positions = torch.cat(
-                (history.retained_position_ids, current_positions), dim=0
-            )
             combined_context_timestamps = torch.cat(
                 (history.timestamps, current_timestamps.to(dtype=torch.float64)), dim=0
             )
@@ -1487,7 +837,6 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
             main_count = min(combined_context_positions.shape[0], self.config.cache_tubelets)
             context_main_start = combined_context_positions.shape[0] - main_count
             context_replay_start = max(0, context_main_start - self.config.replay_context_tubelets)
-            evicted_count = max(0, combined_main_positions.shape[0] - self.config.cache_tubelets)
             cache_hidden = combined_hidden[:, -main_count:]
             cache_timestamps = combined_context_timestamps[-main_count:].unsqueeze(0)
             cache_positions = combined_context_positions[-main_count:].unsqueeze(0)
@@ -1497,10 +846,6 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
             replay_positions = combined_context_positions[
                 context_replay_start:context_main_start
             ].unsqueeze(0)
-            if not torch.equal(
-                combined_main_timestamps[-main_count:], cache_timestamps[0]
-            ) or not torch.equal(combined_main_positions[-main_count:], cache_positions[0]):
-                raise RuntimeError("temporal replay bookkeeping produced inconsistent main cache")
             cache_valid = torch.ones_like(cache_positions, dtype=torch.bool)
             replay_valid = torch.ones_like(replay_positions, dtype=torch.bool)
             next_state = TemporalCache(
@@ -1531,9 +876,6 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
             )
             hidden_rows.append(F.pad(current, (0, 0, 0, max_time - valid_count), value=0.0))
             next_rows.append(next_state)
-            overlap_counts.append(history.overlap_count)
-            evicted_counts.append(evicted_count)
-            cache_lengths.append(next_state.cache_length)
 
         next_cache = TemporalCache.pack(next_rows)
         output_hidden = torch.cat(hidden_rows, dim=0)
@@ -1547,21 +889,12 @@ class TemporalEventEncoder(nn.Module):  # type: ignore[misc]
             tubelet_position_ids,
             torch.full_like(tubelet_position_ids, -1),
         )
-        audit = TemporalEncoderAudit(
-            grid_shapes=restored.grid_shapes,
-            valid_tubelet_counts=tuple(valid_counts),
-            overlap_replay_counts=tuple(overlap_counts),
-            evicted_counts=tuple(evicted_counts),
-            cache_lengths=tuple(cache_lengths),
-            causal_window=self.config.cache_tubelets,
-        )
         return TemporalEncoderOutput(
             hidden=output_hidden,
             timestamps=output_timestamps,
             position_ids=output_positions,
             valid_mask=restored.tubelet_valid_mask,
             cache=next_cache,
-            audit=audit,
         )
 
     def reset_cache(
@@ -1682,7 +1015,6 @@ def build_spatial_encoder(config: ProjectConfig) -> SpatialObjectEncoder:
 
 def build_temporal_encoder(config: ProjectConfig) -> TemporalEventEncoder:
     return TemporalEventEncoder(config.temporal_encoder)
-
 
 
 def _temporal_sinusoidal_encoding(

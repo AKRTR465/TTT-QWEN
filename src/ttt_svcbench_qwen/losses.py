@@ -15,7 +15,6 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
-_NORM_ATOL = 5.0e-4
 _TASK_WEIGHT = 1.0
 _OPERATOR_WEIGHT = 1.0
 _RETRIEVAL_WEIGHT = 1.0
@@ -47,41 +46,6 @@ class LossTerm:
     valid_counts: Tensor
     mask_counts: Tensor
     skip_reasons: tuple[LossSkipReason | None, ...]
-
-    def __post_init__(self) -> None:
-        _require_fp32_scalar(self.value, "loss value")
-        batch_size = self.per_row.shape[0] if self.per_row.ndim == 1 else -1
-        if self.per_row.dtype != torch.float32 or self.per_row.shape != (batch_size,):
-            raise ValueError("loss per_row must be FP32 [B]")
-        if self.row_valid_mask.shape != (batch_size,) or self.row_valid_mask.dtype != torch.bool:
-            raise ValueError("loss row_valid_mask must be bool [B]")
-        for counts, name in (
-            (self.valid_counts, "valid_counts"),
-            (self.mask_counts, "mask_counts"),
-        ):
-            if counts.shape != (batch_size,) or counts.dtype != torch.int64:
-                raise ValueError(f"loss {name} must be int64 [B]")
-        tensors = (
-            self.per_row,
-            self.row_valid_mask,
-            self.valid_counts,
-            self.mask_counts,
-        )
-        if any(tensor.device != self.value.device for tensor in tensors):
-            raise ValueError("all LossTerm tensors must share one device")
-        if len(self.skip_reasons) != batch_size:
-            raise ValueError("loss skip_reasons must contain one entry per row")
-        if any(
-            (reason is None) != bool(self.row_valid_mask[row].item())
-            for row, reason in enumerate(self.skip_reasons)
-        ):
-            raise ValueError("valid rows need no skip reason; invalid rows need one")
-        if bool(torch.any(self.valid_counts < 0)) or bool(torch.any(self.mask_counts < 0)):
-            raise ValueError("loss audit counts must be non-negative")
-        if bool(torch.any(self.valid_counts > self.mask_counts)):
-            raise ValueError("valid_counts cannot exceed mask_counts")
-        if not torch.equal(self.row_valid_mask, self.valid_counts > 0):
-            raise ValueError("row validity must exactly match positive valid_counts")
 
 
 @dataclass(frozen=True, slots=True)
@@ -680,11 +644,6 @@ def _component_reference(component: object) -> Tensor:
     if isinstance(component, TimeLossInput):
         return component.mode_logits
     raise TypeError("unsupported State loss component")
-
-
-def _component_batch_size(component: object) -> int:
-    reference = _component_reference(component)
-    return int(reference.shape[0])
 
 
 def _differentiable_zero(reference: Tensor) -> Tensor:
