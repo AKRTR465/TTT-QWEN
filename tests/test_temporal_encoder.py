@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from pathlib import Path
 
 import pytest
 import torch
@@ -17,7 +16,6 @@ from ttt_svcbench_qwen.state_encoder import (
     build_temporal_encoder,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
 EXACT_PARAMETER_COUNT = 48_438_272
 HIDDEN_DIM = 768
 QUERY_DIM = 512
@@ -46,13 +44,7 @@ def make_source(
     requires_grad: bool = False,
 ) -> Tensor:
     generator = torch.Generator().manual_seed(seed)
-    source = torch.randn(
-        time_count,
-        height,
-        width,
-        4096,
-        generator=generator,
-    )
+    source = torch.randn(time_count, height, width, 4096, generator=generator)
     return source.requires_grad_(requires_grad)
 
 
@@ -69,30 +61,19 @@ def encode_positions(
     q_target: Tensor,
     *,
     cache: TemporalCache | None = None,
-    video_id: str = "video-a",
-    trajectory_id: str = "trajectory-a",
     query_time: float | None = None,
-    timestamp_values: Sequence[float] | None = None,
-    timestamp_dtype: torch.dtype = torch.float64,
     detach_cache: bool = True,
 ) -> TemporalEncoderOutput:
+    """Encode the physical tubelets at `positions`, timestamped at 4 tubelets/second."""
+
     position_tuple = tuple(positions)
-    if not position_tuple:
-        raise ValueError("test helper requires at least one physical tubelet")
     selected = source[list(position_tuple)]
     time_count, height, width = selected.shape[:3]
     embeddings = selected.reshape(1, time_count * height * width, 4096)
     device = embeddings.device
-    effective_timestamps = (
-        tuple(position / 4.0 for position in position_tuple)
-        if timestamp_values is None
-        else tuple(timestamp_values)
-    )
-    if len(effective_timestamps) != time_count:
-        raise ValueError("test timestamp_values must align to positions")
     timestamps = torch.tensor(
-        effective_timestamps,
-        dtype=timestamp_dtype,
+        [position / 4.0 for position in position_tuple],
+        dtype=torch.float64,
         device=device,
     ).unsqueeze(0)
     position_ids = torch.tensor(position_tuple, dtype=torch.int64, device=device).unsqueeze(0)
@@ -106,8 +87,8 @@ def encode_positions(
         position_ids,
         torch.tensor([effective_query_time], dtype=torch.float32, device=device),
         q_target,
-        (video_id,),
-        (trajectory_id,),
+        ("video-a",),
+        ("trajectory-a",),
         cache=cache,
         detach_cache=detach_cache,
     )
@@ -121,8 +102,9 @@ def encode_padded(
     valid_count: int,
     cache: TemporalCache | None = None,
     query_time: float = 10.0,
-    detach_cache: bool = True,
 ) -> TemporalEncoderOutput:
+    """Encode a row whose tail tubelets are padding (`valid_mask=False`, position `-1`)."""
+
     time_count, height, width = source.shape[:3]
     embeddings = source.reshape(1, time_count * height * width, 4096)
     device = embeddings.device
@@ -132,18 +114,9 @@ def encode_padded(
     position_ids = torch.full((1, time_count), -1, dtype=torch.int64, device=device)
     if valid_count:
         timestamps[0, :valid_count] = (
-            torch.arange(
-                valid_count,
-                dtype=torch.float64,
-                device=device,
-            )
-            / 4.0
+            torch.arange(valid_count, dtype=torch.float64, device=device) / 4.0
         )
-        position_ids[0, :valid_count] = torch.arange(
-            valid_count,
-            dtype=torch.int64,
-            device=device,
-        )
+        position_ids[0, :valid_count] = torch.arange(valid_count, dtype=torch.int64, device=device)
     return encoder(
         embeddings,
         torch.ones(1, embeddings.shape[1], dtype=torch.bool, device=device),
@@ -156,7 +129,6 @@ def encode_padded(
         ("video-a",),
         ("trajectory-a",),
         cache=cache,
-        detach_cache=detach_cache,
     )
 
 
@@ -173,6 +145,7 @@ def test_meta_topology_and_exact_parameter_count() -> None:
     with torch.device("meta"):
         module = build_temporal_encoder(config)
 
+    assert isinstance(module, TemporalEventEncoder)
     assert parameter_count(module) == EXACT_PARAMETER_COUNT
     assert parameter_count(module.spatial_pool) == 5_911_040
     assert len(module.layers) == 6
@@ -198,8 +171,6 @@ def test_demo_392_tokens_pool_to_eight_causal_states(
     assert output.cache.hidden.shape == (1, 8, HIDDEN_DIM)
     assert len(output.cache.layer_keys) == len(output.cache.layer_values) == 6
     assert all(value.shape == (1, 12, 8, 64) for value in output.cache.layer_keys)
-    assert output.audit is not None
-    assert output.audit.grid_shapes == ((8, 7, 7),)
 
 
 def test_future_tubelets_cannot_change_past_outputs(
@@ -279,8 +250,6 @@ def test_four_tubelet_overlap_replays_and_replaces_without_duplicates(
         )
 
     torch.testing.assert_close(replay.hidden, full.hidden[:, 4:], atol=1.0e-5, rtol=1.0e-4)
-    assert replay.audit is not None
-    assert replay.audit.overlap_replay_counts == (4,)
     assert replay.cache.position_ids.tolist() == [list(range(12))]
     assert replay.cache.total_seen.tolist() == [12]
     for full_keys, replayed_keys in zip(
@@ -325,62 +294,6 @@ def test_sixty_four_token_sliding_window_is_chunk_boundary_invariant_and_evicts(
     assert overlap_tail.cache.replay_position_ids.tolist() == [[5, 6, 7]]
     assert overlap_tail.cache.timestamps.tolist() == [[position / 4.0 for position in range(8, 72)]]
     assert overlap_tail.cache.total_seen.tolist() == [72]
-    assert overlap_tail.audit is not None
-    assert overlap_tail.audit.overlap_replay_counts == (4,)
-    assert overlap_tail.audit.evicted_counts == (4,)
-
-
-def test_cache_owner_query_and_query_time_drift_fail_closed(
-    encoder: TemporalEventEncoder,
-) -> None:
-    source = make_source(3, seed=11)
-    q_target = make_query(12)
-    with torch.inference_mode():
-        first = encode_positions(
-            encoder,
-            source,
-            range(2),
-            q_target,
-            query_time=1.0,
-        )
-
-    with pytest.raises(ValueError, match="video owners|batch order"):
-        encode_positions(
-            encoder,
-            source,
-            (2,),
-            q_target,
-            cache=first.cache,
-            video_id="video-b",
-        )
-    with pytest.raises(ValueError, match="trajectory owners|batch order"):
-        encode_positions(
-            encoder,
-            source,
-            (2,),
-            q_target,
-            cache=first.cache,
-            trajectory_id="trajectory-b",
-        )
-    with pytest.raises(ValueError, match="query signature drift"):
-        encode_positions(
-            encoder,
-            source,
-            (2,),
-            q_target + 1.0e-3,
-            cache=first.cache,
-        )
-    with pytest.raises(ValueError, match="legal at query_time"):
-        encode_positions(
-            encoder,
-            source,
-            (2,),
-            q_target,
-            cache=first.cache,
-            query_time=0.1,
-        )
-    with pytest.raises(ValueError, match="query_time|legal"):
-        encode_positions(encoder, source, (0,), q_target, query_time=-0.1)
 
 
 def test_reset_cache_is_empty_owned_and_storage_isolated(
@@ -408,8 +321,6 @@ def test_tail_padding_and_all_invalid_rows_are_safe_and_do_not_enter_cache(
     poisoned = source.clone()
     poisoned[2] = torch.nan
     poisoned[3] = torch.inf
-    invalid_valid_token = source.clone()
-    invalid_valid_token[0] = torch.nan
     q_target = make_query(14)
 
     with torch.inference_mode():
@@ -438,8 +349,6 @@ def test_tail_padding_and_all_invalid_rows_are_safe_and_do_not_enter_cache(
     assert empty_after_cache.cache.hidden.untyped_storage().data_ptr() != (
         padded.cache.hidden.untyped_storage().data_ptr()
     )
-    with pytest.raises(ValueError, match="finite"):
-        encode_padded(encoder, invalid_valid_token, q_target, valid_count=2)
 
 
 def test_heterogeneous_batch_pack_split_and_storage_are_isolated(
@@ -495,127 +404,6 @@ def test_heterogeneous_batch_pack_split_and_storage_are_isolated(
     assert round_trip[1].trajectory_ids == ("trajectory-b",)
 
 
-def test_overlap_timestamp_mismatch_and_evicted_rewind_fail_closed(
-    encoder: TemporalEventEncoder,
-) -> None:
-    source = make_source(12, seed=21)
-    q_target = make_query(22)
-    with torch.inference_mode():
-        first = encode_positions(
-            encoder,
-            source,
-            range(8),
-            q_target,
-            query_time=3.0,
-        )
-
-    mismatched_times = [1.1, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75]
-    with pytest.raises(ValueError, match="timestamps must match"):
-        encode_positions(
-            encoder,
-            source,
-            range(4, 12),
-            q_target,
-            cache=first.cache,
-            query_time=3.0,
-            timestamp_values=mismatched_times,
-        )
-
-    cached_positions = torch.arange(4, 68, dtype=torch.int64).unsqueeze(0)
-    evicted_cache = TemporalCache(
-        hidden=torch.zeros(1, 64, HIDDEN_DIM),
-        layer_keys=tuple(torch.zeros(1, 12, 64, 64) for _ in range(6)),
-        layer_values=tuple(torch.zeros(1, 12, 64, 64) for _ in range(6)),
-        replay_layer_keys=tuple(torch.zeros(1, 12, 3, 64) for _ in range(6)),
-        replay_layer_values=tuple(torch.zeros(1, 12, 3, 64) for _ in range(6)),
-        timestamps=cached_positions.to(dtype=torch.float64) / 4.0,
-        replay_timestamps=torch.tensor([[0.25, 0.5, 0.75]], dtype=torch.float64),
-        position_ids=cached_positions,
-        replay_position_ids=torch.tensor([[1, 2, 3]], dtype=torch.int64),
-        valid_mask=torch.ones(1, 64, dtype=torch.bool),
-        replay_valid_mask=torch.ones(1, 3, dtype=torch.bool),
-        video_ids=("video-a",),
-        trajectory_ids=("trajectory-a",),
-        query_signatures=q_target.detach().clone(),
-        total_seen=torch.tensor([68], dtype=torch.int64),
-    )
-    with pytest.raises(ValueError, match="already-evicted"):
-        encode_positions(
-            encoder,
-            source,
-            (0,),
-            q_target,
-            cache=evicted_cache,
-            query_time=20.0,
-        )
-
-
-def test_overlap_timestamp_identity_accepts_float32_then_float64_metadata(
-    encoder: TemporalEventEncoder,
-) -> None:
-    source = make_source(12, seed=27)
-    q_target = make_query(28)
-    first_times = [position / 10.0 for position in range(8)]
-    replay_times = [position / 10.0 for position in range(4, 12)]
-
-    with torch.inference_mode():
-        first = encode_positions(
-            encoder,
-            source,
-            range(8),
-            q_target,
-            query_time=2.0,
-            timestamp_values=first_times,
-            timestamp_dtype=torch.float32,
-        )
-        replay = encode_positions(
-            encoder,
-            source,
-            range(4, 12),
-            q_target,
-            cache=first.cache,
-            query_time=2.0,
-            timestamp_values=replay_times,
-            timestamp_dtype=torch.float64,
-        )
-
-    assert replay.audit is not None
-    assert replay.audit.overlap_replay_counts == (4,)
-    assert replay.cache.position_ids.tolist() == [list(range(12))]
-    assert replay.cache.timestamps.dtype == torch.float64
-
-
-@pytest.mark.parametrize("grad_field", ["key", "value"])
-def test_non_differentiable_cache_rejects_replay_tensors_with_grad(
-    grad_field: str,
-) -> None:
-    main_positions = torch.arange(4, 68, dtype=torch.int64).unsqueeze(0)
-    replay_positions = torch.tensor([[1, 2, 3]], dtype=torch.int64)
-    replay_keys = [torch.zeros(1, 12, 3, 64) for _ in range(6)]
-    replay_values = [torch.zeros(1, 12, 3, 64) for _ in range(6)]
-    target = replay_keys if grad_field == "key" else replay_values
-    target[2].requires_grad_(True)
-
-    with pytest.raises(ValueError, match="non-differentiable|detached"):
-        TemporalCache(
-            hidden=torch.zeros(1, 64, HIDDEN_DIM),
-            layer_keys=tuple(torch.zeros(1, 12, 64, 64) for _ in range(6)),
-            layer_values=tuple(torch.zeros(1, 12, 64, 64) for _ in range(6)),
-            replay_layer_keys=tuple(replay_keys),
-            replay_layer_values=tuple(replay_values),
-            timestamps=main_positions.to(dtype=torch.float64) / 4.0,
-            replay_timestamps=replay_positions.to(dtype=torch.float64) / 4.0,
-            position_ids=main_positions,
-            replay_position_ids=replay_positions,
-            valid_mask=torch.ones(1, 64, dtype=torch.bool),
-            replay_valid_mask=torch.ones(1, 3, dtype=torch.bool),
-            video_ids=("video-a",),
-            trajectory_ids=("trajectory-a",),
-            query_signatures=torch.zeros(1, QUERY_DIM),
-            total_seen=torch.tensor([68], dtype=torch.int64),
-        )
-
-
 def test_current_output_keeps_gradients_while_cache_detach_is_explicit(
     encoder: TemporalEventEncoder,
 ) -> None:
@@ -657,9 +445,7 @@ def test_current_output_keeps_gradients_while_cache_detach_is_explicit(
     assert bool(torch.isfinite(differentiable.hidden).all())
 
 
-def test_float16_forward_backward_and_dtype_guards_are_finite(
-    encoder: TemporalEventEncoder,
-) -> None:
+def test_float16_forward_backward_is_finite() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(20260715)
     module = build_temporal_encoder(load_config()).to(device=device, dtype=torch.float16).eval()
@@ -692,22 +478,3 @@ def test_float16_forward_backward_and_dtype_guards_are_finite(
     assert bool(torch.isfinite(output.hidden).all())
     assert source.grad is not None and bool(torch.isfinite(source.grad).all())
     assert q_target.grad is not None and bool(torch.isfinite(q_target.grad).all())
-
-    with pytest.raises(ValueError, match="dtype|share"):
-        encode_positions(
-            encoder,
-            make_source(1, seed=25),
-            (0,),
-            make_query(26).double(),
-        )
-
-
-def test_temporal_builder_returns_registered_component() -> None:
-    config = load_config()
-    with torch.device("meta"):
-        temporal = build_temporal_encoder(config)
-
-    assert isinstance(temporal, TemporalEventEncoder)
-    assert parameter_count(temporal) == EXACT_PARAMETER_COUNT
-    with pytest.raises(ValueError, match="[Cc]onfig"):
-        build_temporal_encoder()

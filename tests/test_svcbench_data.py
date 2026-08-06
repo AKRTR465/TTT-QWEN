@@ -83,30 +83,28 @@ def test_explicit_time_parser_accepts_only_question_visible_values() -> None:
 
 
 def test_group_kfold_keeps_every_video_in_exactly_one_validation_split(tmp_path: Path) -> None:
-    rows = [
-        {
-            "id": f"question-{index}",
-            "source_dataset": "synthetic",
-            "video_path": f"video-{index}.mp4",
-            "question": "How many objects are visible?",
-            "counting_type": "O1",
-            "counting_subtype": "O1-Snap",
-            "occurrence_times": [1.0, 2.0],
-            "query_points": {"time": [1.0, 2.0], "count": [1, 2]},
-        }
-        for index in range(6)
-    ]
+    row = {
+        "source_dataset": "synthetic",
+        "question": "How many objects are visible?",
+        "counting_type": "O1",
+        "counting_subtype": "O1-Snap",
+        "query_points": {"time": [1.0, 2.0], "count": [1, 2]},
+    }
     path = tmp_path / "train.jsonl"
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    path.write_text(
+        "".join(
+            json.dumps({**row, "id": f"q-{i}", "video_path": f"video-{i}.mp4"}) + "\n"
+            for i in range(6)
+        ),
+        encoding="utf-8",
+    )
     annotations = load_annotations(path, source=DatasetSource("synthetic", "fixture-v1"))
 
     manifest = create_group_kfold_manifest(annotations, n_splits=3, seed=42)
-    validation_video_ids: list[str] = []
+    validation: list[str] = []
     for fold in manifest.folds:
         assert not (set(fold.train_video_ids) & set(fold.validation_video_ids))
-        validation_video_ids.extend(fold.validation_video_ids)
+        validation.extend(fold.validation_video_ids)
 
     assert len(manifest.folds) == 3
-    assert sorted(validation_video_ids) == sorted(
-        {record.identity.video_id for record in annotations.records}
-    )
+    assert sorted(validation) == sorted({r.identity.video_id for r in annotations.records})

@@ -53,6 +53,17 @@ class _FakeZero:
         )
 
 
+_ALL_GROUPS = (
+    "qwen",
+    "state_shared",
+    "state_task",
+    "state_router_time",
+    "state_retrieval",
+    "w0",
+    "associative",
+)
+
+
 def test_zero_partition_groups_match_plain_reference() -> None:
     parameters = (
         _parameter(1.0, (3.0, 4.0)),
@@ -63,28 +74,13 @@ def test_zero_partition_groups_match_plain_reference() -> None:
         _parameter(1.0, (0.06, 0.08)),
         _parameter(1.0, (60.0, 80.0)),
     )
+    learning_rates = (1.0e-5, 1.0e-4, 1.0e-4, 1.0e-4, 1.0e-4, 1.0e-4, 1.0e-4)
     optimizer = _optimizer(
-        (
-            ("qwen", 1.0e-5, parameters[0]),
-            ("state_shared", 1.0e-4, parameters[1]),
-            ("state_task", 1.0e-4, parameters[2]),
-            ("state_router_time", 1.0e-4, parameters[3]),
-            ("state_retrieval", 1.0e-4, parameters[4]),
-            ("w0", 1.0e-4, parameters[5]),
-            ("associative", 1.0e-4, parameters[6]),
-        )
+        tuple(zip(_ALL_GROUPS, learning_rates, parameters, strict=True)),
     )
     controller = OuterGradientController(
         load_config().outer_gradient_control,
-        expected_groups=(
-            "qwen",
-            "state_shared",
-            "state_task",
-            "state_router_time",
-            "state_retrieval",
-            "w0",
-            "associative",
-        ),
+        expected_groups=_ALL_GROUPS,
     )
 
     audit = controller.apply_deepspeed(_FakeZero(optimizer))
@@ -94,15 +90,7 @@ def test_zero_partition_groups_match_plain_reference() -> None:
     assert [float(parameter.grad.norm()) for parameter in parameters] == pytest.approx(
         [1.0, 0.05, 0.05, 0.05, 0.05, 0.1, 0.1]
     )
-    assert tuple(group.name for group in audit.groups) == (
-        "qwen",
-        "state_shared",
-        "state_task",
-        "state_router_time",
-        "state_retrieval",
-        "w0",
-        "associative",
-    )
+    assert tuple(group.name for group in audit.groups) == _ALL_GROUPS
     assert audit.group("state_task").max_norm == 0.05
     assert dict(audit.metrics())["outer_grad/associative/post_norm"] == pytest.approx(0.1)
 

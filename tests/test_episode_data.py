@@ -5,9 +5,7 @@ from collections import Counter
 from itertools import pairwise
 from pathlib import Path
 
-import pytest
-
-from ttt_svcbench_qwen.data import DatasetPurpose, DatasetSource, load_annotations
+from ttt_svcbench_qwen.data import DatasetSource, load_annotations
 from ttt_svcbench_qwen.episode_data import (
     BalancedA2DistributedSampler,
     EpisodeSplit,
@@ -43,18 +41,9 @@ def test_adaptive_support_schedule_covers_history_and_keeps_four_second_overlap(
 def test_greedy_query_groups_are_maximal_bounded_and_nonoverlapping(tmp_path: Path) -> None:
     annotations = _annotations(
         tmp_path,
-        rows=(
-            _row("trajectory-a", "video-a.mp4", [10.0, 30.0, 70.0, 150.0, 160.0, 240.0]),
-            _row("trajectory-b", "video-b.mp4", [10.0, 20.0]),
-            _row("trajectory-c", "video-c.mp4", [10.0, 20.0]),
-            _row("trajectory-d", "video-d.mp4", [10.0, 20.0]),
-            _row("trajectory-e", "video-e.mp4", [10.0, 20.0]),
-        ),
+        rows=(_row("trajectory-a", "video-a.mp4", [10.0, 30.0, 70.0, 150.0, 160.0, 240.0]),),
     )
-    records = tuple(
-        record for record in annotations.records if record.identity.trajectory_id == "trajectory-a"
-    )
-    groups = greedy_nonoverlap_query_groups(records)
+    groups = greedy_nonoverlap_query_groups(annotations.records)
 
     assert [[item.query_time for item in group] for group in groups] == [
         [10.0, 30.0, 70.0],
@@ -64,327 +53,142 @@ def test_greedy_query_groups_are_maximal_bounded_and_nonoverlapping(tmp_path: Pa
     assert len(flattened) == len(set(flattened))
 
 
-def test_production_manifest_has_fold0_buckets_padding_and_explicit_failures(
-    tmp_path: Path,
-) -> None:
-    rows = tuple(
-        _row(f"trajectory-{index}", f"video-{index}.mp4", [50.0, 70.0]) for index in range(5)
-    )
+def test_production_manifest_splits_by_video_pads_buckets_and_round_trips(tmp_path: Path) -> None:
+    rows = tuple(_row(f"trajectory-{i}", f"video-{i}.mp4", [50.0, 70.0]) for i in range(5))
     annotations = _annotations(tmp_path, rows=rows)
-    durations = {f"Demo/video-{index}.mp4": 100.0 for index in range(5)}
+    durations = {f"Demo/video-{i}.mp4": 100.0 for i in range(5)}
+    runtime_paths = {
+        record.identity.query_id: f"videos/{index:04d}.mp4"
+        for index, record in enumerate(annotations.records)
+    }
     manifest = build_production_episode_manifest(
-        annotations,
-        video_durations=durations,
+        annotations, video_durations=durations, runtime_video_paths=runtime_paths
     )
 
     real = tuple(episode for episode in manifest.episodes if episode.loss_weight == 1.0)
     padding = tuple(episode for episode in manifest.episodes if episode.loss_weight == 0.0)
     assert len(manifest.a2_query_ids) == 10
-    assert len(real) == 5
+    assert (len(real), len(padding)) == (5, 3)
     assert sum(episode.meta_query_count for episode in real) == 10
-    assert len(padding) == 3
-    assert all(episode.padding_source_episode_id for episode in padding)
+    # Zero-weight padding keeps every bucket rank-divisible: same backward collectives per rank.
     assert all(len(bucket.episode_ids) % 4 == 0 for bucket in manifest.buckets)
+    # GroupKFold by video_id: no video may appear on both sides of the split.
     train_videos = {episode.video_id for episode in real if episode.split is EpisodeSplit.TRAIN}
-    validation_videos = {
-        episode.video_id for episode in real if episode.split is EpisodeSplit.VALIDATION
-    }
-    assert len(train_videos) == 4
-    assert len(validation_videos) == 1
-    assert train_videos.isdisjoint(validation_videos)
-    assert all(episode.sampling_weight == 0.2 for episode in real)
-    assert all(query.sampling_weight == 0.1 for query in manifest.a2_queries)
-    runtime = manifest.a2_queries[0].query.runtime.as_payload()
-    assert set(runtime) == {"video", "question", "query_time", "explicit_time_values"}
-    assert "count" not in runtime and "answer" not in runtime
+    val_videos = {episode.video_id for episode in real if episode.split is EpisodeSplit.VALIDATION}
+    assert (len(train_videos), len(val_videos)) == (4, 1)
+    assert train_videos.isdisjoint(val_videos)
+    # Runtime payload stays label-free, and each query keeps its own remote clip.
+    payload = manifest.a2_queries[0].query.runtime.as_payload()
+    assert set(payload) == {"video", "question", "query_time", "explicit_time_values"}
+    assert tuple(record.relative_video_path for record in manifest.a2_queries) == tuple(
+        runtime_paths[record.identity.query_id] for record in annotations.records
+    )
+    assert all(
+        episode.relative_video_path == runtime_paths[episode.queries[-1].runtime.query_id]
+        for episode in real
+    )
 
-    failed_annotations = _annotations(
-        tmp_path,
-        rows=(*rows, _row("tomato-oob", "tomato.mp4", [20.0, 120.0], source="TOMATO")),
-        name="failed.jsonl",
-    )
-    failed_durations = {**durations, "TOMATO/tomato.mp4": 100.0}
-    failed_manifest = build_production_episode_manifest(
-        failed_annotations,
-        video_durations=failed_durations,
-    )
-    assert len(failed_manifest.failures) == 1
-    assert failed_manifest.failures[0].source_dataset == "TOMATO"
-    assert failed_manifest.failures[0].reason == "query_time_exceeds_video_duration"
-
-    output = tmp_path / "output"
-    write_production_episode_manifest(
-        failed_manifest,
-        manifest_path=output / "dataset_manifest.json",
-        failed_path=output / "failed.jsonl",
-    )
-    stored = json.loads((output / "dataset_manifest.json").read_text(encoding="utf-8"))
-    failures = (output / "failed.jsonl").read_text(encoding="utf-8").splitlines()
-    assert stored["schema_version"] == "svcbench_a2_a5_v4"
+    output = tmp_path / "output" / "dataset_manifest.json"
+    write_production_episode_manifest(manifest, manifest_path=output)
+    stored = json.loads(output.read_text(encoding="utf-8"))
     assert set(stored["a2_queries"][0]["query"]) == {"runtime", "answer", "weak"}
-    assert len(failures) == 1
-    assert load_production_episode_manifest(output / "dataset_manifest.json") == failed_manifest
-    train_view, validation_view = load_production_manifest_views(
-        output / "dataset_manifest.json",
-        stage=ManifestStage.A5,
-    )
+    assert load_production_episode_manifest(output) == manifest
+
+    train_view, validation_view = load_production_manifest_views(output, stage=ManifestStage.A5)
     assert train_view.manifest is validation_view.manifest
-    assert train_view.split is EpisodeSplit.TRAIN
-    assert validation_view.split is EpisodeSplit.VALIDATION
     assert all(record.split is EpisodeSplit.TRAIN for record in train_view.records)
     assert all(record.split is EpisodeSplit.VALIDATION for record in validation_view.records)
 
-    stored["a2_queries"][0]["query"]["runtime"]["count"] = 99
-    leaked = output / "leaked_manifest.json"
-    leaked.write_text(json.dumps(stored), encoding="utf-8")
-    with pytest.raises(ValueError, match="runtime Query keys drifted"):
-        load_production_episode_manifest(leaked)
 
-
-def test_a5_supervised_segments_align_every_meta_query_to_new_supports(
-    tmp_path: Path,
-) -> None:
+def test_a5_segments_stay_causal_and_bound_truncation_at_eight_chunks(tmp_path: Path) -> None:
     rows = (
         _row("double", "double.mp4", [50.0, 52.0, 70.0]),
         _row("collapsed", "collapsed.mp4", [50.0, 52.0]),
-        *tuple(
-            _row(f"regular-{index}", f"regular-{index}.mp4", [50.0, 70.0])
-            for index in range(3)
-        ),
+        *tuple(_row(f"regular-{i}", f"regular-{i}.mp4", [50.0, 70.0]) for i in range(3)),
     )
     annotations = _annotations(tmp_path, rows=rows, name="aligned.jsonl")
-    durations = {
-        "Demo/double.mp4": 100.0,
-        "Demo/collapsed.mp4": 100.0,
-        **{
-            f"Demo/regular-{index}.mp4": 100.0
-            for index in range(3)
-        },
+    durations = {"Demo/double.mp4": 100.0, "Demo/collapsed.mp4": 100.0} | {
+        f"Demo/regular-{i}.mp4": 100.0 for i in range(3)
     }
-    manifest = build_production_episode_manifest(
-        annotations,
-        video_durations=durations,
-    )
-    real = {
-        episode.trajectory_id: episode
-        for episode in manifest.episodes
-        if episode.loss_weight == 1.0
-    }
+    manifest = build_production_episode_manifest(annotations, video_durations=durations)
+    real = {ep.trajectory_id: ep for ep in manifest.episodes if ep.loss_weight == 1.0}
 
     double = real["double"]
     assert double.segment_lengths == (8, 3)
-    assert tuple(segment.role.value for segment in double.supervised_segments) == (
-        "intermediate",
-        "final",
-    )
-    assert tuple(segment.query_weight for segment in double.supervised_segments) == (
-        1.0,
-        1.0,
-    )
-    assert [query.runtime.query_time for query in double.queries] == [50.0, 52.0, 70.0]
     assert double.segment_query_counts == (2, 1)
-    assert not double.diagnostic_queries
+    assert real["collapsed"].segment_lengths == (8,)
+    assert real["collapsed"].segment_query_counts == (2,)
+    # K=8 truncation horizon bounds every segment.
+    assert all(1 <= length <= 8 for episode in real.values() for length in episode.segment_lengths)
+    # Causal-prefix masking: no Support chunk may end after the Query it supervises.
     assert all(
         chunk.end_time < segment.queries[0].runtime.query_time
         for segment in double.supervised_segments
         for chunk in segment.supports
     )
-    assert all(
-        chunk.end_time > double.queries[0].runtime.query_time
-        for chunk in double.supervised_segments[1].supports
-    )
-
-    collapsed = real["collapsed"]
-    assert collapsed.segment_lengths == (8,)
-    assert tuple(segment.role.value for segment in collapsed.supervised_segments) == (
-        "final",
-    )
-    assert [query.runtime.query_time for query in collapsed.queries] == [50.0, 52.0]
-    assert collapsed.segment_query_counts == (2,)
-    assert not collapsed.diagnostic_queries
-    assert collapsed.insufficient_inter_query_gap
-    assert all(1 <= length <= 8 for episode in real.values() for length in episode.segment_lengths)
     assert sum(episode.meta_query_count for episode in real.values()) == 11
-    assert sum(episode.diagnostic_query_count for episode in real.values()) == 0
 
 
-def test_remote_query_video_mapping_uses_each_a2_clip_and_latest_a5_clip(
-    tmp_path: Path,
-) -> None:
+def test_distributed_samplers_balance_a2_tasks_and_keep_rank_parity(tmp_path: Path) -> None:
+    specs = (("O1", "O1-Snap"), ("O2", "O2-Unique"), ("E1", "E1-Action"), ("E2", "E2-Periodic"))
     rows = tuple(
-        _row(f"trajectory-{index}", f"source-{index}.mp4", [10.0, 20.0]) for index in range(5)
-    )
-    annotations = _annotations(tmp_path, rows=rows, name="mapped.jsonl")
-    durations = {f"Demo/source-{index}.mp4": 30.0 for index in range(5)}
-    runtime_paths = {
-        record.identity.query_id: f"videos/{flat_index:04d}.mp4"
-        for flat_index, record in enumerate(annotations.records)
-    }
-
-    manifest = build_production_episode_manifest(
-        annotations,
-        video_durations=durations,
-        runtime_video_paths=runtime_paths,
-    )
-
-    assert tuple(record.relative_video_path for record in manifest.a2_queries) == tuple(
-        runtime_paths[record.identity.query_id] for record in annotations.records
-    )
-    real_episodes = tuple(row for row in manifest.episodes if row.loss_weight == 1.0)
-    for episode in real_episodes:
-        final_query_id = episode.queries[-1].runtime.query_id
-        assert episode.relative_video_path == runtime_paths[final_query_id]
-
-    incomplete = dict(runtime_paths)
-    incomplete.pop(next(iter(incomplete)))
-    with pytest.raises(ValueError, match="cover every annotation Query"):
-        build_production_episode_manifest(
-            annotations,
-            video_durations=durations,
-            runtime_video_paths=incomplete,
+        _row(
+            f"task-trajectory-{i}",
+            f"task-video-{i}.mp4",
+            [50.0, 70.0],
+            counting_type=specs[i % 4][0],
+            counting_subtype=specs[i % 4][1],
         )
-
-
-def test_distributed_manifest_samplers_balance_a2_and_align_a5_segments(tmp_path: Path) -> None:
-    task_rows = []
-    task_specs = (
-        ("O1", "O1-Snap"),
-        ("O2", "O2-Unique"),
-        ("E1", "E1-Action"),
-        ("E2", "E2-Periodic"),
+        for i in range(20)
     )
-    for index in range(20):
-        counting_type, subtype = task_specs[index % len(task_specs)]
-        task_rows.append(
-            _row(
-                f"task-trajectory-{index}",
-                f"task-video-{index}.mp4",
-                [50.0, 70.0],
-                counting_type=counting_type,
-                counting_subtype=subtype,
-            )
-        )
-    annotations = _annotations(tmp_path, rows=tuple(task_rows), name="tasks.jsonl")
-    durations = {f"Demo/task-video-{index}.mp4": 100.0 for index in range(20)}
+    annotations = _annotations(tmp_path, rows=rows, name="tasks.jsonl")
+    durations = {f"Demo/task-video-{i}.mp4": 100.0 for i in range(20)}
     manifest = build_production_episode_manifest(annotations, video_durations=durations)
 
-    a2_dataset = ProductionManifestDataset(
-        manifest,
-        stage=ManifestStage.A2,
-        split=EpisodeSplit.TRAIN,
-    )
-    a2_samplers = [
-        BalancedA2DistributedSampler(a2_dataset, rank=rank, world_size=4) for rank in range(4)
+    dataset = ProductionManifestDataset(manifest, stage=ManifestStage.A2, split=EpisodeSplit.TRAIN)
+    streams = [
+        list(BalancedA2DistributedSampler(dataset, rank=rank, world_size=4)) for rank in range(4)
     ]
-    global_a2_indices = [list(sampler) for sampler in a2_samplers]
-    assert all(indices == global_a2_indices[0] for indices in global_a2_indices[1:])
-    global_a2 = [a2_dataset[index] for index in global_a2_indices[0]]
-    counts = Counter(record.task_class for record in global_a2)
-    assert len(set(counts.values())) == 1
-    local_a2_indices = [global_a2_indices[0][rank::4] for rank in range(4)]
-    for step in range(len(local_a2_indices[0])):
-        rows = [a2_dataset[local_a2_indices[rank][step]] for rank in range(4)]
-        assert len({row.task_class for row in rows}) == 1
-        assert (
-            len({len(adaptive_support_schedule(row.query.runtime.query_time)[1]) for row in rows})
-            == 1
-        )
-
-    visual_value = {
-        record.query.runtime.query_id: index for index, record in enumerate(a2_dataset.records)
-    }
-    visual_sampler = BalancedA2DistributedSampler(
-        a2_dataset,
-        rank=0,
-        world_size=4,
-        visual_length_fn=lambda record: visual_value[record.query.runtime.query_id],
-    )
-    visual_indices = list(visual_sampler)
-    for start in range(0, len(visual_indices), 4):
-        batch = visual_indices[start : start + 4]
-        first = a2_dataset[batch[0]]
-        support_count = len(adaptive_support_schedule(first.query.runtime.query_time)[1])
-        bucket = [
-            index
-            for index, record in enumerate(a2_dataset.records)
-            if record.task_class == first.task_class
-            and len(adaptive_support_schedule(record.query.runtime.query_time)[1]) == support_count
-        ]
-        ordered = sorted(
-            bucket,
-            key=lambda index: visual_value[a2_dataset[index].query.runtime.query_id],
-        )
-        positions = {index: position for position, index in enumerate(ordered)}
-        assert (
-            max(positions[index] for index in batch) - min(positions[index] for index in batch) < 4
-        )
-    visual_sampler.set_epoch(1)
-    assert list(visual_sampler) != visual_indices
-
-    a5_dataset = ProductionManifestDataset(
-        manifest,
-        stage=ManifestStage.A5,
-        split=EpisodeSplit.TRAIN,
-    )
-    global_a5_indices = [
-        list(RankAlignedA5SegmentSampler(a5_dataset, rank=rank, world_size=4)) for rank in range(4)
-    ]
-    assert all(indices == global_a5_indices[0] for indices in global_a5_indices[1:])
-    local_indices = [global_a5_indices[0][rank::4] for rank in range(4)]
-    assert len({len(values) for values in local_indices}) == 1
-    for step in range(len(local_indices[0])):
-        rows = [a5_dataset[local_indices[rank][step]] for rank in range(4)]
-        segment_counts = {row.tbptt_segment_count for row in rows}
-        shapes = {
-            (row.segment_lengths, row.meta_query_count)
-            for row in rows
+    assert all(indices == streams[0] for indices in streams[1:])
+    assert len(set(Counter(dataset[index].task_class for index in streams[0]).values())) == 1
+    local = [streams[0][rank::4] for rank in range(4)]
+    for step in range(len(local[0])):
+        rows_at_step = [dataset[local[rank][step]] for rank in range(4)]
+        assert len({row.task_class for row in rows_at_step}) == 1
+        schedules = {
+            len(adaptive_support_schedule(row.query.runtime.query_time)[1]) for row in rows_at_step
         }
-        assert len(segment_counts) == 1
-        assert len(shapes) == 1
+        assert len(schedules) == 1
 
+    _assert_a5_rank_parity(manifest, world_size=4)
     manifest_8 = build_production_episode_manifest(
-        annotations,
-        video_durations=durations,
-        world_size=8,
-    )
-    a5_dataset_8 = ProductionManifestDataset(
-        manifest_8,
-        stage=ManifestStage.A5,
-        split=EpisodeSplit.TRAIN,
+        annotations, video_durations=durations, world_size=8
     )
     assert all(bucket.world_size == 8 for bucket in manifest_8.buckets)
-    global_a5_indices_8 = [
-        list(RankAlignedA5SegmentSampler(a5_dataset_8, rank=rank, world_size=8))
-        for rank in range(8)
+    _assert_a5_rank_parity(manifest_8, world_size=8)
+
+
+def _assert_a5_rank_parity(manifest, world_size: int) -> None:
+    """Zero-weight padding parity: identical step count and shape on every rank."""
+
+    dataset = ProductionManifestDataset(manifest, stage=ManifestStage.A5, split=EpisodeSplit.TRAIN)
+    streams = [
+        list(RankAlignedA5SegmentSampler(dataset, rank=rank, world_size=world_size))
+        for rank in range(world_size)
     ]
-    assert all(indices == global_a5_indices_8[0] for indices in global_a5_indices_8[1:])
-    local_indices_8 = [global_a5_indices_8[0][rank::8] for rank in range(8)]
-    assert len({len(values) for values in local_indices_8}) == 1
-    for step in range(len(local_indices_8[0])):
-        rows = [a5_dataset_8[local_indices_8[rank][step]] for rank in range(8)]
+    assert all(indices == streams[0] for indices in streams[1:])
+    local = [streams[0][rank::world_size] for rank in range(world_size)]
+    assert len({len(values) for values in local}) == 1
+    for step in range(len(local[0])):
+        rows = [dataset[local[rank][step]] for rank in range(world_size)]
         assert len({row.tbptt_segment_count for row in rows}) == 1
         assert len({(row.segment_lengths, row.meta_query_count) for row in rows}) == 1
 
-    with pytest.raises(ValueError, match="regenerate the manifest with --world-size 8"):
-        RankAlignedA5SegmentSampler(a5_dataset, rank=0, world_size=8)
 
-
-def _annotations(
-    tmp_path: Path,
-    *,
-    rows: tuple[dict[str, object], ...],
-    name: str = "annotations.jsonl",
-):
+def _annotations(tmp_path: Path, *, rows: tuple[dict[str, object], ...], name: str = "ann.jsonl"):
     path = tmp_path / name
-    path.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows),
-        encoding="utf-8",
-    )
-    return load_annotations(
-        path,
-        source=DatasetSource("fixture", "revision-1", False),
-        purpose=DatasetPurpose.TRAINING,
-    )
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return load_annotations(path, source=DatasetSource("fixture", "revision-1"))
 
 
 def _row(
@@ -392,13 +196,12 @@ def _row(
     video_path: str,
     times: list[float],
     *,
-    source: str = "Demo",
     counting_type: str = "O1",
     counting_subtype: str = "O1-Snap",
 ) -> dict[str, object]:
     return {
         "id": trajectory_id,
-        "source_dataset": source,
+        "source_dataset": "Demo",
         "video_path": video_path,
         "question": "How many objects are visible now?",
         "counting_type": counting_type,

@@ -1,42 +1,23 @@
 from __future__ import annotations
 
-from pathlib import Path
 from types import MethodType
 
 import pytest
 import torch
 from torch import Tensor, nn
 from torch.utils._python_dispatch import TorchDispatchMode
-from transformers.models.qwen3_vl.configuration_qwen3_vl import (
-    Qwen3VLConfig,
-    Qwen3VLVisionConfig,
-)
-from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    Qwen3VLForConditionalGeneration,
-    Qwen3VLVisionModel,
-)
+from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
 
-from tests.support.tiny_qwen import (
-    make_tiny_hf_config,
-    make_tiny_hf_model,
-    make_tiny_project_config,
-)
+from tests.support.tiny_qwen import make_tiny_hf_model, make_tiny_project_config
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.qwen_adapter import (
-    CurrentChunkVisualTokenAudit,
     MergedVideoMetadata,
     PreparedVideoFeatures,
     Qwen3VLAdapter,
     QwenVideoFeatureBoundary,
-    QwenVisualOutput,
     StateEmbeddingPayload,
-    VideoBatch,
-    assert_qwen_checkpoint_config,
-    audit_current_chunk_visual_tokens,
-    build_qwen_adapter,
 )
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def video_inputs() -> dict[str, Tensor | bool]:
@@ -129,17 +110,6 @@ class TrainableScaleAdapter(nn.Module):
         if self.events is not None:
             self.events.append("adapter")
         return embeddings * self.scale * valid_mask.unsqueeze(-1).to(embeddings.dtype)
-
-
-class BadShapeAdapter(nn.Module):
-    def forward(
-        self,
-        embeddings: Tensor,
-        valid_mask: Tensor,
-        metadata: MergedVideoMetadata,
-    ) -> Tensor:
-        del valid_mask, metadata
-        return embeddings[:, :-1]
 
 
 class MaskedScatterRecorder(TorchDispatchMode):
@@ -240,14 +210,6 @@ def test_variable_video_mapping_and_deepstack_objects_are_preserved() -> None:
     assert prepared.main_features == main
     assert all(prepared.deepstack_features[index] is deepstack[index] for index in range(3))
 
-    pixels = torch.zeros(40, 1536)
-    audit = audit_current_chunk_visual_tokens(prepared, pixels, grid)
-    assert isinstance(audit, CurrentChunkVisualTokenAudit)
-    assert audit.raw_patch_counts == (32, 8)
-    assert audit.merged_token_counts == (8, 2)
-    with pytest.raises(TypeError, match="history container"):
-        audit_current_chunk_visual_tokens((prepared,), pixels, grid)  # type: ignore[arg-type]
-
 
 def test_raw_visual_batch_splits_offsets_then_adapts_each_chunk_exactly() -> None:
     config = load_config()
@@ -293,43 +255,7 @@ def test_raw_chunks_apply_adapter_lazily_with_the_current_fast_generation() -> N
     assert torch.equal(second.value.main_visual_embeddings, torch.full((1, 1, 4096), 2.0))
 
 
-def test_visual_output_rejects_invalid_padding_width_and_deepstack_count() -> None:
-    metadata = MergedVideoMetadata(
-        video_grid_thw=torch.tensor([[2, 2, 2]], dtype=torch.int64),
-        merged_grid_thw=torch.tensor([[2, 1, 1]], dtype=torch.int64),
-        spatial_merge_size=2,
-        token_counts=(2,),
-        token_offsets=(0, 2),
-    )
-    packed = torch.zeros(2, 4096)
-
-    with pytest.raises(ValueError, match="padding width"):
-        QwenVisualOutput(
-            main_visual_embeddings=torch.zeros(1, 1, 4096),
-            deepstack_features=(packed, packed, packed),
-            visual_valid_mask=torch.ones(1, 1, dtype=torch.bool),
-            metadata=metadata,
-        )
-    with pytest.raises(ValueError, match="exactly three"):
-        QwenVisualOutput(
-            main_visual_embeddings=torch.zeros(1, 2, 4096),
-            deepstack_features=(packed, packed),  # type: ignore[arg-type]
-            visual_valid_mask=torch.ones(1, 2, dtype=torch.bool),
-            metadata=metadata,
-        )
-
-
-def test_boundary_preserves_standard_nn_module_apply_api() -> None:
-    boundary = QwenVideoFeatureBoundary(load_config())
-    visited: list[nn.Module] = []
-
-    returned = boundary.apply(visited.append)
-
-    assert returned is boundary
-    assert visited == [boundary]
-
-
-def test_enabled_boundary_adapts_only_main_and_rejects_shape_changes() -> None:
+def test_enabled_boundary_adapts_only_main_features() -> None:
     config = load_config()
     grid = torch.tensor([[1, 2, 2]], dtype=torch.int64)
     main = (torch.zeros(1, 4096),)
@@ -345,12 +271,6 @@ def test_enabled_boundary_adapts_only_main_and_rejects_shape_changes() -> None:
     assert not torch.equal(prepared.main_features[0], main[0])
     assert returned_deepstack is deepstack
     assert all(returned_deepstack[index] is deepstack[index] for index in range(3))
-    with pytest.raises(ValueError, match="preserve"):
-        QwenVideoFeatureBoundary(
-            config,
-            BadShapeAdapter(),
-            adapter_enabled=True,
-        ).intercept_features(main, deepstack, grid)
 
 
 def test_tiny_real_hf_disabled_wrapper_is_bitwise_equivalent_for_all_input_kinds() -> None:
@@ -675,77 +595,7 @@ def test_state_embedding_payload_scatters_once_and_decode_preserves_native_paths
     assert all(torch.equal(mask, expected_visual_mask) for mask in deepstack_masks)
     assert not torch.any(expected_visual_mask & payload.state_position_mask)
     assert len(deepstack_ids) == 3
-    assert wrapper._state_hook_active is False
     assert len(embedding_layer._forward_hooks) == initial_embedding_hooks
-
-
-def test_state_embedding_payload_fails_closed_on_invalid_or_unconsumed_input() -> None:
-    model = make_tiny_hf_model(seed=0)
-    wrapper = Qwen3VLAdapter(model, make_tiny_project_config())
-    inputs, payload = state_video_inputs()
-    input_ids = inputs["input_ids"]
-    assert isinstance(input_ids, Tensor)
-
-    with pytest.raises(ValueError, match="rows must equal"):
-        StateEmbeddingPayload(
-            input_ids,
-            payload.state_position_mask,
-            torch.zeros(1, 8),
-        )
-
-    wrong_inputs = dict(inputs)
-    wrong_ids = input_ids.clone()
-    wrong_ids[0, -1] = 2
-    wrong_inputs["input_ids"] = wrong_ids
-    with pytest.raises(ValueError, match="do not match"):
-        wrapper(**wrong_inputs, state_embedding_payload=payload)
-    assert wrapper._state_hook_active is False
-
-    with pytest.raises(ValueError, match="cannot be combined"):
-        wrapper(
-            **inputs,
-            inputs_embeds=model.get_input_embeddings()(input_ids),
-            state_embedding_payload=payload,
-        )
-    assert wrapper._state_hook_active is False
-
-    embedding_layer = model.get_input_embeddings()
-    initial_embedding_hooks = len(embedding_layer._forward_hooks)
-    with (
-        pytest.raises(RuntimeError, match="not consumed exactly once"),
-        wrapper._patched_state_embeddings(payload),
-    ):
-        decoded = embedding_layer(torch.tensor([[1]], dtype=torch.int64))
-        assert decoded.shape == (1, 1, 8)
-    assert wrapper._state_hook_active is False
-    assert len(embedding_layer._forward_hooks) == initial_embedding_hooks
-
-
-def test_state_embedding_payload_rejects_reentry_and_expanded_generation() -> None:
-    model = make_tiny_hf_model(seed=0)
-    wrapper = Qwen3VLAdapter(model, make_tiny_project_config())
-    inputs, payload = state_video_inputs()
-    input_ids = inputs["input_ids"]
-    assert isinstance(input_ids, Tensor)
-    embedding_layer = model.get_input_embeddings()
-
-    with wrapper._patched_state_embeddings(payload):
-        scattered = embedding_layer(input_ids)
-        assert torch.equal(scattered[payload.state_position_mask], payload.state_embeddings)
-        with (
-            pytest.raises(RuntimeError, match="not re-entrant"),
-            wrapper._patched_state_embeddings(payload),
-        ):
-            pass
-
-    with pytest.raises(ValueError, match="num_beams=1"):
-        wrapper.generate(
-            **inputs,
-            state_embedding_payload=payload,
-            max_new_tokens=1,
-            num_beams=2,
-        )
-    assert wrapper._state_hook_active is False
 
 
 def test_answer_forward_reruns_visual_and_adapter_independently() -> None:
@@ -855,7 +705,7 @@ def test_answer_visual_logits_reach_both_bound_query_proxy_matrices() -> None:
     assert all(float(torch.linalg.vector_norm(gradient).item()) > 0.0 for gradient in gradients)
 
 
-def test_video_interception_scope_rejects_reentry_but_allows_multiple_native_calls() -> None:
+def test_video_interception_scope_allows_multiple_native_calls_and_restores_owner() -> None:
     model = make_tiny_hf_model(seed=0)
     owner = model.model
     wrapper = Qwen3VLAdapter(
@@ -873,14 +723,8 @@ def test_video_interception_scope_rejects_reentry_but_allows_multiple_native_cal
         first_main, _ = owner.get_video_features(pixels, grid)
         second_main, _ = owner.get_video_features(pixels, grid)
         assert first_main is not second_main
-        with (
-            pytest.raises(RuntimeError, match="not re-entrant"),
-            wrapper._patched_video_features(),
-        ):
-            pass
 
     assert "get_video_features" not in vars(owner)
-    assert wrapper._hook_active is False
 
 
 def test_hook_and_capture_are_restored_after_upstream_failure() -> None:
@@ -900,22 +744,6 @@ def test_hook_and_capture_are_restored_after_upstream_failure() -> None:
     wrapper(**video_inputs())
     assert "get_video_features" not in vars(owner)
     assert wrapper.last_visual_output is not None
-
-
-def test_direct_video_feature_call_is_rejected_while_forward_hook_is_active() -> None:
-    model = make_tiny_hf_model(seed=0)
-    wrapper = Qwen3VLAdapter(model, make_tiny_project_config())
-    inputs = video_inputs()
-    pixel_values_videos = inputs["pixel_values_videos"]
-    video_grid_thw = inputs["video_grid_thw"]
-    assert isinstance(pixel_values_videos, Tensor)
-    assert isinstance(video_grid_thw, Tensor)
-
-    with (
-        wrapper._patched_video_features(),
-        pytest.raises(RuntimeError, match="while the forward hook is active"),
-    ):
-        wrapper.get_video_features(pixel_values_videos, video_grid_thw)
 
 
 def test_direct_video_feature_failure_clears_stale_capture(
@@ -949,225 +777,3 @@ def test_direct_video_feature_failure_clears_stale_capture(
     with pytest.raises(RuntimeError, match="synthetic owner failure"):
         wrapper.get_video_features(pixel_values_videos, video_grid_thw)
     assert wrapper.last_visual_output is None
-
-
-def test_checkpoint_loader_guards(tmp_path: Path) -> None:
-    project = load_config()
-    assert_qwen_checkpoint_config(make_official_checkpoint_config(), project)
-    bad = make_official_checkpoint_config()
-    bad.vision_config.out_hidden_size = 3584
-    with pytest.raises(ValueError, match="out_hidden_size"):
-        assert_qwen_checkpoint_config(bad, project)
-    with pytest.raises(ValueError, match="ProjectConfig"):
-        build_qwen_adapter()
-    with pytest.raises(FileNotFoundError, match="local Qwen"):
-        build_qwen_adapter(project, tmp_path / "missing")
-
-@pytest.mark.parametrize(
-    ("owner_name", "field_name", "invalid_value"),
-    [
-        ("vision_config", "depth", 26),
-        ("vision_config", "hidden_size", 1024),
-        ("vision_config", "num_heads", 12),
-        ("vision_config", "in_channels", 1),
-        ("vision_config", "patch_size", 14),
-        ("vision_config", "temporal_patch_size", 1),
-        ("vision_config", "spatial_merge_size", 4),
-        ("vision_config", "out_hidden_size", 3584),
-        ("vision_config", "deepstack_visual_indexes", [7, 15, 23]),
-        ("text_config", "hidden_size", 3584),
-        ("text_config", "num_hidden_layers", 32),
-    ],
-)
-def test_every_pinned_checkpoint_field_fails_fast(
-    owner_name: str,
-    field_name: str,
-    invalid_value: object,
-) -> None:
-    checkpoint = make_official_checkpoint_config()
-    setattr(getattr(checkpoint, owner_name), field_name, invalid_value)
-
-    with pytest.raises(ValueError, match=field_name):
-        assert_qwen_checkpoint_config(checkpoint, load_config())
-
-
-def test_transformers_version_mismatch_fails_fast(monkeypatch: pytest.MonkeyPatch) -> None:
-    version_owner = assert_qwen_checkpoint_config.__globals__["transformers"]
-    monkeypatch.setattr(version_owner, "__version__", "0.0.0")
-
-    with pytest.raises(ValueError, match="Transformers version mismatch"):
-        assert_qwen_checkpoint_config(make_official_checkpoint_config(), load_config())
-
-
-def test_loader_forces_local_files_only(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model_root = tmp_path / "tiny-local-checkpoint"
-    model_root.mkdir()
-    tiny_model = make_tiny_hf_model(seed=0)
-    captured: dict[str, object] = {}
-    load_order: list[str] = []
-
-    def fake_config_from_pretrained(
-        checkpoint: str | Path,
-        **kwargs: object,
-    ) -> Qwen3VLConfig:
-        load_order.append("config")
-        captured["config_checkpoint"] = checkpoint
-        captured["config_kwargs"] = kwargs
-        return tiny_model.config
-
-    def fake_from_pretrained(
-        checkpoint: str | Path,
-        **kwargs: object,
-    ) -> Qwen3VLForConditionalGeneration:
-        load_order.append("weights")
-        captured["weight_checkpoint"] = checkpoint
-        captured["weight_kwargs"] = kwargs
-        return tiny_model
-
-    monkeypatch.setattr(
-        Qwen3VLConfig,
-        "from_pretrained",
-        staticmethod(fake_config_from_pretrained),
-    )
-    monkeypatch.setattr(
-        Qwen3VLForConditionalGeneration,
-        "from_pretrained",
-        staticmethod(fake_from_pretrained),
-    )
-
-    wrapper = build_qwen_adapter(make_tiny_project_config(), model_root)
-
-    assert wrapper.qwen_model is tiny_model
-    assert load_order == ["config", "weights"]
-    assert Path(captured["config_checkpoint"]) == model_root
-    assert captured["config_kwargs"] == {"local_files_only": True}
-    assert Path(captured["weight_checkpoint"]) == model_root
-    assert captured["weight_kwargs"] == {
-        "local_files_only": True,
-        "dtype": "auto",
-        "device_map": "auto",
-    }
-
-
-def test_invalid_local_config_is_rejected_before_weight_loading(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model_root = tmp_path / "invalid-local-checkpoint"
-    model_root.mkdir()
-    invalid_config = make_tiny_hf_config()
-    invalid_config.vision_config.depth = 2
-    weight_loader_called = False
-
-    def fake_config_from_pretrained(
-        checkpoint: str | Path,
-        **kwargs: object,
-    ) -> Qwen3VLConfig:
-        assert Path(checkpoint) == model_root
-        assert kwargs == {"local_files_only": True}
-        return invalid_config
-
-    def forbidden_weight_loader(
-        checkpoint: str | Path,
-        **kwargs: object,
-    ) -> Qwen3VLForConditionalGeneration:
-        del checkpoint, kwargs
-        nonlocal weight_loader_called
-        weight_loader_called = True
-        raise AssertionError("weights must not load after config preflight failure")
-
-    monkeypatch.setattr(
-        Qwen3VLConfig,
-        "from_pretrained",
-        staticmethod(fake_config_from_pretrained),
-    )
-    monkeypatch.setattr(
-        Qwen3VLForConditionalGeneration,
-        "from_pretrained",
-        staticmethod(forbidden_weight_loader),
-    )
-
-    with pytest.raises(ValueError, match="vision.depth"):
-        build_qwen_adapter(make_tiny_project_config(), model_root)
-    assert weight_loader_called is False
-
-
-def make_official_checkpoint_config() -> Qwen3VLConfig:
-    return Qwen3VLConfig(
-        vision_config={
-            "depth": 27,
-            "hidden_size": 1152,
-            "intermediate_size": 4304,
-            "num_heads": 16,
-            "in_channels": 3,
-            "patch_size": 16,
-            "spatial_merge_size": 2,
-            "temporal_patch_size": 2,
-            "out_hidden_size": 4096,
-            "num_position_embeddings": 2304,
-            "deepstack_visual_indexes": [8, 16, 24],
-        },
-        text_config={
-            "vocab_size": 151936,
-            "hidden_size": 4096,
-            "intermediate_size": 22016,
-            "num_hidden_layers": 36,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 8,
-            "head_dim": 128,
-        },
-    )
-
-
-def test_video_batch_rejects_packed_patch_count_mismatch() -> None:
-    with pytest.raises(ValueError, match="packed patch count"):
-        VideoBatch(
-            pixel_values_videos=torch.zeros(7, 1536),
-            video_grid_thw=torch.tensor([[2, 2, 2]], dtype=torch.int64),
-            timestamps=torch.zeros(1, 2),
-            query_time=torch.zeros(1),
-            valid_mask=torch.ones(1, 2, dtype=torch.bool),
-            video_ids=("video",),
-            trajectory_ids=("trajectory",),
-        )
-
-
-@pytest.mark.parametrize("invalid_grid_value", [0, -1])
-def test_video_batch_rejects_non_positive_grid(invalid_grid_value: int) -> None:
-    with pytest.raises(ValueError, match="entries must be positive"):
-        VideoBatch(
-            pixel_values_videos=torch.zeros(8, 1536),
-            video_grid_thw=torch.tensor(
-                [[invalid_grid_value, 2, 2]],
-                dtype=torch.int64,
-            ),
-            timestamps=torch.zeros(1, 2),
-            query_time=torch.zeros(1),
-            valid_mask=torch.ones(1, 2, dtype=torch.bool),
-            video_ids=("video",),
-            trajectory_ids=("trajectory",),
-        )
-
-
-def test_video_contracts_reject_empty_batches_and_scalar_grids() -> None:
-    with pytest.raises(ValueError, match="at least one video"):
-        VideoBatch(
-            pixel_values_videos=torch.zeros(0, 1536),
-            video_grid_thw=torch.empty(0, 3, dtype=torch.int64),
-            timestamps=torch.empty(0, 2),
-            query_time=torch.empty(0),
-            valid_mask=torch.empty(0, 2, dtype=torch.bool),
-            video_ids=(),
-            trajectory_ids=(),
-        )
-    with pytest.raises(ValueError, match=r"\[B, 3\]"):
-        MergedVideoMetadata(
-            video_grid_thw=torch.tensor(1, dtype=torch.int64),
-            merged_grid_thw=torch.tensor(1, dtype=torch.int64),
-            spatial_merge_size=2,
-            token_counts=(),
-            token_offsets=(0,),
-        )

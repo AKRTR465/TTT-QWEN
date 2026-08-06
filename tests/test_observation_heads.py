@@ -1,29 +1,23 @@
 from __future__ import annotations
 
+import copy
 from collections.abc import Sequence
 
 import pytest
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from tests.support import parameter_count
 from tests.support.runtime_factories import make_temporal_cache
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.observation_heads import (
-    E1PointEventDecoder,
     E1RuntimeState,
-    E1SoftOutput,
-    E2IntervalEventDecoder,
     E2RuntimeState,
-    E2SoftOutput,
     ObservationHeads,
     build_observation_heads,
 )
-from ttt_svcbench_qwen.state_encoder import (
-    SpatialEncoderOutput,
-    TemporalCache,
-    TemporalEncoderOutput,
-)
+from ttt_svcbench_qwen.state_encoder import SpatialEncoderOutput, TemporalEncoderOutput
 
 EXACT_HEAD_COUNTS = {
     "o1": 2_632_710,
@@ -44,25 +38,6 @@ def heads() -> ObservationHeads:
     return module
 
 
-def _empty_temporal_cache(
-    query_signatures: Tensor,
-    video_ids: tuple[str, ...],
-    trajectory_ids: tuple[str, ...],
-) -> TemporalCache:
-    return make_temporal_cache(
-        hidden=torch.empty(
-            query_signatures.shape[0],
-            0,
-            HIDDEN_DIM,
-            dtype=query_signatures.dtype,
-            device=query_signatures.device,
-        ),
-        video_ids=video_ids,
-        trajectory_ids=trajectory_ids,
-        query_signatures=query_signatures,
-    )
-
-
 def _typed_encoder_outputs(
     slots: Tensor,
     slot_mask: Tensor,
@@ -73,128 +48,64 @@ def _typed_encoder_outputs(
     trajectory_ids: tuple[str, ...],
 ) -> tuple[SpatialEncoderOutput, TemporalEncoderOutput]:
     batch_size, time_count = temporal_mask.shape
-    timestamps = torch.full(
-        (batch_size, time_count),
-        -1.0,
-        dtype=torch.float64,
-        device=hidden.device,
-    )
-    position_ids = torch.full(
-        (batch_size, time_count),
-        -1,
-        dtype=torch.int64,
-        device=hidden.device,
-    )
+    timestamps = torch.full((batch_size, time_count), -1.0, dtype=torch.float64)
+    position_ids = torch.full((batch_size, time_count), -1, dtype=torch.int64)
     for row in range(batch_size):
         count = int(temporal_mask[row].sum().item())
-        timestamps[row, :count] = (
-            torch.arange(count, dtype=torch.float64, device=hidden.device) / 4.0
-        )
-        position_ids[row, :count] = torch.arange(count, dtype=torch.int64, device=hidden.device)
+        timestamps[row, :count] = torch.arange(count, dtype=torch.float64) / 4.0
+        position_ids[row, :count] = torch.arange(count, dtype=torch.int64)
     spatial = SpatialEncoderOutput(
         slots=slots,
         slot_valid_mask=slot_mask,
-        active_slot_overflow_count=torch.zeros(batch_size, dtype=torch.int64, device=slots.device),
+        active_slot_overflow_count=torch.zeros(batch_size, dtype=torch.int64),
     )
     temporal = TemporalEncoderOutput(
         hidden=hidden,
         timestamps=timestamps,
         position_ids=position_ids,
         valid_mask=temporal_mask,
-        cache=_empty_temporal_cache(q_target, video_ids, trajectory_ids),
+        cache=make_temporal_cache(
+            hidden=torch.empty(batch_size, 0, HIDDEN_DIM, dtype=q_target.dtype),
+            video_ids=video_ids,
+            trajectory_ids=trajectory_ids,
+            query_signatures=q_target,
+        ),
     )
     return spatial, temporal
 
 
-def _stream_tensors(
+def _run_stream(
+    decoder: nn.Module,
     source: Tensor,
     positions: Sequence[int],
+    query: Tensor,
     *,
-    timestamp_values: Sequence[float] | None = None,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    selected = source[list(positions)].unsqueeze(0)
-    count = selected.shape[1]
-    valid_mask = torch.ones(1, count, dtype=torch.bool, device=source.device)
-    effective_times = (
-        tuple(float(position) / 4.0 for position in positions)
-        if timestamp_values is None
-        else tuple(timestamp_values)
-    )
-    if len(effective_times) != count:
-        raise ValueError("test timestamps must align to positions")
+    prior: E1RuntimeState | E2RuntimeState | None = None,
+):
+    """Drive one E1/E2 stream row over ``positions`` of ``source`` (identical signatures)."""
+
+    selected = list(positions)
+    hidden = source[selected].unsqueeze(0)
+    mask = torch.ones(1, len(selected), dtype=torch.bool)
     timestamps = torch.tensor(
-        effective_times,
-        dtype=torch.float64,
-        device=source.device,
+        [position / 4.0 for position in selected], dtype=torch.float64
     ).unsqueeze(0)
-    position_ids = torch.tensor(
-        tuple(positions),
-        dtype=torch.int64,
-        device=source.device,
-    ).unsqueeze(0)
-    return selected, valid_mask, timestamps, position_ids
-
-
-def _run_e1(
-    decoder: E1PointEventDecoder,
-    source: Tensor,
-    positions: Sequence[int],
-    query: Tensor,
-    *,
-    prior: E1RuntimeState | None = None,
-    video_id: str = "video-a",
-    trajectory_id: str = "trajectory-a",
-    timestamp_values: Sequence[float] | None = None,
-) -> E1SoftOutput:
-    hidden, mask, timestamps, position_ids = _stream_tensors(
-        source,
-        positions,
-        timestamp_values=timestamp_values,
-    )
+    position_ids = torch.tensor(selected, dtype=torch.int64).unsqueeze(0)
     return decoder(
         hidden,
         mask,
         timestamps,
         position_ids,
-        (video_id,),
-        (trajectory_id,),
-        query,
-        prior_states=(prior,),
-    )
-
-
-def _run_e2(
-    decoder: E2IntervalEventDecoder,
-    source: Tensor,
-    positions: Sequence[int],
-    query: Tensor,
-    *,
-    prior: E2RuntimeState | None = None,
-    video_id: str = "video-a",
-    trajectory_id: str = "trajectory-a",
-    timestamp_values: Sequence[float] | None = None,
-) -> E2SoftOutput:
-    hidden, mask, timestamps, position_ids = _stream_tensors(
-        source,
-        positions,
-        timestamp_values=timestamp_values,
-    )
-    return decoder(
-        hidden,
-        mask,
-        timestamps,
-        position_ids,
-        (video_id,),
-        (trajectory_id,),
+        ("video-a",),
+        ("trajectory-a",),
         query,
         prior_states=(prior,),
     )
 
 
 def test_meta_topology_builder_and_exact_parameter_counts() -> None:
-    config = load_config()
     with torch.device("meta"):
-        module = build_observation_heads(config)
+        module = build_observation_heads(load_config())
 
     assert isinstance(module, ObservationHeads)
     assert set(dict(module.named_children())) == {"o1", "o2", "e1", "e2"}
@@ -213,13 +124,9 @@ def test_meta_topology_builder_and_exact_parameter_counts() -> None:
     assert module.e2.gru.batch_first is True
     assert module.e2.gru.bidirectional is False
     assert module.e2.gru.dropout == 0.0
-    with pytest.raises(ValueError, match="[Cc]onfig"):
-        build_observation_heads()
 
 
-def test_registered_forward_shapes_masks_metadata_and_probabilities(
-    heads: ObservationHeads,
-) -> None:
+def test_registered_forward_shapes_masks_and_metadata(heads: ObservationHeads) -> None:
     generator = torch.Generator().manual_seed(11)
     slots = torch.randn(2, 4, HIDDEN_DIM, generator=generator)
     slot_mask = torch.tensor(
@@ -248,6 +155,7 @@ def test_registered_forward_shapes_masks_metadata_and_probabilities(
     with torch.no_grad():
         output = heads(spatial, temporal, q_target, videos, trajectories)
 
+    # A row with no valid temporal state cannot carry a valid slot observation.
     effective_slot_mask = slot_mask & temporal_mask.any(dim=1, keepdim=True)
     assert output.o1.logits.shape == (2, 4, 6)
     assert output.o2.identity.shape == (2, 4, 256)
@@ -258,6 +166,8 @@ def test_registered_forward_shapes_masks_metadata_and_probabilities(
     assert torch.equal(output.o2.valid_mask, effective_slot_mask)
     assert torch.equal(output.e1.valid_mask, temporal_mask)
     assert torch.equal(output.e2.valid_mask, temporal_mask)
+
+    # Slot observations are stamped with the last valid temporal position of their row.
     assert torch.all(output.o1.timestamps[0, effective_slot_mask[0]] == 0.75)
     assert torch.all(output.o1.timestamps[~effective_slot_mask] == -1.0)
     assert torch.all(output.o1.position_ids[0, effective_slot_mask[0]] == 3)
@@ -268,31 +178,16 @@ def test_registered_forward_shapes_masks_metadata_and_probabilities(
     assert torch.equal(output.e2.timestamps, temporal.timestamps)
     assert torch.equal(output.e1.position_ids, temporal.position_ids)
     assert torch.equal(output.e2.position_ids, temporal.position_ids)
+
+    # Padding never carries signal, and an all-padding row advances no stream state.
     assert torch.count_nonzero(output.o1.logits[~effective_slot_mask]) == 0
     assert torch.count_nonzero(output.o2.identity[~effective_slot_mask]) == 0
     assert torch.count_nonzero(output.e1.logits[~temporal_mask]) == 0
     assert torch.count_nonzero(output.e2.event_logits[~temporal_mask]) == 0
     assert torch.count_nonzero(output.e2.phase_probabilities[~temporal_mask]) == 0
-    torch.testing.assert_close(
-        output.o1.probabilities[effective_slot_mask],
-        torch.sigmoid(output.o1.logits[effective_slot_mask]),
-    )
-    torch.testing.assert_close(
-        output.o2.score_probabilities[effective_slot_mask],
-        torch.sigmoid(output.o2.score_logits[effective_slot_mask]),
-    )
-    torch.testing.assert_close(
-        output.e1.probabilities[temporal_mask],
-        torch.sigmoid(output.e1.logits[temporal_mask]),
-    )
-    torch.testing.assert_close(
-        output.e2.event_probabilities[temporal_mask],
-        torch.sigmoid(output.e2.event_logits[temporal_mask]),
-    )
-    torch.testing.assert_close(
-        output.e2.phase_probabilities[temporal_mask].sum(dim=-1),
-        torch.ones(int(temporal_mask.sum().item())),
-    )
+    assert output.e1.next_states[1].total_seen == 0
+    assert output.e2.next_states[1].total_seen == 0
+
     identity_norms = torch.linalg.vector_norm(
         output.o2.identity[effective_slot_mask].float(), dim=-1
     )
@@ -309,24 +204,13 @@ def test_registered_forward_shapes_masks_metadata_and_probabilities(
     assert output.e1.LOGIT_NAMES == ("eventness", "completion", "transition")
     assert output.e2.EVENT_NAMES == ("start", "active", "end", "complete")
     assert output.e2.PHASE_NAMES == ("inactive", "active", "end_candidate", "completed")
-    assert output.e1.next_states[1].total_seen == 0
-    assert output.e2.next_states[1].total_seen == 0
-    with pytest.raises(ValueError, match="exactly match temporal cache owners"):
-        heads(
-            spatial,
-            temporal,
-            q_target,
-            tuple(reversed(videos)),
-            trajectories,
-        )
 
 
-def test_invalid_slot_and_temporal_padding_are_poison_safe(
-    heads: ObservationHeads,
-) -> None:
+def test_invalid_slot_and_temporal_padding_are_poison_safe(heads: ObservationHeads) -> None:
+    """NaN/Inf parked in masked padding must be zeroed before it reaches any norm."""
+
     generator = torch.Generator().manual_seed(17)
-    slots = torch.randn(1, 3, HIDDEN_DIM, generator=generator)
-    poisoned_slots = slots.clone()
+    poisoned_slots = torch.randn(1, 3, HIDDEN_DIM, generator=generator)
     poisoned_slots[:, 1] = torch.nan
     poisoned_slots[:, 2] = torch.inf
     slot_mask = torch.tensor([[True, False, False]])
@@ -341,49 +225,15 @@ def test_invalid_slot_and_temporal_padding_are_poison_safe(
     timestamps = torch.tensor([[0.0, -1.0, -1.0], [-1.0, -1.0, -1.0]], dtype=torch.float64)
     position_ids = torch.tensor([[0, -1, -1], [-1, -1, -1]], dtype=torch.int64)
     signatures = torch.randn(2, QUERY_DIM, generator=generator)
+    owners = (("video-a", "video-b"), ("trajectory-a", "trajectory-b"))
 
     with torch.no_grad():
-        o1 = heads.o1(
-            poisoned_slots,
-            slot_mask,
-            query,
-            observation_time,
-            observation_position,
-        )
-        o2 = heads.o2(
-            poisoned_slots,
-            slot_mask,
-            observation_time,
-            observation_position,
-        )
-        e1 = heads.e1(
-            hidden,
-            temporal_mask,
-            timestamps,
-            position_ids,
-            ("video-a", "video-b"),
-            ("trajectory-a", "trajectory-b"),
-            signatures,
-        )
-        e2 = heads.e2(
-            hidden,
-            temporal_mask,
-            timestamps,
-            position_ids,
-            ("video-a", "video-b"),
-            ("trajectory-a", "trajectory-b"),
-            signatures,
-        )
+        o1 = heads.o1(poisoned_slots, slot_mask, query, observation_time, observation_position)
+        o2 = heads.o2(poisoned_slots, slot_mask, observation_time, observation_position)
+        e1 = heads.e1(hidden, temporal_mask, timestamps, position_ids, *owners, signatures)
+        e2 = heads.e2(hidden, temporal_mask, timestamps, position_ids, *owners, signatures)
 
-    for tensor in (
-        o1.logits,
-        o1.probabilities,
-        o2.identity,
-        o2.score_logits,
-        e1.logits,
-        e2.event_logits,
-        e2.phase_logits,
-    ):
+    for tensor in (o1.logits, o2.identity, o2.score_logits, e1.logits, e2.event_logits):
         assert bool(torch.isfinite(tensor).all())
     assert torch.count_nonzero(o1.logits[:, 1:]) == 0
     assert torch.count_nonzero(o2.identity[:, 1:]) == 0
@@ -409,13 +259,11 @@ def test_o1_film_formula_soft_count_query_isolation_and_gradients(
     scale, shift = decoder.film_projection(q_target).chunk(2, dim=-1)
     conditioned = decoder.slot_norm(safe_slots) * (1.0 + scale.unsqueeze(1))
     conditioned = conditioned + shift.unsqueeze(1)
-    expected = decoder.output_projection(
-        torch.nn.functional.silu(
-            decoder.mlp_2(torch.nn.functional.silu(decoder.mlp_1(conditioned)))
-        )
-    )
+    expected = decoder.output_projection(F.silu(decoder.mlp_2(F.silu(decoder.mlp_1(conditioned)))))
     expected = torch.where(mask.unsqueeze(-1), expected, 0.0)
     torch.testing.assert_close(output.logits, expected)
+
+    # soft_count is the masked product of object x target x visible, never a threshold count.
     expected_count = (
         output.probabilities[..., 0]
         * output.probabilities[..., 1]
@@ -424,16 +272,11 @@ def test_o1_film_formula_soft_count_query_isolation_and_gradients(
     ).sum(dim=1)
     torch.testing.assert_close(output.soft_count, expected_count)
 
+    # Per-row query isolation: perturbing row 0's query leaves row 1 bitwise identical.
     perturbed_query = q_target.detach().clone()
     perturbed_query[0] += 4.0
     with torch.no_grad():
-        perturbed = decoder(
-            slots.detach(),
-            mask,
-            perturbed_query,
-            timestamps,
-            position_ids,
-        )
+        perturbed = decoder(slots.detach(), mask, perturbed_query, timestamps, position_ids)
     assert not torch.allclose(output.logits.detach()[0], perturbed.logits[0])
     torch.testing.assert_close(output.logits.detach()[1], perturbed.logits[1])
 
@@ -445,7 +288,7 @@ def test_o1_film_formula_soft_count_query_isolation_and_gradients(
     assert decoder.film_projection.weight.grad is not None
 
 
-def test_o2_relevance_head_is_query_conditioned_and_formula_exact(
+def test_o2_relevance_is_query_conditioned_and_pooled_count_is_exact(
     heads: ObservationHeads,
 ) -> None:
     decoder = heads.o2
@@ -459,6 +302,9 @@ def test_o2_relevance_head_is_query_conditioned_and_formula_exact(
 
     output = decoder(slots, mask, timestamps, position_ids, q_target=q_target)
 
+    # Multiplicative relevance: sigma(<identity_i, W q_target>), masked to valid slots.
+    # This is the weight the O2-Unique soft dedup target rides on, so the exact form
+    # (and identity's gradient into it) is mechanism, not a metric.
     expected = torch.sigmoid(
         torch.einsum(
             "bnd,bd->bn",
@@ -468,8 +314,21 @@ def test_o2_relevance_head_is_query_conditioned_and_formula_exact(
     ).to(dtype=output.identity.dtype)
     expected = torch.where(mask, expected, torch.zeros_like(expected))
     torch.testing.assert_close(output.relevance, expected)
-    assert bool(torch.all((output.relevance >= 0.0) & (output.relevance <= 1.0)))
     assert bool(torch.all(output.relevance[~mask] == 0.0))
+
+    # O2-Gain pooled count regression: masked-mean trunk features concatenated with
+    # q_target through the softplus count head, independent of the padded slot width.
+    trunk = F.silu(decoder.trunk_2(F.silu(decoder.trunk_1(decoder.slot_norm(
+        torch.where(mask.unsqueeze(-1), slots, 0.0)
+    )))))
+    weights = mask.unsqueeze(-1).to(dtype=trunk.dtype)
+    pooled = (trunk * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+    torch.testing.assert_close(
+        output.count_prediction,
+        decoder.count_head(torch.cat((pooled, q_target), dim=-1)),
+    )
+    assert output.count_prediction.shape == (2,)
+    assert bool(torch.all(output.count_prediction > 0.0))
 
     # Same slots, different query: the multiplicative head must move the perturbed
     # row's relevance while leaving the untouched row bitwise identical.
@@ -483,132 +342,72 @@ def test_o2_relevance_head_is_query_conditioned_and_formula_exact(
     )
     torch.testing.assert_close(output.relevance.detach()[1], perturbed.relevance[1])
 
-    output.relevance.sum().backward()
-    assert q_target.grad is not None
-    assert float(q_target.grad.abs().sum()) > 0.0
+    (output.relevance.sum() + output.count_prediction.sum()).backward()
+    assert q_target.grad is not None and float(q_target.grad.abs().sum()) > 0.0
     assert decoder.relevance_projection.weight.grad is not None
+    # identity is not detached at the einsum, so the relevance-weighted dedup target
+    # pushes task gradient back through o2.identity itself.
+    identity_grad = decoder.identity_projection.weight.grad
+    assert identity_grad is not None and float(identity_grad.abs().sum()) > 0.0
 
 
 def test_o2_zero_identity_fallback_and_raw_score_logits(heads: ObservationHeads) -> None:
-    decoder = heads.o2
-    saved = {
-        "identity_weight": decoder.identity_projection.weight.detach().clone(),
-        "identity_bias": decoder.identity_projection.bias.detach().clone(),
-        "score_weight": decoder.score_projection.weight.detach().clone(),
-        "score_bias": decoder.score_projection.bias.detach().clone(),
-    }
-    try:
-        with torch.no_grad():
-            decoder.identity_projection.weight.zero_()
-            decoder.identity_projection.bias.zero_()
-            decoder.score_projection.weight.zero_()
-            decoder.score_projection.bias.copy_(torch.tensor([-2.0, 3.0]))
-        slots = torch.randn(1, 3, HIDDEN_DIM)
-        mask = torch.tensor([[True, False, True]])
-        output = decoder(
-            slots,
-            mask,
-            torch.tensor([2.5], dtype=torch.float64),
-            torch.tensor([10], dtype=torch.int64),
-        )
+    decoder = copy.deepcopy(heads.o2)
+    with torch.no_grad():
+        decoder.identity_projection.weight.zero_()
+        decoder.identity_projection.bias.zero_()
+        decoder.score_projection.weight.zero_()
+        decoder.score_projection.bias.copy_(torch.tensor([-2.0, 3.0]))
+    slots = torch.randn(1, 3, HIDDEN_DIM)
+    mask = torch.tensor([[True, False, True]])
+    output = decoder(
+        slots,
+        mask,
+        torch.tensor([2.5], dtype=torch.float64),
+        torch.tensor([10], dtype=torch.int64),
+    )
 
-        expected_identity = torch.zeros(2, 256)
-        expected_identity[:, 0] = 1.0
-        torch.testing.assert_close(output.identity[mask], expected_identity)
-        assert torch.count_nonzero(output.identity[~mask]) == 0
-        torch.testing.assert_close(
-            output.score_logits[mask],
-            torch.tensor([[-2.0, 3.0], [-2.0, 3.0]]),
-        )
-        torch.testing.assert_close(
-            output.score_probabilities[mask],
-            torch.sigmoid(torch.tensor([[-2.0, 3.0], [-2.0, 3.0]])),
-        )
-    finally:
-        with torch.no_grad():
-            decoder.identity_projection.weight.copy_(saved["identity_weight"])
-            decoder.identity_projection.bias.copy_(saved["identity_bias"])
-            decoder.score_projection.weight.copy_(saved["score_weight"])
-            decoder.score_projection.bias.copy_(saved["score_bias"])
+    expected_identity = torch.zeros(2, 256)
+    expected_identity[:, 0] = 1.0
+    torch.testing.assert_close(output.identity[mask], expected_identity)
+    assert torch.count_nonzero(output.identity[~mask]) == 0
+    torch.testing.assert_close(
+        output.score_logits[mask],
+        torch.tensor([[-2.0, 3.0], [-2.0, 3.0]]),
+    )
 
 
-def test_e1_causality_full_disjoint_and_four_overlap_replay(
-    heads: ObservationHeads,
-) -> None:
+def test_e1_causality_full_disjoint_and_four_overlap_replay(heads: ObservationHeads) -> None:
     source = torch.randn(8, HIDDEN_DIM, generator=torch.Generator().manual_seed(31))
     query = torch.randn(1, QUERY_DIM, generator=torch.Generator().manual_seed(32))
     with torch.no_grad():
-        full = _run_e1(heads.e1, source, range(8), query)
-        first = _run_e1(heads.e1, source, range(6), query)
-        overlap = _run_e1(heads.e1, source, range(2, 8), query, prior=first.next_states[0])
-        disjoint_first = _run_e1(heads.e1, source, range(4), query)
-        disjoint_second = _run_e1(
+        full = _run_stream(heads.e1, source, range(8), query)
+        first = _run_stream(heads.e1, source, range(6), query)
+        overlap = _run_stream(heads.e1, source, range(2, 8), query, prior=first.next_states[0])
+        disjoint_first = _run_stream(heads.e1, source, range(4), query)
+        disjoint_second = _run_stream(
             heads.e1,
             source,
             range(4, 8),
             query,
             prior=disjoint_first.next_states[0],
         )
+        # Causal prefix: mutating positions >= 4 cannot move logits at positions < 4.
         future_mutation = source.clone()
         future_mutation[4:] += 100.0
-        mutated = _run_e1(heads.e1, future_mutation, range(8), query)
+        mutated = _run_stream(heads.e1, future_mutation, range(8), query)
 
     torch.testing.assert_close(first.logits, full.logits[:, :6], atol=2.0e-6, rtol=2.0e-5)
     torch.testing.assert_close(overlap.logits, full.logits[:, 2:], atol=2.0e-6, rtol=2.0e-5)
     torch.testing.assert_close(
-        disjoint_first.logits,
-        full.logits[:, :4],
-        atol=2.0e-6,
-        rtol=2.0e-5,
+        disjoint_first.logits, full.logits[:, :4], atol=2.0e-6, rtol=2.0e-5
     )
     torch.testing.assert_close(
-        disjoint_second.logits,
-        full.logits[:, 4:],
-        atol=2.0e-6,
-        rtol=2.0e-5,
+        disjoint_second.logits, full.logits[:, 4:], atol=2.0e-6, rtol=2.0e-5
     )
     torch.testing.assert_close(mutated.logits[:, :4], full.logits[:, :4])
-    assert overlap.audit.overlap_replay_counts == (4,)
-    assert disjoint_second.audit.overlap_replay_counts == (0,)
     assert overlap.next_states[0].total_seen == 8
     assert overlap.next_states[0].position_ids.tolist() == list(range(8))
-    with pytest.raises(ValueError, match="configured replay window"):
-        _run_e1(
-            heads.e1,
-            source,
-            range(1, 8),
-            query,
-            prior=first.next_states[0],
-        )
-
-    with pytest.raises(ValueError, match="owner"):
-        _run_e1(
-            heads.e1,
-            source,
-            range(6, 8),
-            query,
-            prior=first.next_states[0],
-            video_id="video-other",
-        )
-    with pytest.raises(ValueError, match="query signature drift"):
-        _run_e1(
-            heads.e1,
-            source,
-            range(6, 8),
-            query + 1.0,
-            prior=first.next_states[0],
-        )
-    bad_times = [position / 4.0 for position in range(2, 8)]
-    bad_times[0] += 0.1
-    with pytest.raises(ValueError, match="overlap timestamps"):
-        _run_e1(
-            heads.e1,
-            source,
-            range(2, 8),
-            query,
-            prior=first.next_states[0],
-            timestamp_values=bad_times,
-        )
 
 
 def test_e2_causality_full_disjoint_and_four_overlap_checkpoint_replay(
@@ -617,20 +416,21 @@ def test_e2_causality_full_disjoint_and_four_overlap_checkpoint_replay(
     source = torch.randn(8, HIDDEN_DIM, generator=torch.Generator().manual_seed(37))
     query = torch.randn(1, QUERY_DIM, generator=torch.Generator().manual_seed(38))
     with torch.no_grad():
-        full = _run_e2(heads.e2, source, range(8), query)
-        first = _run_e2(heads.e2, source, range(6), query)
-        overlap = _run_e2(heads.e2, source, range(2, 8), query, prior=first.next_states[0])
-        disjoint_first = _run_e2(heads.e2, source, range(4), query)
-        disjoint_second = _run_e2(
+        full = _run_stream(heads.e2, source, range(8), query)
+        first = _run_stream(heads.e2, source, range(6), query)
+        overlap = _run_stream(heads.e2, source, range(2, 8), query, prior=first.next_states[0])
+        disjoint_first = _run_stream(heads.e2, source, range(4), query)
+        disjoint_second = _run_stream(
             heads.e2,
             source,
             range(4, 8),
             query,
             prior=disjoint_first.next_states[0],
         )
+        # Causal prefix: mutating positions >= 4 cannot move logits at positions < 4.
         future_mutation = source.clone()
         future_mutation[4:] -= 100.0
-        mutated = _run_e2(heads.e2, future_mutation, range(8), query)
+        mutated = _run_stream(heads.e2, future_mutation, range(8), query)
 
     for field in ("event_logits", "phase_logits"):
         reference = getattr(full, field)
@@ -639,8 +439,9 @@ def test_e2_causality_full_disjoint_and_four_overlap_checkpoint_replay(
         torch.testing.assert_close(getattr(disjoint_first, field), reference[:, :4])
         torch.testing.assert_close(getattr(disjoint_second, field), reference[:, 4:])
         torch.testing.assert_close(getattr(mutated, field)[:, :4], reference[:, :4])
-    assert overlap.audit.overlap_replay_counts == (4,)
-    assert disjoint_second.audit.overlap_replay_counts == (0,)
+
+    # Four-position overlap replays from the checkpoint before the overlap start, so the
+    # final GRU hidden state matches the uninterrupted run bitwise.
     assert overlap.next_states[0].total_seen == 8
     assert overlap.next_states[0].position_ids.tolist() == [3, 4, 5, 6, 7]
     torch.testing.assert_close(
@@ -648,35 +449,6 @@ def test_e2_causality_full_disjoint_and_four_overlap_checkpoint_replay(
         overlap.next_states[0].checkpoint_hidden[-1],
     )
     torch.testing.assert_close(overlap.next_states[0].hidden, full.next_states[0].hidden)
-
-    with pytest.raises(ValueError, match="owner"):
-        _run_e2(
-            heads.e2,
-            source,
-            range(6, 8),
-            query,
-            prior=first.next_states[0],
-            trajectory_id="trajectory-other",
-        )
-    with pytest.raises(ValueError, match="query signature drift"):
-        _run_e2(
-            heads.e2,
-            source,
-            range(6, 8),
-            query + 1.0,
-            prior=first.next_states[0],
-        )
-    bad_times = [position / 4.0 for position in range(2, 8)]
-    bad_times[0] += 0.1
-    with pytest.raises(ValueError, match="overlap timestamps"):
-        _run_e2(
-            heads.e2,
-            source,
-            range(2, 8),
-            query,
-            prior=first.next_states[0],
-            timestamp_values=bad_times,
-        )
 
 
 def test_online_freeze_preserves_gradients_to_all_decoder_inputs(

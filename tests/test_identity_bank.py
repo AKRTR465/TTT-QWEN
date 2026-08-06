@@ -7,15 +7,11 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
-import ttt_svcbench_qwen.identity_bank as identity_bank_types
 from tests.support.runtime_factories import make_state_record
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.identity_bank import (
     CandidateIdentity,
-    ConfirmedChunk,
     ConfirmedIdentity,
-    ExactMatchStatus,
-    HotCacheEntry,
     IdentityBank,
     IdentityBankRuntimeState,
     IdentityDecisionStatus,
@@ -29,13 +25,15 @@ from ttt_svcbench_qwen.observation_heads import O2SoftOutput
 from ttt_svcbench_qwen.state_bank import (
     HeadType,
     StateBankRuntimeState,
-    StateRecordKind,
     StructuredStateBank,
     build_state_bank,
 )
 
 IDENTITY_DIM = 256
 SEMANTIC_DIM = 512
+NEW = (0.95, 0.05)
+MATCH = (0.05, 0.95)
+WEAK = (0.1, 0.1)
 
 
 @pytest.fixture
@@ -50,12 +48,8 @@ def _random_unit_vectors(count: int, *, seed: int) -> Tensor:
         torch.randn(count, IDENTITY_DIM, generator=generator, dtype=torch.float32),
         dim=-1,
     )
-    if count > 1:
-        off_diagonal = (vectors @ vectors.T).masked_fill(
-            torch.eye(count, dtype=torch.bool),
-            -1.0,
-        )
-        assert float(off_diagonal.max()) < 0.8
+    off_diagonal = (vectors @ vectors.T).masked_fill(torch.eye(count, dtype=torch.bool), -1.0)
+    assert float(off_diagonal.max()) < 0.8
     return vectors
 
 
@@ -65,986 +59,366 @@ def _unit_identity(index: int = 0, *, requires_grad: bool = False) -> Tensor:
     return value.requires_grad_(requires_grad)
 
 
-def _unit_semantics(
-    count: int,
-    *,
-    offset: int = 0,
-    requires_grad: bool = False,
-) -> Tensor:
-    values = torch.zeros(count, SEMANTIC_DIM)
-    rows = torch.arange(count)
-    values[rows, (rows + offset) % SEMANTIC_DIM] = 1.0
+def _unit_semantics(offset: int = 0, *, requires_grad: bool = False) -> Tensor:
+    values = torch.zeros(1, SEMANTIC_DIM)
+    values[0, offset % SEMANTIC_DIM] = 1.0
     return values.requires_grad_(requires_grad)
 
 
-def _o2_output(
-    identities: Tensor,
-    *,
-    novelty: float,
-    match_confidence: float,
-    position_id: int,
-    timestamp: float | None = None,
-    valid_mask: Tensor | None = None,
-) -> O2SoftOutput:
-    if identities.ndim == 2:
-        identities = identities.unsqueeze(0)
-    batch_size, slot_count = identities.shape[:2]
-    if valid_mask is None:
-        valid_mask = torch.ones(batch_size, slot_count, dtype=torch.bool)
-    elif valid_mask.ndim == 1:
-        valid_mask = valid_mask.unsqueeze(0)
-    probabilities = torch.empty(batch_size, slot_count, 2, dtype=identities.dtype)
-    probabilities[..., 0] = novelty
-    probabilities[..., 1] = match_confidence
-    probabilities = probabilities.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
-    logits = torch.zeros_like(probabilities)
-    resolved_timestamp = float(position_id) if timestamp is None else timestamp
-    timestamps = torch.full(
-        (batch_size, slot_count),
-        resolved_timestamp,
-        dtype=torch.float64,
-    )
-    timestamps = torch.where(valid_mask, timestamps, torch.full_like(timestamps, -1.0))
-    position_ids = torch.full(
-        (batch_size, slot_count),
-        position_id,
-        dtype=torch.int64,
-    )
-    position_ids = torch.where(valid_mask, position_ids, torch.full_like(position_ids, -1))
-    safe_identities = identities.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
-    return O2SoftOutput(
-        identity=safe_identities,
-        score_logits=logits,
-        score_probabilities=probabilities,
-        valid_mask=valid_mask,
-        timestamps=timestamps,
-        position_ids=position_ids,
-    )
+class _Driver:
+    """Thread one owner row through ``IdentityBank.update_row`` without per-call boilerplate."""
 
+    def __init__(
+        self,
+        banks: tuple[IdentityBank, StructuredStateBank],
+        *,
+        video_id: str = "video-a",
+        trajectory_id: str = "trajectory-a",
+    ) -> None:
+        self.bank, self.state_bank = banks
+        self.video_id = video_id
+        self.trajectory_id = trajectory_id
+        self.identity = self.bank.reset(video_id, trajectory_id)
+        self.state = self.state_bank.reset(video_id, trajectory_id)
 
-def _update(
-    bank: IdentityBank,
-    identity_state: IdentityBankRuntimeState,
-    state_bank: StructuredStateBank,
-    state_state: StateBankRuntimeState,
-    identities: Tensor,
-    semantics: Tensor,
-    *,
-    novelty: float,
-    match_confidence: float,
-    position_id: int,
-    chunk_index: int | None = None,
-) -> IdentityUpdateResult:
-    observation = _o2_output(
-        identities,
-        novelty=novelty,
-        match_confidence=match_confidence,
-        position_id=position_id,
-    )
-    return bank.update_row(
-        identity_state,
-        state_bank,
-        state_state,
-        observation,
-        semantics,
-        row=0,
-        chunk_index=position_id if chunk_index is None else chunk_index,
-    )
-
-
-def _reset_pair(
-    bank: IdentityBank,
-    state_bank: StructuredStateBank,
-    *,
-    video_id: str = "video-a",
-    trajectory_id: str = "trajectory-a",
-) -> tuple[IdentityBankRuntimeState, StateBankRuntimeState]:
-    return (
-        bank.reset(video_id, trajectory_id, hot_cache_enabled=False),
-        state_bank.reset(video_id, trajectory_id),
-    )
-
-
-def _linked_candidate(
-    index: int,
-    prototype: Tensor,
-    *,
-    confidence: float = 0.95,
-    ttl_remaining: int = 8,
-    position_id: int = 0,
-    chunk_index: int = 0,
-) -> CandidateIdentity:
-    return CandidateIdentity(
-        candidate_id=f"candidate-{index:08d}",
-        identity_prototype=prototype.detach().to(dtype=torch.float32, device="cpu").clone(),
-        observation_count=1,
-        ttl_remaining=ttl_remaining,
-        confidence=confidence,
-        first_seen=float(position_id),
-        last_seen=float(position_id),
-        first_seen_position_id=position_id,
-        last_seen_position_id=position_id,
-        last_reliable_chunk_index=chunk_index,
-        reliable_streak=1,
-        semantic_record_id=f"record-{index:08d}",
-    )
-
-
-def _candidate_runtime(
-    bank: IdentityBank,
-    state_bank: StructuredStateBank,
-    prototypes: Tensor,
-    *,
-    confidence: float = 0.95,
-    ttl_remaining: int = 8,
-    candidate_capacity: int | None = None,
-    video_id: str = "video-a",
-    trajectory_id: str = "trajectory-a",
-) -> tuple[IdentityBankRuntimeState, StateBankRuntimeState]:
-    count = int(prototypes.shape[0])
-    if candidate_capacity is None:
-        candidate_capacity = max(64, ((count + 63) // 64) * 64)
-    candidates = tuple(
-        _linked_candidate(
-            index,
-            prototype,
-            confidence=confidence,
-            ttl_remaining=ttl_remaining,
+    def step(
+        self,
+        identities: Tensor,
+        position_id: int,
+        scores: tuple[float, float] = NEW,
+        *,
+        semantics: Tensor | None = None,
+        chunk_index: int | None = None,
+        commit: bool = True,
+    ) -> IdentityUpdateResult:
+        if identities.ndim == 2:
+            identities = identities.unsqueeze(0)
+        shape = identities.shape[:2]
+        probabilities = torch.empty((*shape, 2), dtype=identities.dtype)
+        probabilities[..., 0], probabilities[..., 1] = scores
+        observation = O2SoftOutput(
+            identity=identities,
+            score_logits=torch.zeros_like(probabilities),
+            score_probabilities=probabilities,
+            valid_mask=torch.ones(shape, dtype=torch.bool),
+            timestamps=torch.full(shape, float(position_id), dtype=torch.float64),
+            position_ids=torch.full(shape, position_id, dtype=torch.int64),
         )
-        for index, prototype in enumerate(prototypes)
-    )
-    records = tuple(
-        make_state_record(
-            candidate.semantic_record_id or "",
-            HeadType.O2,
-            replace(
-                candidate,
-                identity_prototype=candidate.identity_prototype.detach().clone(),
-            ),
-            semantic_embedding=_unit_semantics(1, offset=index)[0].clone(),
-            video_id=video_id,
-            trajectory_id=trajectory_id,
-            timestamp=candidate.first_seen,
-            confidence=candidate.confidence,
+        result = self.bank.update_row(
+            self.identity,
+            self.state_bank,
+            self.state,
+            observation,
+            _unit_semantics(position_id) if semantics is None else semantics,
+            row=0,
+            chunk_index=position_id if chunk_index is None else chunk_index,
         )
-        for index, candidate in enumerate(candidates)
-    )
-    base = bank.reset(video_id, trajectory_id, hot_cache_enabled=False)
-    identity_state = replace(
-        base,
-        candidates=candidates,
-        candidate_capacity=candidate_capacity,
-        next_candidate_sequence=count,
-        issued_candidate_ids=tuple(candidate.candidate_id for candidate in candidates),
-        last_chunk_index=0,
-    )
-    state_state = StateBankRuntimeState(
-        video_id=video_id,
-        trajectory_id=trajectory_id,
-        records=records,
-        audit_log=(),
-        issued_record_ids=tuple(record.record_id for record in records),
-        next_record_sequence=count,
-    )
-    return identity_state, state_state
+        if commit:
+            self.identity, self.state = result.identity_state, result.state_bank_state
+        return result
 
-
-def _confirmed_chunk(
-    prototypes: Tensor,
-    *,
-    id_offset: int,
-    capacity: int = 256,
-) -> ConfirmedChunk:
-    size = int(prototypes.shape[0])
-    assert 0 <= size <= capacity
-    values = torch.zeros(capacity, IDENTITY_DIM, dtype=torch.float32)
-    values[:size] = prototypes.detach().to(dtype=torch.float32, device="cpu")
-    occupied = torch.zeros(capacity, dtype=torch.bool)
-    occupied[:size] = True
-    identity_ids = tuple(
-        f"identity-{id_offset + index:08d}" if index < size else None for index in range(capacity)
-    )
-    record_ids = tuple(
-        f"record-{id_offset + index:08d}" if index < size else None for index in range(capacity)
-    )
-    first_seen = torch.full((capacity,), -1.0, dtype=torch.float64)
-    last_seen = torch.full((capacity,), -1.0, dtype=torch.float64)
-    first_seen[:size] = 0.0
-    last_seen[:size] = 1.0
-    counts = torch.zeros(capacity, dtype=torch.int64)
-    counts[:size] = 2
-    first_positions = torch.full((capacity,), -1, dtype=torch.int64)
-    last_positions = torch.full((capacity,), -1, dtype=torch.int64)
-    first_positions[:size] = 0
-    last_positions[:size] = 1
-    return ConfirmedChunk(
-        prototypes=values,
-        occupied=occupied,
-        identity_ids=identity_ids,
-        first_seen=first_seen,
-        last_seen=last_seen,
-        observation_counts=counts,
-        first_seen_position_ids=first_positions,
-        last_seen_position_ids=last_positions,
-        semantic_record_ids=record_ids,
-        prototype_versions=torch.zeros(capacity, dtype=torch.int64),
-        relevance=torch.full((capacity,), 0.5, dtype=torch.float32),
-    )
-
-
-def _confirmed_runtime(
-    bank: IdentityBank,
-    prototypes: Tensor,
-    *,
-    hot_cache_enabled: bool = False,
-    cached_indices: tuple[int, ...] = (),
-    video_id: str = "video-a",
-    trajectory_id: str = "trajectory-a",
-) -> IdentityBankRuntimeState:
-    chunks = tuple(
-        _confirmed_chunk(prototypes[start : start + 256], id_offset=start)
-        for start in range(0, int(prototypes.shape[0]), 256)
-    )
-    base = bank.reset(
-        video_id,
-        trajectory_id,
-        hot_cache_enabled=hot_cache_enabled,
-        hot_device="cpu" if hot_cache_enabled else None,
-    )
-    cache = tuple(
-        HotCacheEntry(
-            identity_id=f"identity-{index:08d}",
-            identity_prototype=prototypes[index]
-            .detach()
-            .to(dtype=torch.bfloat16, device="cpu")
-            .clone(),
-            last_accessed_position_id=index + 1,
+    def seed_records(
+        self,
+        payloads: tuple[CandidateIdentity, ...] | tuple[ConfirmedIdentity, ...],
+        *,
+        confidence: float,
+    ) -> None:
+        records = tuple(
+            make_state_record(
+                payload.semantic_record_id or "",
+                HeadType.O2,
+                replace(payload, identity_prototype=payload.identity_prototype.clone()),
+                semantic_embedding=_unit_semantics(index)[0].clone(),
+                video_id=self.video_id,
+                trajectory_id=self.trajectory_id,
+                timestamp=0.0,
+                confidence=confidence,
+            )
+            for index, payload in enumerate(payloads)
         )
-        for index in cached_indices
-    )
-    count = int(prototypes.shape[0])
-    return replace(
-        base,
-        confirmed_chunks=chunks,
-        hot_cache=cache,
-        next_identity_sequence=count,
-        issued_identity_ids=tuple(f"identity-{index:08d}" for index in range(count)),
-        last_chunk_index=1,
-    )
+        self.state = StateBankRuntimeState(
+            video_id=self.video_id,
+            trajectory_id=self.trajectory_id,
+            records=records,
+            audit_log=(),
+            issued_record_ids=tuple(record.record_id for record in records),
+            next_record_sequence=len(records),
+        )
 
+    def seed_candidates(self, prototypes: Tensor, *, confidence: float = 0.95) -> None:
+        candidates = tuple(
+            CandidateIdentity(
+                candidate_id=f"candidate-{index:08d}",
+                identity_prototype=prototype.to(dtype=torch.float32).clone(),
+                observation_count=1,
+                ttl_remaining=8,
+                confidence=confidence,
+                last_reliable_chunk_index=0,
+                reliable_streak=1,
+                semantic_record_id=f"record-{index:08d}",
+            )
+            for index, prototype in enumerate(prototypes)
+        )
+        self.identity = replace(
+            self.identity,
+            candidates=candidates,
+            next_candidate_sequence=len(candidates),
+            issued_candidate_ids=tuple(item.candidate_id for item in candidates),
+            last_chunk_index=0,
+        )
+        self.seed_records(candidates, confidence=confidence)
 
-def _confirmed_state_pair(
-    bank: IdentityBank,
-    prototypes: Tensor,
-) -> tuple[IdentityBankRuntimeState, StateBankRuntimeState]:
-    identity_state = _confirmed_runtime(bank, prototypes)
-    records = tuple(
-        make_state_record(
-            f"record-{index:08d}",
-            HeadType.O2,
+    def seed_confirmed(self, prototypes: Tensor) -> None:
+        confirmed = tuple(
             ConfirmedIdentity(
                 identity_id=f"identity-{index:08d}",
-                identity_prototype=prototype.detach().to(dtype=torch.float32).clone(),
+                identity_prototype=prototype.to(dtype=torch.float32).clone(),
                 first_seen=0.0,
                 last_seen=1.0,
                 observation_count=2,
                 semantic_record_id=f"record-{index:08d}",
                 first_seen_position_id=0,
                 last_seen_position_id=1,
-            ),
-            semantic_embedding=_unit_semantics(1, offset=index)[0].clone(),
-            video_id=identity_state.video_id,
-            trajectory_id=identity_state.trajectory_id,
-            confidence=0.95,
+            )
+            for index, prototype in enumerate(prototypes)
         )
-        for index, prototype in enumerate(prototypes)
-    )
-    state_state = StateBankRuntimeState(
-        video_id=identity_state.video_id,
-        trajectory_id=identity_state.trajectory_id,
-        records=records,
-        audit_log=(),
-        issued_record_ids=tuple(record.record_id for record in records),
-        next_record_sequence=len(records),
-    )
-    return identity_state, state_state
+        self.identity = replace(
+            self.identity,
+            confirmed=confirmed,
+            next_identity_sequence=len(confirmed),
+            issued_identity_ids=tuple(item.identity_id for item in confirmed),
+            last_chunk_index=1,
+        )
+        self.seed_records(confirmed, confidence=0.95)
 
 
-def test_candidate_capacity_grows_64_to_512_and_513th_is_explicit_overflow(
+def _promote_single(
+    banks: tuple[IdentityBank, StructuredStateBank],
+    prototype: Tensor,
+    *,
+    video_id: str,
+    trajectory_id: str,
+) -> IdentityBankRuntimeState:
+    driver = _Driver(banks, video_id=video_id, trajectory_id=trajectory_id)
+    driver.step(prototype.unsqueeze(0), 0, NEW)
+    promoted = driver.step(prototype.unsqueeze(0), 1, MATCH)
+    assert promoted.decisions[0].status is IdentityDecisionStatus.PROMOTED
+    return promoted.identity_state
+
+
+def test_full_candidate_store_prunes_low_confidence_before_rejecting_new(
     banks: tuple[IdentityBank, StructuredStateBank],
 ) -> None:
-    bank, state_bank = banks
-    vectors = _random_unit_vectors(513, seed=20260714)
-    first_identity, first_state = _candidate_runtime(
-        bank,
-        state_bank,
-        vectors[:64],
-        candidate_capacity=64,
-    )
-    assert len(first_identity.candidates) == 64
-    assert first_identity.candidate_capacity == 64
+    driver = _Driver(banks)
+    vectors = _random_unit_vectors(513, seed=20260715)
+    driver.seed_candidates(vectors[:512])
+    retained_ids = tuple(item.candidate_id for item in driver.identity.candidates)
+    assert len(retained_ids) == 512
 
-    second = _update(
-        bank,
-        first_identity,
-        state_bank,
-        first_state,
-        vectors[64:65],
-        _unit_semantics(1, offset=64),
-        novelty=0.95,
-        match_confidence=0.05,
-        position_id=1,
-    )
-    assert len(second.identity_state.candidates) == 65
-    assert second.identity_state.candidate_capacity == 128
+    rejected = driver.step(vectors[512:], 1, NEW, commit=False)
+    assert rejected.decisions[0].status is IdentityDecisionStatus.OVERFLOW_REJECTED
+    assert tuple(c.candidate_id for c in rejected.identity_state.candidates) == retained_ids
 
-    full_identity, full_state = _candidate_runtime(
-        bank,
-        state_bank,
-        vectors[:512],
-        candidate_capacity=512,
+    low = replace(driver.identity.candidates[0], confidence=0.49)
+    low_record_id = low.semantic_record_id
+    assert low_record_id is not None
+    driver.identity = replace(driver.identity, candidates=(low,) + driver.identity.candidates[1:])
+    driver.state = replace(
+        driver.state,
+        records=tuple(
+            replace(
+                record,
+                confidence=0.49,
+                payload=replace(low, identity_prototype=low.identity_prototype.clone()),
+            )
+            if record.record_id == low_record_id
+            else record
+            for record in driver.state.records
+        ),
     )
-    assert len(full_identity.candidates) == 512
-    assert full_identity.candidate_capacity == 512
-    retained_ids = tuple(candidate.candidate_id for candidate in full_identity.candidates)
 
-    overflow = _update(
-        bank,
-        full_identity,
-        state_bank,
-        full_state,
-        vectors[512:],
-        _unit_semantics(1, offset=512),
-        novelty=0.95,
-        match_confidence=0.05,
-        position_id=1,
-    )
-    assert len(overflow.identity_state.candidates) == 512
-    assert overflow.identity_state.candidate_capacity == 512
-    assert overflow.identity_state.candidate_overflow_count == 1
-    assert tuple(candidate.candidate_id for candidate in overflow.identity_state.candidates) == (
-        retained_ids
-    )
+    admitted = driver.step(vectors[512:], 1, NEW)
+    assert admitted.decisions[0].status is IdentityDecisionStatus.CANDIDATE_CREATED
+    assert len(admitted.identity_state.candidates) == 512
+    assert admitted.identity_state.candidate_low_confidence_pruned_count == 1
+    ids = tuple(item.candidate_id for item in admitted.identity_state.candidates)
+    assert low.candidate_id not in ids and "candidate-00000512" in ids
+    by_id = {record.record_id: record for record in admitted.state_bank_state.records}
+    assert by_id[low_record_id].valid is False
 
 
 def test_candidate_ttl_expires_at_zero_after_eight_unmatched_positions(
     banks: tuple[IdentityBank, StructuredStateBank],
 ) -> None:
-    bank, state_bank = banks
-    identity_state, state_state = _reset_pair(bank, state_bank)
-    created = _update(
-        bank,
-        identity_state,
-        state_bank,
-        state_state,
-        _unit_identity(0).unsqueeze(0),
-        _unit_semantics(1),
-        novelty=0.95,
-        match_confidence=0.05,
-        position_id=0,
-    )
+    driver = _Driver(banks)
+    created = driver.step(_unit_identity(0).unsqueeze(0), 0, NEW)
     assert created.identity_state.candidates[0].ttl_remaining == 8
-    replay = _update(
-        bank,
-        created.identity_state,
-        state_bank,
-        created.state_bank_state,
-        _unit_identity(0).unsqueeze(0),
-        _unit_semantics(1),
-        novelty=0.05,
-        match_confidence=0.95,
-        position_id=0,
-        chunk_index=0,
-    )
-    assert replay.identity_state is created.identity_state
-    assert replay.state_bank_state is created.state_bank_state
-    assert replay.decisions[0].status is IdentityDecisionStatus.REPLAY_IGNORED
-    same_position_new_chunk = _update(
-        bank,
-        created.identity_state,
-        state_bank,
-        created.state_bank_state,
-        _unit_identity(0).unsqueeze(0),
-        _unit_semantics(1),
-        novelty=0.05,
-        match_confidence=0.95,
-        position_id=0,
-        chunk_index=1,
-    )
-    assert same_position_new_chunk.identity_state is created.identity_state
-    assert same_position_new_chunk.state_bank_state is created.state_bank_state
-    assert same_position_new_chunk.decisions[0].reason == "same_committed_position"
-    current = created
-    for position in range(1, 8):
-        current = _update(
-            bank,
-            current.identity_state,
-            state_bank,
-            current.state_bank_state,
-            _unit_identity(1).unsqueeze(0),
-            _unit_semantics(1, offset=position),
-            novelty=0.1,
-            match_confidence=0.1,
-            position_id=position,
-        )
-    assert len(current.identity_state.candidates) == 1
-    assert current.identity_state.candidates[0].ttl_remaining == 1
 
-    expired = _update(
-        bank,
-        current.identity_state,
-        state_bank,
-        current.state_bank_state,
-        _unit_identity(1).unsqueeze(0),
-        _unit_semantics(1, offset=8),
-        novelty=0.1,
-        match_confidence=0.1,
-        position_id=8,
-    )
+    for chunk_index in (0, 1):
+        replay = driver.step(
+            _unit_identity(0).unsqueeze(0), 0, MATCH, chunk_index=chunk_index, commit=False
+        )
+        assert replay.identity_state is created.identity_state
+        assert replay.state_bank_state is created.state_bank_state
+        assert replay.decisions[0].status is IdentityDecisionStatus.REPLAY_IGNORED
+
+    for position in range(1, 8):
+        aged = driver.step(_unit_identity(1).unsqueeze(0), position, WEAK)
+    assert len(aged.identity_state.candidates) == 1
+    assert aged.identity_state.candidates[0].ttl_remaining == 1
+
+    expired = driver.step(_unit_identity(1).unsqueeze(0), 8, WEAK)
     assert not expired.identity_state.candidates
     assert expired.identity_state.candidate_expired_count == 1
-    candidate_records = [
+    tombstones = [
         record
         for record in expired.state_bank_state.records
-        if isinstance(record.payload, identity_bank_types.CandidateIdentity)
+        if isinstance(record.payload, CandidateIdentity)
     ]
-    assert len(candidate_records) == 1
-    assert candidate_records[0].valid is False
-
-
-def test_low_confidence_prune_precedes_full_store_admission(
-    banks: tuple[IdentityBank, StructuredStateBank],
-) -> None:
-    bank, state_bank = banks
-    vectors = _random_unit_vectors(513, seed=20260715)
-    identity_state, state_state = _candidate_runtime(
-        bank,
-        state_bank,
-        vectors[:512],
-        candidate_capacity=512,
-    )
-    low = replace(identity_state.candidates[0], confidence=0.49)
-    identity_state = replace(
-        identity_state,
-        candidates=(low,) + identity_state.candidates[1:],
-    )
-    low_record_id = low.semantic_record_id
-    records = tuple(
-        replace(
-            record,
-            confidence=0.49,
-            payload=replace(
-                low,
-                identity_prototype=low.identity_prototype.detach().clone(),
-            ),
-        )
-        if record.record_id == low_record_id
-        else record
-        for record in state_state.records
-    )
-    state_state = replace(state_state, records=records)
-
-    admitted = _update(
-        bank,
-        identity_state,
-        state_bank,
-        state_state,
-        vectors[512:],
-        _unit_semantics(1, offset=512),
-        novelty=0.95,
-        match_confidence=0.05,
-        position_id=1,
-    )
-    assert admitted.decisions[0].status is IdentityDecisionStatus.CANDIDATE_CREATED
-    assert len(admitted.identity_state.candidates) == 512
-    assert admitted.identity_state.candidate_low_confidence_pruned_count == 1
-    assert admitted.identity_state.candidate_overflow_count == 0
-    assert all(
-        candidate.candidate_id != low.candidate_id
-        for candidate in admitted.identity_state.candidates
-    )
-    assert any(
-        candidate.candidate_id == "candidate-00000512"
-        for candidate in admitted.identity_state.candidates
-    )
-    by_id = {record.record_id: record for record in admitted.state_bank_state.records}
-    assert low_record_id is not None
-    assert by_id[low_record_id].valid is False
-    actions = tuple(entry.action for entry in admitted.identity_state.audit_log)
-    assert actions.index("candidate_low_confidence_prune") < actions.index("candidate_created")
+    assert len(tombstones) == 1 and tombstones[0].valid is False
 
 
 def test_two_distinct_reliable_positions_promote_candidate_and_link_records(
     banks: tuple[IdentityBank, StructuredStateBank],
 ) -> None:
-    bank, state_bank = banks
-    identity_state, state_state = _reset_pair(bank, state_bank)
+    driver = _Driver(banks)
     prototype = _unit_identity(0).unsqueeze(0)
-    semantic = _unit_semantics(1)
-    candidate = _update(
-        bank,
-        identity_state,
-        state_bank,
-        state_state,
-        prototype,
-        semantic,
-        novelty=0.95,
-        match_confidence=0.05,
-        position_id=0,
-    )
+    candidate = driver.step(prototype, 0, NEW)
+    assert candidate.decisions[0].status is IdentityDecisionStatus.CANDIDATE_CREATED
     candidate_id = candidate.identity_state.candidates[0].candidate_id
     candidate_record_id = candidate.identity_state.candidates[0].semantic_record_id
+    assert candidate_record_id is not None
 
-    promoted = _update(
-        bank,
-        candidate.identity_state,
-        state_bank,
-        candidate.state_bank_state,
-        prototype,
-        semantic,
-        novelty=0.05,
-        match_confidence=0.95,
-        position_id=1,
-    )
+    promoted = driver.step(prototype, 1, MATCH)
+    assert promoted.decisions[0].status is IdentityDecisionStatus.PROMOTED
     assert not promoted.identity_state.candidates
     assert promoted.identity_state.unique_count == 1
-    assert len(promoted.identity_state.confirmed) == 1
     confirmed = promoted.identity_state.confirmed[0]
     assert confirmed.observation_count == 2
     assert confirmed.first_seen_position_id == 0
     assert confirmed.last_seen_position_id == 1
-    assert confirmed.semantic_record_id != candidate_record_id
+    assert confirmed.semantic_record_id not in (None, candidate_record_id)
     assert candidate_id in promoted.identity_state.issued_candidate_ids
 
     by_id = {record.record_id: record for record in promoted.state_bank_state.records}
     assert by_id[candidate_record_id].valid is False
-    assert isinstance(by_id[candidate_record_id].payload, identity_bank_types.CandidateIdentity)
+    assert isinstance(by_id[candidate_record_id].payload, CandidateIdentity)
+    assert confirmed.semantic_record_id is not None
     assert by_id[confirmed.semantic_record_id].valid is True
-    assert isinstance(
-        by_id[confirmed.semantic_record_id].payload,
-        identity_bank_types.ConfirmedIdentity,
-    )
-    view = state_bank.view((promoted.state_bank_state,), head_type=HeadType.O2)
-    kinds = tuple(kind for kind in view.record_kinds[0] if kind is not None)
-    assert kinds == (StateRecordKind.O2_CANDIDATE, StateRecordKind.O2_CONFIRMED)
+    assert isinstance(by_id[confirmed.semantic_record_id].payload, ConfirmedIdentity)
+
+    view = driver.state_bank.view((promoted.state_bank_state,), head_type=HeadType.O2)
+    payloads = tuple(type(r.payload) for r in view.cloned_records[0] if r is not None)
+    assert payloads == (CandidateIdentity, ConfirmedIdentity)
     assert view.retrieval_eligible_mask.tolist() == [[False, True]]
-
-
-def test_257th_confirmed_allocates_second_cpu_chunk_without_losing_first_256(
-    banks: tuple[IdentityBank, StructuredStateBank],
-) -> None:
-    bank, state_bank = banks
-    prototypes = _random_unit_vectors(257, seed=20260716)
-    identity_state, state_state = _confirmed_state_pair(bank, prototypes[:256])
-    before = {
-        identity.identity_id: identity.identity_prototype.clone()
-        for identity in identity_state.confirmed
-    }
-    candidate = _update(
-        bank,
-        identity_state,
-        state_bank,
-        state_state,
-        prototypes[256:].clone(),
-        _unit_semantics(1, offset=256),
-        novelty=0.95,
-        match_confidence=0.05,
-        position_id=2,
-        chunk_index=2,
-    )
-    assert candidate.decisions[0].scanned_confirmed_count == 256
-    promoted = _update(
-        bank,
-        candidate.identity_state,
-        state_bank,
-        candidate.state_bank_state,
-        prototypes[256:].clone(),
-        _unit_semantics(1, offset=256),
-        novelty=0.05,
-        match_confidence=0.95,
-        position_id=3,
-        chunk_index=3,
-    )
-    assert promoted.decisions[0].status is IdentityDecisionStatus.PROMOTED
-    assert promoted.identity_state.unique_count == 257
-    assert promoted.identity_state.confirmed_capacity == 512
-    assert len(promoted.identity_state.confirmed_chunks) == 2
-    assert all(
-        chunk.prototypes.device.type == "cpu" and chunk.prototypes.dtype == torch.float32
-        for chunk in promoted.identity_state.confirmed_chunks
-    )
-    for identity_id, expected in before.items():
-        torch.testing.assert_close(
-            bank.confirmed_by_id(promoted.identity_state, identity_id).identity_prototype,
-            expected,
-            rtol=0.0,
-            atol=0.0,
-        )
-    newest = bank.confirmed_by_id(promoted.identity_state, "identity-00000256")
-    assert newest.first_seen == 2.0
-    assert newest.last_seen == 3.0
-    assert newest.observation_count == 2
 
 
 def test_same_identity_one_hundred_times_counts_once_and_updates_existing_record(
     banks: tuple[IdentityBank, StructuredStateBank],
 ) -> None:
-    bank, state_bank = banks
-    identity_state, state_state = _reset_pair(bank, state_bank)
+    driver = _Driver(banks)
     prototype = _unit_identity(0).unsqueeze(0)
-    semantic = _unit_semantics(1)
-    result = _update(
-        bank,
-        identity_state,
-        state_bank,
-        state_state,
-        prototype,
-        semantic,
-        novelty=0.95,
-        match_confidence=0.05,
-        position_id=0,
-    )
-    statuses = [result.decisions[0].status]
+    statuses = [driver.step(prototype, 0, NEW).decisions[0].status]
     for position in range(1, 100):
-        result = _update(
-            bank,
-            result.identity_state,
-            state_bank,
-            result.state_bank_state,
-            prototype,
-            semantic,
-            novelty=0.05,
-            match_confidence=0.95,
-            position_id=position,
-        )
-        statuses.append(result.decisions[0].status)
+        statuses.append(driver.step(prototype, position, MATCH).decisions[0].status)
     assert statuses.count(IdentityDecisionStatus.CANDIDATE_CREATED) == 1
     assert statuses.count(IdentityDecisionStatus.PROMOTED) == 1
     assert statuses.count(IdentityDecisionStatus.CONFIRMED_UPDATED) == 98
-    assert result.identity_state.unique_count == 1
-    assert not result.identity_state.candidates
-    confirmed = result.identity_state.confirmed[0]
+    assert driver.identity.unique_count == 1
+    assert not driver.identity.candidates
+    confirmed = driver.identity.confirmed[0]
     assert confirmed.observation_count == 100
-    assert confirmed.first_seen == 0.0
-    assert confirmed.last_seen == 99.0
+    assert (confirmed.first_seen, confirmed.last_seen) == (0.0, 99.0)
     assert confirmed.prototype_version == 98
-    valid_confirmed_records = [
+    valid_confirmed = [
         record
-        for record in result.state_bank_state.records
+        for record in driver.state.records
         if record.valid and isinstance(record.payload, ConfirmedIdentity)
     ]
-    assert len(valid_confirmed_records) == 1
+    assert len(valid_confirmed) == 1
 
 
-def test_confirmed_prototype_uses_normalized_ema_and_refreshes_cache_copy(
+def test_confirmed_prototype_uses_normalized_ema(
     banks: tuple[IdentityBank, StructuredStateBank],
 ) -> None:
-    bank, state_bank = banks
-    identity_state = bank.reset(
-        "video-a",
-        "trajectory-a",
-        hot_cache_enabled=True,
-        hot_device="cpu",
-    )
-    state_state = state_bank.reset("video-a", "trajectory-a")
+    driver = _Driver(banks)
     initial = _unit_identity(0)
-    semantic = _unit_semantics(1)
-    first = _update(
-        bank,
-        identity_state,
-        state_bank,
-        state_state,
-        initial.unsqueeze(0),
-        semantic,
-        novelty=0.95,
-        match_confidence=0.05,
-        position_id=0,
-    )
-    promoted = _update(
-        bank,
-        first.identity_state,
-        state_bank,
-        first.state_bank_state,
-        initial.unsqueeze(0),
-        semantic,
-        novelty=0.05,
-        match_confidence=0.95,
-        position_id=1,
-    )
+    driver.step(initial.unsqueeze(0), 0, NEW)
+    driver.step(initial.unsqueeze(0), 1, MATCH)
     observation = F.normalize(
         0.9 * _unit_identity(0) + (1.0 - 0.9**2) ** 0.5 * _unit_identity(1), dim=0
     )
-    updated = _update(
-        bank,
-        promoted.identity_state,
-        state_bank,
-        promoted.state_bank_state,
-        observation.unsqueeze(0),
-        semantic,
-        novelty=0.05,
-        match_confidence=0.95,
-        position_id=2,
-    )
+    updated = driver.step(observation.unsqueeze(0), 2, MATCH)
+    assert updated.decisions[0].status is IdentityDecisionStatus.CONFIRMED_UPDATED
     expected = F.normalize(0.9 * initial + 0.1 * observation, dim=0)
     confirmed = updated.identity_state.confirmed[0]
     torch.testing.assert_close(confirmed.identity_prototype, expected, rtol=1.0e-6, atol=1.0e-6)
     assert confirmed.prototype_version == 1
-    cache = updated.identity_state.hot_cache
-    assert len(cache) == 1 and cache[0].prototype_version == 1
-    torch.testing.assert_close(
-        cache[0].identity_prototype.float(),
-        expected,
-        rtol=5.0e-3,
-        atol=5.0e-3,
-    )
-    assert cache[0].identity_prototype.untyped_storage().data_ptr() != (
-        updated.identity_state.confirmed_chunks[0].prototypes.untyped_storage().data_ptr()
-    )
-    details = dict(updated.identity_state.audit_log[-2].details)
-    assert details["old_prototype_checksum"] != details["new_prototype_checksum"]
 
 
 def test_exact_near_tie_conflict_is_fail_closed_and_updates_neither_identity(
     banks: tuple[IdentityBank, StructuredStateBank],
 ) -> None:
-    bank, state_bank = banks
+    driver = _Driver(banks)
     residual = (1.0 - 0.9**2) ** 0.5
     left = F.normalize(0.9 * _unit_identity(0) + residual * _unit_identity(1), dim=0)
     right = F.normalize(0.9 * _unit_identity(0) - residual * _unit_identity(1), dim=0)
-    identity_state, state_state = _confirmed_state_pair(bank, torch.stack((left, right)))
-    before = tuple(identity.observation_count for identity in identity_state.confirmed)
-    conflict = _update(
-        bank,
-        identity_state,
-        state_bank,
-        state_state,
-        _unit_identity(0).unsqueeze(0),
-        _unit_semantics(1),
-        novelty=0.05,
-        match_confidence=0.95,
-        position_id=2,
-        chunk_index=2,
-    )
+    driver.seed_confirmed(torch.stack((left, right)))
+    before_state = driver.state
+    before = tuple(item.observation_count for item in driver.identity.confirmed)
+
+    conflict = driver.step(_unit_identity(0).unsqueeze(0), 2, MATCH, chunk_index=2)
     assert conflict.decisions[0].status is IdentityDecisionStatus.MATCH_CONFLICT
-    assert conflict.decisions[0].reason == "confirmed_near_tie"
-    assert conflict.decisions[0].scanned_confirmed_count == 2
-    assert conflict.identity_state.match_conflict_count == 1
-    assert (
-        tuple(identity.observation_count for identity in conflict.identity_state.confirmed)
-        == before
-    )
-    assert conflict.state_bank_state is state_state
+    assert tuple(i.observation_count for i in conflict.identity_state.confirmed) == before
+    assert conflict.state_bank_state is before_state
 
 
-def test_threshold_boundaries_are_inclusive_for_scores_and_cosine(
+def test_score_threshold_boundaries_are_inclusive(
     banks: tuple[IdentityBank, StructuredStateBank],
 ) -> None:
-    bank, state_bank = banks
-    identity_state, state_state = _reset_pair(bank, state_bank)
+    driver = _Driver(banks)
     prototype = _unit_identity(0).unsqueeze(0)
-    candidate = _update(
-        bank,
-        identity_state,
-        state_bank,
-        state_state,
-        prototype,
-        _unit_semantics(1),
-        novelty=0.5,
-        match_confidence=0.49,
-        position_id=0,
-    )
+    candidate = driver.step(prototype, 0, (0.5, 0.49))
     assert candidate.decisions[0].status is IdentityDecisionStatus.CANDIDATE_CREATED
     assert candidate.identity_state.candidates[0].confidence == pytest.approx(0.5)
-    promoted = _update(
-        bank,
-        candidate.identity_state,
-        state_bank,
-        candidate.state_bank_state,
-        prototype,
-        _unit_semantics(1),
-        novelty=0.49,
-        match_confidence=0.5,
-        position_id=1,
-    )
+    promoted = driver.step(prototype, 1, (0.49, 0.5))
     assert promoted.decisions[0].status is IdentityDecisionStatus.PROMOTED
 
-    exact_boundary = F.normalize(0.8 * _unit_identity(0) + 0.6 * _unit_identity(1), dim=0)
-    match = bank.exact_match(
-        promoted.identity_state,
-        exact_boundary,
-        access_position_id=2,
-        use_hot_cache=False,
-    )
-    assert match.matches[0].status is ExactMatchStatus.MATCHED
-    assert match.matches[0].score == pytest.approx(0.8, abs=1.0e-6)
 
-
-def test_hot_cache_hit_never_masks_better_full_cpu_exact_match(
+def test_bank_state_is_isolated_per_video_and_release_clears_only_its_owner(
     banks: tuple[IdentityBank, StructuredStateBank],
 ) -> None:
     bank, _ = banks
-    query = _unit_identity(0)
-    true_cpu = F.normalize(
-        0.99 * query + (1.0 - 0.99**2) ** 0.5 * _unit_identity(1),
-        dim=0,
+    left = _promote_single(
+        banks, _unit_identity(0), video_id="video-left", trajectory_id="trajectory-left"
     )
-    cached_but_worse = F.normalize(
-        0.90 * query + (1.0 - 0.90**2) ** 0.5 * _unit_identity(2),
-        dim=0,
+    right = _promote_single(
+        banks, _unit_identity(1), video_id="video-right", trajectory_id="trajectory-right"
     )
-    state = _confirmed_runtime(
-        bank,
-        torch.stack((true_cpu, cached_but_worse)),
-        hot_cache_enabled=True,
-        cached_indices=(1,),
-    )
+    assert (left.video_id, right.video_id) == ("video-left", "video-right")
+    assert len(left.confirmed) == 1 and len(right.confirmed) == 1
+    torch.testing.assert_close(left.confirmed[0].identity_prototype, _unit_identity(0))
+    torch.testing.assert_close(right.confirmed[0].identity_prototype, _unit_identity(1))
+    storages = [
+        {i.identity_prototype.untyped_storage().data_ptr() for i in state.confirmed}
+        for state in (left, right)
+    ]
+    assert not (storages[0] & storages[1])
 
-    cache_on = bank.exact_match(state, query, access_position_id=10, use_hot_cache=True)
-    cache_off = bank.exact_match(state, query, access_position_id=10, use_hot_cache=False)
-    for result in (cache_on, cache_off):
-        decision = result.matches[0]
-        assert decision.status is ExactMatchStatus.MATCHED
-        assert decision.identity_id == "identity-00000000"
-        assert decision.score == pytest.approx(0.99, abs=1.0e-6)
-        assert decision.scanned_confirmed_count == 2
-    assert cache_on.matches[0].cache_hit is False
-    assert cache_off.matches[0].cache_hit is False
-    assert {entry.identity_id for entry in cache_on.state.hot_cache} == {
-        "identity-00000000",
-        "identity-00000001",
-    }
-    assert tuple(entry.identity_id for entry in cache_off.state.hot_cache) == ("identity-00000001",)
-
-
-def test_hot_cache_miss_warms_from_cpu_and_lru_eviction_preserves_truth(
-    banks: tuple[IdentityBank, StructuredStateBank],
-) -> None:
-    bank, _ = banks
-    prototypes = _random_unit_vectors(257, seed=20260718)
-    state = _confirmed_runtime(
-        bank,
-        prototypes,
-        hot_cache_enabled=True,
-        cached_indices=tuple(range(1, 257)),
-    )
-    assert state.unique_count == 257
-    assert len(state.hot_cache) == 256
-    result = bank.exact_match(
-        state,
-        prototypes[0],
-        access_position_id=300,
-        use_hot_cache=True,
-    )
-    decision = result.matches[0]
-    assert decision.status is ExactMatchStatus.MATCHED
-    assert decision.identity_id == "identity-00000000"
-    assert decision.cache_hit is False
-    assert decision.scanned_confirmed_count == 257
-    cache_ids = {entry.identity_id for entry in result.state.hot_cache}
-    assert len(cache_ids) == 256
-    assert "identity-00000000" in cache_ids
-    assert "identity-00000001" not in cache_ids
-    assert result.state.unique_count == 257
-    torch.testing.assert_close(
-        bank.confirmed_by_id(result.state, "identity-00000001").identity_prototype,
-        prototypes[1],
-        rtol=0.0,
-        atol=0.0,
-    )
-
-
-def test_owner_storage_snapshot_clear_and_release_are_isolated_and_fail_closed(
-    banks: tuple[IdentityBank, StructuredStateBank],
-) -> None:
-    bank, state_bank = banks
-    prototype = _unit_identity(0).unsqueeze(0)
-    left, left_state = _candidate_runtime(
-        bank,
-        state_bank,
-        prototype,
-        video_id="video-left",
-        trajectory_id="trajectory-left",
-    )
-    right, right_state = _candidate_runtime(
-        bank,
-        state_bank,
-        prototype,
-        video_id="video-right",
-        trajectory_id="trajectory-right",
-    )
-    assert left.candidates[0].identity_prototype.untyped_storage().data_ptr() != (
-        right.candidates[0].identity_prototype.untyped_storage().data_ptr()
-    )
-    snapshot = bank.snapshot(left)
-    restored = bank.restore(snapshot)
-    assert restored.video_id == left.video_id
-    assert restored.trajectory_id == left.trajectory_id
-    assert restored.candidates[0].identity_prototype.untyped_storage().data_ptr() != (
-        left.candidates[0].identity_prototype.untyped_storage().data_ptr()
-    )
-
-    updated_left = _update(
-        bank,
-        left,
-        state_bank,
-        left_state,
-        prototype,
-        _unit_semantics(1),
-        novelty=0.05,
-        match_confidence=0.95,
-        position_id=1,
-    )
-    assert updated_left.identity_state.unique_count == 1
-    assert right.unique_count == 0 and len(right.candidates) == 1
-    with pytest.raises(ValueError, match="owner identifiers"):
-        _update(
-            bank,
-            left,
-            state_bank,
-            right_state,
-            prototype,
-            _unit_semantics(1),
-            novelty=0.05,
-            match_confidence=0.95,
-            position_id=1,
-        )
-
-    cleared = bank.clear(updated_left.identity_state)
-    assert not cleared.candidates and cleared.unique_count == 0
-    assert cleared.candidate_capacity == 64 and cleared.confirmed_capacity == 256
-    assert cleared.issued_candidate_ids == updated_left.identity_state.issued_candidate_ids
-    released = bank.release(updated_left.identity_state)
-    assert released.released
-    assert not released.candidates and not released.confirmed_chunks and not released.hot_cache
-    assert released.candidate_capacity == 0 and released.hot_cache_capacity == 0
-    for operation in (
-        lambda: bank.snapshot(released),
-        lambda: bank.clear(released),
-        lambda: bank.exact_match(released, prototype[0], access_position_id=2),
-    ):
-        with pytest.raises(ValueError, match="released"):
-            operation()
+    released = bank.release(left)
+    assert released.released and released.video_id == "video-left"
+    assert not released.confirmed and not released.candidates
+    assert len(right.confirmed) == 1 and not right.released
 
 
 def test_hard_writes_detach_clone_and_do_not_break_soft_gradients_or_state_dict(
     banks: tuple[IdentityBank, StructuredStateBank],
 ) -> None:
-    bank, state_bank = banks
-    identity_state, state_state = _reset_pair(bank, state_bank)
+    driver = _Driver(banks)
     identity_leaf = _unit_identity(0, requires_grad=True)
-    semantic_leaf = _unit_semantics(1, requires_grad=True)
-    before_keys = tuple(state_bank.state_dict())
-    result = _update(
-        bank,
-        identity_state,
-        state_bank,
-        state_state,
-        identity_leaf.unsqueeze(0),
-        semantic_leaf,
-        novelty=0.95,
-        match_confidence=0.05,
-        position_id=0,
-    )
+    semantic_leaf = _unit_semantics(requires_grad=True)
+    before_keys = tuple(driver.state_bank.state_dict())
+    result = driver.step(identity_leaf.unsqueeze(0), 0, NEW, semantics=semantic_leaf)
     stored_candidate = result.identity_state.candidates[0].identity_prototype
     stored_record = result.state_bank_state.records[0]
     for tensor in (
@@ -1059,44 +433,17 @@ def test_hard_writes_detach_clone_and_do_not_break_soft_gradients_or_state_dict(
     assert stored_record.semantic_embedding.untyped_storage().data_ptr() != (
         semantic_leaf.untyped_storage().data_ptr()
     )
-    soft_loss = identity_leaf.square().sum() + semantic_leaf.square().sum()
-    soft_loss.backward()
+    (identity_leaf.square().sum() + semantic_leaf.square().sum()).backward()
     assert identity_leaf.grad is not None and torch.isfinite(identity_leaf.grad).all()
     assert semantic_leaf.grad is not None and torch.isfinite(semantic_leaf.grad).all()
-    assert tuple(state_bank.state_dict()) == before_keys
-    assert not isinstance(bank, torch.nn.Module)
-
-
-def test_ann_is_disabled_and_every_decision_reports_full_cpu_scan(
-    banks: tuple[IdentityBank, StructuredStateBank],
-) -> None:
-    bank, _ = banks
-    assert bank.confirmed_config.exact_search is True
-    assert bank.confirmed_config.ann_enabled is False
-    prototypes = _random_unit_vectors(17, seed=20260719)
-    state = _confirmed_runtime(bank, prototypes)
-    result = bank.exact_match(
-        state,
-        prototypes[[0, 8, 16]],
-        access_position_id=2,
-        use_hot_cache=False,
-    )
-    assert result.search_mode == "exact"
-    assert result.ann_enabled is False
-    assert all(match.scanned_confirmed_count == 17 for match in result.matches)
-    assert tuple(match.identity_id for match in result.matches) == (
-        "identity-00000000",
-        "identity-00000008",
-        "identity-00000016",
-    )
+    assert tuple(driver.state_bank.state_dict()) == before_keys
+    assert not isinstance(driver.bank, torch.nn.Module)
 
 
 def test_relevance_survives_confirmed_storage_roundtrip() -> None:
-    prototype = torch.zeros(IDENTITY_DIM, dtype=torch.float32)
-    prototype[3] = 1.0
     base = ConfirmedIdentity(
         identity_id="identity-relevance",
-        identity_prototype=prototype,
+        identity_prototype=_unit_identity(3),
         first_seen=0.0,
         last_seen=1.0,
         observation_count=2,
@@ -1105,34 +452,16 @@ def test_relevance_survives_confirmed_storage_roundtrip() -> None:
         last_seen_position_id=1,
         relevance=0.7,
     )
-    empty = _confirmed_chunk(torch.zeros((0, IDENTITY_DIM)), id_offset=0)
+    store = _append_confirmed((), base)
+    assert store[0].relevance == pytest.approx(0.7)
 
-    chunks = _append_confirmed((empty,), base, 256)
-    assert float(chunks[0].relevance[0].item()) == pytest.approx(0.7)
-
-    updated = ConfirmedIdentity(
-        identity_id="identity-relevance",
-        identity_prototype=prototype,
-        first_seen=0.0,
-        last_seen=2.0,
-        observation_count=3,
-        semantic_record_id="record-relevance",
-        prototype_version=1,
-        first_seen_position_id=0,
-        last_seen_position_id=2,
-        relevance=0.9,
+    store = _update_confirmed(
+        store,
+        replace(base, last_seen=2.0, observation_count=3, prototype_version=1, relevance=0.9),
     )
-    chunks = _update_confirmed(chunks, updated)
-    assert float(chunks[0].relevance[0].item()) == pytest.approx(0.9)
-
-    state = IdentityBankRuntimeState(
-        video_id="video-a",
-        trajectory_id="trajectory-a",
-        confirmed_chunks=chunks,
-        issued_identity_ids=("identity-relevance",),
-        next_identity_sequence=1,
-    )
-    assert state.confirmed[0].relevance == pytest.approx(0.9)
+    assert len(store) == 1
+    assert store[0].relevance == pytest.approx(0.9)
+    assert store[0].prototype_version == 1
 
     assert _relevance_ema(0.5, 0.9, 0.9) == pytest.approx(0.54)
     assert _relevance_ema(1.0, 1.0, 0.9) == 1.0

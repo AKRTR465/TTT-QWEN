@@ -9,10 +9,8 @@ representable at this boundary.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import os
-import time
 import weakref
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -52,7 +50,6 @@ from ttt_svcbench_qwen.input_composer import (
 )
 from ttt_svcbench_qwen.losses import (
     AnswerLossInput,
-    ReaderCountMetricInput,
     compute_answer_loss,
 )
 from ttt_svcbench_qwen.meta_trainer import (
@@ -110,7 +107,6 @@ from ttt_svcbench_qwen.query_encoder import (
 )
 from ttt_svcbench_qwen.query_tokens import QuestionTokenBatch, tokenize_questions
 from ttt_svcbench_qwen.qwen_adapter import (
-    CurrentChunkVisualTokenAudit,
     MergedVideoMetadata,
     PreparedVideoFeatures,
     PreparedVisualChunk,
@@ -118,12 +114,10 @@ from ttt_svcbench_qwen.qwen_adapter import (
     QwenVisualOutput,
     RawVisualChunk,
     StateEmbeddingPayload,
-    audit_current_chunk_visual_tokens,
 )
 from ttt_svcbench_qwen.runtime_metrics import (
     configure_runtime_metrics,
     trace_cuda_phase,
-    trace_event,
 )
 from ttt_svcbench_qwen.stage_a_runtime import StageABankWriter
 from ttt_svcbench_qwen.stage_a_targets import (
@@ -169,24 +163,6 @@ _ANSWER_INSTRUCTION = (
 )
 
 
-def _loader_trace(event: str, **fields: object) -> None:
-    """Emit one buffered rank/worker-local timing event."""
-
-    trace_event(event, **fields)
-
-
-def _a2_record_id_from_chunk(chunk_id: str) -> str | None:
-    marker = ":a2:"
-    return chunk_id.rsplit(marker, 1)[0] if marker in chunk_id else None
-
-
-def _cache_stats(owner: object) -> dict[str, object]:
-    cache = getattr(owner, "preprocess_cache", None)
-    if isinstance(cache, PreprocessCache):
-        return cache.stats()
-    return {}
-
-
 @dataclass(frozen=True, slots=True)
 class SupportChunkSpec:
     """A lightweight, label-free description of exactly one bounded Support chunk."""
@@ -199,19 +175,6 @@ class SupportChunkSpec:
     query_time: float
     reset_soft_state: bool = False
 
-    def __post_init__(self) -> None:
-        if not self.chunk_id or not self.video_path.is_file():
-            raise FileNotFoundError(f"Support chunk video does not exist: {self.video_path}")
-        if (
-            not math.isfinite(self.start_time)
-            or not math.isfinite(self.end_time)
-            or self.start_time < 0.0
-            or self.end_time <= self.start_time
-            or self.end_time > self.query_time + 1.0e-6
-        ):
-            raise ValueError("Support chunk must satisfy 0 <= start < end <= query_time")
-        if self.maximum_frames < 2 or self.maximum_frames > 16:
-            raise ValueError("production Support chunks permit 2..16 frames")
     @property
     def observation_role(self) -> str:
         return "support"
@@ -241,29 +204,6 @@ class QueryObservationSpec:
     decode_max_groups: int = 16
     query_role: Literal["query", "state_query", "answer_query"] = "query"
 
-    def __post_init__(self) -> None:
-        if not self.chunk_id or not self.video_path.is_file():
-            raise FileNotFoundError(f"Query observation video does not exist: {self.video_path}")
-        if (
-            not math.isfinite(self.start_time)
-            or not math.isfinite(self.end_time)
-            or not math.isfinite(self.query_time)
-            or self.start_time < 0.0
-            or self.end_time <= self.start_time
-            or self.end_time > self.query_time + 1.0e-6
-        ):
-            raise ValueError("Query observation must satisfy 0 <= start < end <= query_time")
-        if self.maximum_frames < 2 or self.maximum_frames > 256 or self.maximum_frames % 2:
-            raise ValueError("production Query observations permit an even 2..256 frames")
-        if not math.isfinite(self.sampling_fps) or self.sampling_fps <= 0.0:
-            raise ValueError("Query sampling_fps must be finite and positive")
-        if self.sampling_policy != "llamafactory_uniform_cap":
-            raise ValueError("unsupported Query frame sampling policy")
-        if self.decode_max_groups < 1 or self.decode_max_groups > 16:
-            raise ValueError("Query decode_max_groups must be within [1, 16]")
-        if self.query_role not in {"query", "state_query", "answer_query"}:
-            raise ValueError("unsupported Query observation role")
-
     @property
     def observation_role(self) -> str:
         return self.query_role
@@ -290,37 +230,6 @@ class CurrentChunkMaterialization:
     tubelet_position_ids: Tensor
     pixel_values_videos: Tensor
     video_grid_thw: Tensor
-
-    def __post_init__(self) -> None:
-        if self.frames.ndim != 4 or self.frames.shape[1] != 3:
-            raise ValueError("materialized current frames must be [F, 3, H, W]")
-        frame_count = self.frames.shape[0]
-        if frame_count < 2 or frame_count > self.spec.maximum_frames or frame_count % 2:
-            raise ValueError("materialized current frame count must be even within [2, max]")
-        if self.frame_timestamps.shape != (frame_count,):
-            raise ValueError("current frame timestamps must align to frames")
-        if bool(
-            torch.any(self.frame_timestamps < self.spec.start_time - 1.0e-6)
-            or torch.any(self.frame_timestamps > self.spec.query_time + 1.0e-6)
-        ):
-            raise ValueError("materialized observation contains a frame outside its causal range")
-        tubelets = frame_count // 2
-        if (
-            self.tubelet_timestamps.shape != (1, tubelets)
-            or self.tubelet_valid_mask.shape != (1, tubelets)
-            or self.tubelet_position_ids.shape != (1, tubelets)
-        ):
-            raise ValueError("current tubelet metadata must be [1, F/2]")
-        if self.tubelet_valid_mask.dtype != torch.bool:
-            raise TypeError("current tubelet validity must use bool dtype")
-        if self.pixel_values_videos.ndim != 2 or not torch.is_floating_point(
-            self.pixel_values_videos
-        ):
-            raise ValueError("current Qwen pixels must be packed floating [N_patch, D]")
-        if self.video_grid_thw.shape != (1, 3):
-            raise ValueError("current Qwen video grid must be [1, 3]")
-        if int(self.video_grid_thw[0, 0].item()) != tubelets:
-            raise ValueError("Qwen temporal grid must equal the current chunk tubelet count")
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,45 +269,6 @@ class PreparedVisualCPU:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class QueryPreparationTelemetry:
-    decode_seconds: float
-    processor_seconds: float
-    total_seconds: float
-    frame_count: int
-    patch_count: int
-    visual_token_count: int
-
-    def __post_init__(self) -> None:
-        times = (self.decode_seconds, self.processor_seconds, self.total_seconds)
-        if any(not math.isfinite(value) or value < 0.0 for value in times):
-            raise ValueError("Query preparation times must be finite and non-negative")
-        if self.total_seconds + 1.0e-9 < self.decode_seconds + self.processor_seconds:
-            raise ValueError("Query total preparation time cannot omit decode/processor time")
-        if self.frame_count <= 0 or self.patch_count <= 0 or self.visual_token_count <= 0:
-            raise ValueError("Query preparation counts must be positive")
-
-
-@dataclass(frozen=True, slots=True)
-class A2PreparationTelemetry:
-    collate_seconds: float
-    support_prepare_seconds: float
-    prepared_bytes: int
-    support_payload_bytes: int
-    ready_monotonic_seconds: float
-
-    def __post_init__(self) -> None:
-        times = (
-            self.collate_seconds,
-            self.support_prepare_seconds,
-            self.ready_monotonic_seconds,
-        )
-        if any(not math.isfinite(value) or value < 0.0 for value in times):
-            raise ValueError("A2 preparation times must be finite and non-negative")
-        if self.prepared_bytes <= 0 or self.support_payload_bytes < 0:
-            raise ValueError("A2 prepared payload byte counts are invalid")
-
-
 def _bind_runtime_query(
     query: RuntimeQueryInput,
     video_path: Path,
@@ -416,23 +286,10 @@ class PreparedAnswerCPU:
     base_attention_mask: Tensor
     target_labels: AnswerTargetLabels
     materialized_query: PreparedVisualCPU
-    preparation: QueryPreparationTelemetry
-
-    def __post_init__(self) -> None:
-        if self.materialized_query.spec != self.spec:
-            raise ValueError("prepared answer/current chunk specifications must match")
-        if (
-            self.base_input_ids.ndim != 2
-            or self.base_attention_mask.shape != self.base_input_ids.shape
-        ):
-            raise ValueError("prepared answer IDs/mask must be aligned rank-2 tensors")
-        if self.target_labels.base_labels.shape != self.base_input_ids.shape:
-            raise ValueError("prepared answer labels must align to input IDs")
 
     def pin_memory(self) -> PreparedAnswerCPU:
         """Pin the compact tensors that cross the CPU-to-GPU boundary."""
 
-        started = time.perf_counter()
         chunk = self.materialized_query.pin_memory()
         labels = replace(
             self.target_labels,
@@ -440,19 +297,13 @@ class PreparedAnswerCPU:
             base_number_token_mask=self.target_labels.base_number_token_mask.pin_memory(),
             target_counts=self.target_labels.target_counts.pin_memory(),
         )
-        result = replace(
+        return replace(
             self,
             base_input_ids=self.base_input_ids.pin_memory(),
             base_attention_mask=self.base_attention_mask.pin_memory(),
             target_labels=labels,
             materialized_query=chunk,
         )
-        _loader_trace(
-            "pin_memory",
-            tensor_bytes=_prepared_answer_bytes(result),
-            seconds=time.perf_counter() - started,
-        )
-        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,20 +312,8 @@ class PreparedA2Record:
 
     record: A2QueryRecord
     answer: PreparedAnswerCPU
-    preparation: A2PreparationTelemetry
     state_query: PreparedVisualCPU
     supports: tuple[PreparedVisualCPU, ...] = ()
-
-    def __post_init__(self) -> None:
-        expected = f"{self.record.query.runtime.query_id}:answer_query"
-        if self.answer.spec.chunk_id != expected:
-            raise ValueError("prepared A2 answer does not belong to its manifest Query")
-        state_expected = f"{self.record.query.runtime.query_id}:state_query"
-        if self.state_query.spec.chunk_id != state_expected:
-            raise ValueError("prepared A2 State Query does not belong to its manifest Query")
-        _, schedule = adaptive_support_schedule(self.record.query.runtime.query_time)
-        if len(self.supports) != len(schedule):
-            raise ValueError("prepared A2 Supports do not match the adaptive schedule")
 
     def pin_memory(self) -> PreparedA2Record:
         return replace(
@@ -493,21 +332,6 @@ class PreparedA5Record:
     query_answers: tuple[PreparedAnswerCPU, ...]
     state_queries: tuple[PreparedVisualCPU, ...] = ()
 
-    def __post_init__(self) -> None:
-        if len(self.query_answers) != len(self.record.queries):
-            raise ValueError("prepared A5 answers must align to every Query point")
-        if self.state_queries and len(self.state_queries) != len(self.record.queries):
-            raise ValueError("prepared A5 State Queries must align to every Query point")
-        for index, prepared in enumerate(self.query_answers):
-            expected_prefix = f"{self.record.episode_id}:q{index}"
-            expected_answer = f"{expected_prefix}:answer_query"
-            if prepared.spec.chunk_id not in {expected_prefix, expected_answer}:
-                raise ValueError("prepared A5 answer does not belong to its Query point")
-            if self.state_queries:
-                expected_state = f"{expected_prefix}:state_query"
-                if self.state_queries[index].spec.chunk_id != expected_state:
-                    raise ValueError("prepared A5 State Query does not belong to its Query point")
-
     def pin_memory(self) -> PreparedA5Record:
         return replace(
             self,
@@ -519,22 +343,6 @@ class PreparedA5Record:
 @dataclass(frozen=True, slots=True)
 class ProductionVisualAudit:
     chunk: CurrentChunkMaterialization | PreparedVisualCPU
-    token: CurrentChunkVisualTokenAudit
-
-    @property
-    def observation_role(self) -> str:
-        return self.chunk.spec.observation_role
-
-    @property
-    def visual_token_count(self) -> int:
-        return sum(self.token.merged_token_counts)
-
-    @property
-    def video_grid_thw(self) -> tuple[int, int, int]:
-        values = tuple(int(value) for value in self.chunk.video_grid_thw[0].tolist())
-        if len(values) != 3:
-            raise ValueError("video_grid_thw must contain exactly three dimensions")
-        return values
 
 
 def _identity_chunk(value: object) -> CurrentChunkMaterialization:
@@ -557,27 +365,17 @@ class VideoChunkMaterializer:
         prefetch_depth: int = 2,
         decode_coalesce: bool = True,
     ) -> None:
-        if minimum_pixels <= 0 or maximum_pixels <= 0 or minimum_pixels > maximum_pixels:
-            raise ValueError("video pixel bounds must satisfy 0 < minimum <= maximum")
-        if type(prefetch_depth) is not int or prefetch_depth <= 0:
-            raise ValueError("support prefetch_depth must be a positive integer")
         self.config = config
         self.minimum_pixels = minimum_pixels
         self.maximum_pixels = maximum_pixels
         self.processor = QwenVideoPreprocessor(config)
         self.preprocess_cache = preprocess_cache
-        if type(cache_support_visuals) is not bool:
-            raise TypeError("cache_support_visuals must be bool")
         self.cache_support_visuals = cache_support_visuals
-        if type(cache_query_visuals) is not bool:
-            raise TypeError("cache_query_visuals must be bool")
         self.cache_query_visuals = cache_query_visuals
         if cache_query_roles is None:
             cache_query_roles = (
                 frozenset(("state_query", "answer_query")) if cache_query_visuals else frozenset()
             )
-        if not cache_query_roles.issubset({"state_query", "answer_query"}):
-            raise ValueError("cache_query_roles contains an unknown Query role")
         self.cache_query_roles = cache_query_roles
         self.prefetch_depth = prefetch_depth
         self.decode_coalesce = decode_coalesce
@@ -594,19 +392,10 @@ class VideoChunkMaterializer:
 
     def __call__(self, spec: ObservationSpec) -> CurrentChunkMaterialization:
         if self._pending_queue:
-            expected, future, resolver = self._pending_queue[0]
-            if expected != spec:
-                raise RuntimeError("support chunks were consumed out of prefetch order")
-            started = time.perf_counter()
+            _expected, future, resolver = self._pending_queue[0]
             result = resolver(future.result())
             self._pending_queue.popleft()
             self._schedule_next()
-            _loader_trace(
-                "support_materialize_ready",
-                chunk_id=spec.chunk_id,
-                seconds=time.perf_counter() - started,
-                cache_stats=_cache_stats(self),
-            )
             return result
         return self._materialize(spec)
 
@@ -618,11 +407,7 @@ class VideoChunkMaterializer:
         self.end_prefetch()
         if os.environ.get("TTT_A2_SUPPORT_PREFETCH", "1") == "0" or not specs:
             return
-        if len({spec.chunk_id for spec in specs}) != len(specs):
-            raise ValueError("support prefetch requires unique chunk IDs")
         if source_dataset is not None:
-            if not source_dataset:
-                raise ValueError("support prefetch source_dataset must be non-empty")
             self._source_dataset = source_dataset
         self._remaining_specs.extend(specs)
         if self._executor is None:
@@ -633,8 +418,6 @@ class VideoChunkMaterializer:
         self._schedule_next()
 
     def set_source_dataset(self, source_dataset: str) -> None:
-        if not source_dataset:
-            raise ValueError("source_dataset must be non-empty")
         self._source_dataset = source_dataset
 
     def end_prefetch(self) -> None:
@@ -648,8 +431,7 @@ class VideoChunkMaterializer:
         self._remaining_specs.clear()
 
     def _schedule_next(self) -> None:
-        if self._executor is None:
-            raise RuntimeError("support prefetch executor was not initialized")
+        executor = cast(ThreadPoolExecutor, self._executor)
         while len(self._pending_queue) < self.prefetch_depth and self._remaining_specs:
             if self.decode_coalesce:
                 group = [self._remaining_specs.popleft()]
@@ -660,7 +442,7 @@ class VideoChunkMaterializer:
                     and self._remaining_specs[0].video_path == group[0].video_path
                 ):
                     group.append(self._remaining_specs.popleft())
-                group_future = self._executor.submit(self._materialize_group, tuple(group))
+                group_future = executor.submit(self._materialize_group, tuple(group))
                 for spec in group:
                     chunk_id = spec.chunk_id
 
@@ -678,56 +460,24 @@ class VideoChunkMaterializer:
                     )
             else:
                 spec = self._remaining_specs.popleft()
-                future = self._executor.submit(self._materialize, spec)
+                future = executor.submit(self._materialize, spec)
                 self._pending_queue.append((spec, future, _identity_chunk))
 
     def _materialize(self, spec: ObservationSpec) -> CurrentChunkMaterialization:
-        started = time.perf_counter()
         cache = self._cache_for(spec)
         fingerprint = self._fingerprint(spec) if cache is not None else None
         if cache is not None:
-            if fingerprint is None:
-                raise RuntimeError("enabled preprocess cache lost its fingerprint")
-            cache_started = time.perf_counter()
-            cache_bytes = cache.payload_size(fingerprint)
-            cached = cache.get(fingerprint)
-            if spec.observation_role == "support":
-                _loader_trace(
-                    "support_cache_read",
-                    chunk_id=spec.chunk_id,
-                    record_id=_a2_record_id_from_chunk(spec.chunk_id),
-                    hit=cached is not None,
-                    cache_bytes=cache_bytes,
-                    seconds=time.perf_counter() - cache_started,
-                )
+            cached = cache.get(cast(PreprocessFingerprint, fingerprint))
             if cached is not None:
-                _loader_trace(
-                    f"{spec.observation_role}_cache_hit",
-                    chunk_id=spec.chunk_id,
-                    seconds=time.perf_counter() - started,
-                )
                 return self._from_cached(spec, cached)
-        _loader_trace(f"{spec.observation_role}_cache_miss", chunk_id=spec.chunk_id)
-        decode_started = time.perf_counter()
         frames, timestamps = _decode_uniform_interval(spec, _sample_fps_for(spec, self.config))
-        _loader_trace(
-            "decode",
-            chunk_id=spec.chunk_id,
-            seconds=time.perf_counter() - decode_started,
-        )
-        materialized = self._materialize_decoded(
+        return self._materialize_decoded(
             spec,
             frames,
             timestamps,
             fingerprint,
             cache=cache,
         )
-        _loader_trace(
-            "support_materialize_done",
-            chunk_id=spec.chunk_id,
-            seconds=time.perf_counter() - started,
-        )
-        return materialized
 
     def _materialize_group(
         self, specs: tuple[SupportChunkSpec, ...]
@@ -736,9 +486,6 @@ class VideoChunkMaterializer:
 
         if not specs:
             return {}
-        group_started = time.perf_counter()
-        if len({spec.video_path for spec in specs}) != 1:
-            raise ValueError("coalesced Support group must contain one video path")
         results: dict[str, CurrentChunkMaterialization] = {}
         misses: list[
             tuple[SupportChunkSpec, PreprocessFingerprint | None, PreprocessCache | None]
@@ -746,35 +493,14 @@ class VideoChunkMaterializer:
         for spec in specs:
             cache = self._cache_for(spec)
             fingerprint = self._fingerprint(spec) if cache is not None else None
-            cache_started = time.perf_counter()
-            cache_bytes = (
-                cache.payload_size(fingerprint)
-                if cache is not None and fingerprint is not None
-                else 0
-            )
             cached = (
                 cache.get(fingerprint) if cache is not None and fingerprint is not None else None
             )
-            _loader_trace(
-                "support_cache_read",
-                chunk_id=spec.chunk_id,
-                record_id=_a2_record_id_from_chunk(spec.chunk_id),
-                hit=cached is not None,
-                cache_bytes=cache_bytes,
-                seconds=time.perf_counter() - cache_started,
-            )
             if cached is not None:
                 results[spec.chunk_id] = self._from_cached(spec, cached)
-                _loader_trace("support_cache_hit", chunk_id=spec.chunk_id)
             else:
                 misses.append((spec, fingerprint, cache))
         if not misses:
-            _loader_trace(
-                "support_decode_coalesced",
-                chunk_count=len(specs),
-                cache_only=True,
-                seconds=time.perf_counter() - group_started,
-            )
             return results
         try:
             decoded = _decode_coalesced_intervals(
@@ -799,11 +525,6 @@ class VideoChunkMaterializer:
                 fingerprint,
                 cache=cache,
             )
-        _loader_trace(
-            "support_decode_coalesced",
-            chunk_count=len(specs),
-            seconds=time.perf_counter() - group_started,
-        )
         return results
 
     def materialize_support_group(
@@ -814,8 +535,6 @@ class VideoChunkMaterializer:
         values = tuple(specs)
         if not values:
             return ()
-        if any(spec.observation_role != "support" for spec in values):
-            raise ValueError("support group accepts Support observations only")
         materialized = self._materialize_group(values)
         return tuple(materialized[spec.chunk_id] for spec in values)
 
@@ -828,18 +547,12 @@ class VideoChunkMaterializer:
         *,
         cache: PreprocessCache | None = None,
     ) -> CurrentChunkMaterialization:
-        processor_started = time.perf_counter()
         frames = _resize_to_pixel_budget(
             frames,
             minimum_pixels=self.minimum_pixels,
             maximum_pixels=self.maximum_pixels,
         )
         processed = self.processor.process(frames)
-        _loader_trace(
-            "processor",
-            chunk_id=spec.chunk_id,
-            seconds=time.perf_counter() - processor_started,
-        )
         tubelet_times = timestamps.reshape(-1, 2).amax(dim=1).unsqueeze(0)
         positions = _strict_tubelet_positions(
             tubelet_times[0],
@@ -857,9 +570,10 @@ class VideoChunkMaterializer:
         )
         target_cache = self._cache_for(spec) if cache is None else cache
         if target_cache is not None and target_cache.writable:
-            if fingerprint is None:
-                raise RuntimeError("writable preprocess cache requires a fingerprint")
-            target_cache.put(fingerprint, _cached_from_materialized(materialized))
+            target_cache.put(
+                cast(PreprocessFingerprint, fingerprint),
+                _cached_from_materialized(materialized),
+            )
         return materialized
 
     def _cache_for(self, spec: ObservationSpec) -> PreprocessCache | None:
@@ -912,46 +626,32 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
     def _visual(self, request: ObservationChunkRequest) -> VisualStageOutput:
         raw = request.video_input
         if isinstance(raw, RawVisualChunk):
-            if not isinstance(raw.source, (CurrentChunkMaterialization, PreparedVisualCPU)):
-                raise TypeError("raw visual chunk lost its materialized source")
             prepared_chunk = replace(
                 self.qwen.prepare_raw_visual_chunk(raw),
                 source=raw.source,
             )
             return self._visual(replace(request, video_input=prepared_chunk))
         if isinstance(raw, PreparedVisualChunk):
-            if not isinstance(raw.source, (CurrentChunkMaterialization, PreparedVisualCPU)):
-                raise TypeError("prepared visual chunk lost its materialized source")
-            token_audit = audit_current_chunk_visual_tokens(
-                raw.prepared_video_features,
-                raw.source.pixel_values_videos,
-                raw.source.video_grid_thw,
-            )
             return VisualStageOutput(
                 value=raw.value,
-                audit=ProductionVisualAudit(raw.source, token_audit),
+                audit=ProductionVisualAudit(
+                    cast("CurrentChunkMaterialization | PreparedVisualCPU", raw.source)
+                ),
             )
         chunk: CurrentChunkMaterialization | PreparedVisualCPU
         if isinstance(raw, (SupportChunkSpec, QueryObservationSpec)):
             chunk = self.materializer(raw)
-        elif isinstance(raw, (CurrentChunkMaterialization, PreparedVisualCPU)):
-            chunk = raw
         else:
-            raise TypeError("visual runtime accepts one observation spec/materialization only")
+            chunk = cast("CurrentChunkMaterialization | PreparedVisualCPU", raw)
         device = _module_device(self.qwen)
-        h2d_started = time.perf_counter()
         pixels = chunk.pixel_values_videos.to(device=device, non_blocking=True)
         grid = chunk.video_grid_thw.to(device=device, non_blocking=True)
-        _loader_trace("pin_memory/H2D", seconds=time.perf_counter() - h2d_started)
         with trace_cuda_phase("vit_forward", stage="visual"):
             self.qwen.get_video_features(pixels, grid)
-        captured = self.qwen.last_visual_output
-        prepared_features = self.qwen.last_prepared_video_features
-        if not isinstance(captured, QwenVisualOutput) or not isinstance(
-            prepared_features, PreparedVideoFeatures
-        ):
-            raise RuntimeError("Qwen visual boundary did not return prepared current features")
-        token_audit = audit_current_chunk_visual_tokens(prepared_features, pixels, grid)
+        captured = cast(QwenVisualOutput, self.qwen.last_visual_output)
+        prepared_features = cast(
+            PreparedVideoFeatures, self.qwen.last_prepared_video_features
+        )
         adapted_padded = pad_sequence(prepared_features.main_features, batch_first=True)
         adapted = QwenVisualOutput(
             main_visual_embeddings=adapted_padded,
@@ -969,168 +669,15 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
         )
         return VisualStageOutput(
             value=adapted,
-            audit=ProductionVisualAudit(materialized, token_audit),
+            audit=ProductionVisualAudit(materialized),
         )
-
-    def prepare_support_batch(
-        self,
-        values: Sequence[object],
-        *,
-        batch_size: int,
-    ) -> tuple[PreparedVisualChunk, ...]:
-        """Batch only A2 Support visual work; State/Bank consumers remain sequential."""
-
-        if type(batch_size) is not int or batch_size <= 0:
-            raise ValueError("support visual batch_size must be a positive integer")
-        chunks: list[CurrentChunkMaterialization | PreparedVisualCPU] = []
-        for value in values:
-            if isinstance(value, SupportChunkSpec):
-                chunks.append(self.materializer(value))
-            elif isinstance(value, (CurrentChunkMaterialization, PreparedVisualCPU)):
-                chunks.append(value)
-            else:
-                raise TypeError("Support visual batch accepts specs/materializations only")
-        device = _module_device(self.qwen)
-        outputs: list[PreparedVisualChunk] = []
-        for start in range(0, len(chunks), batch_size):
-            group = tuple(chunks[start : start + batch_size])
-            h2d_started = time.perf_counter()
-            pixels = torch.cat(
-                tuple(
-                    chunk.pixel_values_videos.to(device=device, non_blocking=True)
-                    for chunk in group
-                )
-            )
-            grid = torch.cat(
-                tuple(chunk.video_grid_thw.to(device=device, non_blocking=True) for chunk in group)
-            )
-            _loader_trace(
-                "pin_memory/H2D",
-                stage="a2_support_batch",
-                chunk_count=len(group),
-                seconds=time.perf_counter() - h2d_started,
-            )
-            with trace_cuda_phase(
-                "vit_forward",
-                stage="a2_support_batch",
-                chunk_count=len(group),
-            ):
-                raw_batch = self.qwen.encode_video_batch_raw(pixels, grid)
-                prepared = self.qwen.prepare_raw_video_batch(raw_batch)
-            if len(prepared) != len(group):
-                raise RuntimeError("visual batch split did not preserve Support count")
-            patch_offset = 0
-            for chunk, row in zip(group, prepared, strict=True):
-                patch_count = chunk.pixel_values_videos.shape[0]
-                row_pixels = pixels[patch_offset : patch_offset + patch_count]
-                patch_offset += patch_count
-                materialized = replace(
-                    chunk,
-                    pixel_values_videos=row_pixels,
-                    video_grid_thw=chunk.video_grid_thw.to(device),
-                    tubelet_timestamps=chunk.tubelet_timestamps.to(device),
-                    tubelet_valid_mask=chunk.tubelet_valid_mask.to(device),
-                    tubelet_position_ids=chunk.tubelet_position_ids.to(device),
-                )
-                audit_current_chunk_visual_tokens(
-                    row.prepared_video_features,
-                    materialized.pixel_values_videos,
-                    materialized.video_grid_thw,
-                )
-                outputs.append(replace(row, source=materialized))
-        return tuple(outputs)
-
-    def prepare_raw_support_batch(
-        self,
-        chunks: tuple[MetaCausalChunk, ...],
-        batch_size: int,
-    ) -> tuple[MetaCausalChunk, ...]:
-        """Batch A5 ViT/Main/DeepStack only; Adapter execution remains per Support."""
-
-        if type(batch_size) is not int or batch_size <= 0:
-            raise ValueError("raw Support visual batch_size must be a positive integer")
-        materialized: list[CurrentChunkMaterialization] = []
-        for chunk in chunks:
-            value = chunk.request.video_input
-            if isinstance(value, SupportChunkSpec):
-                materialized.append(self.materializer(value))
-            elif isinstance(value, CurrentChunkMaterialization):
-                materialized.append(value)
-            else:
-                raise TypeError("raw Support batch accepts specs/materializations only")
-        device = _module_device(self.qwen)
-        outputs: list[MetaCausalChunk] = []
-        for start in range(0, len(chunks), batch_size):
-            source_group = tuple(materialized[start : start + batch_size])
-            chunk_group = chunks[start : start + batch_size]
-            h2d_started = time.perf_counter()
-            pixels = torch.cat(
-                tuple(
-                    source.pixel_values_videos.to(device=device, non_blocking=True)
-                    for source in source_group
-                )
-            )
-            grid = torch.cat(
-                tuple(
-                    source.video_grid_thw.to(device=device, non_blocking=True)
-                    for source in source_group
-                )
-            )
-            _loader_trace(
-                "pin_memory/H2D",
-                stage="a5_raw_support_batch",
-                chunk_count=len(source_group),
-                seconds=time.perf_counter() - h2d_started,
-            )
-            with trace_cuda_phase(
-                "vit_forward",
-                stage="a5_raw_support_batch",
-                chunk_count=len(source_group),
-            ):
-                raw_rows = self.qwen.encode_video_batch_raw(pixels, grid).split()
-            if len(raw_rows) != len(source_group):
-                raise RuntimeError("raw visual batch split did not preserve Support count")
-            patch_offset = 0
-            for chunk, source, raw_row in zip(
-                chunk_group,
-                source_group,
-                raw_rows,
-                strict=True,
-            ):
-                patch_count = source.pixel_values_videos.shape[0]
-                row_pixels = pixels[patch_offset : patch_offset + patch_count]
-                patch_offset += patch_count
-                gpu_source = replace(
-                    source,
-                    pixel_values_videos=row_pixels,
-                    video_grid_thw=source.video_grid_thw.to(device),
-                    tubelet_timestamps=source.tubelet_timestamps.to(device),
-                    tubelet_valid_mask=source.tubelet_valid_mask.to(device),
-                    tubelet_position_ids=source.tubelet_position_ids.to(device),
-                )
-                outputs.append(
-                    replace(
-                        chunk,
-                        request=replace(
-                            chunk.request,
-                            video_input=replace(raw_row, source=gpu_source),
-                        ),
-                    )
-                )
-        return tuple(outputs)
 
     def _prefill(self, request: QwenPrefillRequest) -> QwenPrefillOutput:
         device = _module_device(self.qwen)
-        h2d_started = time.perf_counter()
         pixels = request.pixel_values_videos.to(device=device, non_blocking=True)
         grid = request.video_grid_thw.to(device=device, non_blocking=True)
-        _loader_trace("pin_memory/H2D", seconds=time.perf_counter() - h2d_started)
-        if not isinstance(request.input_ids, Tensor) or not isinstance(
-            request.attention_mask, Tensor
-        ):
-            raise TypeError("production prefill IDs/mask must be tensors")
-        input_ids = request.input_ids.to(device=device)
-        attention_mask = request.attention_mask.to(device=device)
+        input_ids = cast(Tensor, request.input_ids).to(device=device)
+        attention_mask = cast(Tensor, request.attention_mask).to(device=device)
         state_payload = _state_embedding_payload(request, input_ids)
         kwargs = dict(request.qwen_kwargs)
         kwargs.setdefault("use_cache", False)
@@ -1169,15 +716,9 @@ class ProductionQwenRuntime(nn.Module):  # type: ignore[misc]
             **kwargs,
         )
         sequences = getattr(generated, "sequences", generated)
-        if not isinstance(sequences, Tensor) or sequences.ndim != 2 or sequences.shape[0] != 1:
-            raise TypeError("Qwen generate() must return one [1, T] token tensor")
         new_tokens = sequences[:, input_ids.shape[1] :]
-        decode = getattr(self.tokenizer, "batch_decode", None)
-        if not callable(decode):
-            raise TypeError("production tokenizer must provide batch_decode()")
+        decode = cast(Any, self.tokenizer).batch_decode
         texts = decode(new_tokens, skip_special_tokens=True)
-        if not isinstance(texts, Sequence) or len(texts) != 1 or not isinstance(texts[0], str):
-            raise TypeError("tokenizer batch_decode() must return one string")
         return QwenGenerateOutput(texts[0].strip(), new_tokens.detach())
 
 
@@ -1198,8 +739,6 @@ class ProductionQueryRuntime(nn.Module):  # type: ignore[misc]
             tokens = tokenize_questions(cast(Any, self.tokenizer), (question,))
             self._token_cache[question] = tokens
         qwen = self._qwen_ref()
-        if qwen is None:
-            raise RuntimeError("Qwen embedding owner was released")
         embeddings = embed_question_tokens(cast(Any, qwen), tokens, self.query_encoder_config)
         inputs = QueryEncoderInput.from_runtime_queries(embeddings, tokens, (value,))
         dropout_seed = query_dropout_seed(value)
@@ -1223,10 +762,7 @@ class ProductionQueryRuntime(nn.Module):  # type: ignore[misc]
 
     @property
     def query_encoder_config(self) -> ProjectConfig:
-        config = getattr(self, "_project_config", None)
-        if not isinstance(config, ProjectConfig):
-            raise RuntimeError("production Query runtime lost its ProjectConfig")
-        return config
+        return cast(ProjectConfig, getattr(self, "_project_config", None))
 
     def bind_project_config(self, config: ProjectConfig) -> None:
         object.__setattr__(self, "_project_config", config)
@@ -1241,7 +777,7 @@ class FastVisualPassThrough:
     def use_associative_context(self, context: FastAssociativeContext) -> object:
         return self.adapter.use_associative_context(context)
 
-    def consume_associative_intermediates(self) -> AssociativeTTTIntermediates:
+    def consume_associative_intermediates(self) -> AssociativeTTTIntermediates | None:
         return self.adapter.consume_associative_intermediates()
 
     def __call__(
@@ -1251,8 +787,6 @@ class FastVisualPassThrough:
         request: ObservationChunkRequest,
     ) -> VisualStageOutput:
         del query, request
-        if not isinstance(visual.audit, ProductionVisualAudit):
-            raise TypeError("Fast pass-through requires an audited current visual chunk")
         return visual
 
 
@@ -1284,9 +818,7 @@ class ProductionSpatialRuntime(nn.Module):  # type: ignore[misc]
                 prior_states=prior,
                 detach_runtime_state=True,
             )
-        if not isinstance(output, SpatialEncoderOutput):
-            raise TypeError("production Spatial encoder returned an invalid output")
-        return output
+        return cast(SpatialEncoderOutput, output)
 
 
 class ProductionTemporalRuntime(nn.Module):  # type: ignore[misc]
@@ -1325,9 +857,7 @@ class ProductionTemporalRuntime(nn.Module):  # type: ignore[misc]
                 cache=cache,
                 detach_cache=True,
             )
-        if not isinstance(output, TemporalEncoderOutput):
-            raise TypeError("production Temporal encoder returned an invalid output")
-        return output
+        return cast(TemporalEncoderOutput, output)
 
 
 def _causal_temporal_tail(
@@ -1345,15 +875,11 @@ def _causal_temporal_tail(
     hard overlap machinery, and no historical visual feature is concatenated here.
     """
 
-    if len(value.metadata.token_counts) != 1 or chunk.tubelet_timestamps.shape[0] != 1:
-        raise ValueError("production temporal tail currently requires one episode per rank")
     times = chunk.tubelet_timestamps
     tubelet_count = times.shape[1]
     drop = 0
     next_position = 0
     if cache is not None:
-        if cache.batch_size != 1:
-            raise ValueError("production temporal cache must contain one episode per rank")
         valid_count = int(cache.valid_mask[0].sum().item())
         if valid_count:
             latest = cache.timestamps[0, valid_count - 1].to(dtype=times.dtype)
@@ -1444,9 +970,7 @@ class ProductionObservationRuntime(nn.Module):  # type: ignore[misc]
                 e2_prior_states=empty if reset else runtime.e2_states,
                 detach_runtime_state=True,
             )
-        if not isinstance(output, ObservationOutputs):
-            raise TypeError("production Observation heads returned an invalid output")
-        return output
+        return cast(ObservationOutputs, output)
 
 
 class ProductionReaderRuntime:
@@ -1504,9 +1028,7 @@ class ProductionOuterModel(nn.Module):  # type: ignore[misc]
         self,
         gradient_checkpointing_kwargs: Mapping[str, object] | None = None,
     ) -> None:
-        enable = getattr(self._qwen_model(), "gradient_checkpointing_enable", None)
-        if not callable(enable):
-            raise TypeError("loaded Qwen model does not support gradient checkpointing")
+        enable = cast(Any, getattr(self._qwen_model(), "gradient_checkpointing_enable", None))
         # ``CustomSeq2SeqTrainer`` calls this owner again after LLaMA-Factory has
         # already configured Qwen.  Passing ``None`` would silently restore the
         # LLaMA-Factory wrapper's default re-entrant checkpointing, which lets
@@ -1517,16 +1039,11 @@ class ProductionOuterModel(nn.Module):  # type: ignore[misc]
         enable(gradient_checkpointing_kwargs=kwargs)
 
     def gradient_checkpointing_disable(self) -> None:
-        disable = getattr(self._qwen_model(), "gradient_checkpointing_disable", None)
-        if not callable(disable):
-            raise TypeError("loaded Qwen model does not support gradient checkpointing")
+        disable = cast(Any, getattr(self._qwen_model(), "gradient_checkpointing_disable", None))
         disable()
 
     def _qwen_model(self) -> nn.Module:
-        model = self._qwen_model_ref()
-        if model is None:
-            raise RuntimeError("loaded Qwen model was released before the outer runtime")
-        return model
+        return cast(nn.Module, self._qwen_model_ref())
 
     def forward(self, **_inputs: object) -> Tensor:
         raise RuntimeError("ProductionOuterModel must be driven by the typed A2/A5 trainer hook")
@@ -1543,7 +1060,6 @@ class _PrefetchCollatorBase:
         minimum_pixels: int,
         maximum_pixels: int,
         preprocess_cache: PreprocessCache | None,
-        context: str,
     ) -> None:
         self.processor = processor
         self.tokenizer = tokenizer
@@ -1635,17 +1151,11 @@ class A2PrefetchCollator(_PrefetchCollatorBase):
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
-            context="A2 prefetch",
         )
-        if prepared_episode_max_bytes <= 0:
-            raise ValueError("prepared episode byte limit must be positive")
         self.prepared_episode_max_bytes = prepared_episode_max_bytes
 
     def __call__(self, records: Sequence[object]) -> dict[str, object]:
-        if len(records) != 1 or not isinstance(records[0], A2QueryRecord):
-            raise ValueError("A2 H200 prefetch requires exactly one A2 record per rank")
-        started = time.perf_counter()
-        record = records[0]
+        record = cast(A2QueryRecord, records[0])
         video_path = _resolve_video_path(record.source_dataset, record.relative_video_path)
         self.video.set_source_dataset(record.source_dataset)
         state_query, answer = _prepare_query_pair(
@@ -1656,50 +1166,15 @@ class A2PrefetchCollator(_PrefetchCollatorBase):
             reset_soft_state=False,
             source_dataset=record.source_dataset,
         )
-        support_started = time.perf_counter()
         support_specs = _a2_support_chunk_specs(record, video_path)
         supports = tuple(
             _compact_materialized_chunk(value)
             for value in self.video.materialize_support_group(support_specs)
         )
-        support_prepare_seconds = time.perf_counter() - support_started
-        prepared_bytes = _prepared_a2_record_bytes(answer, supports, state_query)
-        if prepared_bytes > self.prepared_episode_max_bytes:
-            raise MemoryError(
-                f"prepared A2 episode {record.query.runtime.query_id!r} uses "
-                f"{prepared_bytes} bytes, above limit {self.prepared_episode_max_bytes}"
-            )
-        collate_seconds = time.perf_counter() - started
-        support_payload_bytes = sum(_prepared_visual_bytes(chunk) for chunk in supports)
-        preparation = A2PreparationTelemetry(
-            collate_seconds=collate_seconds,
-            support_prepare_seconds=support_prepare_seconds,
-            prepared_bytes=prepared_bytes,
-            support_payload_bytes=support_payload_bytes,
-            ready_monotonic_seconds=time.monotonic(),
-        )
-        _loader_trace(
-            "a2_collate_done",
-            query_id=record.query.runtime.query_id,
-            seconds=collate_seconds,
-            prepared_bytes=prepared_bytes,
-            support_payload_bytes=support_payload_bytes,
-            query_frame_count=answer.preparation.frame_count,
-            query_patch_count=answer.preparation.patch_count,
-            query_visual_token_count=answer.preparation.visual_token_count,
-            state_query_frame_count=state_query.frame_count,
-            state_query_visual_token_count=(
-                state_query.patch_count // self.config.video_preprocessing.spatial_merge_size**2
-            ),
-            query_decode_seconds=answer.preparation.decode_seconds,
-            query_processor_seconds=answer.preparation.processor_seconds,
-            cache_stats=(self.preprocess_cache.stats() if self.preprocess_cache else {}),
-        )
         return {
             "prepared_a2": PreparedA2Record(
                 record=record,
                 answer=answer,
-                preparation=preparation,
                 supports=supports,
                 state_query=state_query,
             )
@@ -1728,14 +1203,10 @@ class A5PrefetchCollator(_PrefetchCollatorBase):
             minimum_pixels=minimum_pixels,
             maximum_pixels=maximum_pixels,
             preprocess_cache=preprocess_cache,
-            context="A5 prefetch",
         )
 
     def __call__(self, records: Sequence[object]) -> dict[str, object]:
-        if len(records) != 1 or not isinstance(records[0], A5EpisodeRecord):
-            raise ValueError("A5 prefetch requires exactly one A5 episode per rank")
-        started = time.perf_counter()
-        record = records[0]
+        record = cast(A5EpisodeRecord, records[0])
         video_path = _resolve_video_path(record.source_dataset, record.relative_video_path)
         answers: list[PreparedAnswerCPU] = []
         state_queries: list[PreparedVisualCPU] = []
@@ -1752,13 +1223,6 @@ class A5PrefetchCollator(_PrefetchCollatorBase):
             )
             state_queries.append(state_query)
             answers.append(answer)
-        _loader_trace(
-            "a5_collate_done",
-            episode_id=record.episode_id,
-            query_count=len(answers),
-            seconds=time.perf_counter() - started,
-            cache_stats=(self.preprocess_cache.stats() if self.preprocess_cache else {}),
-        )
         return {"prepared_a5": PreparedA5Record(record, tuple(answers), tuple(state_queries))}
 
 
@@ -1786,29 +1250,9 @@ class ProductionEpisodeMaterializer:
         owner = RuntimeOwner((record.video_id,), (record.trajectory_id,))
         runtime = self.writer.reset(owner)
         _, supports = adaptive_support_schedule(record.query.runtime.query_time)
-        state_chunk = _query_chunk_spec(
-            f"{record.query.runtime.query_id}:state_query",
-            video_path,
-            record.query.runtime.query_time,
-            reset_soft_state=False,
-            config=self.ttt_config,
-            role="state_query",
-        )
-        answer_chunk = _query_chunk_spec(
-            f"{record.query.runtime.query_id}:answer_query",
-            video_path,
-            record.query.runtime.query_time,
-            reset_soft_state=False,
-            config=self.ttt_config,
-            role="answer_query",
-        )
         prepared_answer = source.answer
-        if prepared_answer.spec != answer_chunk:
-            raise ValueError("prefetched A2 Answer Query drifted before runtime assembly")
         answer, labels, _ = self._bind_answer(prepared_answer)
         materialized_state = source.state_query
-        if materialized_state.spec != state_chunk:
-            raise ValueError("prefetched A2 State Query drifted before runtime assembly")
         requests_list: list[ObservationChunkRequest] = []
         for index, chunk in enumerate(supports):
             request = self._request(
@@ -1822,8 +1266,6 @@ class ProductionEpisodeMaterializer:
             )
             if source.supports:
                 prepared_support = source.supports[index]
-                if prepared_support.spec != request.video_input:
-                    raise ValueError("prefetched A2 Support drifted before runtime assembly")
                 request = replace(request, video_input=prepared_support)
             requests_list.append(request)
         requests = tuple(requests_list) + (
@@ -1854,7 +1296,7 @@ class ProductionEpisodeMaterializer:
         record = source.record
         self.video.set_source_dataset(record.source_dataset)
         episode_nonce = self._allocate_episode_nonce()
-        video_path = self._video_path(record.source_dataset, record.relative_video_path)
+        video_path = _resolve_video_path(record.source_dataset, record.relative_video_path)
         owner = RuntimeOwner((record.video_id,), (record.trajectory_id,))
         runtime = self.writer.reset(owner)
         primary = record.queries[0].runtime
@@ -1893,25 +1335,13 @@ class ProductionEpisodeMaterializer:
                 config=self.ttt_config,
                 role="state_query",
             )
-            answer_spec = _query_chunk_spec(
-                f"{record.episode_id}:q{index}:answer_query",
-                video_path,
-                query.runtime.query_time,
-                reset_soft_state=index > 0 and query.runtime.question != primary.question,
-                config=self.ttt_config,
-                role="answer_query",
-            )
             prepared_answer = prepared.query_answers[index]
-            if prepared_answer.spec != answer_spec:
-                raise ValueError("prefetched A5 Answer Query drifted before runtime assembly")
             answer, labels, _ = self._bind_answer(prepared_answer)
             materialized = (
                 prepared.state_queries[index]
                 if prepared.state_queries
                 else prepared_answer.materialized_query
             )
-            if prepared.state_queries and materialized.spec != state_spec:
-                raise ValueError("prefetched A5 State Query drifted before runtime assembly")
             request = ObservationChunkRequest(
                 owner=owner,
                 video_input=materialized,
@@ -1954,8 +1384,6 @@ class ProductionEpisodeMaterializer:
             query_weights=tuple(
                 weight for segment in record.supervised_segments for weight in segment.query_weights
             ),
-            diagnostic_query_count=record.diagnostic_query_count,
-            insufficient_inter_query_gap=record.insufficient_inter_query_gap,
         )
 
     def _meta_chunk(
@@ -2044,10 +1472,6 @@ class ProductionEpisodeMaterializer:
             prepared.target_labels,
             prepared.materialized_query,
         )
-
-    @staticmethod
-    def _video_path(source_dataset: str, relative_path: str) -> Path:
-        return _resolve_video_path(source_dataset, relative_path)
 
 
 class ProductionA2LossStep:
@@ -2172,10 +1596,7 @@ def _build_runtime_preprocess_cache(
     mode = PreprocessCacheMode(config.preprocess_cache_mode)
     if mode is PreprocessCacheMode.DISABLED:
         return None
-    env_name = config.preprocess_cache_root_env
-    root = os.environ.get(env_name)
-    if not root:
-        raise ValueError(f"preprocess cache mode {mode.value!r} requires environment {env_name}")
+    root = os.environ.get(config.preprocess_cache_root_env, "")
     max_gb = config.preprocess_cache_max_gb
     model_id = str(getattr(backbone.model_args, "model_name_or_path", "unknown-model"))
     revision = str(getattr(backbone.model_args, "revision", "unknown-revision"))
@@ -2183,8 +1604,6 @@ def _build_runtime_preprocess_cache(
         type(backbone.processor).__qualname__ if backbone.processor is not None else "none"
     )
     raw_cache_dtype = str(config.preprocess_cache_dtype)
-    if raw_cache_dtype not in {"float32", "float16"}:
-        raise ValueError(f"unsupported preprocess cache dtype: {raw_cache_dtype}")
     cache_dtype = cast(PreprocessCacheStorageDtype, raw_cache_dtype)
     namespace_seed = "|".join(
         (
@@ -2197,11 +1616,7 @@ def _build_runtime_preprocess_cache(
             cache_dtype,
         )
     )
-    namespace = os.environ.get("TTT_PREPROCESS_CACHE_NAMESPACE")
-    if namespace is None:
-        namespace = hashlib.sha256(namespace_seed.encode("utf-8")).hexdigest()[:20]
-    elif not namespace.strip():
-        raise ValueError("TTT_PREPROCESS_CACHE_NAMESPACE must be non-empty when set")
+    namespace = hashlib.sha256(namespace_seed.encode("utf-8")).hexdigest()[:20]
     return PreprocessCache(
         root,
         max_bytes=int(max_gb * 1024**3),
@@ -2307,7 +1722,6 @@ def build_runtime(
     )
     stack = _assemble_state_stack(project, backbone.model, backbone.tokenizer, chunk_materializer)
     fast = stack.fast
-    qwen_runtime = stack.qwen_runtime
     writer = stack.writer
     state_model = stack.state_model
     associative_trainable = (
@@ -2333,11 +1747,8 @@ def build_runtime(
             preprocess_cache=preprocess_cache,
             prepared_episode_max_bytes=config.prepared_episode_max_bytes,
         )
-        world_size = int(getattr(backbone.training_args, "world_size", 1))
-        graph_anchor_parameters = (
-            tuple(parameter for parameter in outer.parameters() if parameter.requires_grad)
-            if world_size > 1
-            else ()
+        graph_anchor_parameters = tuple(
+            parameter for parameter in outer.parameters() if parameter.requires_grad
         )
         runner = StageAEpisodeRunner(
             model=state_model,
@@ -2358,8 +1769,6 @@ def build_runtime(
                     materializer,
                     graph_anchor_parameters,
                     project,
-                    qwen_runtime,
-                    config.support_visual_batch_size,
                     official_weak_balancer,
                 ),
             ),
@@ -2379,8 +1788,6 @@ def build_runtime(
         fast_controller=fast,
         runtime_resetter=lambda owner: _reset_meta_runtime(writer, owner),
         query_encoder_reuse=config.query_encoder_reuse,
-        raw_support_visual_batcher=qwen_runtime.prepare_raw_support_batch,
-        support_visual_batch_size=config.support_visual_batch_size,
         query_activation_offload=config.query_activation_offload,
         outer_composer=official_weak_balancer,
         adaptation_mode=config.a5_adaptation_mode,
@@ -2494,11 +1901,12 @@ def _stage_inputs(
     QueryEncoderOutput,
     BatchRuntimeState,
 ]:
-    if not isinstance(visual.value, QwenVisualOutput) or not isinstance(
-        visual.audit, ProductionVisualAudit
-    ):
-        raise TypeError("production state stages require a typed current visual output")
-    return visual.value, visual.audit.chunk, query, _stage_runtime(request)
+    return (
+        cast(QwenVisualOutput, visual.value),
+        cast(ProductionVisualAudit, visual.audit).chunk,
+        query,
+        _stage_runtime(request),
+    )
 
 
 def _current_chunk_input(
@@ -2537,19 +1945,11 @@ def _state_embedding_payload(
 ) -> StateEmbeddingPayload | None:
     if request.state_position_mask is None or request.state_tokens is None:
         return None
-    if not isinstance(request.state_position_mask, Tensor) or not isinstance(
-        request.state_tokens, Tensor
-    ):
-        raise TypeError("production State mask/tokens must be tensors")
     mask = request.state_position_mask.to(device=input_ids.device, dtype=torch.bool)
     tokens = request.state_tokens.to(device=input_ids.device)
-    if tokens.ndim != 3 or mask.ndim != 2 or tokens.shape[0] != mask.shape[0]:
-        raise ValueError("production State tokens/mask batch shapes do not align")
     rows: list[Tensor] = []
     for row in range(mask.shape[0]):
         count = int(mask[row].sum().item())
-        if count not in (0, tokens.shape[1]):
-            raise ValueError("each valid State row must consume all 16 current State tokens")
         if count:
             rows.append(tokens[row, :count])
     if not rows:
@@ -2607,8 +2007,6 @@ def _query_chunk_spec(
         maximum_frames = config.answer_query_max_frames
     end = query_time
     start = 0.0 if mode == "causal_prefix" else max(0.0, end - 8.0)
-    if end <= start:
-        raise ValueError("Query point is too early to materialize a causal observation")
     return QueryObservationSpec(
         chunk_id=chunk_id,
         video_path=video_path,
@@ -2780,42 +2178,6 @@ def _compact_materialized_chunk(materialized: CurrentChunkMaterialization) -> Pr
         tubelet_position_ids=materialized.tubelet_position_ids,
         pixel_values_videos=materialized.pixel_values_videos,
         video_grid_thw=materialized.video_grid_thw,
-    )
-
-
-def _prepared_visual_bytes(chunk: PreparedVisualCPU) -> int:
-    tensors = (
-        chunk.frame_timestamps,
-        chunk.tubelet_timestamps,
-        chunk.tubelet_valid_mask,
-        chunk.tubelet_position_ids,
-        chunk.pixel_values_videos,
-        chunk.video_grid_thw,
-    )
-    return sum(int(value.numel() * value.element_size()) for value in tensors)
-
-
-def _prepared_answer_bytes(answer: PreparedAnswerCPU) -> int:
-    tensors = (
-        answer.base_input_ids,
-        answer.base_attention_mask,
-        answer.target_labels.base_labels,
-        answer.target_labels.base_number_token_mask,
-        answer.target_labels.target_counts,
-    )
-    tensor_bytes = sum(int(value.numel() * value.element_size()) for value in tensors)
-    return tensor_bytes + _prepared_visual_bytes(answer.materialized_query)
-
-
-def _prepared_a2_record_bytes(
-    answer: PreparedAnswerCPU,
-    supports: Sequence[PreparedVisualCPU],
-    state_query: PreparedVisualCPU,
-) -> int:
-    return (
-        _prepared_answer_bytes(answer)
-        + _prepared_visual_bytes(state_query)
-        + sum(_prepared_visual_bytes(chunk) for chunk in supports)
     )
 
 
