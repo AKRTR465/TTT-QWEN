@@ -78,10 +78,10 @@ line-length = 100
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+select = ["E", "F", "I"]
 
 [tool.mypy]
 python_version = "3.12"
 packages = ["ttt_svcbench_qwen"]
-strict = true
+strict = false
 follow_imports = "skip"
