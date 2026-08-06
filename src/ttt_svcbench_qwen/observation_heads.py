@@ -822,7 +822,7 @@ class ObservationHeads(nn.Module):  # type: ignore[misc]
         return all(not parameter.requires_grad for parameter in self.parameters())
 
 
-def build_observation_heads(config: ProjectConfig | None = None) -> ObservationHeads:
+def build_observation_heads(config: ProjectConfig) -> ObservationHeads:
     return ObservationHeads(config)
 
 

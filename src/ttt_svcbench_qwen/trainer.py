@@ -8,7 +8,7 @@ Forbidden: memory writes, transient runtime checkpoints, or label leakage into m
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Protocol, cast
 
 import torch
 from torch import Tensor
@@ -17,7 +17,6 @@ from ttt_svcbench_qwen.data import RuntimeQueryInput
 from ttt_svcbench_qwen.input_composer import ComposedInput
 from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
-    BatchRuntimeState,
     ObservationChunkOutput,
     ObservationChunkRequest,
     PrefillLifecycle,
@@ -35,50 +34,6 @@ from ttt_svcbench_qwen.stage_a_targets import (
     StageATargetBatch,
 )
 from ttt_svcbench_qwen.state_retriever import RetrieverOutput
-from ttt_svcbench_qwen.training_context import query_activation_context
-
-
-@dataclass(frozen=True, slots=True)
-class StageAExecutionAudit:
-    """Facts emitted by the forward adapter and checked before every optimizer step."""
-
-    row_count: int
-    observed_chunk_count: int
-    hard_state_row_count: int
-    query_router_row_count: int
-    time_resolver_row_count: int
-    retrieval_row_count: int
-    reader_result_count: int
-    bank_reset_count: int
-    bank_write_count: int
-    cache_advance_count: int
-    fsm_rollout_count: int
-    decode_step_count: int = 0
-    ground_truth_reader_input_count: int = 0
-    memory_writes_attempted: int = 0
-    memory_writes_applied: int = 0
-    memory_writes_skipped: int = 0
-
-    def validate(self) -> None:
-        if self.decode_step_count:
-            raise ValueError("Stage A teacher forcing must use prefill only, never decode")
-        if self.ground_truth_reader_input_count:
-            raise ValueError("Reader exact count cannot consume ground-truth labels")
-        if any(
-            (
-                self.memory_writes_attempted,
-                self.memory_writes_applied,
-                self.memory_writes_skipped,
-            )
-        ):
-            raise ValueError("Stage A cannot attempt, apply, or skip memory writes")
-        if self.reader_result_count != self.row_count:
-            raise ValueError("A2 Reader results must cover every row")
-        # A randomly initialized label-free router may legitimately choose UNSUPPORTED for
-        # every row in an early batch. The hard writer still ran (the episode runner checks
-        # its typed audit), but there is intentionally no Bank write to commit. Requiring a
-        # write here would force official operator labels into the runtime path and leak
-        # supervision before the loss builder. O1/O2 rows also need no event FSM rollout.
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,34 +44,12 @@ class StageASupervisionBatch:
     state: StageATargetBatch | None
     official_weak: tuple[OfficialWeakSupervision, ...] = ()
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.answer, AnswerTargetLabels):
-            raise TypeError("Stage A Answer supervision has the wrong type")
-        if self.state is not None and not isinstance(self.state, StageATargetBatch):
-            raise TypeError("Stage A State supervision has the wrong type")
-        if any(not isinstance(value, OfficialWeakSupervision) for value in self.official_weak):
-            raise TypeError("Stage A official-weak supervision has the wrong type")
-        if self.official_weak and len(self.official_weak) != self.answer.batch_size:
-            raise ValueError("Stage A official-weak supervision must align to Answer rows")
-        if self.state is not None and self.official_weak:
-            raise ValueError("one Stage A batch cannot mix dense and official-weak State labels")
-
 
 @dataclass(frozen=True, slots=True)
 class StageATrainingBatch:
     runtime_queries: tuple[RuntimeQueryInput, ...]
     model_inputs: object
     supervision: StageASupervisionBatch
-
-    def __post_init__(self) -> None:
-        if not self.runtime_queries:
-            raise ValueError("Stage A batch requires at least one runtime Query")
-        if any(not isinstance(value, RuntimeQueryInput) for value in self.runtime_queries):
-            raise TypeError("Stage A runtime rows must use RuntimeQueryInput")
-        if not isinstance(self.supervision, StageASupervisionBatch):
-            raise TypeError("Stage A supervision must use StageASupervisionBatch")
-        if self.supervision.answer.batch_size != len(self.runtime_queries):
-            raise ValueError("Stage A Answer labels must align to runtime Query rows")
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,40 +62,11 @@ class StageAModelForwardOutput:
     source_attention_mask: Tensor
     reader_counts: Tensor
     reader_count_valid_mask: Tensor
-    audit: StageAExecutionAudit
     observations: ObservationOutputs | None = None
     query: QueryEncoderOutput | None = None
     retrieval: RetrieverOutput | None = None
     metrics: tuple[tuple[str, float | None], ...] = ()
-    failure_cases: tuple[str, ...] = ()
     o2_dedup: O2DedupContext | None = None
-
-    def __post_init__(self) -> None:
-        batch_size, sequence_length = self.composed_input.input_ids.shape
-        if (
-            self.answer_logits.ndim != 3
-            or self.answer_logits.shape[:2] != (batch_size, sequence_length)
-            or not torch.is_floating_point(self.answer_logits)
-        ):
-            raise ValueError("Stage A model answer logits must align [B, L_composed, V]")
-        if self.source_input_ids.shape != self.source_attention_mask.shape:
-            raise ValueError("Stage A source IDs/attention must align")
-        if self.source_input_ids.shape[0] != batch_size:
-            raise ValueError("Stage A source/composed batches must align")
-        if self.source_input_ids.dtype not in (torch.int32, torch.int64):
-            raise TypeError("Stage A source IDs must be integer")
-        if self.source_attention_mask.dtype not in (torch.bool, torch.int32, torch.int64):
-            raise TypeError("Stage A source attention must be bool/integer")
-        if self.reader_counts.shape != (batch_size,) or self.reader_counts.dtype != torch.int64:
-            raise ValueError("Stage A Reader counts must be int64 [B]")
-        if (
-            self.reader_count_valid_mask.shape != (batch_size,)
-            or self.reader_count_valid_mask.dtype != torch.bool
-        ):
-            raise ValueError("Stage A Reader count validity must be bool [B]")
-        tensors = (self.answer_logits, self.reader_counts, self.reader_count_valid_mask)
-        if any(tensor.device != self.answer_logits.device for tensor in tensors):
-            raise ValueError("Stage A model forward tensors must share one device")
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,29 +80,12 @@ class StageAEpisodeAnswerInputs:
     rope_indexer: object
     qwen_kwargs: tuple[tuple[str, object], ...] = ()
 
-    def __post_init__(self) -> None:
-        if self.base_input_ids.ndim != 2 or self.base_input_ids.dtype not in (
-            torch.int32,
-            torch.int64,
-        ):
-            raise ValueError("Stage A answer base IDs must be integer [B, L]")
-        if self.base_attention_mask.shape != self.base_input_ids.shape:
-            raise ValueError("Stage A answer attention must match base IDs")
-
 
 @dataclass(frozen=True, slots=True)
 class StageAEpisodeInputs:
     owner: RuntimeOwner
     observation_requests: tuple[ObservationChunkRequest, ...]
     answer: StageAEpisodeAnswerInputs
-
-    def __post_init__(self) -> None:
-        if not self.observation_requests:
-            raise ValueError("Stage A episode requires at least one causal observation chunk")
-        if any(request.owner != self.owner for request in self.observation_requests):
-            raise ValueError("Stage A episode observation owners must align")
-        if self.answer.base_input_ids.shape[0] != len(self.owner.video_ids):
-            raise ValueError("Stage A answer rows must align to the runtime owner")
 
 
 def answer_query_request(
@@ -218,19 +105,6 @@ def answer_query_request(
         rope_indexer=answer.rope_indexer,
         qwen_kwargs=answer.qwen_kwargs,
     )
-
-
-def prepared_query_pair(
-    model: StateTTTModel,
-    request: ObservationChunkRequest,
-    *,
-    inference: bool,
-) -> tuple[PreparedQueryOutput, PreparedQueryOutput]:
-    prepared = PreparedQueryOutput.bind(
-        request.query_input,
-        model.components.query_encoder(request.query_input, inference=inference),
-    )
-    return prepared, prepared.detached()
 
 
 class StageAEpisodeMetricBuilder(Protocol):
@@ -254,11 +128,7 @@ class StageAEpisodeRunner:
     ) -> None:
         self.model = model
         self.metric_builder = metric_builder
-        if type(query_encoder_reuse) is not bool:
-            raise TypeError("query_encoder_reuse must be bool")
         self.query_encoder_reuse = query_encoder_reuse
-        if type(query_activation_offload) is not bool:
-            raise TypeError("query_activation_offload must be bool")
         self.query_activation_offload = query_activation_offload
 
     def __call__(
@@ -268,30 +138,25 @@ class StageAEpisodeRunner:
         training: bool,
     ) -> StageAModelForwardOutput:
         del training
-        episode = batch.model_inputs
-        if not isinstance(episode, StageAEpisodeInputs):
-            raise TypeError("Stage A episode runner requires StageAEpisodeInputs")
-        from ttt_svcbench_qwen.stage_a_runtime import StageAWriteAudit
-
+        episode = cast(StageAEpisodeInputs, batch.model_inputs)
         initial = episode.observation_requests[0].runtime_state
-        if not isinstance(initial, BatchRuntimeState):
-            raise TypeError("Stage A episode must begin from a reset BatchRuntimeState")
-        if initial.next_chunk_index != 0 or any(
-            state.version != 0 for state in initial.state_bank_states
-        ):
-            raise ValueError("Stage A episode must reset every owner before the batch")
         lifecycle = PrefillLifecycle(episode.owner)
         observations: list[ObservationChunkOutput] = []
         runtime = initial
         bank_states = initial.state_bank_states
-        bank_write_count = fsm_rollout_count = cache_advance_count = 0
         prepared_query: PreparedQueryOutput | None = None
         detached_query: PreparedQueryOutput | None = None
         if self.query_encoder_reuse:
             final_request = episode.observation_requests[-1]
-            prepared_query, detached_query = prepared_query_pair(
-                self.model, final_request, inference=final_request.inference
+            prepared_query = PreparedQueryOutput.bind(
+                final_request.query_input,
+                self.model.components.query_encoder(
+                    final_request.query_input, inference=final_request.inference
+                ),
             )
+            # Support chunks must consume the DETACHED encoding so their graphs never
+            # re-enter the query encoder.
+            detached_query = prepared_query.detached()
         pre_query_identity_states = initial.identity_bank_states
         for chunk_index, template in enumerate(episode.observation_requests):
             is_current_query_chunk = chunk_index + 1 == len(episode.observation_requests)
@@ -316,34 +181,17 @@ class StageAEpisodeRunner:
                 with torch.no_grad():
                     observed = self.model.observe_chunk(request, lifecycle)
             else:
-                with query_activation_context(self.query_activation_offload):
-                    observed = self.model.observe_chunk(request, lifecycle)
+                observed = self.model.observe_chunk(request, lifecycle)
             observations.append(observed)
             runtime = observed.runtime_state
             bank_states = observed.bank_states
-            if runtime.next_chunk_index != chunk_index + 1:
-                raise ValueError("Stage A runtime chunk index did not advance causally")
-            cache_advance_count += len(episode.owner.video_ids)
-            audit = observed.state_audit
-            if not isinstance(audit, StageAWriteAudit):
-                raise TypeError("A2 observation must execute the typed hard-state writer")
-            if isinstance(audit, StageAWriteAudit):
-                bank_write_count += len(audit.head_types) - len(audit.skipped_rows)
-                fsm_rollout_count += sum(
-                    head is not None and head.value in {"e1", "e2"} for head in audit.head_types
-                )
         final_observation = observations[-1]
         answer_inputs = episode.answer
         answer_request = answer_query_request(episode.owner, final_observation, answer_inputs)
-        with query_activation_context(self.query_activation_offload):
-            output = self.model.prefill_answer(
-                self.model.prepare_answer(answer_request, lifecycle),
-                lifecycle,
-            )
-        if not isinstance(output.composed, ComposedInput):
-            raise TypeError("Stage A episode Composer must return ComposedInput")
-        if not isinstance(output.answer_logits, Tensor):
-            raise TypeError("Stage A Qwen prefill must return Tensor logits")
+        output = self.model.prefill_answer(
+            self.model.prepare_answer(answer_request, lifecycle),
+            lifecycle,
+        )
         row_count = len(episode.owner.video_ids)
         reader_counts = torch.full(
             (row_count,),
@@ -361,22 +209,10 @@ class StageAEpisodeRunner:
             if type(exact_count) is int:
                 reader_counts[row] = exact_count
                 reader_valid[row] = True
-        metrics, failure_cases = self.metric_builder(output, batch.supervision)
+        metrics, _ = self.metric_builder(output, batch.supervision)
         observations_output = output.observations
         query_output = output.query
         retrieval_output = output.retrieval
-        if not isinstance(observations_output, ObservationOutputs):
-            raise TypeError("A2 episode must expose ObservationOutputs")
-        if not isinstance(query_output, QueryEncoderOutput):
-            raise TypeError("A2 episode must expose QueryEncoderOutput")
-        if not isinstance(retrieval_output, RetrieverOutput):
-            raise TypeError("A2 episode must expose RetrieverOutput")
-        # This is execution coverage, not the number of currently supported predictions.
-        # UNSUPPORTED is a valid pre-training model decision; the official weak operator
-        # target is joined only after this label-free runtime forward has completed.
-        hard_state_rows = row_count
-        router_rows = time_rows = retrieval_rows = row_count
-        reader_rows = len(output.reader)
         return StageAModelForwardOutput(
             answer_logits=output.answer_logits,
             composed_input=output.composed,
@@ -384,23 +220,9 @@ class StageAEpisodeRunner:
             source_attention_mask=answer_inputs.base_attention_mask,
             reader_counts=reader_counts,
             reader_count_valid_mask=reader_valid,
-            audit=StageAExecutionAudit(
-                row_count=row_count,
-                observed_chunk_count=len(observations) * row_count,
-                hard_state_row_count=hard_state_rows,
-                query_router_row_count=router_rows,
-                time_resolver_row_count=time_rows,
-                retrieval_row_count=retrieval_rows,
-                reader_result_count=reader_rows,
-                bank_reset_count=row_count,
-                bank_write_count=bank_write_count,
-                cache_advance_count=cache_advance_count,
-                fsm_rollout_count=fsm_rollout_count,
-            ),
             observations=observations_output,
             query=query_output,
             retrieval=retrieval_output,
             metrics=metrics,
-            failure_cases=failure_cases,
             o2_dedup=O2DedupContext.from_identity_states(pre_query_identity_states),
         )

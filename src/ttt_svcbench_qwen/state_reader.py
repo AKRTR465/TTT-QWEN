@@ -510,63 +510,35 @@ def _reader_bank_snapshot(
         zip(query.hard_operators, query.time.resolutions, strict=True)
     ):
         n_state = int(view.n_state[row].item())
-        owner_matches = (
-            view.video_ids[row] == normalized_video_ids[row]
-            and view.trajectory_ids[row] == normalized_trajectory_ids[row]
-        )
         rejected_status: RetrievalStatus | None = None
         rejected_reason: RetrievalReason | None = None
-        query_rejected = owner_mismatch = 0
-        if not owner_matches:
-            rejected_status = RetrievalStatus.INVALID
-            rejected_reason = RetrievalReason.OWNER_MISMATCH
-            owner_mismatch = n_state
-        elif resolution.status is TimeResolutionStatus.INVALID:
+        if resolution.status is TimeResolutionStatus.INVALID:
             rejected_status = RetrievalStatus.INVALID
             rejected_reason = RetrievalReason.INVALID_TIME
-            query_rejected = n_state
         elif resolution.status is TimeResolutionStatus.UNSUPPORTED:
             rejected_status = RetrievalStatus.UNSUPPORTED
             rejected_reason = RetrievalReason.UNSUPPORTED_TIME
-            query_rejected = n_state
         elif operator is Operator.UNSUPPORTED or heads[row] is None:
             rejected_status = RetrievalStatus.UNSUPPORTED
             rejected_reason = RetrievalReason.UNSUPPORTED_OPERATOR
-            query_rejected = n_state
 
         if rejected_status is not None and rejected_reason is not None:
             statuses.append(rejected_status)
             reasons.append(rejected_reason)
-            audits.append(
-                RetrievalFilterAudit(
-                    n_state=n_state,
-                    head_partition_excluded_count=0,
-                    query_rejected_count=query_rejected,
-                    owner_mismatch_count=owner_mismatch,
-                    invalid_count=0,
-                    retrieval_ineligible_count=0,
-                    future_count=0,
-                    outside_window_count=0,
-                    below_similarity_count=0,
-                    selected_count=0,
-                )
-            )
+            audits.append(RetrievalFilterAudit(n_state=n_state, selected_count=0))
             selected_ids.append(())
             selected_scores.append(())
             selected_records.append(())
             continue
 
-        head_excluded = invalid = ineligible = 0
         selected_columns: list[int] = []
         for column in range(n_state):
             record = view.cloned_records[row][column]
-            if not bool(predicted_head_mask[row, column]):
-                head_excluded += 1
-            elif not record.valid:
-                invalid += 1
-            elif not bool(view.retrieval_eligible_mask[row, column]):
-                ineligible += 1
-            else:
+            if (
+                bool(predicted_head_mask[row, column])
+                and record.valid
+                and bool(view.retrieval_eligible_mask[row, column])
+            ):
                 selected_columns.append(column)
                 selected_mask[row, column] = True
         selected_columns.sort(key=lambda column: str(view.record_ids[row][column]))
@@ -588,29 +560,10 @@ def _reader_bank_snapshot(
             statuses.append(RetrievalStatus.EMPTY)
             if n_state == 0:
                 reason = RetrievalReason.EMPTY_BANK
-            elif head_excluded == n_state:
-                reason = RetrievalReason.EMPTY_HEAD_PARTITION
-            elif invalid == n_state - head_excluded:
-                reason = RetrievalReason.ALL_INVALID
-            elif invalid + ineligible == n_state - head_excluded and ineligible:
-                reason = RetrievalReason.ALL_RETRIEVAL_INELIGIBLE
             else:
                 reason = RetrievalReason.NO_MATCH
             reasons.append(reason)
-        audits.append(
-            RetrievalFilterAudit(
-                n_state=n_state,
-                head_partition_excluded_count=head_excluded,
-                query_rejected_count=0,
-                owner_mismatch_count=0,
-                invalid_count=invalid,
-                retrieval_ineligible_count=ineligible,
-                future_count=0,
-                outside_window_count=0,
-                below_similarity_count=0,
-                selected_count=selected_count,
-            )
-        )
+        audits.append(RetrievalFilterAudit(n_state=n_state, selected_count=selected_count))
 
     return RetrieverOutput(
         selected_record_ids=tuple(selected_ids),

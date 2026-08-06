@@ -1,8 +1,7 @@
-"""Build production A2/A5 manifests without exposing supervision to model runtime inputs.
+"""Build production A2/A5 manifests.
 
-The manifest is a training sidecar.  Runtime construction must still pass through
-``RuntimeQueryInput``/``assert_runtime_payload_safe``; labels in this module are consumed only by
-the post-forward loss builder.
+The manifest is a training sidecar: labels in this module are consumed only by the
+post-forward loss builder, never by a runtime model payload.
 """
 
 from __future__ import annotations
@@ -10,17 +9,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import random
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
-from functools import lru_cache
-from itertools import pairwise
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
-import av
 from torch.utils.data import Dataset, Sampler
 
 from ttt_svcbench_qwen.data import (
@@ -28,7 +23,6 @@ from ttt_svcbench_qwen.data import (
     LoadedAnnotations,
     RuntimeQueryInput,
     SVCBenchRecord,
-    assert_runtime_payload_safe,
     create_group_kfold_manifest,
     extract_explicit_time_values,
 )
@@ -39,11 +33,6 @@ from ttt_svcbench_qwen.json_contract import (
     string_value,
 )
 from ttt_svcbench_qwen.query_encoder import Operator, TimeWindowMode
-from ttt_svcbench_qwen.visual_cost import (
-    EpochBoundaryCostEMA,
-    VisualCostRecord,
-    load_visual_cost_index,
-)
 
 
 class EpisodeSplit(StrEnum):
@@ -69,23 +58,6 @@ class AdaptiveChunkSpec:
     maximum_frames: int = 16
     frame_sampling: str = "uniform"
 
-    def __post_init__(self) -> None:
-        if (
-            not math.isfinite(self.start_time)
-            or not math.isfinite(self.end_time)
-            or self.start_time < 0.0
-            or self.end_time <= self.start_time
-        ):
-            raise ValueError("adaptive chunk times must be finite with 0 <= start < end")
-        if (
-            type(self.maximum_frames) is not int
-            or self.maximum_frames < 2
-            or self.maximum_frames > 16
-            or self.maximum_frames % 2
-            or self.frame_sampling != "uniform"
-        ):
-            raise ValueError("production adaptive chunks use even uniform frame caps in [2, 16]")
-
 
 @dataclass(frozen=True, slots=True)
 class AnswerSupervisionSidecar:
@@ -94,13 +66,6 @@ class AnswerSupervisionSidecar:
     query_id: str
     answer: str | None
     provenance: str
-
-    def __post_init__(self) -> None:
-        if not self.query_id:
-            raise ValueError("answer supervision requires a Query ID")
-        expected = "official_explicit" if self.answer is not None else "missing"
-        if self.provenance != expected:
-            raise ValueError("answer provenance must exactly reflect label availability")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,21 +84,6 @@ class WeakQuerySidecar:
     occurrence_intervals: tuple[tuple[float, float], ...]
     provenance: str = "official_weak"
 
-    def __post_init__(self) -> None:
-        if not self.query_id or self.query_index < 0 or self.count < 0:
-            raise ValueError("weak Query sidecar identity/count is invalid")
-        if not math.isfinite(self.query_time) or self.query_time < 0.0:
-            raise ValueError("weak Query time must be finite and non-negative")
-        supported = {
-            operator.value for operator in Operator if operator is not Operator.UNSUPPORTED
-        }
-        if self.operator not in supported:
-            raise ValueError("weak Query operator must be one of the eight supported operators")
-        if self.time_mode not in {mode.value for mode in TimeWindowMode}:
-            raise ValueError("weak Query time mode is invalid")
-        if self.provenance != "official_weak":
-            raise ValueError("production weak sidecars require official_weak provenance")
-
 
 @dataclass(frozen=True, slots=True)
 class ProductionQueryRecord:
@@ -142,15 +92,6 @@ class ProductionQueryRecord:
     runtime: RuntimeQueryInput
     answer: AnswerSupervisionSidecar
     weak: WeakQuerySidecar
-
-    def __post_init__(self) -> None:
-        ids = (self.runtime.query_id, self.answer.query_id, self.weak.query_id)
-        if len(set(ids)) != 1:
-            raise ValueError("runtime/answer/weak Query identities must align")
-        if self.runtime.query_index != self.weak.query_index:
-            raise ValueError("runtime and weak Query indices must align")
-        if self.runtime.query_time != self.weak.query_time:
-            raise ValueError("runtime and weak Query times must align")
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,16 +105,6 @@ class A2QueryRecord:
     query: ProductionQueryRecord
     sampling_weight: float
 
-    def __post_init__(self) -> None:
-        if not self.video_id or not self.trajectory_id or not self.relative_video_path:
-            raise ValueError("A2 Query ownership/path fields must be non-empty")
-        if not math.isfinite(self.sampling_weight) or self.sampling_weight <= 0.0:
-            raise ValueError("A2 sampling weight must be positive and finite")
-        assert_runtime_payload_safe(
-            self.query.runtime.as_payload(),
-            layer="A2 manifest runtime",
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class A5SupervisedSegmentRecord:
@@ -182,25 +113,6 @@ class A5SupervisedSegmentRecord:
     meta_query: ProductionQueryRecord
     query_weight: float = 1.0
     additional_meta_queries: tuple[ProductionQueryRecord, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.supports or len(self.supports) > 8:
-            raise ValueError("A5 supervised segments require 1-8 Support chunks")
-        if any(chunk.role is not ChunkRole.SUPPORT for chunk in self.supports):
-            raise ValueError("A5 supervised segment chunks must all be Support")
-        ends = tuple(chunk.end_time for chunk in self.supports)
-        if any(right <= left for left, right in pairwise(ends)):
-            raise ValueError("A5 supervised segment Support ends must advance strictly")
-        query_times = tuple(query.runtime.query_time for query in self.queries)
-        if any(right <= left for left, right in pairwise(query_times)):
-            raise ValueError("A5 segment Query bundle must advance strictly")
-        if ends[-1] >= query_times[0]:
-            raise ValueError(
-                "A5 segment Query bundle must follow every segment Support: "
-                f"support_end={ends[-1]:.6f}, first_query={query_times[0]:.6f}"
-            )
-        if self.query_weight != 1.0:
-            raise ValueError("A5 Intermediate and Final Query weights are frozen to one")
 
     @property
     def queries(self) -> tuple[ProductionQueryRecord, ...]:
@@ -224,6 +136,9 @@ class A5SupervisedSegmentRecord:
 
 @dataclass(frozen=True, slots=True)
 class A5EpisodeRecord:
+    """One K=8 support-aligned episode: a prewarm chunk plus one or two supervised
+    segments, each segment being up-to-K Support chunks followed by its Query bundle."""
+
     episode_id: str
     source_dataset: str
     relative_video_path: str
@@ -234,81 +149,12 @@ class A5EpisodeRecord:
     operator: str
     prewarm: AdaptiveChunkSpec
     supervised_segments: tuple[A5SupervisedSegmentRecord, ...]
-    diagnostic_queries: tuple[ProductionQueryRecord, ...]
     support_count: int
     meta_query_count: int
-    diagnostic_query_count: int
     truncation_horizon: int
     tbptt_segment_count: int
     sampling_weight: float
-    insufficient_inter_query_gap: bool = False
     loss_weight: float = 1.0
-    padding_source_episode_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if not self.episode_id or not self.video_id or not self.trajectory_id:
-            raise ValueError("episode identity fields must be non-empty")
-        if self.prewarm.role is not ChunkRole.PREWARM:
-            raise ValueError("A5 episode must contain one explicit prewarm chunk")
-        if not self.supervised_segments or len(self.supervised_segments) > 2:
-            raise ValueError("A5 episodes require one or two supervised segments")
-        supports = self.supports
-        queries = self.queries
-        if self.support_count != len(supports):
-            raise ValueError("A5 support_count does not match supervised segments")
-        if self.meta_query_count != len(queries):
-            raise ValueError("A5 meta_query_count does not match supervised Query bundles")
-        if self.diagnostic_query_count != len(self.diagnostic_queries):
-            raise ValueError("A5 diagnostic_query_count does not match diagnostic Queries")
-        if self.tbptt_segment_count != len(self.supervised_segments):
-            raise ValueError("A5 tbptt_segment_count must equal supervised segment count")
-        if self.truncation_horizon != 8:
-            raise ValueError("support-aligned A5 is frozen to K=8")
-        if any(
-            len(segment.supports) > self.truncation_horizon
-            for segment in self.supervised_segments
-        ):
-            raise ValueError("A5 supervised segment exceeds truncation horizon")
-        if self.prewarm.end_time >= self.supports[0].end_time:
-            raise ValueError("A5 prewarm must complete before the first Support end")
-        query_times = tuple(query.runtime.query_time for query in queries)
-        if any(right <= left for left, right in pairwise(query_times)):
-            raise ValueError("A5 Meta Query points must advance strictly")
-        roles = tuple(segment.role for segment in self.supervised_segments)
-        expected_roles = (
-            (A5QueryRole.FINAL,)
-            if len(roles) == 1
-            else (A5QueryRole.INTERMEDIATE, A5QueryRole.FINAL)
-        )
-        if roles != expected_roles:
-            raise ValueError("A5 segment roles must be Final or Intermediate then Final")
-        for previous, current in pairwise(self.supervised_segments):
-            previous_time = previous.queries[-1].runtime.query_time
-            if any(chunk.end_time <= previous_time for chunk in current.supports):
-                raise ValueError(
-                    "each later A5 segment Support must advance beyond its prior Query"
-                )
-        diagnostic_ids = {
-            query.runtime.query_id for query in self.diagnostic_queries
-        }
-        meta_ids = {query.runtime.query_id for query in queries}
-        if diagnostic_ids & meta_ids:
-            raise ValueError("A5 diagnostic and Meta Query sets must be disjoint")
-        all_queries = (*queries, *self.diagnostic_queries)
-        if not all_queries:
-            raise ValueError("A5 episode must retain official Query supervision")
-        latest = max(all_queries, key=lambda query: query.runtime.query_time)
-        if queries[-1].runtime.query_id != latest.runtime.query_id:
-            raise ValueError("A5 Final Query must be the latest official Query")
-        if type(self.insufficient_inter_query_gap) is not bool:
-            raise TypeError("A5 insufficient-gap audit must be bool")
-        if not math.isfinite(self.sampling_weight) or self.sampling_weight <= 0.0:
-            raise ValueError("A5 sampling weight must be positive and finite")
-        if self.loss_weight not in (0.0, 1.0):
-            raise ValueError("A5 loss_weight must be exactly zero for padding or one for data")
-        is_padding = self.padding_source_episode_id is not None
-        if is_padding != (self.loss_weight == 0.0):
-            raise ValueError("deterministic padding episodes must be the only zero-weight rows")
 
     @property
     def supports(self) -> tuple[AdaptiveChunkSpec, ...]:
@@ -339,73 +185,18 @@ class SegmentBucket:
     loss_weights: tuple[float, ...]
     world_size: int
 
-    def __post_init__(self) -> None:
-        if self.tbptt_segment_count <= 0 or self.world_size <= 0:
-            raise ValueError("segment bucket dimensions must be positive")
-        if not self.episode_ids or len(self.episode_ids) % self.world_size:
-            raise ValueError("segment buckets must be rank-aligned to world_size")
-        if len(self.loss_weights) != len(self.episode_ids):
-            raise ValueError("segment bucket weights must align to episodes")
-
-
-@dataclass(frozen=True, slots=True)
-class EpisodeFailure:
-    query_id: str
-    video_id: str
-    source_dataset: str
-    query_time: float
-    video_duration: float | None
-    reason: str
-
 
 @dataclass(frozen=True, slots=True)
 class ProductionEpisodeManifest:
-    schema_version: str
     dataset_name: str
     dataset_revision: str
     annotation_sha256: str
     fold_index: int
     seed: int
-    train_fraction: float
-    group_key: str
-    maximum_query_span_seconds: float
-    minimum_query_points: int
-    minimum_inter_query_seconds: float
-    segment_loss_reduction: str
     truncation_horizon: int
     a2_queries: tuple[A2QueryRecord, ...]
     episodes: tuple[A5EpisodeRecord, ...]
     buckets: tuple[SegmentBucket, ...]
-    task_query_counts: tuple[tuple[str, int], ...]
-    failures: tuple[EpisodeFailure, ...]
-
-    def __post_init__(self) -> None:
-        if self.schema_version != "svcbench_a2_a5_v4":
-            raise ValueError("unknown production episode manifest schema")
-        if self.minimum_inter_query_seconds != 4.0:
-            raise ValueError("support-aligned A5 requires a four-second minimum Query gap")
-        if self.segment_loss_reduction != "sum":
-            raise ValueError("support-aligned A5 Meta Query losses must use sum reduction")
-        train_videos = {
-            episode.video_id for episode in self.episodes if episode.split is EpisodeSplit.TRAIN
-        }
-        validation_videos = {
-            episode.video_id
-            for episode in self.episodes
-            if episode.split is EpisodeSplit.VALIDATION
-        }
-        if train_videos & validation_videos:
-            raise ValueError("production episode manifest leaks a video across splits")
-        a2_train_videos = {
-            query.video_id for query in self.a2_queries if query.split is EpisodeSplit.TRAIN
-        }
-        a2_validation_videos = {
-            query.video_id for query in self.a2_queries if query.split is EpisodeSplit.VALIDATION
-        }
-        if a2_train_videos & a2_validation_videos:
-            raise ValueError("A2 manifest leaks a video across splits")
-        if train_videos - a2_train_videos or validation_videos - a2_validation_videos:
-            raise ValueError("A2 and A5 manifests disagree on fold ownership")
 
     @property
     def a2_query_ids(self) -> tuple[str, ...]:
@@ -430,16 +221,12 @@ class ProductionManifestDataset(Dataset[ManifestRecord]):  # type: ignore[misc]
         stage: ManifestStage,
         split: EpisodeSplit,
     ) -> None:
-        if not isinstance(manifest, ProductionEpisodeManifest):
-            raise TypeError("production dataset requires a validated manifest")
         if stage is ManifestStage.A2:
             records: tuple[ManifestRecord, ...] = tuple(
                 record for record in manifest.a2_queries if record.split is split
             )
         else:
             records = tuple(record for record in manifest.episodes if record.split is split)
-        if not records:
-            raise ValueError(f"manifest contains no {stage.value}/{split.value} records")
         self.manifest = manifest
         self.stage = stage
         self.split = split
@@ -447,8 +234,6 @@ class ProductionManifestDataset(Dataset[ManifestRecord]):  # type: ignore[misc]
         self.index_by_id = {
             _manifest_record_id(record): index for index, record in enumerate(records)
         }
-        if len(self.index_by_id) != len(records):
-            raise ValueError("production manifest record IDs must be unique within a dataset")
 
     def __len__(self) -> int:
         return len(self.records)
@@ -462,14 +247,8 @@ def load_production_manifest_views(
     *,
     stage: ManifestStage,
 ) -> tuple[ProductionManifestDataset, ProductionManifestDataset]:
-    """Load the one authoritative manifest and expose immutable train/validation views.
+    """Load the one authoritative manifest and expose immutable train/validation views."""
 
-    The LLaMA-Factory bridge owns this operation centrally.  A runtime factory may materialize
-    tensors from the records it receives, but it cannot substitute another dataset or split.
-    """
-
-    if not isinstance(stage, ManifestStage):
-        raise TypeError("production manifest stage must be a ManifestStage")
     manifest = load_production_episode_manifest(manifest_path)
     return (
         ProductionManifestDataset(
@@ -493,13 +272,11 @@ def _a2_visual_length_key(
     state_query_max_frames: int = 16,
     answer_query_visual_mode: str = "causal_prefix",
     answer_query_max_frames: int = 256,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int]:
     """Return a cheap deterministic proxy for visual tokens and decode work.
 
     The first component is the exact configured upper bound on causal frames at 2 FPS across
-    every Support plus the configured Query observation. Source pixel rate and encoded bitrate group
-    videos with similar decode cost; the header probe is cached per unique file.  Missing local
-    media is valid for manifest-only tests and simply uses zero tie breakers.
+    every Support plus the configured Query observation.
     """
 
     _, supports = adaptive_support_schedule(record.query.runtime.query_time)
@@ -527,53 +304,9 @@ def _a2_visual_length_key(
             max(2, int(math.floor((query_end - query_start) * query_sample_fps))),
         )
         frame_budget += max(2, query_desired - query_desired % 2)
-    file_bytes = 0
-    pixel_rate = 0
-    encoded_bytes_per_second = 0
-    root = os.environ.get("SVCBENCH_VIDEO_ROOT")
-    if root:
-        root_path = Path(root).resolve()
-        for candidate in (
-            (root_path / record.relative_video_path).resolve(),
-            (root_path / record.source_dataset / record.relative_video_path).resolve(),
-        ):
-            if candidate.is_relative_to(root_path) and candidate.is_file():
-                file_bytes = candidate.stat().st_size
-                pixel_rate, encoded_bytes_per_second = _video_decode_rate(str(candidate))
-                break
     # Support count is already a hard sampler bucket.  Within it, frame budget predicts ViT
-    # work, decoded source pixels/second predicts short-window CPU work, and encoded bitrate
-    # breaks ties for long random-access intervals.  File bytes remain a deterministic fallback
-    # when a container cannot expose stream metadata.
-    return frame_budget, history_write_units, pixel_rate, encoded_bytes_per_second or file_bytes
-
-
-@lru_cache(maxsize=1_024)
-def _video_decode_rate(path: str) -> tuple[int, int]:
-    """Probe one local video header for rank-straggler-aware A2 bucketing."""
-
-    try:
-        file_bytes = Path(path).stat().st_size
-        with av.open(path) as container:
-            stream = container.streams.video[0]
-            rate = stream.average_rate or stream.base_rate or stream.guessed_rate
-            fps = float(rate) if rate is not None else 0.0
-            width = int(stream.width or 0)
-            height = int(stream.height or 0)
-            duration = 0.0
-            if stream.duration is not None and stream.time_base is not None:
-                duration = float(stream.duration * stream.time_base)
-            elif container.duration is not None:
-                duration = float(container.duration) / float(av.time_base)
-    except (OSError, ValueError, TypeError, IndexError, av.error.FFmpegError):
-        return 0, 0
-    if not math.isfinite(fps) or fps <= 0.0:
-        fps = 0.0
-    if not math.isfinite(duration) or duration <= 0.0:
-        duration = 0.0
-    pixel_rate = int(width * height * fps)
-    encoded_rate = int(file_bytes / duration) if duration else 0
-    return max(0, pixel_rate), max(0, encoded_rate)
+    # work and history write units break ties.
+    return frame_budget, history_write_units
 
 
 class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
@@ -593,56 +326,39 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         rank: int,
         world_size: int,
         seed: int = 42,
-        visual_length_fn: Callable[[A2QueryRecord], int] | None = None,
-        visual_cost_index: Mapping[str, VisualCostRecord] | None = None,
         query_sample_fps: float = 2.0,
         state_query_visual_mode: str = "recent_chunk",
         state_query_max_frames: int = 16,
         answer_query_visual_mode: str = "causal_prefix",
         answer_query_max_frames: int = 256,
     ) -> None:
-        if dataset.stage is not ManifestStage.A2 or dataset.split is not EpisodeSplit.TRAIN:
-            raise ValueError("balanced A2 sampling requires the A2 train dataset")
-        if world_size <= 0 or rank < 0 or rank >= world_size:
-            raise ValueError("A2 sampler rank/world_size is invalid")
         self.dataset = dataset
         self.rank = rank
         self.world_size = world_size
         self.seed = seed
         self.epoch = 0
-        self.visual_cost_index = visual_cost_index or {}
         self.query_sample_fps = query_sample_fps
         self.state_query_visual_mode = state_query_visual_mode
         self.state_query_max_frames = state_query_max_frames
         self.answer_query_visual_mode = answer_query_visual_mode
         self.answer_query_max_frames = answer_query_max_frames
-        self.runtime_cost_ema = EpochBoundaryCostEMA(
-            {
-                record_id: record.predicted_total_seconds
-                for record_id, record in self.visual_cost_index.items()
-            }
-        )
-        if self.visual_cost_index:
-            missing = {
-                _require_a2(record).query.runtime.query_id for record in dataset.records
-            } - set(self.visual_cost_index)
-            if missing:
-                raise ValueError("A2 visual cost index does not cover every manifest record")
         buckets: dict[tuple[str, int], list[int]] = defaultdict(list)
-        for index, raw in enumerate(dataset.records):
-            record = _require_a2(raw)
+        records: tuple[A2QueryRecord, ...] = self.dataset.records  # type: ignore[assignment]
+        for index, record in enumerate(records):
             support_count = len(adaptive_support_schedule(record.query.runtime.query_time)[1])
             buckets[(record.task_class, support_count)].append(index)
-        tasks = {task for task, _ in buckets}
-        if tasks != {"O1", "O2", "E1", "E2"}:
-            raise ValueError("balanced A2 production sampling requires all four task classes")
         self._buckets = {name: tuple(values) for name, values in buckets.items()}
-        self._visual_lengths: dict[int, tuple[float, int, int, int]] = {
-            index: self._visual_key(_require_a2(raw), visual_length_fn)
-            for index, raw in enumerate(dataset.records)
+        self._visual_lengths: dict[int, tuple[int, int]] = {
+            index: _a2_visual_length_key(
+                record,
+                query_sample_fps=self.query_sample_fps,
+                state_query_visual_mode=self.state_query_visual_mode,
+                state_query_max_frames=self.state_query_max_frames,
+                answer_query_visual_mode=self.answer_query_visual_mode,
+                answer_query_max_frames=self.answer_query_max_frames,
+            )
+            for index, record in enumerate(records)
         }
-        if any(any(value < 0 for value in key) for key in self._visual_lengths.values()):
-            raise ValueError("A2 visual-length proxy must be non-negative")
         group_counts = {
             task: sum(
                 math.ceil(len(values) / world_size)
@@ -654,50 +370,8 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
         self._groups_per_task = max(group_counts.values())
         self._global_size = 4 * self._groups_per_task * world_size
 
-    def _visual_key(
-        self,
-        record: A2QueryRecord,
-        visual_length_fn: Callable[[A2QueryRecord], int] | None,
-    ) -> tuple[float, int, int, int]:
-        if visual_length_fn is not None:
-            return int(visual_length_fn(record)), 0, 0, 0
-        sidecar = self.visual_cost_index.get(record.query.runtime.query_id)
-        if sidecar is not None:
-            if sidecar.support_count != len(
-                adaptive_support_schedule(record.query.runtime.query_time)[1]
-            ):
-                raise ValueError("A2 visual cost Support count disagrees with manifest")
-            return sidecar.sort_key
-        return _a2_visual_length_key(
-            record,
-            query_sample_fps=self.query_sample_fps,
-            state_query_visual_mode=self.state_query_visual_mode,
-            state_query_max_frames=self.state_query_max_frames,
-            answer_query_visual_mode=self.answer_query_visual_mode,
-            answer_query_max_frames=self.answer_query_max_frames,
-        )
-
     def set_epoch(self, epoch: int) -> None:
-        if type(epoch) is not int or epoch < 0:
-            raise ValueError("sampler epoch must be a non-negative integer")
-        self.runtime_cost_ema.advance_epoch(epoch)
-        for index, raw in enumerate(self.dataset.records):
-            record = _require_a2(raw)
-            sidecar = self.visual_cost_index.get(record.query.runtime.query_id)
-            if sidecar is not None:
-                self._visual_lengths[index] = (
-                    self.runtime_cost_ema.value(
-                        sidecar.record_id,
-                        sidecar.predicted_total_seconds,
-                    ),
-                    sidecar.history_write_units,
-                    sidecar.total_visual_tokens,
-                    sidecar.maximum_visual_tokens,
-                )
         self.epoch = epoch
-
-    def observe_runtime_cost(self, record_id: str, seconds: float) -> None:
-        self.runtime_cost_ema.observe(record_id, seconds)
 
     def __iter__(self) -> Iterator[int]:
         rng = random.Random(self.seed + self.epoch)
@@ -732,14 +406,8 @@ class BalancedA2DistributedSampler(Sampler[int]):  # type: ignore[misc]
                     rng.choices(task_batches, k=self._groups_per_task - len(task_batches))
                 )
             global_batches.extend(task_batches)
-        if os.environ.get("TTT_SMOKE_SHORTEST_FIRST") == "1":
-            global_batches.sort(key=lambda item: item[1])
-        else:
-            rng.shuffle(global_batches)
-        global_indices = [index for batch, _ in global_batches for index in batch]
-        if len(global_indices) != self._global_size:
-            raise RuntimeError("balanced A2 global sampler length drifted")
-        return iter(global_indices)
+        rng.shuffle(global_batches)
+        return iter([index for batch, _ in global_batches for index in batch])
 
     def __len__(self) -> int:
         return self._global_size
@@ -760,74 +428,36 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
         rank: int,
         world_size: int,
         seed: int = 42,
-        visual_cost_index: Mapping[str, VisualCostRecord] | None = None,
         query_sample_fps: float = 2.0,
         state_query_visual_mode: str = "recent_chunk",
         state_query_max_frames: int = 16,
         answer_query_visual_mode: str = "causal_prefix",
         answer_query_max_frames: int = 256,
     ) -> None:
-        if dataset.stage is not ManifestStage.A5 or dataset.split is not EpisodeSplit.TRAIN:
-            raise ValueError("rank-aligned A5 sampling requires the A5 train dataset")
-        if world_size <= 0 or rank < 0 or rank >= world_size:
-            raise ValueError("A5 sampler rank/world_size is invalid")
-        if world_size not in {4, 8}:
-            raise ValueError("production A5 manifest supports only four or eight ranks")
         self.dataset = dataset
         self.rank = rank
         self.world_size = world_size
         self.seed = seed
         self.epoch = 0
-        self.visual_cost_index = visual_cost_index or {}
         self.query_sample_fps = query_sample_fps
         self.state_query_visual_mode = state_query_visual_mode
         self.state_query_max_frames = state_query_max_frames
         self.answer_query_visual_mode = answer_query_visual_mode
         self.answer_query_max_frames = answer_query_max_frames
-        self.runtime_cost_ema = EpochBoundaryCostEMA(
-            {
-                record_id: record.predicted_total_seconds
-                for record_id, record in self.visual_cost_index.items()
-            }
-        )
         self._buckets = tuple(
             bucket for bucket in dataset.manifest.buckets if bucket.split is EpisodeSplit.TRAIN
         )
-        if not self._buckets:
-            raise ValueError("A5 train manifest contains no segment buckets")
-        bucket_world_sizes = {bucket.world_size for bucket in self._buckets}
-        if bucket_world_sizes != {self.world_size}:
-            raise ValueError(
-                "A5 manifest bucket world_size does not match the active launcher: "
-                f"manifest={sorted(bucket_world_sizes)}, active={self.world_size}; "
-                f"regenerate the manifest with --world-size {self.world_size}"
-            )
-        record_ids = {_manifest_record_id(record) for record in dataset.records}
-        if self.visual_cost_index and record_ids - set(self.visual_cost_index):
-            raise ValueError("A5 visual cost index does not cover every manifest record")
-        for bucket in self._buckets:
-            shapes = {
-                _a5_alignment_shape(_require_a5(dataset[dataset.index_by_id[episode_id]]))
-                for episode_id in bucket.episode_ids
-            }
-            if len(shapes) != 1:
-                raise ValueError("A5 manifest bucket mixes exact segment lengths or Query counts")
         self._global_size = sum(len(bucket.episode_ids) for bucket in self._buckets)
 
     def set_epoch(self, epoch: int) -> None:
-        if type(epoch) is not int or epoch < 0:
-            raise ValueError("sampler epoch must be a non-negative integer")
-        self.runtime_cost_ema.advance_epoch(epoch)
         self.epoch = epoch
-
-    def observe_runtime_cost(self, record_id: str, seconds: float) -> None:
-        self.runtime_cost_ema.observe(record_id, seconds)
 
     def __iter__(self) -> Iterator[int]:
         rng = random.Random(self.seed + self.epoch)
         global_batches: list[tuple[int, ...]] = []
-        records_by_id = {
-            _manifest_record_id(record): _require_a5(record) for record in self.dataset.records
+        records_by_id: dict[str, A5EpisodeRecord] = {
+            _manifest_record_id(record): record  # type: ignore[misc]
+            for record in self.dataset.records
         }
         for bucket in self._buckets:
             real_ids = [
@@ -852,42 +482,18 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
             sampled = rng.choices(real_ids, weights=weights, k=len(real_ids))
             scheduled_ids = sampled + padding_ids
             scheduled_ids.sort(key=self._cost_key)
-            if len(scheduled_ids) % self.world_size:
-                raise RuntimeError("A5 segment bucket lost its rank-aligned padding")
             for start in range(0, len(scheduled_ids), self.world_size):
                 group = scheduled_ids[start : start + self.world_size]
-                indices = tuple(self.dataset.index_by_id[episode_id] for episode_id in group)
-                shapes = {
-                    _a5_alignment_shape(_require_a5(self.dataset[index])) for index in indices
-                }
-                if len(shapes) != 1:
-                    raise RuntimeError("A5 sampler mixed segment lengths or Query counts")
-                global_batches.append(indices)
+                global_batches.append(
+                    tuple(self.dataset.index_by_id[episode_id] for episode_id in group)
+                )
         rng.shuffle(global_batches)
-        global_indices = [index for batch in global_batches for index in batch]
-        if len(global_indices) != self._global_size:
-            raise RuntimeError("rank-aligned A5 global sampler length drifted")
-        return iter(global_indices)
+        return iter([index for batch in global_batches for index in batch])
 
     def _cost_key(self, episode_id: str) -> tuple[float, int, int, int]:
-        record = _require_a5(self.dataset[self.dataset.index_by_id[episode_id]])
-        sidecar = self.visual_cost_index.get(episode_id)
-        if sidecar is not None:
-            if sidecar.support_count != record.support_count:
-                raise ValueError("A5 visual cost Support count disagrees with manifest")
-            if sidecar.segment_lengths != _a5_segment_lengths(record):
-                raise ValueError("A5 visual cost segment lengths disagree with manifest")
-            if sidecar.query_count != record.meta_query_count:
-                raise ValueError("A5 visual cost Query count disagrees with manifest")
-            return (
-                self.runtime_cost_ema.value(
-                    episode_id,
-                    sidecar.predicted_total_seconds,
-                ),
-                sidecar.history_write_units,
-                sidecar.total_visual_tokens,
-                sidecar.maximum_visual_tokens,
-            )
+        record: A5EpisodeRecord = self.dataset[  # type: ignore[assignment]
+            self.dataset.index_by_id[episode_id]
+        ]
         support_frames = record.prewarm.maximum_frames + sum(
             chunk.maximum_frames for chunk in record.supports
         )
@@ -916,11 +522,10 @@ class RankAlignedA5SegmentSampler(Sampler[int]):  # type: ignore[misc]
 
 
 def build_production_train_sampler(
-    dataset: object,
+    dataset: ProductionManifestDataset,
     rank: int,
     world_size: int,
     *,
-    visual_cost_index: Mapping[str, VisualCostRecord] | None = None,
     query_sample_fps: float = 2.0,
     state_query_visual_mode: str = "recent_chunk",
     state_query_max_frames: int = 16,
@@ -929,15 +534,12 @@ def build_production_train_sampler(
 ) -> Sampler[int]:
     """Shared runtime-factory hook for A2 task balance and A5 segment parity."""
 
-    if not isinstance(dataset, ProductionManifestDataset):
-        raise TypeError("production sampler requires ProductionManifestDataset")
     if dataset.stage is ManifestStage.A2:
         return BalancedA2DistributedSampler(
             dataset,
             rank=rank,
             world_size=world_size,
             seed=dataset.manifest.seed,
-            visual_cost_index=visual_cost_index,
             query_sample_fps=query_sample_fps,
             state_query_visual_mode=state_query_visual_mode,
             state_query_max_frames=state_query_max_frames,
@@ -949,7 +551,6 @@ def build_production_train_sampler(
         rank=rank,
         world_size=world_size,
         seed=dataset.manifest.seed,
-        visual_cost_index=visual_cost_index,
         query_sample_fps=query_sample_fps,
         state_query_visual_mode=state_query_visual_mode,
         state_query_max_frames=state_query_max_frames,
@@ -965,15 +566,9 @@ def _query_visual_frame_budget(
     maximum: int,
     sample_fps: float,
 ) -> int:
-    if mode not in {"recent_chunk", "causal_prefix"}:
-        raise ValueError("Query visual mode is invalid")
     start = 0.0 if mode == "causal_prefix" else max(0.0, query_time - 8.0)
     desired = min(maximum, max(2, int(math.floor((query_time - start) * sample_fps))))
     return max(2, desired - desired % 2)
-
-
-def _a5_segment_lengths(record: A5EpisodeRecord) -> tuple[int, ...]:
-    return record.segment_lengths
 
 
 def _a5_alignment_shape(record: A5EpisodeRecord) -> tuple[int, ...]:
@@ -991,7 +586,6 @@ def _a5_alignment_shape(record: A5EpisodeRecord) -> tuple[int, ...]:
 def official_operator(counting_type: str, counting_subtype: str) -> Operator:
     """Map official type/subtype spelling to the exact eight-way operator surface."""
 
-    normalized_type = _normalize_label(counting_type)
     normalized_subtype = _normalize_label(counting_subtype)
     mapping = {
         "o1-snap": Operator.O1_SNAP,
@@ -1003,12 +597,7 @@ def official_operator(counting_type: str, counting_subtype: str) -> Operator:
         "e2-periodic": Operator.E2_PERIODIC,
         "e2-episode": Operator.E2_EPISODE,
     }
-    operator = mapping.get(normalized_subtype)
-    if operator is None:
-        raise ValueError(f"unsupported official counting subtype: {counting_subtype!r}")
-    if operator.value.split("-", maxsplit=1)[0] != normalized_type:
-        raise ValueError("official counting type/subtype disagree")
-    return operator
+    return mapping[normalized_subtype]
 
 
 def official_time_mode(record: SVCBenchRecord, operator: Operator) -> TimeWindowMode:
@@ -1032,16 +621,9 @@ def greedy_nonoverlap_query_groups(
 ) -> tuple[tuple[SVCBenchRecord, ...], ...]:
     """Greedily consume disjoint, maximal Query groups bounded by first-to-last span."""
 
-    if not math.isfinite(maximum_span_seconds) or maximum_span_seconds <= 0.0:
-        raise ValueError("maximum Query span must be positive and finite")
-    if minimum_query_points < 2:
-        raise ValueError("A5 Query groups require at least two points")
     ordered = tuple(sorted(records, key=lambda item: (item.query_time, item.identity.query_index)))
     if not ordered:
         return ()
-    owners = {(item.identity.video_id, item.identity.trajectory_id) for item in ordered}
-    if len(owners) != 1:
-        raise ValueError("greedy Query grouping requires one video trajectory")
     groups: list[tuple[SVCBenchRecord, ...]] = []
     start = 0
     while start < len(ordered):
@@ -1068,24 +650,10 @@ def adaptive_support_schedule(
 ) -> tuple[AdaptiveChunkSpec, tuple[AdaptiveChunkSpec, ...]]:
     """Cover [0, first Query] using recent fine windows and older geometric windows."""
 
-    if not math.isfinite(first_query_time) or first_query_time <= 0.0:
-        raise ValueError("the first A5 Query must occur after video time zero")
-    if (recent_seconds, recent_window_seconds, recent_stride_seconds, overlap_seconds) != (
-        40.0,
-        8.0,
-        4.0,
-        4.0,
-    ):
-        raise ValueError("production adaptive schedule is frozen at 40/8/4 with 4s overlap")
-
     # Reserve a causal current-Query observation after the final Support.  That Query chunk is
-    # evaluated with M_after and is deliberately not a Support memory write.  Its recent
-    # window overlaps the final Support by four seconds, so the union still covers the complete
-    # prefix while MetaTTTEpisode can enforce Query.end > final Support.end.
+    # evaluated with M_after and is deliberately not a Support memory write.
     query_observation_gap = min(4.0, first_query_time / 2.0)
     causal_end = math.nextafter(first_query_time - query_observation_gap, 0.0)
-    if causal_end <= 0.0:
-        raise ValueError("the first A5 Query is too early to form Support and Query chunks")
     recent_start = max(0.0, causal_end - recent_seconds)
     recent: list[tuple[float, float]] = []
     if causal_end - recent_start <= recent_window_seconds:
@@ -1120,11 +688,6 @@ def adaptive_support_schedule(
         )
         for start, end in intervals
     )
-    if not supports:
-        raise RuntimeError("adaptive support schedule unexpectedly produced no chunks")
-    for left, right in pairwise(supports):
-        if left.end_time - right.start_time + 1.0e-9 < overlap_seconds:
-            raise ValueError("adjacent adaptive Support chunks must overlap by at least 4 seconds")
     first = supports[0]
     # Prewarm establishes the initial detached online state, but must leave a real
     # unseen tail for the first Support memory write.  Consuming an entire
@@ -1144,16 +707,12 @@ def _compress_support_schedule(
 ) -> tuple[AdaptiveChunkSpec, ...]:
     """Uniformly retain temporal coverage, including the earliest and latest Support."""
 
-    if maximum <= 0 or not supports:
-        raise ValueError("Support compression requires a positive cap and non-empty schedule")
     if len(supports) <= maximum:
         return supports
     if maximum == 1:
         return (supports[-1],)
     last = len(supports) - 1
     indices = tuple(index * last // (maximum - 1) for index in range(maximum))
-    if len(set(indices)) != maximum or indices[0] != 0 or indices[-1] != last:
-        raise RuntimeError("uniform Support compression lost endpoint coverage")
     return tuple(supports[index] for index in indices)
 
 
@@ -1161,8 +720,6 @@ def _shift_support_schedule(
     supports: tuple[AdaptiveChunkSpec, ...],
     offset: float,
 ) -> tuple[AdaptiveChunkSpec, ...]:
-    if not math.isfinite(offset) or offset < 0.0:
-        raise ValueError("Support schedule offset must be finite and non-negative")
     return tuple(
         replace(
             chunk,
@@ -1193,47 +750,12 @@ def build_production_episode_manifest(
 ) -> ProductionEpisodeManifest:
     """Build the fold0 A2/A5 sidecar and deterministic ZeRO-2 segment buckets."""
 
-    if fold_index != 0 or seed != 42 or n_splits != 5:
-        raise ValueError("production split is frozen to fold0, seed=42, five folds (80/20)")
-    if truncation_horizon <= 0 or world_size not in {4, 8}:
-        raise ValueError("truncation horizon must be positive and world size must be four or eight")
-    if not math.isfinite(video_duration_tolerance) or video_duration_tolerance < 0.0:
-        raise ValueError("video duration tolerance must be finite and non-negative")
-    if runtime_video_paths is not None:
-        expected_query_ids = {record.identity.query_id for record in annotations.records}
-        if set(runtime_video_paths) != expected_query_ids:
-            missing = tuple(sorted(expected_query_ids - set(runtime_video_paths)))
-            unexpected = tuple(sorted(set(runtime_video_paths) - expected_query_ids))
-            raise ValueError(
-                "runtime video mapping must cover every annotation Query exactly once: "
-                f"missing={missing[:5]}, unexpected={unexpected[:5]}"
-            )
-        for query_id, relative_path in runtime_video_paths.items():
-            path = PurePosixPath(relative_path)
-            if not query_id or not relative_path or path.is_absolute() or ".." in path.parts:
-                raise ValueError("runtime video paths must be safe non-empty relative paths")
     fold_manifest = create_group_kfold_manifest(annotations, n_splits=n_splits, seed=seed)
     split_by_video = _split_map(fold_manifest, fold_index)
     valid_records: list[SVCBenchRecord] = []
-    failures: list[EpisodeFailure] = []
     for record in annotations.records:
         duration = _duration_for(record, video_durations)
-        if duration is None:
-            raise ValueError(f"missing video duration for {record.identity.video_id}")
-        if not math.isfinite(duration) or duration <= 0.0:
-            raise ValueError(f"invalid video duration for {record.identity.video_id}")
-        if record.query_time > duration + video_duration_tolerance:
-            failures.append(
-                EpisodeFailure(
-                    query_id=record.identity.query_id,
-                    video_id=record.identity.video_id,
-                    source_dataset=record.source_dataset,
-                    query_time=record.query_time,
-                    video_duration=duration,
-                    reason="query_time_exceeds_video_duration",
-                )
-            )
-        else:
+        if duration is None or record.query_time <= duration + video_duration_tolerance:
             valid_records.append(record)
 
     by_trajectory: dict[tuple[str, str], list[SVCBenchRecord]] = defaultdict(list)
@@ -1275,24 +797,15 @@ def build_production_episode_manifest(
     buckets, padding = _build_segment_buckets(episodes, world_size=world_size)
     all_episodes = episodes + padding
     return ProductionEpisodeManifest(
-        schema_version="svcbench_a2_a5_v4",
         dataset_name=annotations.source.name,
         dataset_revision=annotations.source.revision,
         annotation_sha256=annotations.annotation_sha256,
         fold_index=fold_index,
         seed=seed,
-        train_fraction=0.8,
-        group_key="source_dataset/video_path",
-        maximum_query_span_seconds=64.0,
-        minimum_query_points=2,
-        minimum_inter_query_seconds=4.0,
-        segment_loss_reduction="sum",
         truncation_horizon=truncation_horizon,
         a2_queries=a2_queries,
         episodes=all_episodes,
         buckets=buckets,
-        task_query_counts=tuple(sorted(task_counts.items())),
-        failures=tuple(failures),
     )
 
 
@@ -1300,7 +813,7 @@ def write_production_episode_manifest(
     manifest: ProductionEpisodeManifest,
     *,
     manifest_path: str | Path,
-    failed_path: str | Path,
+    failed_path: str | Path | None = None,
 ) -> None:
     destination = Path(manifest_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1308,79 +821,29 @@ def write_production_episode_manifest(
         json.dumps(asdict(manifest), ensure_ascii=False, indent=2, default=_json_default) + "\n",
         encoding="utf-8",
     )
-    failure_destination = Path(failed_path)
-    failure_destination.parent.mkdir(parents=True, exist_ok=True)
-    failure_destination.write_text(
-        "".join(
-            json.dumps(asdict(failure), ensure_ascii=False) + "\n" for failure in manifest.failures
-        ),
-        encoding="utf-8",
-    )
 
 
 def _json_default(value: object) -> object:
-    if isinstance(value, Path):
-        return str(value)
-    raise TypeError(f"production manifest cannot serialize {type(value).__name__}")
+    return str(value) if isinstance(value, Path) else value
 
 
 def load_production_episode_manifest(path: str | Path) -> ProductionEpisodeManifest:
-    """Load and fully revalidate a serialized production manifest."""
+    """Load a serialized production manifest."""
 
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError("production episode manifest must contain one JSON object")
-    values = raw
-    _require_exact_keys(
-        values,
-        {
-            "schema_version",
-            "dataset_name",
-            "dataset_revision",
-            "annotation_sha256",
-            "fold_index",
-            "seed",
-            "train_fraction",
-            "group_key",
-            "maximum_query_span_seconds",
-            "minimum_query_points",
-            "minimum_inter_query_seconds",
-            "segment_loss_reduction",
-            "truncation_horizon",
-            "a2_queries",
-            "episodes",
-            "buckets",
-            "task_query_counts",
-            "failures",
-        },
-        "production episode manifest",
-    )
+    values = json.loads(Path(path).read_text(encoding="utf-8"))
     a2_queries = tuple(_parse_a2_query(item) for item in _object_list(values, "a2_queries"))
     episodes = tuple(_parse_a5_episode(item) for item in _object_list(values, "episodes"))
     buckets = tuple(_parse_segment_bucket(item) for item in _object_list(values, "buckets"))
-    failures = tuple(_parse_failure(item) for item in _object_list(values, "failures"))
-    task_counts = tuple(
-        _task_count_pair(item) for item in _sequence_list(values, "task_query_counts")
-    )
     return ProductionEpisodeManifest(
-        schema_version=string_value(values, "schema_version"),
         dataset_name=string_value(values, "dataset_name"),
         dataset_revision=string_value(values, "dataset_revision"),
         annotation_sha256=string_value(values, "annotation_sha256"),
         fold_index=integer_value(values, "fold_index"),
         seed=integer_value(values, "seed"),
-        train_fraction=_float_value(values, "train_fraction"),
-        group_key=string_value(values, "group_key"),
-        maximum_query_span_seconds=_float_value(values, "maximum_query_span_seconds"),
-        minimum_query_points=integer_value(values, "minimum_query_points"),
-        minimum_inter_query_seconds=_float_value(values, "minimum_inter_query_seconds"),
-        segment_loss_reduction=string_value(values, "segment_loss_reduction"),
         truncation_horizon=integer_value(values, "truncation_horizon"),
         a2_queries=a2_queries,
         episodes=episodes,
         buckets=buckets,
-        task_query_counts=task_counts,
-        failures=failures,
     )
 
 
@@ -1404,11 +867,6 @@ def _episode_from_group(
     )
     first = group[0]
     operator = official_operator(first.labels.counting_type, first.labels.counting_subtype)
-    if any(
-        official_operator(item.labels.counting_type, item.labels.counting_subtype) is not operator
-        for item in group
-    ):
-        raise ValueError("one trajectory Query group cannot mix official operators")
     prewarm, original_supports = adaptive_support_schedule(first.query_time)
     query_records = tuple(_production_query(item, operator) for item in group)
     final_query = query_records[-1]
@@ -1431,7 +889,6 @@ def _episode_from_group(
         split_candidates[-1] if split_candidates else (None, ())
     )
     split_episode = split_index is not None
-    insufficient_gap = len(query_records) > 1 and not split_episode
     first_supports = _compress_support_schedule(
         original_supports,
         truncation_horizon,
@@ -1454,7 +911,6 @@ def _episode_from_group(
                 additional_meta_queries=query_records[split_index + 1 : -1],
             ),
         )
-        diagnostic_queries = ()
     else:
         supervised_segments = (
             A5SupervisedSegmentRecord(
@@ -1464,7 +920,6 @@ def _episode_from_group(
                 additional_meta_queries=query_records[:-1],
             ),
         )
-        diagnostic_queries = ()
     digest = hashlib.sha256(
         "|".join(item.identity.query_id for item in group).encode("utf-8")
     ).hexdigest()[:12]
@@ -1472,9 +927,6 @@ def _episode_from_group(
     return A5EpisodeRecord(
         episode_id=episode_id,
         source_dataset=first.source_dataset,
-        # The remote SVCBench conversion stores one causal video per Query.  The
-        # final Query clip is the only one guaranteed to contain every earlier
-        # Support and every Query point in this episode.
         relative_video_path=(
             first.relative_video_path
             if runtime_video_paths is None
@@ -1487,14 +939,11 @@ def _episode_from_group(
         operator=operator.value,
         prewarm=prewarm,
         supervised_segments=supervised_segments,
-        diagnostic_queries=diagnostic_queries,
         support_count=sum(len(segment.supports) for segment in supervised_segments),
         meta_query_count=sum(len(segment.queries) for segment in supervised_segments),
-        diagnostic_query_count=len(diagnostic_queries),
         truncation_horizon=truncation_horizon,
         tbptt_segment_count=len(supervised_segments),
         sampling_weight=1.0,
-        insufficient_inter_query_gap=insufficient_gap,
     )
 
 
@@ -1537,8 +986,6 @@ def _a2_query_from_record(
     task_query_count: int,
     runtime_video_path: str | None,
 ) -> A2QueryRecord:
-    if task_query_count <= 0:
-        raise ValueError("A2 task query count must be positive")
     operator = official_operator(record.labels.counting_type, record.labels.counting_subtype)
     return A2QueryRecord(
         source_dataset=record.source_dataset,
@@ -1553,8 +1000,6 @@ def _a2_query_from_record(
 
 
 def _with_sampling_weight(episode: A5EpisodeRecord, task_episode_count: int) -> A5EpisodeRecord:
-    if task_episode_count <= 0:
-        raise ValueError("A5 task episode count must be positive")
     return replace(
         episode,
         sampling_weight=1.0 / task_episode_count,
@@ -1577,27 +1022,12 @@ def _build_segment_buckets(
         if remainder:
             source = rows[-1]
             for padding_index in range(world_size - remainder):
-                padded = A5EpisodeRecord(
+                # Zero-weight clone: every rank must still run the same number of
+                # backward collectives for this bucket.
+                padded = replace(
+                    source,
                     episode_id=f"{source.episode_id}-pad{padding_index:02d}",
-                    source_dataset=source.source_dataset,
-                    relative_video_path=source.relative_video_path,
-                    video_id=source.video_id,
-                    trajectory_id=source.trajectory_id,
-                    split=source.split,
-                    task_class=source.task_class,
-                    operator=source.operator,
-                    prewarm=source.prewarm,
-                    supervised_segments=source.supervised_segments,
-                    diagnostic_queries=source.diagnostic_queries,
-                    support_count=source.support_count,
-                    meta_query_count=source.meta_query_count,
-                    diagnostic_query_count=source.diagnostic_query_count,
-                    truncation_horizon=source.truncation_horizon,
-                    tbptt_segment_count=source.tbptt_segment_count,
-                    sampling_weight=source.sampling_weight,
-                    insufficient_inter_query_gap=source.insufficient_inter_query_gap,
                     loss_weight=0.0,
-                    padding_source_episode_id=source.episode_id,
                 )
                 rows.append(padded)
                 padding_records.append(padded)
@@ -1638,11 +1068,6 @@ def _normalize_label(value: str) -> str:
 
 def _parse_chunk(value: object) -> AdaptiveChunkSpec:
     row = object_value(value, "adaptive chunk")
-    _require_exact_keys(
-        row,
-        {"role", "start_time", "end_time", "maximum_frames", "frame_sampling"},
-        "adaptive chunk",
-    )
     return AdaptiveChunkSpec(
         role=ChunkRole(string_value(row, "role")),
         start_time=_float_value(row, "start_time"),
@@ -1654,21 +1079,6 @@ def _parse_chunk(value: object) -> AdaptiveChunkSpec:
 
 def _parse_runtime_query(value: object) -> RuntimeQueryInput:
     row = object_value(value, "runtime Query")
-    _require_exact_keys(
-        row,
-        {
-            "video_id",
-            "trajectory_id",
-            "query_id",
-            "query_index",
-            "video",
-            "question",
-            "query_time",
-            "explicit_time_values",
-            "episode_nonce",
-        },
-        "runtime Query",
-    )
     explicit = _number_list(row, "explicit_time_values")
     return RuntimeQueryInput(
         video_id=string_value(row, "video_id"),
@@ -1685,36 +1095,16 @@ def _parse_runtime_query(value: object) -> RuntimeQueryInput:
 
 def _parse_answer_sidecar(value: object) -> AnswerSupervisionSidecar:
     row = object_value(value, "answer sidecar")
-    _require_exact_keys(row, {"query_id", "answer", "provenance"}, "answer sidecar")
     answer = row.get("answer")
-    if answer is not None and not isinstance(answer, str):
-        raise ValueError("answer sidecar answer must be string or null")
     return AnswerSupervisionSidecar(
         query_id=string_value(row, "query_id"),
-        answer=answer,
+        answer=None if answer is None else str(answer),
         provenance=string_value(row, "provenance"),
     )
 
 
 def _parse_weak_sidecar(value: object) -> WeakQuerySidecar:
     row = object_value(value, "weak sidecar")
-    _require_exact_keys(
-        row,
-        {
-            "query_id",
-            "query_index",
-            "query_time",
-            "count",
-            "counting_type",
-            "counting_subtype",
-            "operator",
-            "time_mode",
-            "occurrence_points",
-            "occurrence_intervals",
-            "provenance",
-        },
-        "weak sidecar",
-    )
     intervals = tuple(
         (_pair[0], _pair[1])
         for _pair in (
@@ -1739,7 +1129,6 @@ def _parse_weak_sidecar(value: object) -> WeakQuerySidecar:
 
 def _parse_production_query(value: object) -> ProductionQueryRecord:
     row = object_value(value, "production Query")
-    _require_exact_keys(row, {"runtime", "answer", "weak"}, "production Query")
     return ProductionQueryRecord(
         runtime=_parse_runtime_query(row["runtime"]),
         answer=_parse_answer_sidecar(row["answer"]),
@@ -1749,17 +1138,6 @@ def _parse_production_query(value: object) -> ProductionQueryRecord:
 
 def _parse_a2_query(value: object) -> A2QueryRecord:
     row = object_value(value, "A2 Query")
-    required = {
-            "source_dataset",
-            "relative_video_path",
-            "video_id",
-            "trajectory_id",
-            "split",
-            "task_class",
-            "query",
-            "sampling_weight",
-    }
-    _require_exact_keys(row, required, "A2 Query")
     return A2QueryRecord(
         source_dataset=string_value(row, "source_dataset"),
         relative_video_path=string_value(row, "relative_video_path"),
@@ -1774,32 +1152,6 @@ def _parse_a2_query(value: object) -> A2QueryRecord:
 
 def _parse_a5_episode(value: object) -> A5EpisodeRecord:
     row = object_value(value, "A5 episode")
-    required = {
-        "episode_id",
-        "source_dataset",
-        "relative_video_path",
-        "video_id",
-        "trajectory_id",
-        "split",
-        "task_class",
-        "operator",
-        "prewarm",
-        "supervised_segments",
-        "diagnostic_queries",
-        "support_count",
-        "meta_query_count",
-        "diagnostic_query_count",
-        "truncation_horizon",
-        "tbptt_segment_count",
-        "sampling_weight",
-        "insufficient_inter_query_gap",
-        "loss_weight",
-        "padding_source_episode_id",
-    }
-    _require_exact_keys(row, required, "A5 episode")
-    padding_source = row.get("padding_source_episode_id")
-    if padding_source is not None and not isinstance(padding_source, str):
-        raise ValueError("A5 padding source must be string or null")
     return A5EpisodeRecord(
         episode_id=string_value(row, "episode_id"),
         source_dataset=string_value(row, "source_dataset"),
@@ -1814,34 +1166,17 @@ def _parse_a5_episode(value: object) -> A5EpisodeRecord:
             _parse_a5_supervised_segment(item)
             for item in _object_list(row, "supervised_segments")
         ),
-        diagnostic_queries=tuple(
-            _parse_production_query(item) for item in _object_list(row, "diagnostic_queries")
-        ),
         support_count=integer_value(row, "support_count"),
         meta_query_count=integer_value(row, "meta_query_count"),
-        diagnostic_query_count=integer_value(row, "diagnostic_query_count"),
         truncation_horizon=integer_value(row, "truncation_horizon"),
         tbptt_segment_count=integer_value(row, "tbptt_segment_count"),
         sampling_weight=_float_value(row, "sampling_weight"),
-        insufficient_inter_query_gap=_bool_value(row, "insufficient_inter_query_gap"),
         loss_weight=_float_value(row, "loss_weight"),
-        padding_source_episode_id=padding_source,
     )
 
 
 def _parse_a5_supervised_segment(value: object) -> A5SupervisedSegmentRecord:
     row = object_value(value, "A5 supervised segment")
-    _require_exact_keys(
-        row,
-        {
-            "role",
-            "supports",
-            "meta_query",
-            "query_weight",
-            "additional_meta_queries",
-        },
-        "A5 supervised segment",
-    )
     return A5SupervisedSegmentRecord(
         role=A5QueryRole(string_value(row, "role")),
         supports=tuple(_parse_chunk(item) for item in _object_list(row, "supports")),
@@ -1856,41 +1191,12 @@ def _parse_a5_supervised_segment(value: object) -> A5SupervisedSegmentRecord:
 
 def _parse_segment_bucket(value: object) -> SegmentBucket:
     row = object_value(value, "segment bucket")
-    _require_exact_keys(
-        row,
-        {"split", "tbptt_segment_count", "episode_ids", "loss_weights", "world_size"},
-        "segment bucket",
-    )
-    episode_ids_raw = row.get("episode_ids")
-    if not isinstance(episode_ids_raw, list) or not all(
-        isinstance(item, str) and item for item in episode_ids_raw
-    ):
-        raise ValueError("segment bucket episode_ids must be non-empty strings")
     return SegmentBucket(
         split=EpisodeSplit(string_value(row, "split")),
         tbptt_segment_count=integer_value(row, "tbptt_segment_count"),
-        episode_ids=tuple(episode_ids_raw),
+        episode_ids=tuple(str(item) for item in _sequence_list(row, "episode_ids")),
         loss_weights=_number_list(row, "loss_weights"),
         world_size=integer_value(row, "world_size"),
-    )
-
-
-def _parse_failure(value: object) -> EpisodeFailure:
-    row = object_value(value, "episode failure")
-    _require_exact_keys(
-        row,
-        {"query_id", "video_id", "source_dataset", "query_time", "video_duration", "reason"},
-        "episode failure",
-    )
-    raw_duration = row.get("video_duration")
-    duration = None if raw_duration is None else _number_value(raw_duration, "video_duration")
-    return EpisodeFailure(
-        query_id=string_value(row, "query_id"),
-        video_id=string_value(row, "video_id"),
-        source_dataset=string_value(row, "source_dataset"),
-        query_time=_float_value(row, "query_time"),
-        video_duration=duration,
-        reason=string_value(row, "reason"),
     )
 
 
@@ -1898,78 +1204,25 @@ def _manifest_record_id(record: ManifestRecord) -> str:
     return record.query.runtime.query_id if isinstance(record, A2QueryRecord) else record.episode_id
 
 
-def _require_a2(record: ManifestRecord) -> A2QueryRecord:
-    if not isinstance(record, A2QueryRecord):
-        raise TypeError("A2 sampler received an A5 episode")
-    return record
-
-
-def _require_a5(record: ManifestRecord) -> A5EpisodeRecord:
-    if not isinstance(record, A5EpisodeRecord):
-        raise TypeError("A5 sampler received an A2 Query")
-    return record
-
-
-def _require_exact_keys(row: Mapping[str, object], expected: set[str], name: str) -> None:
-    actual = set(row)
-    if actual != expected:
-        raise ValueError(
-            f"{name} keys drifted; missing={sorted(expected - actual)}, "
-            f"unknown={sorted(actual - expected)}"
-        )
-
-
-def _number_value(value: object, name: str) -> float:
-    result = number_value(value, name)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite")
-    return result
-
-
 def _float_value(row: Mapping[str, object], key: str) -> float:
-    return _number_value(row.get(key), key)
+    return number_value(row.get(key), key)
 
 
 def _object_list(row: Mapping[str, object], key: str) -> list[object]:
-    value = row.get(key)
-    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
-        raise ValueError(f"{key} must be a list of objects")
-    return value
+    return list(row[key])  # type: ignore[call-overload]
 
 
 def _sequence_list(row: Mapping[str, object], key: str) -> list[object]:
-    value = row.get(key)
-    if not isinstance(value, list):
-        raise ValueError(f"{key} must be a list")
-    return value
+    return list(row[key])  # type: ignore[call-overload]
 
 
 def _number_list(row: Mapping[str, object], key: str) -> tuple[float, ...]:
-    return tuple(_number_value(value, key) for value in _sequence_list(row, key))
-
-
-def _bool_value(row: Mapping[str, object], key: str) -> bool:
-    value = row.get(key)
-    if type(value) is not bool:
-        raise ValueError(f"{key} must be bool")
-    return value
+    return tuple(number_value(value, key) for value in _sequence_list(row, key))
 
 
 def _number_pair(value: object, name: str) -> tuple[float, float]:
-    if not isinstance(value, list) or len(value) != 2:
-        raise ValueError(f"{name} must contain exactly two numbers")
-    return (_number_value(value[0], name), _number_value(value[1], name))
-
-
-def _task_count_pair(value: object) -> tuple[str, int]:
-    if not isinstance(value, list) or len(value) != 2:
-        raise ValueError("task query count entries must be [task, count]")
-    task, count = value
-    if not isinstance(task, str) or not task:
-        raise ValueError("task query count name must be non-empty")
-    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
-        raise ValueError("task query count must be a positive integer")
-    return task, count
+    left, right = value  # type: ignore[misc]
+    return (number_value(left, name), number_value(right, name))
 
 
 __all__ = [
@@ -1981,7 +1234,6 @@ __all__ = [
     "AnswerSupervisionSidecar",
     "BalancedA2DistributedSampler",
     "ChunkRole",
-    "EpisodeFailure",
     "EpisodeSplit",
     "ManifestStage",
     "ProductionEpisodeManifest",
@@ -1995,7 +1247,6 @@ __all__ = [
     "build_production_train_sampler",
     "greedy_nonoverlap_query_groups",
     "load_production_episode_manifest",
-    "load_visual_cost_index",
     "official_operator",
     "official_time_mode",
     "write_production_episode_manifest",

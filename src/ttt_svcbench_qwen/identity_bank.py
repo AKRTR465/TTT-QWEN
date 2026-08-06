@@ -789,7 +789,7 @@ class IdentityBank:
         )
 
 
-def build_identity_bank(config: ProjectConfig | None = None) -> IdentityBank:
+def build_identity_bank(config: ProjectConfig) -> IdentityBank:
     return IdentityBank(config)
 
 
