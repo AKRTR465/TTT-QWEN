@@ -59,6 +59,7 @@ from ttt_svcbench_qwen.model import (
     query_dropout_seed,
     query_reuse_key,
 )
+from ttt_svcbench_qwen.observation_heads import ObservationOutputs
 from ttt_svcbench_qwen.outer_loss_balance import (
     OfficialWeakBalanceAudit,
     OfficialWeakGradientAnchors,
@@ -73,6 +74,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     StageATargetBuilder,
     TargetProvenance,
 )
+from ttt_svcbench_qwen.state_retriever import RetrieverOutput
 from ttt_svcbench_qwen.trainer import (
     StageAEpisodeAnswerInputs,
     StageASupervisionBatch,
@@ -212,20 +214,22 @@ class StageAQueryLossBuilder:
             dtype=torch.bool,
             device=device,
         )
+        observations = cast(ObservationOutputs, output.observations)
+        retrieval = cast(RetrieverOutput, output.retrieval)
         if supervision.official_weak:
             state: StateLossInput | OfficialWeakStateLossOutput = self.official_weak_builder(
-                output.observations,
+                observations,
                 output.query,
-                output.retrieval,
+                retrieval,
                 supervision.official_weak,
                 dedup=dedup,
             )
         else:
             assert supervision.state is not None
             state = self.target_builder(
-                output.observations,
+                observations,
                 output.query,
-                output.retrieval,
+                retrieval,
                 supervision.state,
             )
         return MetaQueryLossInput(

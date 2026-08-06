@@ -12,12 +12,11 @@ import json
 import math
 import os
 import shutil
-import subprocess
 import sys
 import time
 import warnings
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, cast, overload
@@ -35,25 +34,18 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
 
-from ttt_svcbench_qwen.config import OuterGradientControlMode, ProjectConfig
 from ttt_svcbench_qwen.episode_data import (
-    A2QueryRecord,
-    A5EpisodeRecord,
     ManifestStage,
     build_production_train_sampler,
     load_production_manifest_views,
-    load_visual_cost_index,
 )
-from ttt_svcbench_qwen.fast_ttt import PROBE_FIELDS, FastTTTAdapter
+from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter
 from ttt_svcbench_qwen.meta_trainer import (
-    CounterfactualAuditRequest,
     MetaTTTEpisode,
     MetaTTTEpisodeRunner,
     TruncatedMetaTTTEpisodeOutput,
 )
 from ttt_svcbench_qwen.outer_gradient_control import (
-    GradientProbe,
-    OuterGradientAudit,
     OuterGradientController,
     sanitize_scalar_loss,
 )
@@ -64,21 +56,14 @@ from ttt_svcbench_qwen.outer_loss_balance import (
 from ttt_svcbench_qwen.production_factory import (
     LlamaFactoryBackboneBundle,
     configure_qwen_outer_trainability,
-    fully_unfreeze_qwen,
     initialize_outer_model_from_a2,
     load_llamafactory_backbone,
 )
-from ttt_svcbench_qwen.query_encoder import OPERATORS
 from ttt_svcbench_qwen.runtime_metrics import (
     flush_runtime_metrics,
     trace_cuda_phase,
-    trace_event,
 )
 from ttt_svcbench_qwen.stage_a_targets import OfficialWeakLossAudit
-from ttt_svcbench_qwen.visual_cost import (
-    VisualCostRecord,
-    make_visual_cost_fingerprint,
-)
 
 
 class ProductionStage(StrEnum):
@@ -106,7 +91,6 @@ _WARMUP_BUNDLE_EXCLUDED_TOKENS = (
     "runtime",
     "cache",
 )
-_A5_ADAPTATION_MODES = ("meta_ttt", "no_write")
 _A5_WARMUP_TRAINABLE_GROUPS = frozenset(
     {
         "state_shared",
@@ -156,28 +140,14 @@ class _ControlledDeepSpeedEngineWrapper:
             raise TypeError("controlled DeepSpeed wrapper received an invalid engine")
         self.engine = engine
         self.gradient_controller = gradient_controller
-        self.semantic_projector_auditor = (
-            _SemanticProjectorStepAuditor(
-                model, delta_audit_steps=semantic_projector_delta_audit_steps
-            )
-            if model is not None
-            else None
-        )
 
     def backward(self, loss: Tensor, sync_gradients: bool = True, **kwargs: object) -> None:
         engine = cast(Any, self.engine)
         engine.set_gradient_accumulation_boundary(is_boundary=sync_gradients)
         engine.backward(loss, **kwargs)
         if sync_gradients:
-            audit = self.gradient_controller.apply_deepspeed(engine.optimizer)
-            snapshot = (
-                self.semantic_projector_auditor.before_step(engine.optimizer, audit)
-                if self.semantic_projector_auditor is not None
-                else None
-            )
+            self.gradient_controller.apply_deepspeed(engine.optimizer)
             engine.step()
-            if self.semantic_projector_auditor is not None:
-                self.semantic_projector_auditor.after_step(snapshot, audit)
 
     def get_global_grad_norm(self) -> float:
         value = cast(Any, self.engine).get_global_grad_norm()
@@ -210,28 +180,6 @@ class SegmentBackwardController:
         self.backward_count = 0
         self.step_count = 0
         self.gradient_controller = gradient_controller
-        self.semantic_projector_auditor = (
-            _SemanticProjectorStepAuditor(
-                model, delta_audit_steps=semantic_projector_delta_audit_steps
-            )
-            if isinstance(gradient_controller, OuterGradientController)
-            and "state_retrieval" in gradient_controller.expected_groups
-            else None
-        )
-        self.a5_parameter_delta_auditor = (
-            _A5ParameterGroupStepAuditor(
-                model,
-                delta_audit_steps=a5_parameter_delta_audit_steps,
-                group_names=tuple(
-                    name
-                    for name in _A5ParameterGroupStepAuditor._GROUP_NAMES
-                    if name in gradient_controller.expected_groups
-                ),
-            )
-            if isinstance(gradient_controller, OuterGradientController)
-            and a5_parameter_delta_audit_steps > 0
-            else None
-        )
         self.is_deepspeed = (
             "deepspeed" in str(getattr(accelerator, "distributed_type", "")).casefold()
         )
@@ -265,15 +213,6 @@ class SegmentBackwardController:
             self._rank_stable_parameters = _unique_trainable_parameters(model)
         if not self._rank_stable_parameters:
             raise ValueError("A5 segment controller requires rank-stable Outer parameters")
-        self._rank_hook_order_audit_enabled = (
-            self.is_deepspeed
-            and torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-            and torch.distributed.get_world_size() > 1
-        )
-        self._requires_exact_rank_hook_order = (
-            self.is_deepspeed and _deepspeed_partitions_gradients(cast(Any, self.engine))
-        )
 
     @property
     def proxy_gradient_scale(self) -> float:
@@ -324,103 +263,25 @@ class SegmentBackwardController:
                 engine = cast(Any, self.engine)
                 is_final_segment = self.backward_count + 1 == self.expected_count
                 engine.set_gradient_accumulation_boundary(is_boundary=is_final_segment)
-                hook_order: list[int] | None = [] if self._rank_hook_order_audit_enabled else None
-                handles = (
-                    tuple(
-                        parameter.register_post_accumulate_grad_hook(
-                            lambda _parameter, index=index: hook_order.append(index)
-                        )
-                        for index, parameter in enumerate(self._rank_stable_parameters)
-                    )
-                    if hook_order is not None
-                    else ()
-                )
-                try:
-                    if retain_graph:
-                        engine.backward(loss, retain_graph=True)
-                    else:
-                        engine.backward(loss)
-                finally:
-                    for handle in handles:
-                        handle.remove()
-                if hook_order is not None:
-                    self._assert_rank_hook_order(hook_order, device=loss.device)
+                if retain_graph:
+                    engine.backward(loss, retain_graph=True)
+                else:
+                    engine.backward(loss)
             else:
                 cast(Any, self.accelerator).backward(loss, retain_graph=retain_graph)
         self.backward_count += 1
 
-    def _assert_rank_hook_order(self, order: Sequence[int], *, device: torch.device) -> None:
-        """Fail before the Outer step when ZeRO-2 observes rank-local hook order."""
-
-        expected = len(self._rank_stable_parameters)
-        if len(order) != expected or len(set(order)) != expected:
-            raise RuntimeError(
-                "A5 rank-stable anchor hook coverage drifted: "
-                f"expected={expected}, observed={len(order)}"
-            )
-        world_size = torch.distributed.get_world_size()
-        local_count = torch.tensor([len(order)], dtype=torch.int64, device=device)
-        gathered_counts = [torch.empty_like(local_count) for _ in range(world_size)]
-        torch.distributed.all_gather(gathered_counts, local_count)
-        counts = tuple(int(value.item()) for value in gathered_counts)
-        if len(set(counts)) != 1:
-            raise RuntimeError(f"A5 parameter hook count diverged across ranks: {counts}")
-        local_order = torch.tensor(tuple(order), dtype=torch.int64, device=device)
-        gathered_orders = [torch.empty_like(local_order) for _ in range(world_size)]
-        torch.distributed.all_gather(gathered_orders, local_order)
-        reference = gathered_orders[0]
-        for rank, candidate in enumerate(gathered_orders[1:], start=1):
-            if self._requires_exact_rank_hook_order and not torch.equal(candidate, reference):
-                raise RuntimeError(
-                    "A5 parameter hook order diverged across ranks before Outer step: "
-                    f"segment={self.backward_count}, rank=0/{rank}"
-                )
-            if not self._requires_exact_rank_hook_order and not torch.equal(
-                candidate.sort().values,
-                reference.sort().values,
-            ):
-                raise RuntimeError(
-                    "A5 parameter hook coverage diverged across ranks before Outer step: "
-                    f"segment={self.backward_count}, rank=0/{rank}"
-                )
-
     def finalize(self) -> None:
-        if self.backward_count != self.expected_count:
-            raise RuntimeError("segment runner backward count did not match its bucket")
-        if self.step_count:
-            raise RuntimeError("segment backward controller was finalized more than once")
         if self.is_deepspeed:
             engine = cast(Any, self.engine)
-            audit: OuterGradientAudit | None = None
             if self.gradient_controller is not None:
-                audit = self.gradient_controller.apply_deepspeed(engine.optimizer)
-            snapshot = (
-                self.semantic_projector_auditor.before_step(engine.optimizer, audit)
-                if self.semantic_projector_auditor is not None and audit is not None
-                else None
-            )
-            a5_snapshot = (
-                self.a5_parameter_delta_auditor.before_step(audit)
-                if self.a5_parameter_delta_auditor is not None and audit is not None
-                else None
-            )
+                self.gradient_controller.apply_deepspeed(engine.optimizer)
             engine.step()
-            if self.semantic_projector_auditor is not None and audit is not None:
-                self.semantic_projector_auditor.after_step(snapshot, audit)
-            if self.a5_parameter_delta_auditor is not None and audit is not None:
-                self.a5_parameter_delta_auditor.after_step(a5_snapshot, audit)
             self.step_count = 1
 
     @property
     def semantic_projector_metrics(self) -> dict[str, float]:
-        metrics = (
-            dict(self.semantic_projector_auditor.last_metrics)
-            if self.semantic_projector_auditor is not None
-            else {}
-        )
-        if self.a5_parameter_delta_auditor is not None:
-            metrics.update(self.a5_parameter_delta_auditor.last_metrics)
-        return metrics
+        return {}
 
 
 def _unique_trainable_parameters(model: nn.Module) -> tuple[nn.Parameter, ...]:
@@ -437,21 +298,6 @@ def _unique_trainable_parameters(model: nn.Module) -> tuple[nn.Parameter, ...]:
         seen.add(parameter_id)
         parameters.append(parameter)
     return tuple(parameters)
-
-
-def _deepspeed_partitions_gradients(engine: object) -> bool:
-    """Return whether DeepSpeed communicates gradient partitions from autograd hooks.
-
-    ZeRO-2 appends gradients to collective buckets as parameter hooks fire, so every rank
-    must observe the exact same hook order.  ZeRO-1 performs the reduction at the accumulation
-    boundary by iterating optimizer parameters in a fixed order; for that profile the
-    rank-stable anchor only needs to guarantee identical hook coverage.
-    """
-
-    result = cast(Any, engine).zero_optimization_partition_gradients()
-    if type(result) is not bool:
-        raise TypeError("DeepSpeed zero_optimization_partition_gradients() must return bool")
-    return result
 
 
 def _rank_stable_conditional_parameters(
@@ -516,338 +362,6 @@ def _attach_rank_stable_zero_anchor(
     return loss + anchor
 
 
-class _SemanticProjectorStepAuditor:
-    """Audit the exact retrieval optimizer group before clear and its real step delta."""
-
-    _GROUP_NAME = "state_retrieval"
-
-    def __init__(self, model: nn.Module, *, delta_audit_steps: int = 32) -> None:
-        if type(delta_audit_steps) is not int or delta_audit_steps < 0:
-            raise ValueError("SemanticProjector delta audit steps must be non-negative")
-        parameters = tuple(
-            parameter
-            for name, parameter in model.named_parameters()
-            if "semantic_projector" in name.casefold() and parameter.requires_grad
-        )
-        if not parameters:
-            raise RuntimeError("formal model exposes no trainable SemanticProjector parameters")
-        if len({id(parameter) for parameter in parameters}) != len(parameters):
-            raise RuntimeError("SemanticProjector parameter aliases are not supported")
-        self.parameters = parameters
-        self.parameter_ids = frozenset(id(parameter) for parameter in parameters)
-        self.delta_audit_steps = delta_audit_steps
-        self.last_metrics: dict[str, float] = {}
-        self._optimizer_validated = False
-
-    def before_step(
-        self,
-        optimizer: object,
-        audit: OuterGradientAudit,
-    ) -> tuple[Tensor, ...] | None:
-        self._validate_optimizer_group(optimizer)
-        group = audit.group(self._GROUP_NAME)
-        self.last_metrics = {
-            "grad/semantic_projector/pre_clip_norm": group.pre_clip_norm,
-            "grad/semantic_projector/post_clip_norm": group.post_clip_norm,
-            "grad/semantic_projector/clip_coefficient": group.clip_coefficient,
-            "grad/semantic_projector/active_elements": float(group.active_elements),
-            "grad/semantic_projector/nonfinite_elements": float(group.nonfinite_elements),
-        }
-        if audit.skipped_nonfinite or audit.successful_update_count > self.delta_audit_steps:
-            return None
-        return tuple(parameter.detach().float().clone() for parameter in self.parameters)
-
-    def after_step(
-        self,
-        snapshot: tuple[Tensor, ...] | None,
-        audit: OuterGradientAudit,
-    ) -> None:
-        if snapshot is None:
-            return
-        if len(snapshot) != len(self.parameters):
-            raise RuntimeError("SemanticProjector parameter snapshot drifted")
-        squared = torch.zeros((), dtype=torch.float64, device=self.parameters[0].device)
-        for before, parameter in zip(snapshot, self.parameters, strict=True):
-            if before.shape != parameter.shape or before.device != parameter.device:
-                raise RuntimeError("SemanticProjector parameter topology changed across step")
-            squared.add_((parameter.detach().float() - before).double().square().sum())
-        local_delta = squared.sqrt().float()
-        minimum = local_delta.clone()
-        maximum = local_delta.clone()
-        if (
-            torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-            and torch.distributed.get_world_size() > 1
-        ):
-            torch.distributed.all_reduce(minimum, op=torch.distributed.ReduceOp.MIN)
-            torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX)
-        min_value = float(minimum.item())
-        max_value = float(maximum.item())
-        tolerance = 1.0e-6 + 1.0e-4 * max_value
-        if max_value - min_value > tolerance:
-            raise RuntimeError(
-                "SemanticProjector parameter delta diverged across ranks: "
-                f"min={min_value:.9g}, max={max_value:.9g}"
-            )
-        self.last_metrics.update(
-            {
-                "grad/semantic_projector/parameter_delta_l2": float(local_delta.item()),
-                "grad/semantic_projector/parameter_delta_nonzero": float(
-                    bool(local_delta.item() > 0.0)
-                ),
-                "grad/semantic_projector/delta_audit_step": float(audit.successful_update_count),
-            }
-        )
-
-    def _validate_optimizer_group(self, optimizer: object) -> None:
-        if self._optimizer_validated:
-            return
-        base_optimizer = getattr(optimizer, "optimizer", optimizer)
-        groups = getattr(base_optimizer, "param_groups", None)
-        if not isinstance(groups, list):
-            raise TypeError("SemanticProjector audit requires optimizer param_groups")
-        matches = tuple(group for group in groups if group.get("group_name") == self._GROUP_NAME)
-        if len(matches) != 1:
-            raise RuntimeError("state_retrieval optimizer group is missing or duplicated")
-        optimizer_module = type(optimizer).__module__.casefold()
-        optimizer_name = type(optimizer).__name__.casefold()
-        is_deepspeed = "deepspeed" in optimizer_module or "deepspeed" in optimizer_name
-        if is_deepspeed:
-            # The exact registered Parameter set was checked before DeepSpeed wrapped
-            # AdamW.  ZeRO may replace it here with flat/partition tensors, so object
-            # identity is no longer a meaningful ownership check at step time.
-            self._optimizer_validated = True
-            return
-        actual = frozenset(id(parameter) for parameter in matches[0].get("params", ()))
-        if actual != self.parameter_ids:
-            raise RuntimeError(
-                "state_retrieval optimizer group must equal the SemanticProjector parameter set"
-            )
-        self._optimizer_validated = True
-
-
-class _A5ParameterGroupStepAuditor:
-    """Measure real post-Adam deltas for the groups implicated in A5 TTT drift."""
-
-    _GROUP_NAMES = ("associative", "fast_slow", "w0", "state_shared")
-    _DEFAULT_GROUP_NAMES = ("associative", "w0", "state_shared")
-
-    def __init__(
-        self,
-        model: nn.Module,
-        *,
-        delta_audit_steps: int,
-        group_names: Sequence[str] = _DEFAULT_GROUP_NAMES,
-    ) -> None:
-        if type(delta_audit_steps) is not int or delta_audit_steps <= 0:
-            raise ValueError("A5 parameter delta audit steps must be positive")
-        selected = tuple(group_names)
-        if (
-            not selected
-            or len(set(selected)) != len(selected)
-            or any(name not in self._GROUP_NAMES for name in selected)
-        ):
-            raise ValueError("A5 parameter delta audit groups are invalid")
-        self.group_names = selected
-        grouped: dict[str, list[nn.Parameter]] = {name: [] for name in self.group_names}
-        fast_slow_ids = {
-            id(parameter)
-            for module in model.modules()
-            if isinstance(module, FastTTTAdapter)
-            for parameter in module.collect_slow_parameters()
-        }
-        seen: set[int] = set()
-        for name, parameter in model.named_parameters(remove_duplicate=False):
-            parameter_id = id(parameter)
-            if not parameter.requires_grad or parameter_id in seen:
-                continue
-            group = "fast_slow" if parameter_id in fast_slow_ids else self._classify_parameter(name)
-            if group in grouped:
-                grouped[group].append(parameter)
-            seen.add(parameter_id)
-        empty = tuple(name for name, values in grouped.items() if not values)
-        if empty:
-            raise RuntimeError(f"A5 parameter delta audit groups are empty: {empty}")
-        self.parameters = {name: tuple(values) for name, values in grouped.items()}
-        self.delta_audit_steps = delta_audit_steps
-        self.last_metrics: dict[str, float] = {}
-
-    @staticmethod
-    def _classify_parameter(name: str) -> str:
-        lowered = name.casefold()
-        if (
-            lowered.startswith(("qwen.", "module.qwen."))
-            or ".visual_stage.qwen.qwen_model." in lowered
-        ):
-            return "qwen"
-        return _state_group_for_name(lowered)
-
-    def before_step(
-        self,
-        audit: OuterGradientAudit,
-    ) -> dict[str, tuple[Tensor, ...]] | None:
-        self.last_metrics = {}
-        if audit.skipped_nonfinite or audit.successful_update_count > self.delta_audit_steps:
-            return None
-        return {
-            name: tuple(parameter.detach().float().clone() for parameter in parameters)
-            for name, parameters in self.parameters.items()
-        }
-
-    def after_step(
-        self,
-        snapshot: dict[str, tuple[Tensor, ...]] | None,
-        audit: OuterGradientAudit,
-    ) -> None:
-        if snapshot is None:
-            return
-        local_l2: list[Tensor] = []
-        group_metrics: dict[str, tuple[float, float, float, float, float, int]] = {}
-        for name in self.group_names:
-            parameters = self.parameters[name]
-            before_values = snapshot.get(name)
-            if before_values is None or len(before_values) != len(parameters):
-                raise RuntimeError(f"A5 {name} parameter snapshot drifted")
-            device = parameters[0].device
-            delta_squared = torch.zeros((), dtype=torch.float64, device=device)
-            before_squared = torch.zeros((), dtype=torch.float64, device=device)
-            delta_max_abs = torch.zeros((), dtype=torch.float32, device=device)
-            nonzero_count = torch.zeros((), dtype=torch.int64, device=device)
-            element_count = 0
-            for before, parameter in zip(before_values, parameters, strict=True):
-                if before.shape != parameter.shape or before.device != parameter.device:
-                    raise RuntimeError(f"A5 {name} parameter topology changed across step")
-                delta = parameter.detach().float() - before
-                delta_squared.add_(delta.square().sum(dtype=torch.float64))
-                before_squared.add_(before.square().sum(dtype=torch.float64))
-                delta_max_abs = torch.maximum(delta_max_abs, delta.abs().amax())
-                nonzero_count.add_(torch.count_nonzero(delta))
-                element_count += parameter.numel()
-            delta_l2 = delta_squared.sqrt().float()
-            before_l2 = before_squared.sqrt().float()
-            delta_rms = delta_l2 / math.sqrt(element_count)
-            relative_l2 = delta_l2 / before_l2.clamp_min(torch.finfo(torch.float32).tiny)
-            nonzero_fraction = nonzero_count.float() / element_count
-            local_l2.append(delta_l2)
-            group_metrics[name] = (
-                float(delta_l2.item()),
-                float(delta_rms.item()),
-                float(relative_l2.item()),
-                float(delta_max_abs.item()),
-                float(nonzero_fraction.item()),
-                element_count,
-            )
-        local = torch.stack(local_l2)
-        if (
-            torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-            and torch.distributed.get_world_size() > 1
-        ):
-            gathered = [torch.empty_like(local) for _ in range(torch.distributed.get_world_size())]
-            torch.distributed.all_gather(gathered, local)
-            reference = gathered[0]
-            tolerance = 1.0e-6 + 1.0e-4 * torch.maximum(
-                reference.abs(),
-                torch.stack(gathered[1:]).abs().amax(dim=0),
-            )
-            for rank, candidate in enumerate(gathered[1:], start=1):
-                if bool(torch.any((candidate - reference).abs() > tolerance).item()):
-                    raise RuntimeError(
-                        "A5 parameter delta diverged across ranks: "
-                        f"rank=0/{rank}, local={reference.tolist()}, "
-                        f"candidate={candidate.tolist()}"
-                    )
-        for name, (
-            delta_l2,
-            delta_rms,
-            relative_l2,
-            delta_max_abs,
-            nonzero_fraction,
-            element_count,
-        ) in group_metrics.items():
-            prefix = f"a5/parameter_delta/{name}"
-            self.last_metrics.update(
-                {
-                    f"{prefix}/l2": delta_l2,
-                    f"{prefix}/rms": delta_rms,
-                    f"{prefix}/relative_l2": relative_l2,
-                    f"{prefix}/max_abs": delta_max_abs,
-                    f"{prefix}/nonzero_fraction": nonzero_fraction,
-                    f"{prefix}/element_count": float(element_count),
-                    f"{prefix}/audit_step": float(audit.successful_update_count),
-                }
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class OuterParameterAudit:
-    stage: ProductionStage
-    total_parameter_count: int
-    trainable_parameter_count: int
-    qwen_parameter_count: int
-    qwen_trainable_count: int
-    non_qwen_parameter_count: int
-    non_qwen_trainable_count: int
-    associative_parameter_count: int
-    associative_trainable_count: int
-    transient_parameter_names: tuple[str, ...]
-    backbone_registered: bool
-    a5_adaptation_mode: str = "meta_ttt"
-    a5_phase: str = "main"
-
-    def __post_init__(self) -> None:
-        if self.a5_adaptation_mode not in _A5_ADAPTATION_MODES:
-            raise ValueError("outer parameter audit has an invalid A5 adaptation mode")
-        if self.a5_phase not in {"fast_state_warmup", "main"}:
-            raise ValueError("outer parameter audit has an invalid A5 phase")
-        if self.total_parameter_count <= 0 or self.trainable_parameter_count <= 0:
-            raise ValueError("production outer model exposes no trainable parameters")
-        if self.associative_parameter_count <= 0:
-            raise ValueError("production outer model must register Associative parameters")
-        if self.transient_parameter_names:
-            raise ValueError("transient fast matrices entered registered outer parameters")
-        if not self.backbone_registered:
-            raise ValueError("runtime model did not register the loaded Qwen backbone")
-        if self.qwen_parameter_count <= 0 or self.non_qwen_parameter_count <= 0:
-            raise ValueError("production outer model must register Qwen and state parameters")
-        if self.qwen_parameter_count + self.non_qwen_parameter_count != self.total_parameter_count:
-            raise ValueError("Qwen/non-Qwen parameter audit does not cover the outer model")
-        if (
-            self.qwen_trainable_count + self.non_qwen_trainable_count
-            != self.trainable_parameter_count
-        ):
-            raise ValueError("Qwen/non-Qwen trainable audit does not cover the outer model")
-        if self.stage is ProductionStage.A2:
-            if self.associative_trainable_count:
-                raise ValueError("A2 Associative must remain frozen")
-            expected = self.total_parameter_count - self.associative_parameter_count
-            if self.trainable_parameter_count != expected:
-                raise ValueError("A2 must train every registered non-Associative parameter")
-        elif self.a5_adaptation_mode == "meta_ttt":
-            if self.a5_phase == "fast_state_warmup":
-                if self.qwen_trainable_count:
-                    raise ValueError("Memory/State warmup must freeze every Qwen parameter")
-            elif self.qwen_trainable_count <= 0:
-                raise ValueError("A5 main must train configured Qwen parameters")
-            if (
-                self.a5_phase != "fast_state_warmup"
-                and self.non_qwen_trainable_count != self.non_qwen_parameter_count
-            ):
-                raise ValueError("A5 must train every state, W0, and Associative parameter")
-            if self.associative_trainable_count != self.associative_parameter_count:
-                raise ValueError("A5 Associative must be fully trainable")
-        else:
-            if self.qwen_trainable_count <= 0:
-                raise ValueError("no-write A5 must train configured Qwen parameters")
-            if self.associative_trainable_count:
-                raise ValueError("no-write A5 memory-interface parameters must remain frozen")
-            expected_non_qwen = self.non_qwen_parameter_count - self.associative_parameter_count
-            if self.non_qwen_trainable_count != expected_non_qwen:
-                raise ValueError(
-                    "no-write A5 must train every non-memory state and W0 parameter"
-                )
-
-
 @dataclass(frozen=True, slots=True)
 class ProductionTrainerRuntime:
     """Dataset/materialization hooks assembled entirely inside TTT-QWEN."""
@@ -869,45 +383,6 @@ class ProductionTrainerRuntime:
     a5_parameter_delta_audit_steps: int = 0
     operator_diagnostics_interval: int = 10
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.stage, ProductionStage) or not isinstance(self.model, nn.Module):
-            raise TypeError("production runtime stage/model is invalid")
-        if not callable(self.data_collator):
-            raise TypeError("production runtime requires a data collator")
-        if self.a5_adaptation_mode not in _A5_ADAPTATION_MODES:
-            raise ValueError("production runtime has an invalid A5 adaptation mode")
-        if self.stage is ProductionStage.A2 and self.a5_adaptation_mode != "meta_ttt":
-            raise ValueError("A2 cannot select an A5 adaptation mode")
-        if (
-            type(self.semantic_projector_delta_audit_steps) is not int
-            or self.semantic_projector_delta_audit_steps < 0
-        ):
-            raise ValueError("SemanticProjector delta audit steps must be non-negative")
-        if (
-            type(self.a5_parameter_delta_audit_steps) is not int
-            or self.a5_parameter_delta_audit_steps < 0
-        ):
-            raise ValueError("A5 parameter delta audit steps must be non-negative")
-        if self.stage is ProductionStage.A2 and self.a5_parameter_delta_audit_steps:
-            raise ValueError("A2 cannot enable the A5 parameter delta audit")
-        if (
-            type(self.operator_diagnostics_interval) is not int
-            or self.operator_diagnostics_interval <= 0
-        ):
-            raise ValueError("Operator diagnostics interval must be positive")
-        if self.stage is ProductionStage.A2:
-            if not callable(self.stage_a_loss_step):
-                raise ValueError("A2 runtime requires a post-forward state+answer loss step")
-            if self.meta_runner is not None or self.episode_adapter is not None:
-                raise ValueError("A2 runtime cannot expose Meta-TTT hooks")
-        else:
-            if not isinstance(self.meta_runner, MetaTTTEpisodeRunner) or not callable(
-                self.episode_adapter
-            ):
-                raise ValueError("A5 runtime requires a Meta runner and episode adapter")
-            if self.stage_a_loss_step is not None:
-                raise ValueError("A5 runtime cannot expose the A2 loss hook")
-
 
 class _LazyGradientAccumulationGroup(Sequence[object]):
     """Pull one A2 microbatch only when the pinned Trainer loop is ready to execute it."""
@@ -918,7 +393,6 @@ class _LazyGradientAccumulationGroup(Sequence[object]):
         self.iterator = iterator
         self.expected_count = expected_count
         self._cache: list[object] = []
-        self._started = time.perf_counter()
 
     def __len__(self) -> int:
         return self.expected_count
@@ -944,8 +418,6 @@ class _LazyGradientAccumulationGroup(Sequence[object]):
             yield self[index]
 
     def _pull_next(self) -> None:
-        microbatch_index = len(self._cache)
-        wait_started = time.perf_counter()
         try:
             batch = next(self.iterator)
         except StopIteration as error:
@@ -953,21 +425,6 @@ class _LazyGradientAccumulationGroup(Sequence[object]):
                 "A2 DataLoader ended before the declared gradient-accumulation group"
             ) from error
         self._cache.append(batch)
-        trace_event(
-            "a2_ga_microbatch_fetch",
-            seconds=time.perf_counter() - wait_started,
-            microbatch_index=microbatch_index,
-            requested_batches=self.expected_count,
-            lazy=True,
-        )
-        if len(self._cache) == self.expected_count:
-            trace_event(
-                "a2_ga_group_fetch",
-                seconds=time.perf_counter() - self._started,
-                requested_batches=self.expected_count,
-                fetched_batches=len(self._cache),
-                lazy=True,
-            )
 
 
 class _A2AuditAccumulator:
@@ -1004,36 +461,13 @@ class _A2AuditAccumulator:
         metrics: dict[str, float] = {
             "loss/ga_microbatch_count": float(len(balances)),
         }
-        answer = _weighted_audit_mean(
-            tuple((audit.answer_global_mean, audit.answer_global_count) for audit in balances)
-        )
-        state = _audit_mean(tuple(audit.state_global_mean for audit in balances))
-        if answer is not None:
-            metrics["loss/answer"] = answer
-        if state is not None:
-            metrics["loss/state"] = state
-        if answer is not None and state is not None:
-            metrics["loss/outer_total"] = answer + state
-
         for term_index, name in enumerate(("task", "operator", "retrieval", "time")):
             terms = tuple(audit.terms[term_index] for audit in balances)
             count = sum(float(term.global_valid_count.item()) for term in terms)
             metrics[f"loss/global_valid_count/{name}"] = count
             metrics[f"grad_balance/global_valid_count/{name}"] = count
-            raw = _weighted_audit_mean(
-                tuple((term.raw_global_mean, term.global_valid_count) for term in terms)
-            )
-            _set_optional_metric(metrics, f"loss/raw/{name}", raw)
             for key, values in (
                 (f"loss/scale/{name}", tuple(term.scale for term in terms)),
-                (
-                    f"loss/aligned/{name}",
-                    tuple(term.aligned_global_mean for term in terms),
-                ),
-                (
-                    f"loss/weighted/{name}",
-                    tuple(term.weighted_global_mean for term in terms),
-                ),
                 (
                     f"grad_balance/raw_rms/{name}",
                     tuple(term.raw_gradient_rms for term in terms),
@@ -1046,242 +480,18 @@ class _A2AuditAccumulator:
                     f"grad_balance/loss_scale/{name}",
                     tuple(term.loss_scale for term in terms),
                 ),
-                (
-                    f"grad_balance/grad_scale/{name}",
-                    tuple(term.gradient_scale for term in terms),
-                ),
                 (f"grad_balance/final_scale/{name}", tuple(term.scale for term in terms)),
             ):
                 _set_optional_metric(metrics, key, _audit_mean(values))
-            active_terms = tuple(
-                term for term in terms if float(term.global_valid_count.item()) > 0
-            )
-            clamp_rate = (
-                sum(float(term.scale_clamped.item()) for term in active_terms)
-                / float(len(active_terms))
-                if active_terms
-                else 0.0
-            )
-            metrics[f"loss/scale_clamped/{name}"] = clamp_rate
-            metrics[f"grad_balance/scale_clamped/{name}"] = clamp_rate
 
-        for key, values in (
-            (
-                "loss/aux_to_answer_ratio",
-                tuple(audit.auxiliary_to_answer_ratio for audit in balances),
-            ),
-            ("loss/group_guard", tuple(audit.group_guard for audit in balances)),
-            (
-                "loss/group_guard_active",
-                tuple(audit.group_guard_active for audit in balances),
-            ),
-            (
-                "loss/group_guard_reference",
-                tuple(audit.group_guard_reference for audit in balances),
-            ),
-            (
-                "loss/group_guard_reference_floored",
-                tuple(audit.group_guard_reference_floored for audit in balances),
-            ),
-            (
-                "loss/state_to_reference_ratio",
-                tuple(audit.state_to_reference_ratio for audit in balances),
-            ),
-            (
-                "loss/state_to_current_answer_ratio",
-                tuple(audit.state_to_current_answer_ratio for audit in balances),
-            ),
-        ):
-            value = _audit_mean(values)
-            if value is not None:
-                metrics[key] = value
-
-        last = balances[-1]
-        for name, mean, updates in zip(
-            ("answer", "task", "operator", "retrieval", "time"),
-            last.ema_means,
-            last.ema_update_counts,
-            strict=True,
-        ):
-            value = _audit_scalar(mean)
-            if value is not None:
-                metrics[f"loss/ema/{name}"] = value
-            metrics[f"loss/ema_updates/{name}"] = float(updates.item())
-        for name, updates in zip(
-            ("task", "operator", "retrieval", "time"),
-            last.gradient_ema_update_counts,
-            strict=True,
-        ):
-            metrics[f"grad_balance/ema_updates/{name}"] = float(updates.item())
+        guard = _audit_mean(tuple(audit.group_guard for audit in balances))
+        if guard is not None:
+            metrics["loss/group_guard"] = guard
 
         for audit in weak:
             for name, value in audit.metrics():
                 metrics[name] = metrics.get(name, 0.0) + float(value)
-        _aggregate_operator_diagnostics(metrics, weak)
-        _aggregate_task_diagnostics(metrics, weak)
         return metrics
-
-
-def _aggregate_operator_diagnostics(
-    metrics: dict[str, float],
-    audits: Sequence[OfficialWeakLossAudit],
-) -> None:
-    raw = [0] * 72
-    effective = [0] * 72
-    loss_sums = [0.0] * 8
-    support = [0] * 8
-    confidence_sum = entropy_sum = temperature_sum = 0.0
-    temperature_count = 0
-    for audit in audits:
-        values = audit.operator_diagnostics
-        raw = [left + right for left, right in zip(raw, values.raw_confusion, strict=True)]
-        effective = [
-            left + right for left, right in zip(effective, values.effective_confusion, strict=True)
-        ]
-        loss_sums = [
-            left + right for left, right in zip(loss_sums, values.class_loss_sums, strict=True)
-        ]
-        support = [left + right for left, right in zip(support, values.class_support, strict=True)]
-        confidence_sum += values.confidence_sum
-        entropy_sum += values.entropy_sum
-        temperature_sum += values.temperature_sum
-        temperature_count += values.temperature_count
-    total = sum(support)
-    if total != sum(raw) or total != sum(effective):
-        raise RuntimeError("aggregated Operator confusion totals drifted from support")
-    recalls: list[float] = []
-    raw_recalls: list[float] = []
-    raw_correct = effective_correct = 0
-    unsupported_index = len(OPERATORS) - 1
-    for target_index, target in enumerate(OPERATORS[:-1]):
-        target_name = target.value
-        row_offset = target_index * len(OPERATORS)
-        row_support = support[target_index]
-        metrics[f"operator/support/{target_name}"] = float(row_support)
-        if row_support:
-            target_raw_correct = raw[row_offset + target_index]
-            target_effective_correct = effective[row_offset + target_index]
-            raw_recall = target_raw_correct / float(row_support)
-            recall = target_effective_correct / float(row_support)
-            metrics[f"operator/raw_recall/{target_name}"] = raw_recall
-            metrics[f"operator/recall/{target_name}"] = recall
-            metrics[f"operator/raw_loss/{target_name}"] = loss_sums[target_index] / float(
-                row_support
-            )
-            raw_recalls.append(raw_recall)
-            recalls.append(recall)
-            raw_correct += target_raw_correct
-            effective_correct += target_effective_correct
-        for predicted_index, predicted in enumerate(OPERATORS):
-            metrics[f"operator/raw_confusion/{target_name}/{predicted.value}"] = float(
-                raw[row_offset + predicted_index]
-            )
-            metrics[f"operator/effective_confusion/{target_name}/{predicted.value}"] = float(
-                effective[row_offset + predicted_index]
-            )
-    metrics["operator/observed_class_count"] = float(len(recalls))
-    metrics["operator/observed_class_fraction"] = len(recalls) / 8.0
-    if total:
-        metrics["operator/raw_micro_accuracy"] = raw_correct / float(total)
-        metrics["operator/micro_accuracy"] = effective_correct / float(total)
-        metrics["operator/raw_macro_recall"] = sum(raw_recalls) / float(len(raw_recalls))
-        metrics["operator/macro_recall"] = sum(recalls) / float(len(recalls))
-        metrics["operator/raw_predicted_unsupported_rate"] = sum(
-            raw[index * 9 + unsupported_index] for index in range(8)
-        ) / float(total)
-        metrics["operator/predicted_unsupported_rate"] = sum(
-            effective[index * 9 + unsupported_index] for index in range(8)
-        ) / float(total)
-        metrics["operator/mean_confidence"] = confidence_sum / float(total)
-        metrics["operator/mean_entropy"] = entropy_sum / float(total)
-    if temperature_count:
-        metrics["operator/temperature"] = temperature_sum / float(temperature_count)
-
-
-def _aggregate_task_diagnostics(
-    metrics: dict[str, float],
-    audits: Sequence[OfficialWeakLossAudit],
-) -> None:
-    count_loss = [0.0] * 4
-    count_error = [0.0] * 4
-    count_rows = [0] * 4
-    component_loss = [0.0] * 3
-    component_rows = [0] * 3
-    o1_loss = [0.0] * 2
-    o1_rows = [0] * 2
-    channel_stats = [[0] * 7 for _ in range(6)]
-    representable = unrepresentable = 0
-    for audit in audits:
-        values = audit.task_diagnostics
-        count_loss = [
-            left + right for left, right in zip(count_loss, values.count_loss_sums, strict=True)
-        ]
-        count_error = [
-            left + right
-            for left, right in zip(count_error, values.count_abs_error_sums, strict=True)
-        ]
-        count_rows = [
-            left + right for left, right in zip(count_rows, values.count_rows, strict=True)
-        ]
-        component_loss = [
-            left + right
-            for left, right in zip(component_loss, values.component_loss_sums, strict=True)
-        ]
-        component_rows = [
-            left + right for left, right in zip(component_rows, values.component_rows, strict=True)
-        ]
-        o1_loss = [left + right for left, right in zip(o1_loss, values.o1_loss_sums, strict=True)]
-        o1_rows = [left + right for left, right in zip(o1_rows, values.o1_rows, strict=True)]
-        sources = (
-            values.channel_positive_counts,
-            values.channel_negative_counts,
-            values.channel_masked_counts,
-            values.channel_true_positive_counts,
-            values.channel_false_positive_counts,
-            values.channel_false_negative_counts,
-        )
-        for target, source in zip(channel_stats, sources, strict=True):
-            for index, value in enumerate(source):
-                target[index] += value
-        representable += values.e1_representable_occurrences
-        unrepresentable += values.e1_unrepresentable_occurrences
-    for index, name in enumerate(("o1", "o2", "e1", "e2")):
-        metrics[f"task/count_rows/{name}"] = float(count_rows[index])
-        if count_rows[index]:
-            metrics[f"task/count/{name}"] = count_loss[index] / float(count_rows[index])
-            metrics[f"task/count_mae/{name}"] = count_error[index] / float(count_rows[index])
-    for index, name in enumerate(("e1_dense", "e2_event", "e2_phase")):
-        metrics[f"task/{name}_rows"] = float(component_rows[index])
-        if component_rows[index]:
-            metrics[f"task/{name}"] = component_loss[index] / float(component_rows[index])
-    for index, name in enumerate(("snap", "delta")):
-        metrics[f"task/o1_rows/{name}"] = float(o1_rows[index])
-        if o1_rows[index]:
-            metrics[f"task/o1/{name}"] = o1_loss[index] / float(o1_rows[index])
-    metrics["task/e1_representable_occurrences"] = float(representable)
-    metrics["task/e1_unrepresentable_occurrences"] = float(unrepresentable)
-    channel_names = (
-        "e1_eventness",
-        "e1_completion",
-        "e1_transition",
-        "e2_start",
-        "e2_active",
-        "e2_end",
-        "e2_complete",
-    )
-    positive, negative, masked, true_positive, false_positive, false_negative = channel_stats
-    for index, name in enumerate(channel_names):
-        metrics[f"task/dense_positive/{name}"] = float(positive[index])
-        metrics[f"task/dense_negative/{name}"] = float(negative[index])
-        metrics[f"task/dense_masked/{name}"] = float(masked[index])
-        precision_denominator = true_positive[index] + false_positive[index]
-        recall_denominator = true_positive[index] + false_negative[index]
-        if precision_denominator:
-            metrics[f"task/dense_precision/{name}"] = true_positive[index] / float(
-                precision_denominator
-            )
-        if recall_denominator:
-            metrics[f"task/dense_recall/{name}"] = true_positive[index] / float(recall_denominator)
 
 
 def _audit_scalar(value: Tensor) -> float | None:
@@ -1294,73 +504,9 @@ def _audit_mean(values: Sequence[Tensor]) -> float | None:
     return sum(finite) / float(len(finite)) if finite else None
 
 
-def _weighted_audit_mean(values: Sequence[tuple[Tensor, Tensor]]) -> float | None:
-    numerator = 0.0
-    denominator = 0.0
-    for value, weight in values:
-        scalar = _audit_scalar(value)
-        count = float(weight.item())
-        if scalar is None or not math.isfinite(count) or count <= 0.0:
-            continue
-        numerator += scalar * count
-        denominator += count
-    return numerator / denominator if denominator > 0.0 else None
-
-
 def _set_optional_metric(metrics: dict[str, float], name: str, value: float | None) -> None:
     if value is not None:
         metrics[name] = value
-
-
-def _query_tail_distribution(values: Sequence[float]) -> dict[str, float]:
-    ordered = sorted(values)
-    if not ordered or any(not math.isfinite(value) or value < 0.0 for value in ordered):
-        raise ValueError("Query-tail distribution requires finite non-negative values")
-
-    def quantile(probability: float) -> float:
-        position = (len(ordered) - 1) * probability
-        lower = math.floor(position)
-        upper = math.ceil(position)
-        if lower == upper:
-            return ordered[lower]
-        weight = position - lower
-        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
-
-    return {
-        "mean": sum(ordered) / len(ordered),
-        "median": quantile(0.5),
-        "p90": quantile(0.90),
-        "p95": quantile(0.95),
-        "p99": quantile(0.99),
-        "max": ordered[-1],
-    }
-
-
-def _top_fraction_share(values: Sequence[float], fraction: float) -> float:
-    ordered = sorted(values, reverse=True)
-    if not ordered or not 0.0 < fraction <= 1.0:
-        raise ValueError("top-fraction share requires values and a fraction in (0, 1]")
-    total = math.fsum(ordered)
-    if total == 0.0:
-        return 0.0
-    count = max(1, math.ceil(len(ordered) * fraction))
-    return math.fsum(ordered[:count]) / total
-
-
-def _counterfactual_query_selector(optimizer_step: int) -> int:
-    """Select one shared Query ordinal for every rank in an exact-shape bucket."""
-
-    if type(optimizer_step) is not int or optimizer_step <= 0:
-        raise ValueError("counterfactual optimizer step must be a positive integer")
-    return optimizer_step
-
-
-def _counterfactual_all_ranks_eligible(loss_weights: Sequence[float]) -> bool:
-    """Only audit a step when every rank owns a real, non-padding episode."""
-
-    if not loss_weights or any(weight not in (0.0, 1.0) for weight in loss_weights):
-        raise ValueError("counterfactual rank eligibility requires binary loss weights")
-    return all(weight == 1.0 for weight in loss_weights)
 
 
 class TTTQwenTrainerMixin:
@@ -1482,303 +628,30 @@ class TTTQwenTrainerMixin:
                 self._last_timed_global_step = global_step
             if self._last_a5_training_seconds is not None:
                 enriched["a5/training_step_seconds"] = self._last_a5_training_seconds
-            enriched.update(self._last_counterfactual_metrics)
             retrieval_metrics: dict[str, float] = {}
             meta_output = self.last_meta_output
             meta_audit = meta_output.audit
             if meta_audit.loss_weight == 1.0:
-                for query in meta_audit.queries:
-                    for name, value in query.metrics.metrics:
-                        if name.startswith("retrieval/") and value is not None:
-                            retrieval_metrics[name] = retrieval_metrics.get(name, 0.0) + value
-            balance = getattr(self.ttt_runtime.meta_runner, "last_balance_audit", None)
-            if isinstance(balance, OfficialWeakBalanceAudit):
-                retrieval_metrics["retrieval/valid_bag_rows"] = float(
-                    balance.terms[2].global_valid_count.item()
-                )
+                balance = getattr(self.ttt_runtime.meta_runner, "last_balance_audit", None)
+                if isinstance(balance, OfficialWeakBalanceAudit):
+                    retrieval_metrics["retrieval/valid_bag_rows"] = float(
+                        balance.terms[2].global_valid_count.item()
+                    )
             enriched.update(retrieval_metrics)
             enriched.update(
                 {
                     "a5/meta_query_count": float(meta_audit.query_count),
-                    "a5/diagnostic_query_count": float(meta_audit.diagnostic_query_count),
-                    "a5/zero_support_query_count": float(meta_audit.zero_support_query_count),
-                    "a5/support_segments_without_query": float(
-                        meta_audit.support_segments_without_query
-                    ),
-                    "a5/meta_ttt_segment_count": float(meta_audit.meta_ttt_segment_count),
-                    "a5/outer_only_segment_count": float(meta_audit.outer_only_segment_count),
-                    "a5/no_write_segment_count": float(meta_audit.no_write_segment_count),
-                    "a5/ablation/ttt_enabled": float(meta_audit.ttt_enabled),
+                    "a5/segment_count": float(meta_audit.segment_count),
                     "a5/memory/write_valid": float(meta_audit.associative_valid_count > 0),
                     "a5/memory/write_count": float(meta_audit.write_count),
-                    "a5/memory/write_attempt_count": float(meta_audit.write_attempt_count),
                     "a5/memory/skip_count": float(meta_audit.skip_count),
-                    "a5/ablation/memory_interface_trainable": float(
-                        self.ttt_runtime.a5_adaptation_mode == "meta_ttt"
-                    ),
-                    "a5/ablation/w0_outer_trainable": 1.0,
-                    "a5/insufficient_inter_query_gap": float(
-                        meta_audit.insufficient_inter_query_gap
-                    ),
                     "a5/loss/meta_query_sum": float(meta_output.query_loss.item()),
                     "memory/readout_target_cosine": meta_audit.readout_target_cosine_mean,
                     "memory/pre_write_error_mean": (
                         1.0 - meta_audit.readout_target_cosine_mean
                     ),
-                    "memory/post_write_cosine": meta_audit.post_write_cosine_mean,
-                    "memory/readout_share": meta_audit.readout_share_mean,
-                    "memory/memory_norm_max": meta_audit.memory_norm_max,
-                    "memory/write_norm": meta_audit.write_norm_mean,
-                    "memory/eta_sum": meta_audit.eta_sum_mean,
-                    "memory/eta_renormalized_fraction": meta_audit.renormalized_fraction,
-                    "memory/slots_written": float(meta_audit.slots_written_total),
-                    "a5/memory/bank_record_count": float(meta_audit.bank_record_count),
-                    "a5/memory/empty_bank_count": float(meta_audit.empty_bank_count),
                 }
             )
-            role_norms: dict[str, list[float]] = {}
-            role_clipped_norms: dict[str, list[float]] = {}
-            role_losses: dict[str, list[float]] = {}
-            for query in meta_audit.queries:
-                proxy_norm = math.sqrt(sum(value * value for value in query.proxy_gradient_norms))
-                enriched[f"a5/query_weight/{query.query_role}"] = query.query_weight
-                enriched[
-                    f"a5/query_proxy_grad_norm/query_{query.query_index}_{query.query_role}"
-                ] = proxy_norm
-                enriched[
-                    f"a5/query_proxy_grad_norm/raw/query_{query.query_index}_{query.query_role}"
-                ] = query.proxy_gradient_joint_norm_raw
-                enriched[
-                    f"a5/query_proxy_grad_norm/clipped/query_{query.query_index}_{query.query_role}"
-                ] = query.proxy_gradient_joint_norm_clipped
-                enriched[
-                    f"a5/query_proxy_grad_clip_scale/query_{query.query_index}_{query.query_role}"
-                ] = query.proxy_gradient_clip_scale
-                enriched[
-                    f"a5/query_proxy_grad_clipped/query_{query.query_index}_{query.query_role}"
-                ] = float(query.proxy_gradient_clipped)
-                enriched[
-                    f"a5/query_proxy_grad_nonzero/query_{query.query_index}_{query.query_role}"
-                ] = float(query.proxy_gradient_status == "nonzero")
-                status_key = f"a5/query_proxy_grad_status/{query.proxy_gradient_status}"
-                enriched[status_key] = enriched.get(status_key, 0.0) + 1.0
-                enriched[f"a5/query_outer_loss/query_{query.query_index}_{query.query_role}"] = (
-                    query.weighted_outer_loss
-                )
-                role_norms.setdefault(query.query_role, []).append(proxy_norm)
-                role_clipped_norms.setdefault(query.query_role, []).append(
-                    query.proxy_gradient_joint_norm_clipped
-                )
-                role_losses.setdefault(query.query_role, []).append(query.weighted_outer_loss)
-            if global_step != self._last_query_tail_global_step:
-                for query in meta_audit.queries:
-                    if query.proxy_gradient_status == "zero_padding":
-                        continue
-                    item = (
-                        query.proxy_gradient_joint_norm_raw,
-                        query.proxy_gradient_joint_norm_clipped,
-                        query.proxy_gradient_clipped,
-                    )
-                    self._query_tail_history["all"].append(item)
-                    self._query_tail_history[query.query_role].append(item)
-                for history_values in self._query_tail_history.values():
-                    del history_values[:-256]
-                self._last_query_tail_global_step = global_step
-            for role, role_values in role_norms.items():
-                enriched[f"a5/query_proxy_grad_norm/{role}"] = sum(role_values) / len(role_values)
-            for role, role_values in role_clipped_norms.items():
-                enriched[f"a5/query_proxy_grad_norm/clipped/{role}"] = sum(role_values) / len(
-                    role_values
-                )
-            for role, role_values in role_losses.items():
-                enriched[f"a5/query_outer_loss/{role}"] = sum(role_values) / len(role_values)
-            for role, history in self._query_tail_history.items():
-                if not history:
-                    continue
-                raw_values = tuple(item[0] for item in history)
-                clipped_values = tuple(item[1] for item in history)
-                for label, distribution_values in (
-                    ("raw", raw_values),
-                    ("clipped", clipped_values),
-                ):
-                    for statistic, value in _query_tail_distribution(distribution_values).items():
-                        enriched[f"a5/query_proxy_grad_norm/{label}/recent_{role}/{statistic}"] = (
-                            value
-                        )
-                enriched[f"a5/query_proxy_grad_clip_rate/recent_{role}"] = sum(
-                    float(item[2]) for item in history
-                ) / len(history)
-                enriched[f"a5/query_proxy_grad_count/recent_{role}"] = float(len(history))
-            all_history = self._query_tail_history["all"]
-            if all_history:
-                for label, index in (("raw", 0), ("clipped", 1)):
-                    share_values = tuple(item[index] for item in all_history)
-                    enriched[f"a5/query_proxy_grad_norm/{label}/recent_top1_share"] = (
-                        _top_fraction_share(share_values, 0.01)
-                    )
-                    enriched[f"a5/query_proxy_grad_norm/{label}/recent_top5_share"] = (
-                        _top_fraction_share(share_values, 0.05)
-                    )
-            for segment in meta_audit.segments:
-                enriched[f"a5/deferred_vjp_norm/segment_{segment.segment_index}"] = (
-                    segment.deferred_vjp_norm
-                )
-                enriched[f"a5/write_version_at_query/segment_{segment.segment_index}"] = float(
-                    max(segment.write_version_at_query)
-                )
-                enriched[f"a5/write_version_delta/segment_{segment.segment_index}"] = float(
-                    max(segment.write_version_at_query)
-                    - max(segment.write_version_before_segment)
-                )
-                enriched[f"a5/write_attempt_count/segment_{segment.segment_index}"] = float(
-                    segment.write_attempt_count
-                )
-                enriched[f"a5/write_count/segment_{segment.segment_index}"] = float(
-                    segment.write_count
-                )
-                enriched[f"a5/skip_count/segment_{segment.segment_index}"] = float(
-                    segment.skip_count
-                )
-                enriched[f"a5/query_count/segment_{segment.segment_index}"] = float(
-                    segment.query_count
-                )
-                enriched[f"a5/query_cotangent_sum_norm/raw/segment_{segment.segment_index}"] = (
-                    segment.raw_query_cotangent_sum_norm
-                )
-                enriched[f"a5/query_cotangent_sum_norm/clipped/segment_{segment.segment_index}"] = (
-                    segment.clipped_query_cotangent_sum_norm
-                )
-                enriched[f"a5/meta_ttt_active/segment_{segment.segment_index}"] = float(
-                    segment.training_mode == "meta_ttt"
-                )
-                enriched[f"a5/outer_only/segment_{segment.segment_index}"] = float(
-                    segment.training_mode == "outer_only"
-                )
-                enriched[f"a5/no_write/segment_{segment.segment_index}"] = float(
-                    segment.training_mode == "no_write"
-                )
-                enriched[f"memory/pre_write_cosine/segment_{segment.segment_index}"] = (
-                    segment.pre_write_cosine_mean
-                )
-                enriched[f"memory/eta_sum/segment_{segment.segment_index}"] = segment.eta_sum
-                for reason, count in segment.skip_reason_counts:
-                    enriched[f"a5/skip_reason/segment_{segment.segment_index}/{reason}"] = float(
-                        count
-                    )
-            if meta_audit.writes:
-                write_norms = tuple(
-                    value for write in meta_audit.writes for value in write.write_norms
-                )
-                memory_norms = tuple(
-                    value for write in meta_audit.writes for value in write.memory_norms
-                )
-                readout_shares = tuple(
-                    value for write in meta_audit.writes for value in write.readout_shares
-                )
-                enriched["a5/memory/write_norm_mean"] = sum(write_norms) / len(write_norms)
-                enriched["a5/memory/memory_norm_mean"] = sum(memory_norms) / len(memory_norms)
-                enriched["a5/memory/readout_share_mean"] = sum(readout_shares) / len(
-                    readout_shares
-                )
-                pairwise_fields = (
-                    ("key_pairwise_cosine_mean", "key_pairwise_cosine_means"),
-                    ("value_pairwise_cosine_mean", "value_pairwise_cosine_means"),
-                    ("delta_pairwise_cosine_mean", "delta_pairwise_cosine_means"),
-                )
-                for metric_name, field_name in pairwise_fields:
-                    written_values = tuple(
-                        value
-                        for write in meta_audit.writes
-                        for did_write, value in zip(
-                            write.did_write,
-                            getattr(write, field_name),
-                            strict=True,
-                        )
-                        if did_write
-                    )
-                    if written_values:
-                        enriched[f"a5/memory/{metric_name}"] = sum(written_values) / len(
-                            written_values
-                        )
-                    # The episode mean hides whether the per-video forward loop
-                    # tightens the collapse as the video proceeds: `M` feeds the
-                    # readout, which feeds the slots, which produce the next
-                    # chunk's keys.  `meta_audit.writes` is ordered by Support
-                    # index, so the first and last entries bracket that loop.
-                    for label, write in (
-                        ("first", meta_audit.writes[0]),
-                        ("last", meta_audit.writes[-1]),
-                    ):
-                        bounded = tuple(
-                            value
-                            for did_write, value in zip(
-                                write.did_write,
-                                getattr(write, field_name),
-                                strict=True,
-                            )
-                            if did_write
-                        )
-                        if bounded:
-                            enriched[f"a5/memory/{metric_name}/{label}_write"] = sum(
-                                bounded
-                            ) / len(bounded)
-                for probe_field in PROBE_FIELDS:
-                    probe_values = tuple(
-                        getattr(probe, probe_field)
-                        for write in meta_audit.writes
-                        if write.slot_geometry_probes
-                        for did_write, probe in zip(
-                            write.did_write,
-                            write.slot_geometry_probes,
-                            strict=True,
-                        )
-                        if did_write and probe is not None
-                    )
-                    if probe_values:
-                        enriched[f"a5/geometry/{probe_field}"] = sum(probe_values) / len(
-                            probe_values
-                        )
-                # `memory/readout_target_cosine` is diluted by construction: it is
-                # a flat mean over every accepted write, and each video's FIRST
-                # write lands on a zero memory, so its recall is the zero vector
-                # and the masked cosine contributes an exact 0.0 while still
-                # counting in the denominator.  That is not a recall measurement,
-                # it is an arithmetic artifact, and it depresses the reported
-                # value well below the steady state.  Emit the recall-only mean
-                # alongside, selecting on the pre-write memory generation rather
-                # than on `value == 0.0` so a legitimately orthogonal recall is
-                # never silently dropped.
-                recall_values = tuple(
-                    value
-                    for write in meta_audit.writes
-                    for did_write, before, value in zip(
-                        write.did_write,
-                        write.write_versions_before,
-                        write.pre_write_cosine_means,
-                        strict=True,
-                    )
-                    if did_write and before > 0
-                )
-                if recall_values:
-                    enriched["a5/memory/readout_target_cosine_recall_only"] = sum(
-                        recall_values
-                    ) / len(recall_values)
-                skip_reasons = tuple(
-                    reason
-                    for write in meta_audit.writes
-                    for did_write, reason in zip(
-                        write.did_write,
-                        write.skip_reasons,
-                        strict=True,
-                    )
-                    if not did_write
-                )
-                enriched["a5/memory/skip_count/no_valid_slot"] = float(
-                    sum(reason == "no_valid_slot" for reason in skip_reasons)
-                )
-                enriched["a5/memory/skip_count/nonfinite"] = float(
-                    sum(reason == "nonfinite_key_value" for reason in skip_reasons)
-                )
         enriched.update(self.last_semantic_projector_metrics)
         controller = self.ttt_runtime.gradient_controller
         if isinstance(controller, OuterGradientController) and controller.last_audit is not None:
@@ -1840,14 +713,7 @@ class TTTQwenTrainerMixin:
             ):
                 raise RuntimeError("formal A2 step did not publish typed loss audits")
             self._a2_audit_accumulator.add(balance_audit, weak_audit)
-            wrapper = getattr(self.accelerator, "deepspeed_engine_wrapped", None)  # type: ignore[attr-defined]
-            if not isinstance(wrapper, _ControlledDeepSpeedEngineWrapper):
-                raise RuntimeError("formal A2 lost its controlled DeepSpeed wrapper")
-            auditor = wrapper.semantic_projector_auditor
-            self.last_semantic_projector_metrics = (
-                dict(auditor.last_metrics) if auditor is not None else {}
-            )
-            self._observe_runtime_cost(inputs, time.perf_counter() - step_started)
+            self.last_semantic_projector_metrics = {}
             return result
         if int(self.args.gradient_accumulation_steps) != 1:  # type: ignore[attr-defined]
             raise ValueError("A5 uses one complete episode/rank and episode-level GA=1")
@@ -1862,51 +728,9 @@ class TTTQwenTrainerMixin:
         if loss_weight not in (0.0, 1.0):
             raise ValueError("A5 episode loss weight must be one or deterministic-padding zero")
         runner = cast(MetaTTTEpisodeRunner, self.ttt_runtime.meta_runner)
-        counterfactual_config = runner.config.a5.counterfactual_audit
-        trainer_state = getattr(self, "state", None)
-        next_optimizer_step = int(getattr(trainer_state, "global_step", 0)) + 1
-        audit_due_now = bool(
-            counterfactual_config.enabled
-            and next_optimizer_step % counterfactual_config.interval_steps == 0
-        )
-        self._counterfactual_audit_pending = self._counterfactual_audit_pending or audit_due_now
         segment_lengths = episode.segment_lengths
         expected_segments = len(segment_lengths)
         expected_backwards = len(episode.query_points) + expected_segments
-        self._assert_rank_episode_parity(
-            segment_lengths,
-            episode.segment_query_counts,
-        )
-        counterfactual_request: CounterfactualAuditRequest | None = None
-        if counterfactual_config.enabled and self._counterfactual_audit_pending:
-            local_eligibility = torch.tensor(
-                [loss_weight],
-                dtype=torch.float32,
-                device=self.args.device,  # type: ignore[attr-defined]
-            )
-            gathered_eligibility = self.accelerator.gather(local_eligibility)  # type: ignore[attr-defined]
-            rank_loss_weights = tuple(
-                float(value) for value in gathered_eligibility.detach().cpu().reshape(-1).tolist()
-            )
-            if _counterfactual_all_ranks_eligible(rank_loss_weights):
-                # Every rank in the exact-shape bucket must audit the same Query
-                # ordinal.  A rank-dependent ordinal, or auditing while one rank
-                # is deterministic padding, can interleave local no-grad forwards
-                # with different distributed backward collectives and deadlock.
-                counterfactual_request = CounterfactualAuditRequest(
-                    optimizer_step=next_optimizer_step,
-                    query_selector=_counterfactual_query_selector(next_optimizer_step),
-                    queries_per_rank=counterfactual_config.queries_per_rank,
-                )
-                self._counterfactual_audit_pending = False
-            else:
-                trace_event(
-                    "a5_diagnostic_counterfactual_deferred",
-                    optimizer_step=next_optimizer_step,
-                    scheduled_now=audit_due_now,
-                    reason="padding_rank",
-                    rank_loss_weights=rank_loss_weights,
-                )
 
         backward_controller = SegmentBackwardController(
             self.accelerator,  # type: ignore[attr-defined]
@@ -1929,17 +753,13 @@ class TTTQwenTrainerMixin:
                 backward=distributed_backward,
                 backward_gradient_scale=backward_controller.proxy_gradient_scale,
                 episode_loss_weight=loss_weight,
-                counterfactual_audit=counterfactual_request,
             )
         finally:
             if callable(end_prefetch):
                 end_prefetch()
-        if output.audit.backward_count != expected_backwards:
-            raise RuntimeError("A5 streamed backward collective count drifted from its bucket")
         backward_controller.finalize()
         self.last_semantic_projector_metrics = backward_controller.semantic_projector_metrics
         self.last_meta_output = output
-        self._last_counterfactual_metrics = self._gather_counterfactual_metrics(output)
         local_training_seconds = time.perf_counter() - step_started
         timing = torch.tensor(
             [local_training_seconds],
@@ -1948,123 +768,7 @@ class TTTQwenTrainerMixin:
         )
         gathered_timing = self.accelerator.gather(timing)  # type: ignore[attr-defined]
         self._last_a5_training_seconds = float(gathered_timing.max().item())
-        self._observe_runtime_cost(inputs, local_training_seconds)
         return (output.total * loss_weight).detach().to(self.args.device)  # type: ignore[attr-defined]
-
-    def _gather_counterfactual_metrics(
-        self,
-        output: TruncatedMetaTTTEpisodeOutput,
-    ) -> dict[str, float]:
-        audited = tuple(
-            query.counterfactual
-            for query in output.audit.queries
-            if query.counterfactual is not None
-        )
-        local = torch.zeros((9,), dtype=torch.float64, device=self.args.device)  # type: ignore[attr-defined]
-        for counterfactual in audited:
-            references = {item.reference: item for item in counterfactual.references}
-            if set(references) != {"episode_zero", "segment_start"}:
-                raise RuntimeError("counterfactual audit did not publish both references")
-            local[0] += 1.0
-            for offset, name in ((1, "episode_zero"), (5, "segment_start")):
-                item = references[name]
-                local[offset : offset + 4] += torch.tensor(
-                    (
-                        item.gain_abs,
-                        item.gain_rel,
-                        float(item.gain_abs > 0.0),
-                        item.descent_cosine,
-                    ),
-                    dtype=torch.float64,
-                    device=local.device,
-                )
-        gathered = self.accelerator.gather(local)  # type: ignore[attr-defined]
-        rows = gathered.reshape(int(self.args.world_size), 9)  # type: ignore[attr-defined]
-        count = float(rows[:, 0].sum().item())
-        if count == 0.0:
-            return {}
-        metrics = {"a5/cf/audited_query_count": count}
-        for offset, name in ((1, "episode_zero"), (5, "segment_start")):
-            metrics.update(
-                {
-                    f"a5/cf/query_gain_abs/{name}": float(rows[:, offset].sum().item()) / count,
-                    f"a5/cf/query_gain_rel/{name}": float(rows[:, offset + 1].sum().item()) / count,
-                    f"a5/cf/gain_positive_rate/{name}": float(rows[:, offset + 2].sum().item())
-                    / count,
-                    f"a5/cf/descent_cosine/{name}": float(rows[:, offset + 3].sum().item()) / count,
-                }
-            )
-        return metrics
-
-    def _observe_runtime_cost(
-        self,
-        inputs: Mapping[str, object],
-        seconds: float,
-    ) -> None:
-        prepared = inputs.get(
-            "prepared_a2" if self.ttt_runtime.stage is ProductionStage.A2 else "prepared_a5"
-        )
-        record = getattr(prepared, "record", None)
-        preparation_seconds = 0.0
-        record_id: str | None = None
-        if isinstance(record, A2QueryRecord):
-            record_id = record.query.runtime.query_id
-            telemetry = getattr(prepared, "preparation", None)
-            raw_seconds = getattr(telemetry, "collate_seconds", 0.0)
-            if isinstance(raw_seconds, (int, float)):
-                preparation_seconds = float(raw_seconds)
-        elif isinstance(record, A5EpisodeRecord):
-            record_id = record.episode_id
-            answers = getattr(prepared, "query_answers", ())
-            for answer in answers if isinstance(answers, tuple) else ():
-                telemetry = getattr(answer, "preparation", None)
-                raw_seconds = getattr(telemetry, "total_seconds", 0.0)
-                if isinstance(raw_seconds, (int, float)):
-                    preparation_seconds += float(raw_seconds)
-        if record_id is None:
-            return
-        total_seconds = preparation_seconds + seconds
-        trace_event(
-            "runtime_cost_observation",
-            record_id=record_id,
-            preparation_seconds=preparation_seconds,
-            training_seconds=seconds,
-            seconds=total_seconds,
-        )
-        sampler = getattr(self, "_ttt_train_sampler", None)
-        observe = getattr(sampler, "observe_runtime_cost", None)
-        if callable(observe):
-            observe(record_id, total_seconds)
-
-    def _assert_rank_episode_parity(
-        self,
-        segment_lengths: tuple[int, ...],
-        segment_query_counts: tuple[int, ...],
-    ) -> None:
-        device = self.args.device  # type: ignore[attr-defined]
-        local = torch.tensor(
-            tuple(
-                value
-                for pair in zip(
-                    segment_lengths,
-                    segment_query_counts,
-                    strict=True,
-                )
-                for value in pair
-            ),
-            dtype=torch.int64,
-            device=device,
-        )
-        gathered = self.accelerator.gather(local)  # type: ignore[attr-defined]
-        world_size = int(self.args.world_size)  # type: ignore[attr-defined]
-        signatures = tuple(
-            tuple(int(value) for value in row)
-            for row in gathered.detach().cpu().reshape(world_size, -1).tolist()
-        )
-        if len(set(signatures)) != 1:
-            raise ValueError(
-                f"A5 ranks received unequal segment lengths or Query counts: {signatures}"
-            )
 
 
 def build_trainer_class(base: type) -> type:
@@ -2143,15 +847,10 @@ def _run_main(argv: list[str] | None = None) -> int:
         and requested_adaptation_mode != backbone.ttt_config.a5_adaptation_mode
     ):
         raise ValueError("TTT_A5_ADAPTATION_MODE disagrees with ttt_qwen.a5_adaptation_mode")
-    trainability_audit = configure_qwen_outer_trainability(
+    configure_qwen_outer_trainability(
         backbone.model,
         backbone.project_config,
         backbone.ttt_config.qwen_outer_trainability,
-    )
-    full_unfreeze_audit = (
-        fully_unfreeze_qwen(backbone.model, backbone.project_config)
-        if trainability_audit.mode == "full"
-        else None
     )
     if getattr(backbone.training_args, "resume_from_checkpoint", None) is not None:
         raise ValueError(
@@ -2166,7 +865,7 @@ def _run_main(argv: list[str] | None = None) -> int:
         raise ValueError("Memory/State warmup is restart-only and cannot resume")
     if same_stage_resume is not None:
         _validate_resume_balance_schema(same_stage_resume)
-    from ttt_svcbench_qwen.production_runtime import _video_pixel_bounds, build_runtime
+    from ttt_svcbench_qwen.production_runtime import build_runtime
 
     runtime_raw = build_runtime(backbone, backbone.ttt_config)
     if not isinstance(runtime_raw, ProductionTrainerRuntime):
@@ -2483,14 +1182,6 @@ def make_production_outer_optimizer_factory(
     a5_adaptation_mode: str = "meta_ttt",
     a5_phase: str = "main",
 ) -> Callable[[nn.Module], torch.optim.Optimizer]:
-    if a5_adaptation_mode not in _A5_ADAPTATION_MODES:
-        raise ValueError("A5 adaptation mode must be meta_ttt or no_write")
-    if stage is ProductionStage.A2 and a5_adaptation_mode != "meta_ttt":
-        raise ValueError("A2 cannot select an A5 adaptation mode")
-    if a5_phase not in {"fast_state_warmup", "main"}:
-        raise ValueError("A5 phase must be fast_state_warmup or main")
-    if stage is ProductionStage.A2 and a5_phase != "main":
-        raise ValueError("A2 cannot select an A5 phase")
     qwen_ids = {id(parameter) for parameter in backbone.model.parameters()}
     training_args = cast(Any, backbone.training_args)
     if stage is ProductionStage.A2:
