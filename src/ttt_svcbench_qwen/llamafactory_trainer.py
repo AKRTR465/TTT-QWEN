@@ -39,7 +39,11 @@ from ttt_svcbench_qwen.episode_data import (
     build_production_train_sampler,
     load_production_manifest_views,
 )
-from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter
+from ttt_svcbench_qwen.fast_ttt import (
+    ASSOCIATIVE_CONTRACT,
+    ASSOCIATIVE_CONTRACT_VERSION,
+    FastTTTAdapter,
+)
 from ttt_svcbench_qwen.meta_trainer import (
     MetaTTTEpisode,
     MetaTTTEpisodeRunner,
@@ -71,15 +75,8 @@ class ProductionStage(StrEnum):
     A5 = "a5"
 
 
-class CheckpointPolicy(StrEnum):
-    ATOMIC_FINAL_ONLY = "atomic_final_only"
-    EPOCH_2_AND_EPOCH_4 = "epoch_2_and_epoch_4"
-
-
-
-
 _WARMUP_BUNDLE_SCHEMA_VERSION = 2
-_WARMUP_BUNDLE_ASSOCIATIVE_CONTRACT_VERSION = 4
+_WARMUP_BUNDLE_ASSOCIATIVE_CONTRACT_VERSION = ASSOCIATIVE_CONTRACT_VERSION
 _WARMUP_BUNDLE_EXCLUDED_TOKENS = (
     "official_weak_balancer",
     "transient_memory",
@@ -132,8 +129,6 @@ class _ControlledDeepSpeedEngineWrapper:
         self,
         engine: object,
         gradient_controller: OuterGradientController,
-        model: nn.Module | None = None,
-        semantic_projector_delta_audit_steps: int = 0,
     ) -> None:
         required = ("set_gradient_accumulation_boundary", "backward", "step")
         if any(not callable(getattr(engine, name, None)) for name in required):
@@ -170,8 +165,6 @@ class SegmentBackwardController:
         *,
         expected_count: int,
         gradient_controller: OuterGradientController | None = None,
-        semantic_projector_delta_audit_steps: int = 0,
-        a5_parameter_delta_audit_steps: int = 0,
     ) -> None:
         if type(expected_count) is not int or expected_count <= 0:
             raise ValueError("segment backward count must be a positive integer")
@@ -279,11 +272,6 @@ class SegmentBackwardController:
             engine.step()
             self.step_count = 1
 
-    @property
-    def semantic_projector_metrics(self) -> dict[str, float]:
-        return {}
-
-
 def _unique_trainable_parameters(model: nn.Module) -> tuple[nn.Parameter, ...]:
     """Return every trainable Outer parameter once in deterministic model order."""
 
@@ -379,9 +367,6 @@ class ProductionTrainerRuntime:
     gradient_controller: OuterGradientController | None = None
     train_sampler_factory: TrainSamplerFactory | None = None
     callbacks: tuple[object, ...] = ()
-    semantic_projector_delta_audit_steps: int = 0
-    a5_parameter_delta_audit_steps: int = 0
-    operator_diagnostics_interval: int = 10
 
 
 class _LazyGradientAccumulationGroup(Sequence[object]):
@@ -520,19 +505,10 @@ class TTTQwenTrainerMixin:
     ) -> None:
         self.ttt_runtime = ttt_runtime
         self.last_meta_output: TruncatedMetaTTTEpisodeOutput | None = None
-        self.last_semantic_projector_metrics: dict[str, float] = {}
         self._a2_audit_accumulator = _A2AuditAccumulator()
         self._last_a5_training_seconds: float | None = None
         self._last_optimizer_log_time: float | None = None
         self._last_timed_global_step = -1
-        self._last_counterfactual_metrics: dict[str, float] = {}
-        self._counterfactual_audit_pending = False
-        self._query_tail_history: dict[str, list[tuple[float, float, bool]]] = {
-            "all": [],
-            "intermediate": [],
-            "final": [],
-        }
-        self._last_query_tail_global_step = -1
         super().__init__(*args, **kwargs)
 
     def _install_a2_deepspeed_gradient_control(self) -> None:
@@ -552,8 +528,6 @@ class TTTQwenTrainerMixin:
         self.accelerator.deepspeed_engine_wrapped = _ControlledDeepSpeedEngineWrapper(  # type: ignore[attr-defined]
             engine,
             controller,
-            self.ttt_runtime.model,
-            self.ttt_runtime.semantic_projector_delta_audit_steps,
         )
 
     def create_optimizer(self, *args: object, **kwargs: object) -> torch.optim.Optimizer:
@@ -603,14 +577,6 @@ class TTTQwenTrainerMixin:
         enriched = dict(logs)
         if self.ttt_runtime.stage is ProductionStage.A2:
             enriched.update(self._a2_audit_accumulator.flush())
-            global_step = int(getattr(getattr(self, "state", None), "global_step", 0))
-            if global_step % self.ttt_runtime.operator_diagnostics_interval:
-                enriched = {
-                    name: value
-                    for name, value in enriched.items()
-                    if not name.startswith("operator/raw_confusion/")
-                    and not name.startswith("operator/effective_confusion/")
-                }
         else:
             audit = getattr(self.ttt_runtime.meta_runner, "last_balance_audit", None)
             metrics = getattr(audit, "metrics", None)
@@ -652,7 +618,6 @@ class TTTQwenTrainerMixin:
                     ),
                 }
             )
-        enriched.update(self.last_semantic_projector_metrics)
         controller = self.ttt_runtime.gradient_controller
         if isinstance(controller, OuterGradientController) and controller.last_audit is not None:
             enriched.update(dict(controller.last_audit.metrics()))
@@ -713,7 +678,6 @@ class TTTQwenTrainerMixin:
             ):
                 raise RuntimeError("formal A2 step did not publish typed loss audits")
             self._a2_audit_accumulator.add(balance_audit, weak_audit)
-            self.last_semantic_projector_metrics = {}
             return result
         if int(self.args.gradient_accumulation_steps) != 1:  # type: ignore[attr-defined]
             raise ValueError("A5 uses one complete episode/rank and episode-level GA=1")
@@ -737,10 +701,6 @@ class TTTQwenTrainerMixin:
             model,
             expected_count=expected_backwards,
             gradient_controller=self.ttt_runtime.gradient_controller,
-            semantic_projector_delta_audit_steps=(
-                self.ttt_runtime.semantic_projector_delta_audit_steps
-            ),
-            a5_parameter_delta_audit_steps=(self.ttt_runtime.a5_parameter_delta_audit_steps),
         )
 
         def distributed_backward(loss: Tensor, retain_graph: bool) -> None:
@@ -758,7 +718,6 @@ class TTTQwenTrainerMixin:
             if callable(end_prefetch):
                 end_prefetch()
         backward_controller.finalize()
-        self.last_semantic_projector_metrics = backward_controller.semantic_projector_metrics
         self.last_meta_output = output
         local_training_seconds = time.perf_counter() - step_started
         timing = torch.tensor(
@@ -841,12 +800,6 @@ def _run_main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     backbone = load_llamafactory_backbone(arguments[0])
     configured_stage = ProductionStage(backbone.ttt_config.stage)
-    requested_adaptation_mode = os.environ.get("TTT_A5_ADAPTATION_MODE")
-    if (
-        requested_adaptation_mode is not None
-        and requested_adaptation_mode != backbone.ttt_config.a5_adaptation_mode
-    ):
-        raise ValueError("TTT_A5_ADAPTATION_MODE disagrees with ttt_qwen.a5_adaptation_mode")
     configure_qwen_outer_trainability(
         backbone.model,
         backbone.project_config,
@@ -937,11 +890,6 @@ def _run_main(argv: list[str] | None = None) -> int:
             backbone.project_config.outer_gradient_control,
             expected_groups=expected_gradient_groups,
         ),
-        semantic_projector_delta_audit_steps=(
-            backbone.ttt_config.semantic_projector_delta_audit_steps
-        ),
-        a5_parameter_delta_audit_steps=(backbone.ttt_config.a5_parameter_delta_audit_steps),
-        operator_diagnostics_interval=backbone.ttt_config.operator_diagnostics_interval,
         train_sampler_factory=(
             lambda dataset, rank, world_size: build_production_train_sampler(
                 dataset,
@@ -1131,7 +1079,6 @@ def _validate_resume_balance_schema(checkpoint: Path) -> None:
         "official_weak_balancer.gradient_ema_values": (torch.float64, (4,)),
         "official_weak_balancer.gradient_ema_valid": (torch.bool, (4,)),
         "official_weak_balancer.gradient_ema_update_counts": (torch.int64, (4,)),
-        "official_weak_balancer.balance_schema_version": (torch.int64, ()),
     }
     single = checkpoint / "model.safetensors"
     index = checkpoint / "model.safetensors.index.json"
@@ -1168,13 +1115,6 @@ def _validate_resume_balance_schema(checkpoint: Path) -> None:
                 f"balance checkpoint tensor {key} must be {dtype} {shape}; "
                 f"found {value.dtype} {tuple(value.shape)}"
             )
-    schema = tensors["official_weak_balancer.balance_schema_version"]
-    if int(schema.item()) != 7:
-        raise ValueError(
-            "balance checkpoint has incompatible schema; formal training requires schema 7"
-        )
-
-
 def make_production_outer_optimizer_factory(
     backbone: LlamaFactoryBackboneBundle,
     stage: ProductionStage,
@@ -1506,7 +1446,7 @@ def _publish_warmup_bundle(
     save_file(tensors, str(weights))
     manifest: dict[str, object] = {
         "bundle_schema_version": _WARMUP_BUNDLE_SCHEMA_VERSION,
-        "associative_contract": backbone.project_config.associative_ttt.contract,
+        "associative_contract": ASSOCIATIVE_CONTRACT,
         "associative_contract_version": _WARMUP_BUNDLE_ASSOCIATIVE_CONTRACT_VERSION,
         "optimizer_steps": global_step,
         "parameter_allowlist": list(allowlist),
@@ -1533,21 +1473,38 @@ def _load_warmup_bundle(
     weights = root / "model.safetensors"
     manifest_path = root / "manifest.json"
     manifest = cast(object, json.loads(manifest_path.read_text(encoding="utf-8")))
+    if not isinstance(manifest, dict):
+        raise ValueError("warmup bundle manifest must contain one object")
     allowlist = _warmup_bundle_allowlist(model, qwen_model)
+    expected_manifest = {
+        "bundle_schema_version": _WARMUP_BUNDLE_SCHEMA_VERSION,
+        "associative_contract": ASSOCIATIVE_CONTRACT,
+        "associative_contract_version": _WARMUP_BUNDLE_ASSOCIATIVE_CONTRACT_VERSION,
+        "optimizer_steps": backbone.project_config.a5.warmup.max_steps,
+        "parameter_allowlist": list(allowlist),
+    }
+    for key, expected in expected_manifest.items():
+        if manifest.get(key) != expected:
+            raise ValueError(f"warmup bundle manifest mismatch for {key}")
+    bundle_sha256 = _sha256_file(weights)
+    if manifest.get("bundle_sha256") != bundle_sha256:
+        raise ValueError("warmup bundle checksum mismatch")
     tensors = load_file(str(weights), device="cpu")
+    if set(tensors) != set(allowlist):
+        raise ValueError("warmup bundle tensor keys do not match the parameter allowlist")
+    if manifest.get("tensor_count") != len(tensors):
+        raise ValueError("warmup bundle tensor count mismatch")
     result = model.load_state_dict(tensors, strict=False)
     if result.unexpected_keys:
         raise RuntimeError(f"warmup bundle produced unexpected keys: {result.unexpected_keys}")
     return {
         "path": str(root),
-        "bundle_sha256": _sha256_file(weights),
+        "bundle_sha256": bundle_sha256,
         "tensor_count": len(tensors),
         "parameter_allowlist_sha256": hashlib.sha256(
             "\n".join(allowlist).encode("utf-8")
         ).hexdigest(),
-        "manifest_schema_version": (
-            manifest.get("bundle_schema_version") if isinstance(manifest, dict) else None
-        ),
+        "manifest_schema_version": manifest["bundle_schema_version"],
     }
 
 

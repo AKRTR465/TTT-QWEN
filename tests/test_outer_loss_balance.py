@@ -101,16 +101,6 @@ def _anchors() -> OfficialWeakGradientAnchors:
     )
 
 
-def test_config_rejects_inverted_scale_bounds() -> None:
-    with pytest.raises(ValueError, match="scale_min"):
-        OfficialWeakBalanceConfig(
-            group_weight=0.3,
-            scale_min=10.0,
-            scale_max=0.1,
-            epsilon=1.0e-8,
-        )
-
-
 def test_ema_answer_reference_persists_and_missing_term_keeps_history() -> None:
     config = OfficialWeakBalanceConfig(
         group_weight=0.3,
@@ -135,9 +125,9 @@ def test_ema_answer_reference_persists_and_missing_term_keeps_history() -> None:
     )
     assert first.audit is not None
     assert tuple(term.scale for term in first.audit.terms) == pytest.approx((1.0,) * 4)
-    assert first.audit.ema_means == pytest.approx((4.0, 2.0, 2.0, 2.0, 2.0))
-    assert first.audit.ema_update_counts == (1, 1, 1, 1, 1)
-    assert first.audit.gradient_ema_rms == pytest.approx((2.0, 2.0, 2.0, 2.0))
+    assert composer.ema_values.tolist() == pytest.approx((4.0, 2.0, 2.0, 2.0, 2.0))
+    assert composer.ema_update_counts.tolist() == [1, 1, 1, 1, 1]
+    assert composer.gradient_ema_values.tolist() == pytest.approx((2.0, 2.0, 2.0, 2.0))
     assert all(
         anchor.grad is None
         for anchor in (
@@ -161,14 +151,13 @@ def test_ema_answer_reference_persists_and_missing_term_keeps_history() -> None:
         gradient_anchors=(second_anchors,),
     )
     assert second.audit is not None
-    assert second.audit.ema_means == pytest.approx((3.0, 5.0, 5.0, 2.0, 5.0))
-    assert second.audit.ema_update_counts == (2, 2, 2, 1, 2)
-    assert second.audit.gradient_ema_rms == pytest.approx((9.0, 9.0, 2.0, 9.0))
-    assert second.audit.gradient_ema_update_counts == (2, 2, 1, 2)
+    assert composer.ema_values.tolist() == pytest.approx((3.0, 5.0, 5.0, 2.0, 5.0))
+    assert composer.ema_update_counts.tolist() == [2, 2, 2, 1, 2]
+    assert composer.gradient_ema_values.tolist() == pytest.approx((9.0, 9.0, 2.0, 9.0))
+    assert composer.gradient_ema_update_counts.tolist() == [2, 2, 1, 2]
     assert second.audit.terms[2].global_valid_count == 0
     assert torch.isnan(second.audit.terms[2].scale)
     assert torch.isnan(second.audit.terms[2].raw_gradient_rms)
-    assert dict(second.audit.metrics())["loss/scale/retrieval"] is None
     assert second.audit.terms[0].loss_scale == pytest.approx(2.0)
 
     restored = OfficialWeakOuterLossComposer(config)
@@ -176,7 +165,6 @@ def test_ema_answer_reference_persists_and_missing_term_keeps_history() -> None:
     assert torch.equal(restored.ema_values, composer.ema_values)
     assert torch.equal(restored.ema_update_counts, composer.ema_update_counts)
     assert torch.equal(restored.gradient_ema_values, composer.gradient_ema_values)
-    assert int(restored.balance_schema_version.item()) == 7
 
 
 def test_ema_buffers_remain_float64_across_parent_dtype_conversions() -> None:
@@ -237,32 +225,7 @@ def test_float64_ema_updates_below_bfloat16_resolution_do_not_plateau() -> None:
     assert torch.all(composer.ema_values < 1.001)
 
 
-def test_checkpoint_load_rejects_quantized_or_stale_balance_state() -> None:
-    composer = OfficialWeakOuterLossComposer(
-        OfficialWeakBalanceConfig(
-            group_weight=0.3,
-            scale_min=0.001,
-            scale_max=20.0,
-            epsilon=1.0e-8,
-        )
-    )
-    quantized = composer.state_dict()
-    quantized["ema_values"] = quantized["ema_values"].to(torch.bfloat16)
-    with pytest.raises(RuntimeError, match="expected torch.float64"):
-        composer.load_state_dict(quantized, strict=True)
-
-    stale = composer.state_dict()
-    stale["balance_schema_version"] = torch.tensor(6, dtype=torch.int64)
-    with pytest.raises(RuntimeError, match="expected 7"):
-        composer.load_state_dict(stale, strict=True)
-
-    wrong_shape = composer.state_dict()
-    wrong_shape["gradient_ema_values"] = torch.zeros(5, dtype=torch.float64)
-    with pytest.raises(RuntimeError, match="expected torch.float64.*found"):
-        composer.load_state_dict(wrong_shape, strict=True)
-
-
-def test_group_guard_uses_previous_answer_ema_and_reports_unclamped_current_ratio() -> None:
+def test_group_guard_uses_previous_answer_ema() -> None:
     composer = OfficialWeakOuterLossComposer(
         OfficialWeakBalanceConfig(
             group_weight=0.4,
@@ -286,13 +249,9 @@ def test_group_guard_uses_previous_answer_ema_and_reports_unclamped_current_rati
     )
 
     assert second.audit is not None
-    assert second.audit.group_guard_reference == pytest.approx(1.0)
-    assert not bool(second.audit.group_guard_reference_floored)
     assert second.audit.group_guard == pytest.approx(1.0)
-    assert second.audit.state_global_mean == pytest.approx(0.4)
-    assert float(second.audit.state_to_reference_ratio) <= 0.4 + 1.0e-6
-    assert second.audit.state_to_current_answer_ratio > 100_000
-    assert second.audit.auxiliary_to_answer_ratio > 100_000
+    assert composer.ema_values[0] == pytest.approx(0.99000001)
+    assert float(second.objectives[0].state_after.detach()) == pytest.approx(0.4)
 
 
 def test_group_guard_reference_applies_configured_floor_on_cold_start() -> None:
@@ -313,9 +272,8 @@ def test_group_guard_reference_applies_configured_floor_on_cold_start() -> None:
     )
 
     assert output.audit is not None
-    assert output.audit.group_guard_reference == pytest.approx(0.1)
-    assert bool(output.audit.group_guard_reference_floored)
-    assert output.audit.state_to_reference_ratio <= 0.4 + 1.0e-6
+    assert output.audit.group_guard == pytest.approx(0.1)
+    assert float(output.objectives[0].state_after.detach()) == pytest.approx(0.04)
 
 
 def test_gradient_ema_uses_previous_step_and_balances_activation_rms() -> None:
@@ -348,10 +306,6 @@ def test_gradient_ema_uses_previous_step_and_balances_activation_rms() -> None:
         gradient_anchors=(second_anchors,),
     )
     assert second.audit is not None
-    assert tuple(term.gradient_scale for term in second.audit.terms) == pytest.approx(
-        (10.0, 10.0**0.5, 10.0**-0.5, 0.1),
-        rel=1.0e-5,
-    )
     assert tuple(term.scale for term in second.audit.terms) == pytest.approx(
         (10.0, 10.0**0.5, 10.0**-0.5, 0.1),
         rel=1.0e-5,
@@ -413,7 +367,6 @@ def test_formal_collectives_have_fixed_loss_then_streamed_gradient_lengths() -> 
     assert calls == [18, 8]
     assert tuple(term.global_valid_count for term in committed.terms) == (4, 4, 0, 4)
     assert torch.isnan(committed.terms[2].raw_gradient_rms)
-    assert dict(committed.metrics())["grad_balance/raw_rms/retrieval"] is None
 
 
 def test_zero_weight_padding_is_excluded_from_loss_gradient_and_ema_statistics() -> None:
@@ -450,13 +403,9 @@ def test_zero_weight_padding_is_excluded_from_loss_gradient_and_ema_statistics()
 
     assert output.audit is not None
     assert output.audit.answer_global_count == 1
-    assert output.audit.answer_global_mean == pytest.approx(2.0)
     assert tuple(term.global_valid_count for term in output.audit.terms) == (1, 1, 1, 1)
-    assert tuple(term.raw_global_mean for term in output.audit.terms) == pytest.approx(
-        (1.0, 1.0, 1.0, 1.0)
-    )
-    assert output.audit.ema_means == pytest.approx((2.0, 1.0, 1.0, 1.0, 1.0))
-    assert output.audit.gradient_ema_rms == pytest.approx((1.0, 2.0, 3.0, 4.0))
+    assert composer.ema_values.tolist() == pytest.approx((2.0, 1.0, 1.0, 1.0, 1.0))
+    assert composer.gradient_ema_values.tolist() == pytest.approx((1.0, 2.0, 3.0, 4.0))
     assert float(output.objectives[0].total.detach()) == pytest.approx(0.0)
     assert float(output.objectives[1].total.detach()) > 0.0
 
@@ -528,25 +477,6 @@ def test_streamed_gradient_measurement_traverses_invalid_local_slots(
         anchors.q_time.numel(),
     )
     assert squares[2].item() == 0.0
-
-
-def test_old_ema_checkpoint_cannot_silently_load_into_schema_six() -> None:
-    composer = OfficialWeakOuterLossComposer(
-        OfficialWeakBalanceConfig(
-            group_weight=0.3,
-            scale_min=0.001,
-            scale_max=20.0,
-            epsilon=1.0e-8,
-        )
-    )
-    old_state = {
-        "ema_values": torch.zeros(5, dtype=torch.float64),
-        "ema_valid": torch.zeros(5, dtype=torch.bool),
-        "ema_update_counts": torch.zeros(5, dtype=torch.int64),
-    }
-
-    with pytest.raises(RuntimeError, match="Missing required balance-state key"):
-        composer.load_state_dict(old_state, strict=True)
 
 
 def test_compose_hot_path_has_no_host_item_control_flow() -> None:

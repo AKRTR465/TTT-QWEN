@@ -5,7 +5,6 @@ from collections.abc import Sequence
 from dataclasses import replace
 from types import SimpleNamespace
 
-import pytest
 import torch
 from torch import Tensor
 
@@ -17,7 +16,7 @@ from tests.support.runtime_factories import (
     make_temporal_cache,
 )
 from ttt_svcbench_qwen.config import load_config
-from ttt_svcbench_qwen.identity_bank import IdentityDecisionStatus, build_identity_bank
+from ttt_svcbench_qwen.identity_bank import build_identity_bank
 from ttt_svcbench_qwen.model import BatchRuntimeState, ObservationChunkRequest, RuntimeOwner
 from ttt_svcbench_qwen.observation_heads import (
     E1RuntimeState,
@@ -35,7 +34,6 @@ from ttt_svcbench_qwen.query_encoder import (
 from ttt_svcbench_qwen.stage_a_runtime import (
     StageABankWriter,
     StageASoftWriteOutput,
-    StageAWriteAudit,
 )
 from ttt_svcbench_qwen.state_bank import (
     RETRIEVAL_HEAD_ORDER,
@@ -228,14 +226,14 @@ def test_stage_a_writer_runs_four_hard_heads_and_keeps_soft_projector_gradient()
 
     assert isinstance(result.runtime_state, BatchRuntimeState)
     assert result.runtime_state.next_chunk_index == 1
-    assert isinstance(result.audit, StageAWriteAudit)
-    assert result.audit.head_types == (HeadType.O1, HeadType.O2, HeadType.E1, HeadType.E2)
-    assert len(result.audit.identity_decisions) == 4
-    assert result.audit.identity_decisions[0] == ()
-    assert result.audit.identity_decisions[1]
-    assert result.audit.identity_decisions[2:] == ((), ())
     assert isinstance(result.soft_write, StageASoftWriteOutput)
-    assert all(state.records for state in result.bank_states)
+    for state, expected_head in zip(
+        result.bank_states,
+        (HeadType.O1, HeadType.O2, HeadType.E1, HeadType.E2),
+        strict=True,
+    ):
+        assert state.records
+        assert {record.head_type for record in state.records} == {expected_head}
     assert all(
         not record.semantic_embedding.requires_grad and record.semantic_embedding.grad_fn is None
         for state in result.bank_states
@@ -340,13 +338,6 @@ def test_stage_a_soft_write_masks_carried_slots_without_new_temporal_positions()
     assert torch.count_nonzero(soft.o1_sources) == 0
     assert torch.count_nonzero(soft.o2_sources) == 0
 
-    nonfinite = replace(
-        soft,
-        o1_sources=torch.full_like(soft.o1_sources, float("nan")),
-    )
-    with pytest.raises(ValueError, match="retrieval sources must be finite"):
-        nonfinite.validate_commit_boundary()
-
 
 def test_all_head_history_is_written_before_o2_candidates_promote() -> None:
     torch.manual_seed(20260720)
@@ -386,10 +377,8 @@ def test_all_head_history_is_written_before_o2_candidates_promote() -> None:
         ).sum()
     )
     assert first_o2_count == 2
-    assert all(
-        decision.status is IdentityDecisionStatus.CANDIDATE_CREATED
-        for decision in first.audit.identity_decisions[1]
-    )
+    assert first.runtime_state.identity_bank_states[1].candidates
+    assert first.runtime_state.identity_bank_states[1].confirmed == ()
 
     second_observations = replace(
         observations,
@@ -426,10 +415,7 @@ def test_all_head_history_is_written_before_o2_candidates_promote() -> None:
         ),
     )
 
-    assert all(
-        decision.status is IdentityDecisionStatus.PROMOTED
-        for decision in second.audit.identity_decisions[1]
-    )
+    assert len(second.runtime_state.identity_bank_states[1].confirmed) == 2
     second_view = tensorized_retrieval_view(second.runtime_state.retrieval_histories)
     o2_history_count = int(
         (

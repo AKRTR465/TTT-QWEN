@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
 
 from ttt_svcbench_qwen.config import load_config
+from ttt_svcbench_qwen.llamafactory_trainer import (
+    SegmentBackwardController,
+    _ControlledDeepSpeedEngineWrapper,
+)
 from ttt_svcbench_qwen.outer_gradient_control import (
     OuterGradientController,
     sanitize_scalar_loss,
@@ -185,3 +191,75 @@ def test_gradient_nonfinite_remains_owned_by_zero_overflow() -> None:
     assert audit.skipped_nonfinite
     assert not audit.skipped_nonfinite_loss
     assert audit.nonfinite_loss_sources == ()
+
+
+def test_deepspeed_glue_clips_only_at_boundaries_and_steps_once() -> None:
+    events: list[str] = []
+
+    class _Controller:
+        def apply_deepspeed(self, _optimizer: object) -> None:
+            events.append("clip")
+
+    class _Engine:
+        optimizer = SimpleNamespace(loss_scale=1.0)
+
+        @staticmethod
+        def zero_optimization_partition_gradients() -> bool:
+            return True
+
+        @staticmethod
+        def set_gradient_accumulation_boundary(*, is_boundary: bool) -> None:
+            events.append(f"boundary:{is_boundary}")
+
+        @staticmethod
+        def backward(loss: torch.Tensor, **kwargs: object) -> None:
+            events.append("backward")
+            loss.backward(**kwargs)
+
+        @staticmethod
+        def step() -> None:
+            events.append("step")
+
+        @staticmethod
+        def get_global_grad_norm() -> float:
+            return 1.0
+
+    a2_engine = _Engine()
+    wrapper = _ControlledDeepSpeedEngineWrapper(
+        a2_engine,
+        _Controller(),  # type: ignore[arg-type]
+    )
+    wrapper.backward(torch.tensor(1.0, requires_grad=True), sync_gradients=False)
+    wrapper.backward(torch.tensor(2.0, requires_grad=True), sync_gradients=True)
+    assert events == [
+        "boundary:False",
+        "backward",
+        "boundary:True",
+        "backward",
+        "clip",
+        "step",
+    ]
+
+    events.clear()
+    model = nn.Linear(1, 1, bias=False)
+    engine = _Engine()
+    controller = SegmentBackwardController(
+        SimpleNamespace(
+            distributed_type="DistributedType.DEEPSPEED",
+            deepspeed_engine_wrapped=SimpleNamespace(engine=engine),
+        ),
+        model,
+        expected_count=2,
+        gradient_controller=_Controller(),  # type: ignore[arg-type]
+    )
+    controller.backward(model.weight.sum())
+    controller.backward(model.weight.sum())
+    controller.finalize()
+    assert events == [
+        "boundary:False",
+        "backward",
+        "boundary:True",
+        "backward",
+        "clip",
+        "step",
+    ]

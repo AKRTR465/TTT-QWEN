@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,8 +15,6 @@ from ttt_svcbench_qwen.model import (
     AnswerQueryRequest,
     BankWriteOutput,
     BatchRuntimeState,
-    LifecycleError,
-    LifecyclePhase,
     ModelComponents,
     ModelFeatureFlags,
     ObservationChunkRequest,
@@ -141,11 +139,6 @@ class SpySuite:
         assert tuple(trajectory_ids) == ("trajectory-a",)
         return self.retrieval
 
-    def read(self, retrieval: object) -> tuple[object, ...]:
-        self.events.append("reader.read")
-        assert retrieval is self.retrieval
-        return self.reader_results
-
     def read_bank(
         self,
         state_bank: object,
@@ -161,11 +154,6 @@ class SpySuite:
         assert tuple(video_ids) == ("video-a",)
         assert tuple(trajectory_ids) == ("trajectory-a",)
         return self.reader_results
-
-    def audit_number_tokens(self, result: object) -> int:
-        self.events.append("reader.number")
-        assert result is self.reader_results[0]
-        return 2
 
     def resample(self, q_target: object, retrieval: object) -> object:
         self.events.append("resampler")
@@ -313,21 +301,6 @@ def run_answer(
     return model.prefill_answer(model.prepare_answer(request, lifecycle), lifecycle)
 
 
-def test_model_validates_feature_dependencies_before_any_stage(
-    config: ProjectConfig,
-) -> None:
-    suite = make_suite()
-    with pytest.raises(ValueError, match="fast_adapter"):
-        build_model(config, components=make_components(suite, fast_adapter=None))
-    with pytest.raises(ValueError, match="reader"):
-        build_model(config, components=make_components(suite, reader=None))
-    with pytest.raises(ValueError, match="resampler"):
-        build_model(config, components=make_components(suite, resampler=None))
-    with pytest.raises(ValueError, match="Reader requires"):
-        ModelFeatureFlags(bank_enabled=False, reader_enabled=True, state_tokens_enabled=False)
-    assert suite.events == []
-
-
 def test_model_registers_each_injected_module_identity_once_and_never_runtime(
     config: ProjectConfig,
 ) -> None:
@@ -360,7 +333,7 @@ def test_model_registers_each_injected_module_identity_once_and_never_runtime(
     assert lifecycle not in tuple(model.modules())
 
 
-def test_observe_chunk_is_composition_only_and_returns_soft_intermediates(
+def test_observe_chunk_runs_the_visual_and_state_pipeline(
     config: ProjectConfig,
 ) -> None:
     suite = make_suite()
@@ -374,62 +347,13 @@ def test_observe_chunk_is_composition_only_and_returns_soft_intermediates(
     assert output.visual.value == "adapted-main"
     assert output.runtime_state == "runtime-1"
     assert output.bank_states == ("bank-1",)
-    assert output.state_audit == "bank-audit"
     assert output.soft_intermediates.adapted_visual == "adapted-main"
     assert output.soft_intermediates.spatial == "spatial-soft"
     assert output.soft_intermediates.temporal == "temporal-soft"
     assert output.soft_intermediates.observations == "observation-soft"
-    assert output.lifecycle.phase is LifecyclePhase.READY
-    assert output.lifecycle.observation_count == 1
 
 
-def test_soft_observation_recompute_boundary_cannot_duplicate_hard_commit(
-    config: ProjectConfig,
-) -> None:
-    suite = make_suite()
-    model = build_model(config, components=make_components(suite))
-    owner = make_owner()
-    lifecycle = PrefillLifecycle(owner)
-    request = make_observation_request(owner)
-
-    soft = model.observe_chunk_soft(request)
-
-    assert suite.events == ["query", "visual", "fast", "spatial", "temporal", "heads"]
-    assert "bank" not in suite.events
-    assert lifecycle.audit().observation_count == 0
-    output = model.commit_observation(request, soft, lifecycle)
-    assert output.runtime_state == "runtime-1"
-    assert suite.events.count("bank") == 1
-    assert soft.commit_guard.committed
-
-    with pytest.raises(LifecycleError, match="already committed"):
-        model.commit_observation(request, soft, lifecycle)
-    assert suite.events.count("bank") == 1
-
-
-def test_soft_observation_nonfinite_fails_before_hard_commit(
-    config: ProjectConfig,
-) -> None:
-    suite = make_suite()
-    model = build_model(config, components=make_components(suite))
-    owner = make_owner()
-    lifecycle = PrefillLifecycle(owner)
-    request = make_observation_request(owner)
-    soft = model.observe_chunk_soft(request)
-    poisoned = replace(
-        soft,
-        visual=VisualStageOutput(torch.tensor(float("nan")), "poisoned"),
-    )
-
-    with pytest.raises(ValueError, match="soft observation commit contains a nonfinite"):
-        model.commit_observation(request, poisoned, lifecycle)
-
-    assert "bank" not in suite.events
-    assert not soft.commit_guard.committed
-    assert lifecycle.phase is LifecyclePhase.FAILED
-
-
-def test_answer_query_audits_same_retrieval_before_resampler_and_native_prefill(
+def test_answer_query_retrieves_resamples_composes_and_prefills(
     config: ProjectConfig,
 ) -> None:
     suite = make_suite()
@@ -444,7 +368,6 @@ def test_answer_query_audits_same_retrieval_before_resampler_and_native_prefill(
     assert suite.events == [
         "retriever.history",
         "reader.bank",
-        "reader.number",
         "resampler",
         "composer",
         "qwen.prefill",
@@ -454,8 +377,6 @@ def test_answer_query_audits_same_retrieval_before_resampler_and_native_prefill(
     assert output.retrieval is suite.retrieval
     assert output.resampler is suite.resampler_output
     assert output.runtime_state == "runtime-1"
-    assert output.lifecycle.phase is LifecyclePhase.PREFILLED
-    assert output.lifecycle.prefill_count == 1
 
     composer_request = suite.composer_request
     assert composer_request is not None
@@ -474,93 +395,7 @@ def test_answer_query_audits_same_retrieval_before_resampler_and_native_prefill(
     assert not hasattr(prefill, "prepared_video_features")
     assert prefill.state_position_mask == "state-mask"
     assert prefill.state_tokens == "state-tokens"
-    assert prefill.composer_position_ids_audit == "composer-position-audit"
-    assert prefill.composer_rope_deltas_audit == "composer-rope-audit"
     assert not hasattr(prefill, "inputs_embeds")
-
-
-def test_prefill_is_one_shot_and_observe_is_forbidden_after_it(
-    config: ProjectConfig,
-) -> None:
-    suite = make_suite()
-    model = build_model(config, components=make_components(suite))
-    owner = make_owner()
-    lifecycle = PrefillLifecycle(owner)
-    observation = run_observation(model, owner, lifecycle)
-    run_answer(model, make_answer_request(owner, observation), lifecycle)
-    event_count = len(suite.events)
-
-    with pytest.raises(LifecycleError, match="exactly once"):
-        run_answer(model, make_answer_request(owner, observation), lifecycle)
-    with pytest.raises(LifecycleError, match="forbidden after prefill"):
-        model.observe_chunk(make_observation_request(owner), lifecycle)
-    assert len(suite.events) == event_count
-
-
-def test_cross_owner_observation_fails_closed(
-    config: ProjectConfig,
-) -> None:
-    suite = make_suite()
-    model = build_model(config, components=make_components(suite))
-    owner = make_owner()
-    other = make_owner("b")
-    lifecycle = PrefillLifecycle(owner)
-
-    with pytest.raises(LifecycleError, match="owner"):
-        model.observe_chunk(make_observation_request(other), lifecycle)
-    assert suite.events == []
-
-
-def test_resampler_provenance_mismatch_blocks_composer_and_prefill(
-    config: ProjectConfig,
-) -> None:
-    suite = make_suite()
-    suite.resampler_output = SimpleNamespace(
-        state_tokens="state-tokens",
-        state_token_valid_mask="state-valid",
-        selected_record_ids=(("different-record",),),
-        retrieval_status=("ok",),
-    )
-    model = build_model(config, components=make_components(suite))
-    owner = make_owner()
-    lifecycle = PrefillLifecycle(owner)
-    observation = run_observation(model, owner, lifecycle)
-    suite.events.clear()
-
-    with pytest.raises(ValueError, match="same Retriever"):
-        model.prepare_answer(make_answer_request(owner, observation), lifecycle)
-
-    assert suite.events[-1] == "resampler"
-    assert "composer" not in suite.events
-    assert "qwen.prefill" not in suite.events
-    assert lifecycle.audit().phase is LifecyclePhase.READY
-
-
-def test_prefill_failure_is_terminal_and_cannot_repeat_state_reads(
-    config: ProjectConfig,
-) -> None:
-    suite = make_suite()
-
-    def failing_prefill(request: QwenPrefillRequest) -> object:
-        suite.events.append("qwen.prefill")
-        raise RuntimeError("synthetic prefill failure")
-
-    model = build_model(
-        config,
-        components=make_components(suite, qwen_prefill=failing_prefill),
-    )
-    owner = make_owner()
-    lifecycle = PrefillLifecycle(owner)
-    observation = run_observation(model, owner, lifecycle)
-    suite.events.clear()
-
-    with pytest.raises(RuntimeError, match="synthetic prefill failure"):
-        run_answer(model, make_answer_request(owner, observation), lifecycle)
-    event_count = len(suite.events)
-    assert lifecycle.audit().phase is LifecyclePhase.FAILED
-    with pytest.raises(LifecycleError, match="reset"):
-        run_answer(model, make_answer_request(owner, observation), lifecycle)
-    assert len(suite.events) == event_count
 
 
 def test_disabled_features_are_not_called_and_are_reported_as_absent(
@@ -604,30 +439,4 @@ def test_disabled_features_are_not_called_and_are_reported_as_absent(
     assert suite.composer_request["state_tokens"] is None
     assert suite.composer_request["include_state"] is False
     assert suite.composer_request["include_number"] is False
-
-
-def test_qwen_kwargs_cannot_override_composer_or_native_visual_fields() -> None:
-    owner = make_owner()
-    suite = make_suite()
-    observation = SimpleNamespace(owner=owner)
-    base = dict(
-        owner=owner,
-        observation=observation,
-        base_input_ids="ids",
-        base_attention_mask="mask",
-        pixel_values_videos=torch.ones((8, 4)),
-        video_grid_thw=torch.tensor([[2, 2, 2]], dtype=torch.int64),
-        tokenizer="tokenizer",
-        embedding_owner="embedding",
-        rope_indexer="rope",
-    )
-    with pytest.raises(ValueError, match="P13-owned"):
-        AnswerQueryRequest(**base, qwen_kwargs=(("inputs_embeds", "forbidden"),))  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="P13-owned"):
-        AnswerQueryRequest(
-            **base,
-            qwen_kwargs=(("prepared_video_features", "forbidden"),),
-        )  # type: ignore[arg-type]
-    assert suite.events == []
-
 

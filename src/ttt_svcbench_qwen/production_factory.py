@@ -286,7 +286,7 @@ def initialize_outer_model_from_a2(
     model: nn.Module,
     checkpoint: str | Path,
 ) -> OuterCheckpointAudit:
-    """Load exact-current or narrowly profiled legacy A2 weights for A5 initialization."""
+    """Strictly load the complete A2 outer model used to initialize A5."""
 
     root = Path(checkpoint).resolve()
     safe_index = root / "model.safetensors.index.json"
@@ -294,7 +294,7 @@ def initialize_outer_model_from_a2(
     safe_weights = root / "model.safetensors"
     torch_weights = root / "pytorch_model.bin"
     if safe_index.is_file() or torch_index.is_file():
-        load_sharded_checkpoint(model, str(root), strict=False, prefer_safe=True)
+        load_sharded_checkpoint(model, str(root), strict=True, prefer_safe=True)
         index_path = safe_index if safe_index.is_file() else torch_index
         index = json.loads(index_path.read_text(encoding="utf-8"))
         weight_map = cast("dict[str, str]", index["weight_map"])
@@ -302,13 +302,13 @@ def initialize_outer_model_from_a2(
         checkpoint_format = "sharded_safetensors" if safe_index.is_file() else "sharded_torch"
     elif safe_weights.is_file():
         state = load_file(str(safe_weights), device="cpu")
-        model.load_state_dict(state, strict=False)
+        model.load_state_dict(state, strict=True)
         loaded_keys = set(state)
         checkpoint_format = "safetensors"
     else:
         raw = torch.load(torch_weights, map_location="cpu", weights_only=True)
         state = cast("dict[str, torch.Tensor]", raw)
-        model.load_state_dict(state, strict=False)
+        model.load_state_dict(state, strict=True)
         loaded_keys = set(state)
         checkpoint_format = "torch"
     return OuterCheckpointAudit(

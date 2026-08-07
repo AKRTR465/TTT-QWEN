@@ -173,9 +173,6 @@ else
   TASK_NAME="a5_k8_fullprefix256_8b_${WORLD_SIZE}h200"
   CONFIG="${YAML:-configs/h200/a5_meta_ttt_k8_vithalf_decoder8_4gpu.yaml}"
 fi
-if [[ "${TTT_PREFLIGHT_ONLY:-0}" == "1" ]]; then
-  TASK_NAME="${TASK_NAME}_preflight"
-fi
 if [[ -n "${TTT_RESUME_CHECKPOINT:-}" ]]; then
   TASK_NAME="${TASK_NAME}_resume"
 fi
@@ -194,7 +191,6 @@ export LAUNCHER_PID="$$"
 
 "$PYTHON" - "$RUN_ROOT/run_config.json" "$STAGE" "$CONFIG" <<'PY'
 import json
-import math
 import os
 import socket
 import sys
@@ -205,6 +201,7 @@ path, stage, config = sys.argv[1:]
 adaptation_mode = None
 from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.episode_data import EpisodeSplit, load_production_episode_manifest
+from ttt_svcbench_qwen.fast_ttt import ASSOCIATIVE_CONTRACT
 from ttt_svcbench_qwen.production_factory import load_training_yaml
 
 native, extension = load_training_yaml(config)
@@ -212,11 +209,6 @@ project = load_config(extension.project_config)
 world_size = int(os.environ["NPROC_PER_NODE"])
 if stage == "a5":
     adaptation_mode = extension.a5_adaptation_mode
-    requested_mode = os.environ.get("TTT_A5_ADAPTATION_MODE")
-    if requested_mode is not None and requested_mode != adaptation_mode:
-        raise ValueError(
-            "TTT_A5_ADAPTATION_MODE disagrees with ttt_qwen.a5_adaptation_mode"
-        )
     manifest = load_production_episode_manifest(os.environ["SVCBENCH_DATASET_MANIFEST"])
     active_bucket_world_sizes = {
         bucket.world_size for bucket in manifest.buckets if bucket.split is EpisodeSplit.TRAIN
@@ -227,55 +219,11 @@ if stage == "a5":
             f"manifest={sorted(active_bucket_world_sizes)}, active={world_size}; "
             f"regenerate it with scripts/prepare_svcbench_episodes.py --world-size {world_size}"
         )
-caps = project.outer_gradient_control.max_grad_norm
-if stage == "a2":
-    qwen_lr = float(project.a2.optimizer.qwen_learning_rate)
-    state_lr = float(project.a2.optimizer.state_learning_rate)
-    w0_lr = float(project.a2.optimizer.w0_learning_rate)
-    independent_budgets = {"w0": w0_lr * float(caps.w0)}
-    reference_budget = qwen_lr * float(caps.qwen)
-else:
-    is_warmup = extension.a5_phase == "fast_state_warmup"
-    qwen_lr = 0.0 if is_warmup else float(native["learning_rate"])
-    optimizer = (
-        project.a5.warmup
-        if is_warmup
-        else project.a5.optimizer
-    )
-    fast_slow_lr = float(optimizer.fast_slow_learning_rate)
-    state_lr = float(optimizer.state_learning_rate)
-    w0_lr = float(optimizer.w0_learning_rate)
-    associative_budget = (
-        float(optimizer.associative_learning_rate) * float(caps.associative)
-    )
-    if is_warmup:
-        independent_budgets = {"associative": associative_budget}
-        reference_budget = associative_budget
-    else:
-        independent_budgets = {
-            "fast_slow": fast_slow_lr * float(caps.fast_slow),
-            "w0": w0_lr * float(caps.w0),
-        }
-        if adaptation_mode == "meta_ttt":
-            independent_budgets["associative"] = associative_budget
-        reference_budget = qwen_lr * float(caps.qwen)
-state_names = ("state_shared", "state_task", "state_router_time", "state_retrieval")
-budget_audit = {
-    "policy": project.outer_gradient_control.mode.value,
-    "memory_eta_max_per_slot": float(project.fast_memory.eta_max_per_slot),
-    "memory_eta_chunk_budget": float(project.fast_memory.eta_chunk_budget),
-    "memory_forget_beta_max": float(project.fast_memory.forget_beta_max),
-    "reference": reference_budget,
-    "independent": independent_budgets,
-    "state_rss": math.sqrt(
-        sum((state_lr * float(getattr(caps, name))) ** 2 for name in state_names)
-    ),
-}
 payload = {
     "stage": stage,
     "project_spec_version": project.spec_version,
     "config_schema_version": project.config_schema_version,
-    "associative_ttt_contract": project.associative_ttt.contract,
+    "associative_ttt_contract": ASSOCIATIVE_CONTRACT,
     "a5_adaptation_mode": adaptation_mode,
     "a5_phase": extension.a5_phase if stage == "a5" else None,
     "warmup_bundle": extension.warmup_bundle if stage == "a5" else None,
@@ -286,7 +234,6 @@ payload = {
         "max_norm": float(project.a5.query_meta_gradient.max_norm),
         "epsilon": float(project.a5.query_meta_gradient.epsilon),
     },
-    "outer_update_norm_budget_audit": budget_audit,
     "config": config,
     "working_directory": os.getcwd(),
     "host": socket.gethostname(),
@@ -299,7 +246,6 @@ payload = {
     "runtime_factory": "ttt_svcbench_qwen.production_runtime:build_runtime",
     "initialize_from_a2": os.environ.get("A2_CHECKPOINT"),
     "same_stage_resume_from": os.environ.get("TTT_RESUME_CHECKPOINT"),
-    "checkpoint_policy": os.environ.get("TTT_CHECKPOINT_POLICY", "atomic_final_only"),
     "progress_command": f"tail -f {os.environ['RUN_ROOT']}/train.log",
     "launcher_log": os.environ.get("LOG_FILE"),
     "video_root": os.environ["SVCBENCH_VIDEO_ROOT"],
@@ -373,92 +319,10 @@ START_EPOCH="$(date +%s)"
     echo "same_stage_resume_from=$TTT_RESUME_CHECKPOINT"
   fi
   if [[ "$STAGE" == "a5" ]]; then
-    echo "a5_adaptation_mode=${TTT_A5_ADAPTATION_MODE:-from_yaml}"
     echo "a5_warmup_bundle=${A5_WARMUP_BUNDLE:-none}"
   fi
   echo "launch world_size=$WORLD_SIZE config=$CONFIG"
 } > "$RUN_ROOT/experiment.log"
-
-if [[ "${TTT_PREFLIGHT_ONLY:-0}" == "1" ]]; then
-  "$PYTHON" - "$CONFIG" "$RUN_ROOT" <<'PY'
-import importlib.metadata as metadata
-import json
-import sys
-from pathlib import Path
-
-from ttt_svcbench_qwen.episode_data import ManifestStage, load_production_manifest_views
-from ttt_svcbench_qwen.production_factory import import_llamafactory, load_training_yaml
-
-config_path = Path(sys.argv[1])
-run_root = Path(sys.argv[2])
-native, extension = load_training_yaml(config_path)
-symbols = import_llamafactory()
-required_native = {
-    "model_name_or_path",
-    "stage",
-    "do_train",
-    "finetuning_type",
-    "dataset_dir",
-    "dataset",
-    "output_dir",
-    "deepspeed",
-}
-missing_native = sorted(required_native.difference(native))
-if missing_native:
-    raise RuntimeError(f"production YAML is missing LLaMA-Factory keys: {missing_native}")
-stage = ManifestStage(extension.stage)
-train, validation = load_production_manifest_views(
-    extension.dataset_manifest,
-    stage=stage,
-)
-payload = {
-    "status": "preflight_completed",
-    "stage": stage.value,
-    "a5_adaptation_mode": extension.a5_adaptation_mode,
-    "train_records": len(train),
-    "validation_records": len(validation),
-    "llamafactory_commit": symbols.checkout.commit,
-    "llamafactory_dirty": symbols.checkout.dirty,
-    "python": sys.version,
-    "torch": metadata.version("torch"),
-    "transformers": metadata.version("transformers"),
-    "deepspeed": metadata.version("deepspeed"),
-    "runtime_factory": "ttt_svcbench_qwen.production_runtime:build_runtime",
-}
-(run_root / "environment.json").write_text(
-    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-    encoding="utf-8",
-)
-(run_root / "run_summary.json").write_text(
-    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-    encoding="utf-8",
-)
-PY
-  echo "complete stage=$STAGE preflight_only=1" >> "$RUN_ROOT/experiment.log"
-  echo "preflight complete: $RUN_ROOT"
-  exit 0
-fi
-
-GPU_MONITOR_PID=""
-if [[ -n "${TTT_GPU_SAMPLE_LOG:-}" ]]; then
-  if [[ "$TTT_GPU_SAMPLE_LOG" != /* ]]; then
-    echo "TTT_GPU_SAMPLE_LOG must be an absolute path" >&2
-    exit 2
-  fi
-  mkdir -p "$(dirname "$TTT_GPU_SAMPLE_LOG")"
-  /usr/bin/nvidia-smi \
-    --query-gpu=timestamp,index,utilization.gpu,memory.used,power.draw \
-    --format=csv,noheader,nounits -l 1 > "$TTT_GPU_SAMPLE_LOG" 2>&1 &
-  GPU_MONITOR_PID="$!"
-fi
-cleanup_gpu_monitor() {
-  if [[ -n "$GPU_MONITOR_PID" ]]; then
-    kill "$GPU_MONITOR_PID" 2>/dev/null || true
-    wait "$GPU_MONITOR_PID" 2>/dev/null || true
-    GPU_MONITOR_PID=""
-  fi
-}
-trap cleanup_gpu_monitor EXIT INT TERM
 
 set +e
 TRAIN_COMMAND=(
@@ -477,8 +341,6 @@ else
 fi
 STATUS="${PIPESTATUS[0]}"
 set -e
-cleanup_gpu_monitor
-trap - EXIT INT TERM
 
 ELAPSED="$(( $(date +%s) - START_EPOCH ))"
 if [[ "$STATUS" -eq 0 ]]; then
@@ -488,12 +350,8 @@ else
 fi
 
 "$PYTHON" - "$RUN_ROOT" "$STAGE" "$STATUS" "$ELAPSED" <<'PY'
-import csv
 import json
-import os
-import statistics
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 root = Path(sys.argv[1])
@@ -516,44 +374,6 @@ summary.update(
         "successful_run_count": 1 if status == 0 else 0,
     }
 )
-gpu_log_value = os.environ.get("TTT_GPU_SAMPLE_LOG")
-if gpu_log_value:
-    gpu_log = Path(gpu_log_value)
-    rows = defaultdict(lambda: {"utilization": [], "memory_mib": [], "power_w": []})
-    if gpu_log.is_file():
-        with gpu_log.open(encoding="utf-8", errors="replace") as handle:
-            for row in csv.reader(handle):
-                if len(row) != 5:
-                    continue
-                try:
-                    index = int(row[1].strip())
-                    rows[index]["utilization"].append(float(row[2].strip()))
-                    rows[index]["memory_mib"].append(float(row[3].strip()))
-                    rows[index]["power_w"].append(float(row[4].strip()))
-                except ValueError:
-                    continue
-    per_gpu = {
-        str(index): {
-            "sample_count": len(values["utilization"]),
-            "utilization_mean_percent": statistics.fmean(values["utilization"]),
-            "memory_peak_mib": max(values["memory_mib"]),
-            "power_mean_w": statistics.fmean(values["power_w"]),
-        }
-        for index, values in sorted(rows.items())
-        if values["utilization"]
-    }
-    gpu_summary = {
-        "sample_log": str(gpu_log),
-        "per_gpu": per_gpu,
-        "memory_gate_mib": 136 * 1024,
-        "memory_gate_passed": bool(per_gpu)
-        and all(item["memory_peak_mib"] <= 136 * 1024 for item in per_gpu.values()),
-    }
-    (root / "gpu_summary.json").write_text(
-        json.dumps(gpu_summary, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    summary["gpu_summary"] = gpu_summary
 summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
 
 if status == 0:

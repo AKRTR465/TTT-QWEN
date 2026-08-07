@@ -16,9 +16,8 @@ Runs four-GPU A5 main training with the state-write Associative LTTT design:
   - disable periodic Trainer checkpoints and atomically publish final-checkpoint only
 
 The manifest must match the prewarmed dense-Query v4 FP16 Support + State-Query cache.
-The final checkpoint includes model weights, trainer metadata, and resume state. Set
-TTT_SMOKE_MAX_STEPS together with TTT_SKIP_FINAL_CHECKPOINT=1 only for an explicit
-smoke run. DRY_RUN=1 prints the tmux command without starting training.
+The final checkpoint includes model weights, trainer metadata, and resume state.
+DRY_RUN=1 prints the tmux command without starting training.
 EOF
   exit 2
 }
@@ -35,18 +34,11 @@ if [[ ! -f "$ASSOCIATIVE_YAML" ]]; then
 fi
 
 export YAML="$ASSOCIATIVE_YAML"
-export TTT_A5_ADAPTATION_MODE="meta_ttt"
 export A5_WARMUP_BUNDLE="$2"
 export TTT_PROJECT_CONFIG="${TTT_PROJECT_CONFIG:-$PROJECT_ROOT/configs/model_state_ttt_8b.yaml}"
 export TTT_H200_VENV="${TTT_H200_VENV:-$PROJECT_ROOT/.venv-h200-uv-py312-torch28}"
 export TTT_SKIP_ENV_SETUP="${TTT_SKIP_ENV_SETUP:-1}"
-export TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"
 export TTT_PREPROCESS_CACHE_ROOT="${TTT_PREPROCESS_CACHE_ROOT:-$PROJECT_ROOT/.cache/preprocess/260726_a5_dense_querybundle_v4_fp16}"
-export TTT_PREPROCESS_CACHE_NAMESPACE="${TTT_PREPROCESS_CACHE_NAMESPACE:-a5_dense_querybundle_train_support_statequery_fp16_v4}"
-export TTT_CHECKPOINT_POLICY="atomic_final_only"
-if [[ -n "${TTT_SMOKE_MAX_STEPS:-}" ]]; then
-  export TTT_DATALOADER_TRACE="${TTT_DATALOADER_TRACE:-1}"
-fi
 export RUN_ID="${RUN_ID:-$(date +%y%m%d_%H%M%S)_a5_statewrite_lttt_warmup256_v4_4epoch_finalonly}"
 export SESSION="${SESSION:-a5_associative_lttt_${RUN_ID}}"
 

@@ -1,9 +1,7 @@
 """No-op runtime-tracing shim.
 
-The mainline runs with ``runtime_trace_mode: "off"`` in every h200 config, so tracing never
-produced output on a production run. The buffered JSONL writer and CUDA event-pair machinery
-were removed; this shim keeps the four call shapes so the ~31 ``trace_event`` /
-``with trace_cuda_phase(...)`` sites need no edit and no unindenting.
+The buffered JSONL writer, CUDA event-pair machinery, and trace configuration were removed.
+This shim keeps the four call shapes so wrapped production work needs no risky unindenting.
 """
 
 from __future__ import annotations

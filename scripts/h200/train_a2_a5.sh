@@ -11,10 +11,8 @@ If dataset_manifest.json is omitted, the script builds the fixed fold0/K=8 manif
 existing H200 SVCBench conversion. Environment overrides: TTT_PROJECT_ROOT,
 SVCBENCH_DATASET_ROOT, SVCBENCH_DATASET_MANIFEST, RUN_ID, SESSION,
 CUDA_VISIBLE_DEVICES, TTT_WORLD_SIZE, TTT_LAUNCHER, TTT_RESUME_CHECKPOINT, TTT_H200_VENV,
-TTT_PREPROCESS_CACHE_ROOT, TTT_DATALOADER_TRACE. The outer invocation starts a detached tmux;
-set RUN_IN_TMUX=1 only when already running inside the intended tmux pane. One-step validation may
-set TTT_SMOKE_MAX_STEPS=1 and TTT_SKIP_FINAL_CHECKPOINT=1. Shortest-first sampling is disabled by
-default; set TTT_SMOKE_SHORTEST_FIRST=1 explicitly only for a deliberately lightweight smoke test.
+TTT_PREPROCESS_CACHE_ROOT. The outer invocation starts a detached tmux; set RUN_IN_TMUX=1 only
+when already running inside the intended tmux pane.
 EOF
   exit 2
 }
@@ -56,12 +54,6 @@ H200_TORCHVISION_VERSION="0.23.0+cu128"
 H200_TORCHAUDIO_VERSION="2.8.0+cu128"
 PYTORCH_INDEX_URL="${TTT_PYTORCH_INDEX_URL:-http://pypi.i.h.pjlab.org.cn/brain/dev/+simple}"
 PYPI_INDEX_URL="${TTT_PYPI_INDEX_URL:-http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/}"
-TTT_SMOKE_SHORTEST_FIRST="${TTT_SMOKE_SHORTEST_FIRST:-0}"
-if [[ "$TTT_SMOKE_SHORTEST_FIRST" != "0" && "$TTT_SMOKE_SHORTEST_FIRST" != "1" ]]; then
-  echo "TTT_SMOKE_SHORTEST_FIRST must be 0 or 1, got: $TTT_SMOKE_SHORTEST_FIRST" >&2
-  exit 2
-fi
-export TTT_SMOKE_SHORTEST_FIRST
 export TTT_WORLD_SIZE
 
 if [[ "$(id -un)" != "$EXPECTED_USER" ]]; then
@@ -166,31 +158,13 @@ if [[ "${RUN_IN_TMUX:-0}" != "1" ]]; then
   if [[ -n "${TTT_RESUME_CHECKPOINT:-}" ]]; then
     inner_env+=("TTT_RESUME_CHECKPOINT=$TTT_RESUME_CHECKPOINT")
   fi
-  if [[ -n "${TTT_PREFLIGHT_ONLY:-}" ]]; then
-    inner_env+=("TTT_PREFLIGHT_ONLY=$TTT_PREFLIGHT_ONLY")
-  fi
   for forwarded_name in \
-    TTT_SMOKE_MAX_STEPS \
-    TTT_SKIP_FINAL_CHECKPOINT \
-    TTT_CHECKPOINT_POLICY \
-    TTT_SMOKE_SHORTEST_FIRST \
     TTT_RUN_TIMEOUT_SECONDS \
-    TTT_A2_PROGRESS_TRACE \
     TTT_PREPROCESS_CACHE_ROOT \
-    TTT_PREPROCESS_CACHE_NAMESPACE \
-    TTT_DATALOADER_TRACE \
-    TTT_VISUAL_COST_PREFLIGHT \
-    VISUAL_COST_INDEX \
     TTT_A2_SUPPORT_PREFETCH \
-    TTT_SUPPORT_VISUAL_BATCH_SIZE \
     TTT_SKIP_ENV_SETUP \
-    TTT_QUERY_ACTIVATION_OFFLOAD \
-    TTT_QUERY_ACTIVATION_OFFLOAD_MAX_GB \
-    TTT_A5_ADAPTATION_MODE \
-    TTT_DIAGNOSTIC_FORCE_SLOT_MEAN \
     A5_WARMUP_BUNDLE \
     TTT_PROJECT_CONFIG \
-    TTT_GPU_SAMPLE_LOG \
     PYTORCH_CUDA_ALLOC_CONF \
     NCCL_DEBUG \
     NCCL_DEBUG_SUBSYS \

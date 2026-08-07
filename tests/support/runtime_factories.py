@@ -222,18 +222,12 @@ def make_query_output(
         TimeResolution(
             window=TimeWindow(TimeWindowMode.HISTORY, 2.0, 0.0, 2.0, True),
             status=TimeResolutionStatus.OK,
-            reason="synthetic_explicit",
-            mode_confidence=1.0,
-            numeric_span=None,
-            parsed_values_seconds=(),
-            used_operator_default=True,
         )
         for _ in range(batch_size)
     )
     return QueryEncoderOutput(
         embeddings=QueryEmbeddingOutput(
             token_states=torch.zeros((batch_size, 1, HIDDEN_DIM)),
-            pooling_weights=torch.ones((batch_size, 1)),
             q_target=q_target,
             q_operator=q_target.clone(),
             q_time=q_target.clone(),

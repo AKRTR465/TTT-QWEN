@@ -125,7 +125,6 @@ temporal_encoder:
 observation_heads:
   temporal_input_conditioning: inherited_query_conditioned_h_t
   raw_logits: true
-  debug_probabilities: true
   output_valid_mask: true
   output_timestamps: true
   output_position_ids: true
@@ -501,13 +500,6 @@ a5:
     mode: per_query_global_norm_clip_sum
     max_norm: 10.0
     epsilon: 1.0e-12
-  counterfactual_audit:
-    enabled: true
-    interval_steps: 2
-    queries_per_rank: 2
-    references:
-      - episode_zero
-      - segment_start
 
 inference:
   audit_level: boundary

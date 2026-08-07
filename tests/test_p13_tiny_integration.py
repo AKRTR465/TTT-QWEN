@@ -116,14 +116,16 @@ def test_tiny_composer_to_native_qwen_prefill_and_decode_contract() -> None:
         include_state=True,
         include_number=True,
     )
+    video_position_mask = composed.input_ids == tokenizer.convert_tokens_to_ids("<|video_pad|>")
+    number_position_mask = composed.input_ids == reader.number_token_ids[0]
     assert not torch.any(
-        composed.video_position_mask & composed.state_position_mask
-        | composed.video_position_mask & composed.number_position_mask
-        | composed.state_position_mask & composed.number_position_mask
+        video_position_mask & composed.state_position_mask
+        | video_position_mask & number_position_mask
+        | composed.state_position_mask & number_position_mask
     )
-    assert composed.video_position_mask.sum().item() == 1
+    assert video_position_mask.sum().item() == 1
     assert composed.state_position_mask.sum().item() == 16
-    assert composed.number_position_mask.sum().item() == 1
+    assert number_position_mask.sum().item() == 1
 
     payload = StateEmbeddingPayload(
         composed.input_ids,
@@ -214,24 +216,21 @@ def test_tiny_composer_to_native_qwen_prefill_and_decode_contract() -> None:
     ]
     prefill = language_calls[0]
     assert torch.equal(prefill["position_ids"], composed.position_ids)
-    assert torch.equal(prefill["cache_position"], composed.cache_position)
     assert torch.equal(owner.rope_deltas, composed.rope_deltas)
-    assert torch.equal(prefill["visual_pos_masks"], composed.video_position_mask)
+    assert torch.equal(prefill["visual_pos_masks"], video_position_mask)
     assert torch.equal(
         prefill["inputs_embeds"][composed.state_position_mask],  # type: ignore[index]
         payload.state_embeddings,
     )
     expected_number_embeddings = qwen.get_input_embeddings()(
-        composed.input_ids[composed.number_position_mask]
+        composed.input_ids[number_position_mask]
     )
     assert torch.equal(
-        prefill["inputs_embeds"][composed.number_position_mask],  # type: ignore[index]
+        prefill["inputs_embeds"][number_position_mask],  # type: ignore[index]
         expected_number_embeddings,
     )
-    assert all(torch.equal(mask, composed.video_position_mask) for mask in deepstack_masks)
+    assert all(torch.equal(mask, video_position_mask) for mask in deepstack_masks)
     assert deepstack_ids == [id(value) for value in answer_prepared.deepstack_features]
     assert adapter.calls == 2
     assert len(merger_outputs) == 2
     assert scatter_counter.calls == 2  # one State scatter plus native video scatter
-    assert wrapper._state_hook_active is False
-    assert wrapper._hook_active is False

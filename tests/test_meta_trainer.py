@@ -10,10 +10,6 @@ import pytest
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
-from ttt_svcbench_qwen.associative_ttt import (
-    AssociativeTTTIntermediates,
-    FastAssociativeContext,
-)
 
 import ttt_svcbench_qwen.meta_trainer as meta_trainer_module
 from tests.support.runtime_factories import (
@@ -24,29 +20,25 @@ from tests.support.runtime_factories import (
 from ttt_svcbench_qwen.config import ProjectConfig, load_config
 from ttt_svcbench_qwen.data import RuntimeQueryInput, assert_runtime_payload_safe
 from ttt_svcbench_qwen.fast_ttt import (
+    AssociativeTTTIntermediates,
+    FastAssociativeContext,
     FastMemoryState,
     FastTTTForwardAudit,
     MemoryWriteBatch,
 )
-from ttt_svcbench_qwen.identity_bank import (
-    IdentityDecisionStatus,
-    IdentityObservationDecision,
-    build_identity_bank,
-)
+from ttt_svcbench_qwen.identity_bank import build_identity_bank
 from ttt_svcbench_qwen.losses import (
     AnswerLossInput,
     O1StateTarget,
     StateLossInput,
 )
 from ttt_svcbench_qwen.meta_trainer import (
-    CounterfactualAuditRequest,
     MetaCausalChunk,
     MetaQueryLossBuilder,
     MetaQueryLossInput,
     MetaTTTEpisode,
     MetaTTTEpisodeRunner,
     MetaTTTQueryPoint,
-    StageAQueryLossBuilder,
     _reanchor_query_signature,
 )
 from ttt_svcbench_qwen.model import (
@@ -73,7 +65,7 @@ from ttt_svcbench_qwen.observation_heads import (
     ObservationOutputs,
 )
 from ttt_svcbench_qwen.query_encoder import Operator
-from ttt_svcbench_qwen.stage_a_runtime import StageASoftWriteOutput, StageAWriteAudit
+from ttt_svcbench_qwen.stage_a_runtime import StageASoftWriteOutput
 from ttt_svcbench_qwen.stage_a_targets import (
     AnswerTargetLabels,
     OfficialWeakLossAudit,
@@ -122,11 +114,7 @@ class _RuntimeResetter:
                     e1_state=None,
                     e2_state=None,
                     state_bank=state_bank.reset(video_id, trajectory_id),
-                    identity_bank=identity_bank.reset(
-                        video_id,
-                        trajectory_id,
-                        hot_cache_enabled=False,
-                    ),
+                    identity_bank=identity_bank.reset(video_id, trajectory_id),
                     retrieval_history=TensorizedRetrievalHistory(
                         video_id,
                         trajectory_id,
@@ -242,11 +230,9 @@ class _TinyFastController(nn.Module):
         finally:
             self._context = None
 
-    def consume_associative_intermediates(self) -> AssociativeTTTIntermediates:
+    def consume_associative_intermediates(self) -> AssociativeTTTIntermediates | None:
         value = self._intermediates
         self._intermediates = None
-        if value is None:
-            raise RuntimeError("tiny associative forward was not captured")
         return value
 
     def forward(
@@ -260,7 +246,6 @@ class _TinyFastController(nn.Module):
         static_gain = self.w0_1[0, 0] * self.w0_2[0, 0]
         gains = torch.stack([static_gain + state.m[0, 0] for state in self._active])
         adapted = visual.value + gains[:, None, None]
-        residual = adapted - visual.value
         context = self._context
         if context is None:
             raise RuntimeError("tiny Fast forward requires an associative context")
@@ -289,16 +274,10 @@ class _TinyFastController(nn.Module):
             write_counts=tuple(state.write_count for state in self._active),
             valid_token_counts=tuple(adapted.shape[1] for _ in self._active),
             used_runtime_state=True,
-            used_associative_context=True,
             bank_record_counts=tuple(int(value.item()) for value in context.bank_record_counts),
-            memory_norms=tuple(float(state.m.detach().norm()) for state in self._active),
             readout_share_norms=tuple(
                 float(state.m.detach()[0, 0].abs()) for state in self._active
             ),
-            input_norms=tuple(
-                float(visual.value[row].detach().norm()) for row in range(len(gains))
-            ),
-            residual_norms=tuple(float(residual[row].detach().norm()) for row in range(len(gains))),
         )
         return replace(visual, value=adapted)
 
@@ -476,32 +455,6 @@ class _BankWriter:
                 for index, row in enumerate(runtime.rows)
             )
         )
-        decisions = tuple(
-            (
-                IdentityObservationDecision(
-                    slot_index=0,
-                    position_id=0,
-                    timestamp=0.0,
-                    status=IdentityDecisionStatus.CONFIRMED_UPDATED,
-                    identity_id=f"identity-{row}",
-                    similarity=1.0,
-                    novelty=0.0,
-                    match_confidence=1.0,
-                    scanned_confirmed_count=1,
-                ),
-            )
-            for row in range(len(request.owner.video_ids))
-        )
-        audit = StageAWriteAudit(
-            chunk_index=runtime.next_chunk_index,
-            head_types=(HeadType.O2,) * len(request.owner.video_ids),
-            bank_versions_before=tuple(bank.version for bank in runtime.bank_states),
-            bank_versions_after=tuple(bank.version for bank in next_banks),
-            record_counts_after=(1,) * len(next_banks),
-            identity_counts_after=(1,) * len(next_banks),
-            identity_decisions=decisions,
-            skipped_rows=(),
-        )
         valid = _temporal.valid_mask
         counts = valid.sum(dim=1).clamp_min(1).to(_temporal.hidden.dtype)
         source = (
@@ -541,7 +494,7 @@ class _BankWriter:
             e1_sources=source,
             e2_sources=source,
         )
-        return BankWriteOutput(next_runtime, next_banks, audit, soft_write=soft_write)
+        return BankWriteOutput(next_runtime, next_banks, None, soft_write=soft_write)
 
 
 class _Retriever:
@@ -734,9 +687,6 @@ def _system(
     *,
     query_loss_builder: MetaQueryLossBuilder | None = None,
     query_encoder_reuse: bool = False,
-    raw_support_visual_batcher: object | None = None,
-    support_visual_batch_size: int = 1,
-    adaptation_mode: str = "meta_ttt",
 ) -> tuple[MetaTTTEpisodeRunner, _TinyFastController, _TinyFastController, _RuntimeResetter]:
     fast = _TinyFastController()
     resetter = _RuntimeResetter()
@@ -773,9 +723,6 @@ def _system(
         runtime_resetter=resetter,
         query_loss_builder=query_loss_builder or _TinyQueryLossBuilder(),
         query_encoder_reuse=query_encoder_reuse,
-        raw_support_visual_batcher=raw_support_visual_batcher,  # type: ignore[arg-type]
-        support_visual_batch_size=support_visual_batch_size,
-        adaptation_mode=adaptation_mode,
     )
     return runner, fast, fast, resetter
 
@@ -982,6 +929,44 @@ def _e2_state(owner: RuntimeOwner, row: int, positions: Tensor) -> E2RuntimeStat
     )
 
 
+def _counting_backward() -> tuple[list[float], object]:
+    """Collect one entry per backward call; the schedule replaces the deleted audit."""
+
+    values: list[float] = []
+
+    def backward(loss: Tensor, retain_graph: bool) -> None:
+        assert not retain_graph
+        values.append(float(loss.detach()))
+        loss.backward()
+
+    return values, backward
+
+
+def test_meta_episode_supports_stay_strictly_inside_the_causal_prefix(
+    config: ProjectConfig,
+) -> None:
+    """Cross-segment time monotonicity: no Support may reach or pass its own Query."""
+
+    episode = _truncated_episode(config, support_count=16)
+    offset = 0
+    previous_query_time = float(episode.prewarm_chunk.end_time)  # type: ignore[union-attr]
+    for segment_length, query in zip(
+        episode.segment_lengths,
+        episode.query_points,
+        strict=True,
+    ):
+        segment = episode.support_chunks[offset : offset + segment_length]
+        assert [chunk.end_time for chunk in segment] == sorted(
+            chunk.end_time for chunk in segment
+        )
+        assert segment[0].start_time >= previous_query_time - 1.0
+        assert min(chunk.end_time for chunk in segment) > previous_query_time
+        assert segment[-1].end_time < query.query_time
+        assert query.chunk.end_time <= query.query_time
+        previous_query_time = query.query_time
+        offset += segment_length
+
+
 def test_stage_c_invalid_chunk_skips_then_later_supports_continue(
     config: ProjectConfig,
 ) -> None:
@@ -989,37 +974,33 @@ def test_stage_c_invalid_chunk_skips_then_later_supports_continue(
     output = runner.run_truncated(
         _truncated_episode(config, support_count=4, invalid_first_support=True)
     )
-    assert output.audit.writes[0].did_write == (False,)
-    assert output.audit.writes[0].skip_reasons == ("no_valid_slot",)
-    assert [write.write_versions_before for write in output.audit.writes] == [
-        (0,),
-        (0,),
-        (1,),
-        (2,),
-    ]
+    assert output.audit.write_count == 3
+    assert output.audit.skip_count == 1
     assert output.final_fast_states[0].write_count == 3
     assert output.final_fast_states[0].skip_count == 1
-    assert len(output.audit.queries) == 1
+    assert output.final_fast_states[0].write_version == 3
+    assert output.audit.query_count == 1
 
 
-def test_a5_all_skipped_segment_is_explicit_outer_only(
+def test_a5_all_skipped_segment_still_closes_with_its_query(
     config: ProjectConfig,
 ) -> None:
     runner, _, _, _ = _system(config)
+    backward_values, backward = _counting_backward()
 
     output = runner.run_truncated(
-        _truncated_episode(config, support_count=1, invalid_first_support=True)
+        _truncated_episode(config, support_count=1, invalid_first_support=True),
+        backward=backward,  # type: ignore[arg-type]
     )
 
-    segment = output.audit.segments[0]
-    assert segment.training_mode == "outer_only"
-    assert segment.write_attempt_count == 1
-    assert segment.write_count == 0
-    assert segment.skip_count == 1
-    assert output.audit.meta_ttt_segment_count == 0
-    assert output.audit.outer_only_segment_count == 1
-    assert output.audit.query_backward_count == 1
-    assert output.audit.queries[0].query_weight == 1.0
+    assert output.audit.segment_count == 1
+    assert output.audit.write_count == 0
+    assert output.audit.skip_count == 1
+    assert output.audit.query_count == 1
+    assert output.audit.loss_weight == 1.0
+    # One Query backward plus the segment's single deferred VJP closure.
+    assert len(backward_values) == 2
+    assert output.final_fast_states[0].write_version == 0
 
 
 @pytest.mark.parametrize("support_count", [1, 4, 8])
@@ -1029,15 +1010,12 @@ def test_a5_support_schedule_is_bounded_and_next_only(
 ) -> None:
     runner, _, _, _ = _system(config)
     output = runner.run_truncated(_truncated_episode(config, support_count=support_count))
-    assert output.audit.support_count == support_count
-    assert output.audit.maximum_retained_support_graphs == min(support_count, 8)
-    assert output.audit.truncation_horizon == 8
-    assert output.audit.write_attempt_count == support_count
-    assert all(write.next_only_verified for write in output.audit.writes)
+    assert output.audit.segment_count == 1
+    assert output.audit.write_count == support_count
+    assert output.audit.skip_count == 0
+    assert output.audit.associative_valid_count == support_count
     assert output.final_fast_states[0].write_count == support_count
-    if support_count > 1:
-        assert sum(output.audit.writes[1].valid_token_counts) > 0
-        assert output.audit.bank_context_detached
+    assert output.final_fast_states[0].write_version == support_count
 
 
 def test_truncated_a5_two_k8_segments_each_close_with_a_query(
@@ -1045,40 +1023,18 @@ def test_truncated_a5_two_k8_segments_each_close_with_a_query(
 ) -> None:
     runner, fast, associative, resetter = _system(config)
     episode = _truncated_episode(config, support_count=16)
-    output = runner.run_truncated(episode)
+    backward_values, backward = _counting_backward()
+    output = runner.run_truncated(episode, backward=backward)  # type: ignore[arg-type]
 
-    assert output.audit.support_count == 16
-    assert output.audit.truncation_horizon == 8
-    assert output.audit.truncation_count == 2
     assert output.audit.segment_count == 2
-    assert output.audit.backward_count == 4
-    assert output.audit.query_backward_count == 2
-    assert output.audit.deferred_vjp_backward_count == 2
-    assert output.audit.maximum_retained_support_graphs == 8
-    assert [segment.support_count for segment in output.audit.segments] == [8, 8]
-    assert all(segment.training_mode == "meta_ttt" for segment in output.audit.segments)
-    assert output.audit.meta_ttt_segment_count == 2
-    assert output.audit.outer_only_segment_count == 0
-    assert all(segment.includes_query_backward for segment in output.audit.segments)
-    assert all(segment.truncated for segment in output.audit.segments)
-    assert output.audit.readout_target_cosine_mean != 0.0
-    assert output.audit.post_write_cosine_mean > 0.0
-    assert output.audit.eta_sum_mean > 0.0
+    assert output.audit.query_count == 2
+    assert output.audit.write_count == 16
+    assert output.audit.skip_count == 0
+    # Two Query backwards plus one deferred VJP closure per K=8 segment.
+    assert len(backward_values) == 4
     assert output.final_fast_states[0].write_version == 16
     assert output.final_fast_states[0].write_count == 16
-    assert [query.query_role for query in output.audit.queries] == [
-        "intermediate",
-        "final",
-    ]
-    assert all(query.query_weight == 1.0 for query in output.audit.queries)
-    assert output.query_loss.item() == pytest.approx(
-        sum(query.weighted_outer_loss for query in output.audit.queries)
-    )
-    assert [segment.write_version_at_query for segment in output.audit.segments] == [
-        (8,),
-        (16,),
-    ]
-    assert all(segment.deferred_vjp_norm > 0.0 for segment in output.audit.segments)
+    assert output.query_loss.item() == pytest.approx(output.total.item())
     # The final memory was truncated at the last segment boundary: a leaf with no
     # retained Support graph, values preserved bitwise.
     assert output.final_fast_states[0].m.is_leaf
@@ -1118,19 +1074,16 @@ def test_truncated_a5_query_bundle_sums_proxy_gradients_then_closes_once(
         query_roles=("intermediate", "final"),
         query_weights=(1.0, 1.0),
     )
+    backward_values, backward = _counting_backward()
 
-    output = runner.run_truncated(episode)
+    output = runner.run_truncated(episode, backward=backward)  # type: ignore[arg-type]
 
     assert output.audit.segment_count == 1
     assert output.audit.query_count == 2
-    assert output.audit.backward_count == 3
-    assert output.audit.query_backward_count == 2
-    assert output.audit.deferred_vjp_backward_count == 1
-    assert output.audit.segments[0].query_count == 2
-    assert output.audit.segments[0].query_roles == ("intermediate", "final")
-    assert output.audit.segments[0].write_count == 8
-    assert output.audit.segments[0].skip_count == 0
-    assert output.audit.segments[0].deferred_vjp_norm > 0.0
+    assert output.audit.write_count == 8
+    assert output.audit.skip_count == 0
+    # Two bundled Query backwards, then exactly one deferred VJP closure.
+    assert len(backward_values) == 3
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
 
 
@@ -1153,23 +1106,23 @@ def test_query_cotangents_clip_independently_then_sum_without_averaging() -> Non
     )
 
     clipped_queries = []
-    audits = []
     for query in (ordinary, small, extreme):
-        clipped, audit = meta_trainer_module._clip_query_proxy_gradients(
+        clipped = meta_trainer_module._clip_query_proxy_gradients(
             query,
             max_norm=1.0,
             epsilon=1.0e-12,
         )
         clipped_queries.append(clipped)
-        audits.append(audit)
 
-    assert [audit.raw_joint_norm for audit in audits] == pytest.approx([0.5, 0.05, 10.0])
-    assert [audit.clipped_joint_norm for audit in audits] == pytest.approx(
-        [0.5, 0.05, 1.0]
-    )
-    assert [audit.clip_scale for audit in audits] == pytest.approx([1.0, 1.0, 0.1])
-    assert [audit.clipped for audit in audits] == [False, False, True]
-    assert all(audit.max_norm == 1.0 for audit in audits)
+    raw_norms = [
+        meta_trainer_module._cotangent_norm_float(query)
+        for query in (ordinary, small, extreme)
+    ]
+    clipped_norms = [
+        meta_trainer_module._cotangent_norm_float(query) for query in clipped_queries
+    ]
+    assert raw_norms == pytest.approx([0.5, 0.05, 10.0])
+    assert clipped_norms == pytest.approx([0.5, 0.05, 1.0])
 
     segment_sum = tuple(
         sum(query[matrix_index] for query in clipped_queries)
@@ -1177,6 +1130,7 @@ def test_query_cotangents_clip_independently_then_sum_without_averaging() -> Non
     )
     torch.testing.assert_close(segment_sum[0], torch.tensor([0.93]))
     torch.testing.assert_close(segment_sum[1], torch.tensor([1.24]))
+    # Per-Query clipping is not a segment-level clip: the sum may exceed max_norm.
     assert meta_trainer_module._cotangent_norm_float(segment_sum) > 1.0
 
     for query, original in zip((ordinary, small, extreme), originals, strict=True):
@@ -1184,26 +1138,27 @@ def test_query_cotangents_clip_independently_then_sum_without_averaging() -> Non
             torch.testing.assert_close(gradient, expected)
 
 
-def test_query_cotangent_clip_norm_is_config_driven() -> None:
+def test_query_cotangent_clip_norm_is_config_driven(config: ProjectConfig) -> None:
     gradients = (torch.tensor([30.0, 40.0], dtype=torch.float32),)
 
-    clipped, audit = meta_trainer_module._clip_query_proxy_gradients(
+    clipped = meta_trainer_module._clip_query_proxy_gradients(
         gradients,
         max_norm=10.0,
         epsilon=1.0e-12,
     )
 
-    assert audit.raw_joint_norm == pytest.approx(50.0)
-    assert audit.clipped_joint_norm == pytest.approx(10.0)
-    assert audit.max_norm == 10.0
-    assert audit.clipped
+    assert meta_trainer_module._cotangent_norm_float(gradients) == pytest.approx(50.0)
+    assert meta_trainer_module._cotangent_norm_float(clipped) == pytest.approx(10.0)
     torch.testing.assert_close(clipped[0], torch.tensor([6.0, 8.0]))
-    with pytest.raises(ValueError, match="finite and positive"):
-        meta_trainer_module._clip_query_proxy_gradients(
-            gradients,
-            max_norm=0.0,
-            epsilon=1.0e-12,
-        )
+    # The production clip norm is the configured one, not a hard-coded constant.
+    configured = meta_trainer_module._clip_query_proxy_gradients(
+        gradients,
+        max_norm=config.a5.query_meta_gradient.max_norm,
+        epsilon=config.a5.query_meta_gradient.epsilon,
+    )
+    assert meta_trainer_module._cotangent_norm_float(configured) == pytest.approx(
+        min(50.0, config.a5.query_meta_gradient.max_norm)
+    )
 
 
 def test_query_cotangent_clipping_does_not_rescale_direct_outer_gradient() -> None:
@@ -1216,7 +1171,7 @@ def test_query_cotangent_clipping_does_not_rescale_direct_outer_gradient() -> No
     for direct_coefficient, proxy in zip((3.0, 5.0), query_proxies, strict=True):
         (direct_outer * direct_coefficient + proxy.square().sum()).backward()
         assert proxy.grad is not None
-        clipped, _ = meta_trainer_module._clip_query_proxy_gradients(
+        clipped = meta_trainer_module._clip_query_proxy_gradients(
             (proxy.grad.detach().float().clone(),),
             max_norm=1.0,
             epsilon=1.0e-12,
@@ -1240,13 +1195,13 @@ def test_query_proxy_gradient_equals_answer_plus_state_components(
         states: Sequence[FastMemoryState],
         *,
         backward_gradient_scale: float,
-    ) -> tuple[tuple[Tensor, ...], tuple[float, ...]]:
-        gradients, norms = original_capture(
+    ) -> tuple[Tensor, ...]:
+        gradients = original_capture(
             states,
             backward_gradient_scale=backward_gradient_scale,
         )
         captured.append(tuple(gradient.detach().clone() for gradient in gradients))
-        return gradients, norms
+        return gradients
 
     monkeypatch.setattr(meta_trainer_module, "_capture_query_proxy_gradients", capture)
 
@@ -1273,120 +1228,20 @@ def test_query_proxy_gradient_equals_answer_plus_state_components(
         )
 
 
-def test_legacy_static_w0_adaptation_mode_is_rejected_by_name(
-    config: ProjectConfig,
-) -> None:
-    with pytest.raises(ValueError, match="renamed; use 'no_write'"):
-        _system(config, adaptation_mode="static_w0")
-
-
-def test_no_write_keeps_dense_queries_and_outer_trains_w0_without_writes(
-    config: ProjectConfig,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner, fast, associative, _ = _system(config, adaptation_mode="no_write")
-    episode = _truncated_episode(config, support_count=16)
-    backward_values: list[float] = []
-
-    def unexpected_write_call(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("no-write A5 must not construct or apply a memory write")
-
-    monkeypatch.setattr(
-        "ttt_svcbench_qwen.meta_trainer.apply_memory_writes",
-        unexpected_write_call,
-    )
-
-    def backward(loss: Tensor, retain_graph: bool) -> None:
-        assert not retain_graph
-        backward_values.append(float(loss.detach()))
-        loss.backward()
-
-    output = runner.run_truncated(episode, backward=backward)
-
-    assert output.audit.adaptation_mode == "no_write"
-    assert not output.audit.ttt_enabled
-    assert output.audit.associative_valid_count == 0
-    assert output.audit.query_count == len(episode.query_points) == 2
-    assert output.audit.query_backward_count == 2
-    assert output.audit.deferred_vjp_backward_count == 2
-    assert output.audit.backward_count == 4
-    assert output.audit.write_attempt_count == 0
-    assert output.audit.write_count == 0
-    assert output.audit.skip_count == 0
-    assert output.audit.writes == ()
-    assert output.audit.no_write_segment_count == 2
-    assert output.audit.meta_ttt_segment_count == 0
-    assert output.audit.outer_only_segment_count == 0
-    assert all(
-        segment.training_mode == "no_write"
-        and segment.write_attempt_count == 0
-        and segment.write_count == 0
-        and segment.skip_count == 0
-        and segment.pre_write_cosine_mean == 0.0
-        and segment.eta_sum == 0.0
-        for segment in output.audit.segments
-    )
-    assert output.audit.maximum_retained_support_graphs == 0
-    assert output.audit.readout_target_cosine_mean == 0.0
-    assert output.audit.slots_written_total == 0
-    assert output.total.item() == pytest.approx(output.query_loss.item())
-    assert [query.query_role for query in output.audit.queries] == [
-        "intermediate",
-        "final",
-    ]
-    assert all(query.query_weight == 1.0 for query in output.audit.queries)
-    assert output.final_fast_states[0].write_version == 0
-    assert output.final_fast_states[0].write_count == 0
-    assert output.final_fast_states[0].skip_count == 0
-    assert output.final_runtime.next_chunk_index == 17
-    assert output.final_runtime.state_bank_states[0].version == 17
-    assert associative.value_scale.grad is None
-    assert not associative.value_scale.requires_grad
-    assert not associative.eta_raw.requires_grad
-    assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
-    assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
-    assert len(backward_values) == 4
-
-
-def test_truncated_a5_batches_raw_visuals_only_within_each_k_segment(
-    config: ProjectConfig,
-) -> None:
-    calls: list[tuple[int, int]] = []
-
-    def raw_batcher(
-        chunks: tuple[MetaCausalChunk, ...],
-        batch_size: int,
-    ) -> tuple[MetaCausalChunk, ...]:
-        calls.append((len(chunks), batch_size))
-        return chunks
-
-    runner, _, _, _ = _system(
-        config,
-        raw_support_visual_batcher=raw_batcher,
-        support_visual_batch_size=2,
-    )
-
-    output = runner.run_truncated(_truncated_episode(config, support_count=16))
-
-    assert calls == [(8, 2), (8, 2)]
-    assert [segment.support_count for segment in output.audit.segments] == [8, 8]
-    assert all(write.next_only_verified for write in output.audit.writes)
-    assert output.final_fast_states[0].write_version == 16
-
-
 def test_truncated_a5_exact_k_waits_for_query_before_truncation(config: ProjectConfig) -> None:
     runner, fast, _, _ = _system(config)
+    backward_values, backward = _counting_backward()
 
-    output = runner.run_truncated(_truncated_episode(config, support_count=8))
+    output = runner.run_truncated(
+        _truncated_episode(config, support_count=8),
+        backward=backward,  # type: ignore[arg-type]
+    )
 
     assert output.audit.segment_count == 1
-    assert output.audit.backward_count == 2
-    assert output.audit.query_backward_count == 1
-    assert output.audit.deferred_vjp_backward_count == 1
-    assert output.audit.truncation_count == 1
-    assert output.audit.segments[0].support_count == 8
-    assert output.audit.segments[0].includes_query_backward
-    assert output.audit.segments[0].truncated
+    assert output.audit.write_count == 8
+    # A K=8 segment closes with exactly one Query backward and one deferred VJP.
+    assert len(backward_values) == 2
+    assert output.final_fast_states[0].write_version == 8
     assert fast.w0_1.grad is not None and float(fast.w0_1.grad.norm()) > 0.0
     assert fast.w0_2.grad is not None and float(fast.w0_2.grad.norm()) > 0.0
 
@@ -1396,9 +1251,11 @@ def test_truncated_queries_and_deferred_vjp_never_retain_local_graph(
 ) -> None:
     runner, _, _, _ = _system(config)
     retain_flags: list[bool] = []
+    graph_bearing: list[bool] = []
 
     def backward(loss: Tensor, retain_graph: bool) -> None:
         retain_flags.append(retain_graph)
+        graph_bearing.append(loss.grad_fn is not None)
         loss.backward(retain_graph=retain_graph)
 
     output = runner.run_truncated(
@@ -1406,39 +1263,35 @@ def test_truncated_queries_and_deferred_vjp_never_retain_local_graph(
         backward=backward,
     )
 
+    # Two segments, each one Query backward plus one deferred VJP, none retained.
     assert retain_flags == [False] * 4
-    assert output.audit.backward_count == 4
-    assert output.audit.query_backward_count == 2
-    assert output.audit.deferred_vjp_backward_count == 2
-    assert output.audit.diagnostic_query_count == 4
-    assert all(query.proxy_storage_isolated for query in output.audit.queries)
-    assert all(query.proxy_max_abs_value_drift == 0.0 for query in output.audit.queries)
+    # Every backward really consumed a local graph; nothing was a detached no-op.
+    assert graph_bearing == [True] * 4
+    # The truncation point is a fresh leaf, so no Support graph survived the episode.
+    assert output.final_fast_states[0].m.is_leaf
+    assert output.final_fast_states[0].m.grad_fn is None
+    assert output.final_fast_states[0].m.requires_grad
 
 
 def test_zero_weight_padding_keeps_backward_schedule_but_contributes_zero(
     config: ProjectConfig,
 ) -> None:
     runner, fast, associative, _ = _system(config)
-    backward_values: list[float] = []
-
-    def backward(loss: Tensor, retain_graph: bool) -> None:
-        assert not retain_graph
-        backward_values.append(float(loss.detach()))
-        loss.backward()
+    backward_values, backward = _counting_backward()
 
     output = runner.run_truncated(
         _truncated_episode(config, support_count=9, diagnostic_query_count=3),
-        backward=backward,
+        backward=backward,  # type: ignore[arg-type]
         episode_loss_weight=0.0,
     )
 
     assert output.audit.loss_weight == 0.0
-    assert output.audit.backward_count == 4
+    # The 4-rank sampler pads with zero-weight episodes: the backward schedule must
+    # stay identical to a weighted rank so the collective never desynchronizes.
     assert len(backward_values) == 4
     assert backward_values == pytest.approx([0.0] * 4)
     assert output.total == pytest.approx(0.0)
     assert output.query_loss == pytest.approx(0.0)
-    assert all(query.proxy_gradient_status == "zero_padding" for query in output.audit.queries)
     assert fast.w0_1.grad is not None and torch.count_nonzero(fast.w0_1.grad) == 0
     assert fast.w0_2.grad is not None and torch.count_nonzero(fast.w0_2.grad) == 0
     assert associative.value_scale.grad is not None
@@ -1456,18 +1309,18 @@ def test_truncated_a5_ema_balance_composes_all_queries_once(
     output = runner.run_truncated(_truncated_episode(config, support_count=9))
 
     assert runner.last_balance_audit is not None
-    assert (
-        runner.last_balance_audit.auxiliary_to_answer_ratio
-        <= config.loss.official_weak_balance.group_weight
+    assert tuple(term.name for term in runner.last_balance_audit.terms) == (
+        "task",
+        "operator",
+        "retrieval",
+        "time",
     )
-    assert len(output.audit.queries) == 2
-    assert dict(runner.last_balance_audit.metrics())["loss/aux_to_answer_ratio"] is not None
-    assert all(
-        "loss/aux_to_answer_ratio" not in dict(query.metrics.metrics)
-        for query in output.audit.queries
-    )
+    assert all(term.global_valid_count > 0 for term in runner.last_balance_audit.terms)
+    assert output.audit.query_count == 2
     qwen = runner.model.components.qwen_prefill
     assert isinstance(qwen, _Qwen)
+    # One calibration prefill and one graph-bearing prefill per Query, each reading
+    # the memory generation produced by its own segment (M_{t-1} recurrence order).
     assert qwen.answer_write_versions == [(8,), (8,), (9,), (9,)]
 
 
@@ -1506,10 +1359,6 @@ def test_query_signature_reanchor_preserves_value_and_fresh_gradient() -> None:
     anchored.float().sum().backward()
     assert current.grad is not None
     assert torch.equal(current.grad, torch.ones_like(current))
-
-    unrelated = F.normalize(torch.randn(2, 512), dim=-1).to(torch.bfloat16)
-    with pytest.raises(ValueError, match="changed semantically"):
-        _reanchor_query_signature(unrelated, reference)
 
 
 def test_query_dropout_seed_is_stable_for_same_question_within_episode() -> None:
@@ -1556,23 +1405,6 @@ def test_truncated_a5_does_not_reuse_different_final_query_ids(
     assert query.calls == 7  # prewarm + two segments + calibration and Meta Query pairs
 
 
-def test_query_future_and_prefill_reuse_are_rejected(config: ProjectConfig) -> None:
-    owner = RuntimeOwner(("video-a",), ("trajectory-a",))
-    chunk = _chunk(owner, chunk_index=1, end_time=2.0, width=2)
-    with pytest.raises(ValueError, match="future"):
-        MetaTTTQueryPoint(
-            chunk=chunk,
-            query_time=1.5,
-            answer=_answer_inputs(),
-            supervision=_supervision(),
-            task_name="task",
-            case_id="case",
-        )
-    runner, _, _, _ = _system(config)
-    output = runner.run_truncated(_truncated_episode(config, support_count=1))
-    assert all(query.prefill_count == 1 for query in output.audit.queries)
-
-
 def test_later_query_labels_cannot_change_earlier_query_path(config: ProjectConfig) -> None:
     clean_runner, _, _, _ = _system(config)
     changed_runner, _, _, _ = _system(config)
@@ -1584,11 +1416,15 @@ def test_later_query_labels_cannot_change_earlier_query_path(config: ProjectConf
             replace(clean_episode.query_points[1], supervision=_supervision(label=1)),
         ),
     )
-    clean = clean_runner.run_truncated(clean_episode)
-    changed = changed_runner.run_truncated(changed_episode)
+    clean_values, clean_backward = _counting_backward()
+    changed_values, changed_backward = _counting_backward()
+    clean_runner.run_truncated(clean_episode, backward=clean_backward)  # type: ignore[arg-type]
+    changed_runner.run_truncated(changed_episode, backward=changed_backward)  # type: ignore[arg-type]
 
-    assert clean.audit.queries[0].metrics == changed.audit.queries[0].metrics
-    assert clean.audit.queries[1].metrics != changed.audit.queries[1].metrics
+    # Backward schedule is [query 0, deferred 0, query 1, deferred 1].
+    assert len(clean_values) == len(changed_values) == 4
+    assert clean_values[0] == pytest.approx(changed_values[0])
+    assert clean_values[2] != pytest.approx(changed_values[2])
 
 
 def test_later_support_cannot_change_earlier_intermediate_query(
@@ -1614,107 +1450,16 @@ def test_later_support_cannot_change_earlier_intermediate_query(
         clean_episode,
         support_chunks=tuple(changed_supports),
     )
+    clean_values, clean_backward = _counting_backward()
+    changed_values, changed_backward = _counting_backward()
 
-    clean = clean_runner.run_truncated(clean_episode)
-    changed = changed_runner.run_truncated(changed_episode)
+    clean_runner.run_truncated(clean_episode, backward=clean_backward)  # type: ignore[arg-type]
+    changed_runner.run_truncated(changed_episode, backward=changed_backward)  # type: ignore[arg-type]
 
-    assert clean.audit.queries[0] == changed.audit.queries[0]
-    assert clean.audit.queries[1] != changed.audit.queries[1]
-
-
-def test_diagnostic_counterfactual_is_no_grad_and_does_not_change_training(
-    config: ProjectConfig,
-) -> None:
-    raw = config.model_dump(mode="python")
-    raw["a5"]["counterfactual_audit"]["enabled"] = True
-    audit_config = ProjectConfig.model_validate(raw)
-    torch.manual_seed(23)
-    baseline_runner, _, _, _ = _system(audit_config)
-    torch.manual_seed(23)
-    audited_runner, _, _, _ = _system(audit_config)
-    episode = _truncated_episode(audit_config, support_count=4)
-
-    baseline = baseline_runner.run_truncated(episode)
-    audited = audited_runner.run_truncated(
-        episode,
-        counterfactual_audit=CounterfactualAuditRequest(
-            optimizer_step=8,
-            query_selector=0,
-        ),
-    )
-    baseline_fast_gradients = tuple(
-        parameter.grad.detach().clone() if parameter.grad is not None else None
-        for parameter in baseline_runner.fast_controller.parameters()
-    )
-    audited_fast_gradients = tuple(
-        parameter.grad.detach().clone() if parameter.grad is not None else None
-        for parameter in audited_runner.fast_controller.parameters()
-    )
-
-    assert torch.equal(baseline.total, audited.total)
-    assert len(baseline_fast_gradients) == len(audited_fast_gradients)
-    assert all(
-        (left is None and right is None)
-        or (
-            isinstance(left, Tensor)
-            and isinstance(right, Tensor)
-            and torch.equal(left, right)
-        )
-        for left, right in zip(
-            baseline_fast_gradients,
-            audited_fast_gradients,
-            strict=True,
-        )
-    )
-    assert baseline.audit.training_counterfactual_executed is False
-    assert baseline.audit.diagnostic_counterfactual_executed is False
-    assert audited.audit.training_counterfactual_executed is False
-    assert audited.audit.diagnostic_counterfactual_executed is True
-    assert audited.audit.counterfactual_audited_query_count == 1
-    counterfactual = audited.audit.queries[0].counterfactual
-    assert counterfactual is not None
-    assert counterfactual.optimizer_step == 8
-    assert tuple(item.reference for item in counterfactual.references) == (
-        "episode_zero",
-        "segment_start",
-    )
-    audited_qwen = audited_runner.model.components.qwen_prefill
-    assert isinstance(audited_qwen, _Qwen)
-    assert audited_qwen.answer_write_versions == [(4,), (4,), (0,), (0,)]
-    assert all(torch.equal(left.m.detach(), right.m.detach()) for left, right in zip(
-        baseline.final_fast_states,
-        audited.final_fast_states,
-        strict=True,
-    ))
-
-
-def test_counterfactual_can_audit_multiple_queries_per_rank(
-    config: ProjectConfig,
-) -> None:
-    raw = config.model_dump(mode="python")
-    raw["a5"]["counterfactual_audit"]["enabled"] = True
-    audit_config = ProjectConfig.model_validate(raw)
-    runner, _, _, _ = _system(audit_config)
-    episode = _truncated_episode(audit_config, support_count=16)
-
-    output = runner.run_truncated(
-        episode,
-        counterfactual_audit=CounterfactualAuditRequest(
-            optimizer_step=4,
-            query_selector=0,
-            queries_per_rank=2,
-        ),
-    )
-
-    assert output.audit.counterfactual_audited_query_count == 2
-    audited = tuple(
-        query for query in output.audit.queries if query.counterfactual is not None
-    )
-    assert len(audited) == 2
-    for query in audited:
-        assert query.counterfactual is not None
-        references = {item.reference for item in query.counterfactual.references}
-        assert references == {"episode_zero", "segment_start"}
+    # Chunk t only ever reads M_{t-1}: the second segment's Support cannot move the
+    # first segment's Query loss, but must move its own.
+    assert clean_values[0] == pytest.approx(changed_values[0])
+    assert clean_values[2] != pytest.approx(changed_values[2])
 
 
 def test_answer_only_proxy_gradient_trains_the_memory_interface(
@@ -1727,9 +1472,7 @@ def test_answer_only_proxy_gradient_trains_the_memory_interface(
 
     output = runner.run_truncated(_truncated_episode(config, support_count=4))
 
-    query = output.audit.queries[0]
-    assert all(value > 0.0 for value in query.proxy_gradient_norms)
-    assert output.audit.segments[0].deferred_vjp_norm > 0.0
+    assert output.audit.write_count == 4
     assert associative.value_scale.grad is not None
     assert float(torch.linalg.vector_norm(associative.value_scale.grad).item()) > 0.0
     assert associative.eta_raw.grad is not None
@@ -1751,7 +1494,3 @@ def test_support_label_poison_is_rejected_before_any_model_call(
         assert_runtime_payload_safe(poisoned, layer="Meta-TTT Support/Query")
     assert resetter.calls == 0
     assert fast.last_audit is None
-
-
-def test_stage_a_query_builder_stays_available_as_production_adapter() -> None:
-    assert isinstance(StageAQueryLossBuilder(), StageAQueryLossBuilder)

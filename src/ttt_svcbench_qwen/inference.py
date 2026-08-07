@@ -199,6 +199,76 @@ class InferenceResult:
     audit_fields: tuple[tuple[str, AuditValue], ...]
 
 
+class MaterializedQuery(Protocol):
+    @property
+    def frames(self) -> Tensor: ...
+
+    @property
+    def frame_timestamps(self) -> Tensor: ...
+
+    @property
+    def pixel_values_videos(self) -> Tensor: ...
+
+    @property
+    def video_grid_thw(self) -> Tensor: ...
+
+
+def _inference_output(
+    *,
+    query: RuntimeQueryInput,
+    result: InferenceResult,
+    audit_level: str,
+    state_materialized: MaterializedQuery,
+    answer_materialized: MaterializedQuery,
+) -> dict[str, object]:
+    """Build the fixed CLI JSON object from one completed inference."""
+
+    audits = dict(result.audit_fields)
+    return {
+        "video_id": query.video_id,
+        "trajectory_id": query.trajectory_id,
+        "query_id": query.query_id,
+        "answer": result.answer_text,
+        "reader": {
+            "status": result.reader_result.status.value,
+            "selected_record_ids": list(result.selected_record_ids),
+        },
+        "write_version": audits["final_write_version"],
+        "write_count": audits["final_write_count"],
+        "skip_count": audits["final_skip_count"],
+        "audit": {
+            "level": audit_level,
+            "prefill_count": audits["prefill_count"],
+            "chunk_count": result.chunk_count,
+            "state_query_visual_mode": "recent_chunk",
+            "answer_query_visual_mode": "causal_prefix",
+            "state_query_frame_count": int(state_materialized.frames.shape[0]),
+            "answer_query_frame_count": int(answer_materialized.frames.shape[0]),
+            "state_query_visual_token_count": int(
+                state_materialized.pixel_values_videos.shape[0]
+            ),
+            "answer_query_visual_token_count": int(
+                answer_materialized.pixel_values_videos.shape[0]
+            ),
+            "state_query_video_grid_thw": [
+                int(value) for value in state_materialized.video_grid_thw[0].tolist()
+            ],
+            "answer_query_video_grid_thw": [
+                int(value) for value in answer_materialized.video_grid_thw[0].tolist()
+            ],
+            "state_query_timestamp_range": [
+                float(state_materialized.frame_timestamps[0].item()),
+                float(state_materialized.frame_timestamps[-1].item()),
+            ],
+            "answer_query_timestamp_range": [
+                float(answer_materialized.frame_timestamps[0].item()),
+                float(answer_materialized.frame_timestamps[-1].item()),
+            ],
+            "released": result.released,
+        },
+    }
+
+
 class PerVideoRuntimeManager:
     """Own exactly one functional per-video runtime and all lifecycle transitions."""
 
@@ -786,49 +856,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         request=request,
         updater=cast(TTTUpdateStage, bundle.updater),
     )
-    audits = dict(result.audit_fields)
-    output = {
-        "video_id": query.video_id,
-        "trajectory_id": query.trajectory_id,
-        "query_id": query.query_id,
-        "answer": result.answer_text,
-        "reader": {
-            "status": result.reader_result.status.value,
-            "selected_record_ids": list(result.selected_record_ids),
-        },
-        "write_version": audits["final_write_version"],
-        "write_count": audits["final_write_count"],
-        "skip_count": audits["final_skip_count"],
-        "audit": {
-            "level": bundle.config.inference.audit_level.value,
-            "prefill_count": audits["prefill_count"],
-            "decode_count": audits["decode_count"],
-            "chunk_count": result.chunk_count,
-            "state_query_visual_mode": "recent_chunk",
-            "answer_query_visual_mode": "causal_prefix",
-            "state_query_frame_count": int(state_materialized.frames.shape[0]),
-            "answer_query_frame_count": int(answer_materialized.frames.shape[0]),
-            "state_query_visual_token_count": int(state_materialized.pixel_values_videos.shape[0]),
-            "answer_query_visual_token_count": int(
-                answer_materialized.pixel_values_videos.shape[0]
-            ),
-            "state_query_video_grid_thw": [
-                int(value) for value in state_materialized.video_grid_thw[0].tolist()
-            ],
-            "answer_query_video_grid_thw": [
-                int(value) for value in answer_materialized.video_grid_thw[0].tolist()
-            ],
-            "state_query_timestamp_range": [
-                float(state_materialized.frame_timestamps[0].item()),
-                float(state_materialized.frame_timestamps[-1].item()),
-            ],
-            "answer_query_timestamp_range": [
-                float(answer_materialized.frame_timestamps[0].item()),
-                float(answer_materialized.frame_timestamps[-1].item()),
-            ],
-            "released": result.released,
-        },
-    }
+    output = _inference_output(
+        query=query,
+        result=result,
+        audit_level=bundle.config.inference.audit_level.value,
+        state_materialized=state_materialized,
+        answer_materialized=answer_materialized,
+    )
     output_path = cast(Path, args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(

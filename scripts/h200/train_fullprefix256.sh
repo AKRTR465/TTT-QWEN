@@ -13,7 +13,6 @@ TASK_NAME="qwen3vl8b_ttt_a2_fullprefix256_4h200"
 
 export YAML
 export TTT_SKIP_ENV_SETUP="${TTT_SKIP_ENV_SETUP:-1}"
-export TTT_QUERY_ACTIVATION_OFFLOAD="${TTT_QUERY_ACTIVATION_OFFLOAD:-0}"
 export RUN_ID="${RUN_ID:-$(date +%y%m%d_%H%M%S)_${TASK_NAME}}"
 export SESSION="${SESSION:-${TASK_NAME}_${RUN_ID}}"
 

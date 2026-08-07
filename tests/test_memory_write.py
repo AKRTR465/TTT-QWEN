@@ -16,6 +16,8 @@ from ttt_svcbench_qwen.fast_ttt import (
     apply_memory_write,
     apply_memory_writes,
     build_fast_ttt_adapter,
+    deferred_fast_vjp_loss,
+    make_query_proxy_fast_state,
     truncate_memory_state,
     truncate_memory_states,
 )
@@ -349,3 +351,65 @@ def test_truncation_cuts_gradient_and_preserves_values_bitwise() -> None:
     (plural,) = truncate_memory_states((written,))
     assert torch.equal(plural.m.detach(), written.m.detach())
     assert plural.m.is_leaf and plural.m.grad_fn is None
+
+
+def test_real_k8_query_gradient_reaches_all_token_keys_then_cuts() -> None:
+    torch.manual_seed(101)
+    adapter = build_fast_ttt_adapter(load_config()).eval()
+    initial = adapter.initialize_fast_state(differentiable=True)
+    state = initial
+    token_keys: list[Tensor] = []
+
+    for step in range(8):
+        visual = torch.randn(1, 3, 4096, requires_grad=True)
+        slots = torch.randn(1, 1, 768, requires_grad=True)
+        adapter(visual, fast_state=(state,))
+        intermediates = adapter.consume_associative_intermediates()
+        assert intermediates is not None
+        token_keys.append(intermediates.keys)
+        result = apply_memory_write(
+            fast_state=state,
+            batch=adapter.prepare_write(intermediates, _Slots(slots)),
+            row=0,
+        )
+        assert result.did_write
+        assert result.gradient_mode is GradientMode.META_LINEAR_RECURRENCE
+        state = result.fast_state
+        assert state.write_count == state.write_version == step + 1
+
+    proxy = make_query_proxy_fast_state(state)
+    query_loss = adapter(torch.randn(1, 3, 4096), fast_state=(proxy,)).square().mean()
+    proxy_gradient, direct_gradient = torch.autograd.grad(
+        query_loss,
+        (proxy.m, state.m),
+        allow_unused=True,
+    )
+    assert proxy_gradient is not None and torch.count_nonzero(proxy_gradient) > 0
+    assert direct_gradient is None
+
+    write_parameters = adapter.collect_memory_write_parameters()
+    targets = (*write_parameters, adapter.p_in.weight, *token_keys, initial.m)
+    gradients = torch.autograd.grad(
+        deferred_fast_vjp_loss((state,), (proxy_gradient.detach(),)),
+        targets,
+        allow_unused=True,
+    )
+    write_gradients = gradients[: len(write_parameters)]
+    assert all(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients)
+    for index in (0, 1, 2, 3, 6, 7, 8):
+        assert torch.count_nonzero(write_gradients[index]) > 0  # type: ignore[arg-type]
+    key_start = len(write_parameters) + 1
+    key_gradients = gradients[key_start : key_start + len(token_keys)]
+    assert all(torch.count_nonzero(gradient) > 0 for gradient in key_gradients)  # type: ignore[arg-type]
+    assert torch.count_nonzero(gradients[-1]) > 0  # type: ignore[arg-type]
+
+    before = state.m.detach().clone()
+    truncated = truncate_memory_state(state)
+    assert torch.equal(truncated.m.detach(), before)
+    assert truncated.m.is_leaf and truncated.m.grad_fn is None
+    cut = torch.autograd.grad(
+        truncated.m.sum(),
+        (state.m, *write_parameters, adapter.p_in.weight, *token_keys, initial.m),
+        allow_unused=True,
+    )
+    assert all(gradient is None for gradient in cut)

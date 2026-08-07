@@ -115,10 +115,7 @@ from ttt_svcbench_qwen.qwen_adapter import (
     RawVisualChunk,
     StateEmbeddingPayload,
 )
-from ttt_svcbench_qwen.runtime_metrics import (
-    configure_runtime_metrics,
-    trace_cuda_phase,
-)
+from ttt_svcbench_qwen.runtime_metrics import trace_cuda_phase
 from ttt_svcbench_qwen.stage_a_runtime import StageABankWriter
 from ttt_svcbench_qwen.stage_a_targets import (
     AnswerTargetLabels,
@@ -1708,7 +1705,6 @@ def build_runtime(
     )
 
     stage = ProductionStage(config.stage)
-    configure_runtime_metrics(config.runtime_trace_mode, config.runtime_trace_dir)
     project = backbone.project_config
     minimum_pixels, maximum_pixels = _video_pixel_bounds(backbone)
     preprocess_cache = _build_runtime_preprocess_cache(backbone, config)

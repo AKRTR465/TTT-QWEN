@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch import Tensor
 
-from ttt_svcbench_qwen.config import ProjectConfig, load_config
+from ttt_svcbench_qwen.config import load_config
 from ttt_svcbench_qwen.query_encoder import (
     OPERATOR_TO_HEAD_TYPE,
     OPERATORS,
@@ -71,11 +71,6 @@ def _resolution(
             valid=status is TimeResolutionStatus.OK,
         ),
         status=status,
-        reason=f"synthetic-{status.value}",
-        mode_confidence=1.0,
-        numeric_span=None,
-        parsed_values_seconds=(),
-        used_operator_default=True,
     )
 
 
@@ -213,7 +208,6 @@ def test_all_head_scoring_preserves_predicted_head_runtime_selection(
     assert output.n_state.tolist() == [2]
     assert output.present_mask.tolist() == [[True, True]]
     assert output.predicted_head_mask.tolist() == [[True, False]]
-    assert output.audit[0].head_partition_excluded_count == 1
     assert all(record.head_type is HeadType.O1 for record in output.selected_records[0])
     chunked = _project_history_sources(bank, history, chunk_size=1)
     single = _project_history_sources(bank, history, chunk_size=256)
@@ -368,14 +362,13 @@ def test_tensor_ring_snapshot_is_immutable_and_release_is_terminal() -> None:
     ring.append_many(batch)
     assert snapshot.n_state.tolist() == [1]
     assert snapshot.sequence_ids.tolist() == [[0]]
-    with pytest.raises(RuntimeError, match="changed"):
-        snapshot.assert_snapshot_current()
     fork = ring.fork()
     fork.append_many(batch)
     assert fork.count == 2 and ring.count == 2
     ring.release()
-    with pytest.raises(RuntimeError, match="released"):
-        ring.append_many(batch)
+    assert ring.released
+    assert ring.count == 0
+    assert ring.sources.numel() == 0
 
 
 def test_history_filters_future_invalid_and_ineligible_records(
@@ -405,11 +398,10 @@ def test_history_filters_future_invalid_and_ineligible_records(
     output = _retrieve(retriever, bank, history, query)
 
     assert output.causal_mask.tolist() == [[True, True, True, False]]
+    assert output.record_valid_mask.tolist() == [[True, False, True, True]]
+    assert output.retrieval_eligible_mask.tolist() == [[True, False, False, True]]
     assert output.selected_record_ids == (("retrieval-00000000",),)
     assert output.status == (RetrievalStatus.OK,)
-    assert output.audit[0].invalid_count == 1
-    assert output.audit[0].retrieval_ineligible_count == 1
-    assert output.audit[0].future_count == 1
 
 
 def test_history_retriever_statuses_fail_closed(
@@ -421,13 +413,6 @@ def test_history_retriever_statuses_fail_closed(
     history = _view((state,))
     matching = _matching_query(bank, history)
 
-    owner_mismatch = _retrieve(
-        retriever,
-        bank,
-        history,
-        _query(matching, (Operator.O1_SNAP,)),
-        video_ids=("wrong-video",),
-    )
     unsupported = _retrieve(
         retriever,
         bank,
@@ -445,52 +430,7 @@ def test_history_retriever_statuses_fail_closed(
         ),
     )
 
-    assert owner_mismatch.status == (RetrievalStatus.INVALID,)
-    assert owner_mismatch.reason == (RetrievalReason.OWNER_MISMATCH,)
     assert unsupported.status == (RetrievalStatus.UNSUPPORTED,)
     assert unsupported.reason == (RetrievalReason.UNSUPPORTED_OPERATOR,)
     assert invalid_time.status == (RetrievalStatus.INVALID,)
     assert invalid_time.reason == (RetrievalReason.INVALID_TIME,)
-
-
-def test_retriever_rejects_aggregate_or_malformed_inputs(
-    components: tuple[StructuredStateBank, EmbeddingStateRetriever],
-) -> None:
-    bank, retriever = components
-    state = _new_history(bank, "video-errors", "trajectory-errors")
-    state = _append_history(bank, state, source=torch.randn(SOURCE_DIM), timestamp=1.0)
-    history = _view((state,))
-    query = _query(_matching_query(bank, history), (Operator.O1_SNAP,))
-
-    with pytest.raises(TypeError, match="RetrievalHistoryView"):
-        retriever(
-            bank,
-            bank.view((state.bank_state,), (HeadType.O1,)),  # type: ignore[arg-type]
-            query,  # type: ignore[arg-type]
-            video_ids=history.video_ids,
-            trajectory_ids=history.trajectory_ids,
-        )
-    with pytest.raises(ValueError, match="q_target"):
-        _retrieve(
-            retriever,
-            bank,
-            history,
-            _query(torch.full((1, SEMANTIC_DIM), float("nan")), (Operator.O1_SNAP,)),
-        )
-
-
-def test_build_retriever_validates_frozen_config() -> None:
-    config = load_config()
-    retriever = build_state_retriever(config)
-    assert tuple(retriever.parameters()) == ()
-    assert tuple(retriever.buffers()) == ()
-    raw = config.model_dump(mode="json")
-    raw["retriever"]["top_k"] = 1
-    with pytest.raises(ValueError, match="retriever.top_k"):
-        ProjectConfig.model_validate(raw)
-    with pytest.raises(ValueError, match="Retriever top_k"):
-        build_state_retriever(
-            config.model_copy(
-                update={"retriever": config.retriever.model_copy(update={"top_k": 1})}
-            )
-        )

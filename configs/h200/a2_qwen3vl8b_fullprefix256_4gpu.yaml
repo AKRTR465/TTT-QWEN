@@ -82,8 +82,4 @@ ttt_qwen:
   preprocess_cache_max_gb: 200
   preprocess_cache_dtype: float32
   visual_cost_mode: proxy
-  runtime_trace_mode: "off"
-  runtime_trace_dir: null
   segment_prefetch_depth: 0
-  semantic_projector_delta_audit_steps: 0
-  operator_diagnostics_interval: 10

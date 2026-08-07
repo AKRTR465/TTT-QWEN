@@ -15,7 +15,6 @@ from typing import cast
 import av
 
 from ttt_svcbench_qwen.data import (
-    DatasetPurpose,
     DatasetSource,
     LoadedAnnotations,
     SVCBenchRecord,
@@ -64,8 +63,7 @@ def main() -> int:
 
     annotations = load_annotations(
         args.annotation,
-        source=DatasetSource(args.dataset_name, args.dataset_revision, False),
-        purpose=DatasetPurpose.TRAINING,
+        source=DatasetSource(args.dataset_name, args.dataset_revision),
     )
     runtime_video_paths = (
         None

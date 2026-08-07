@@ -1,43 +1,44 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
 import torch
 from torch import Tensor
-from ttt_svcbench_qwen.associative_ttt import (
-    AssociativeTTTIntermediates,
-    FastAssociativeContext,
-)
 
 from tests.support import make_test_model as build_model
 from tests.support.runtime_factories import (
     make_e1_state,
     make_e2_state,
-    make_query_output,
     make_spatial_output,
     make_temporal_cache,
 )
-from ttt_svcbench_qwen.config import AuditLevel, ProjectConfig, load_config
-from ttt_svcbench_qwen.fast_ttt import FastTTTAdapter, build_fast_ttt_adapter
+from ttt_svcbench_qwen.config import ProjectConfig, load_config
+from ttt_svcbench_qwen.data import RuntimeQueryInput
+from ttt_svcbench_qwen.fast_ttt import (
+    AssociativeTTTIntermediates,
+    FastAssociativeContext,
+    FastTTTAdapter,
+    build_fast_ttt_adapter,
+)
 from ttt_svcbench_qwen.identity_bank import IdentityBank, build_identity_bank
 from ttt_svcbench_qwen.inference import (
     AnswerInputs,
     CausalChunk,
-    InferenceProtocolError,
     InferenceRequest,
     OnlineTTTUpdater,
     PerVideoRuntimeManager,
     QueryAttempt,
-    QueryAttemptKind,
     TTTUpdateOutcome,
+    _inference_output,
     assert_inference_runtime_payload,
     run_inference,
-    runtime_boundary_stamp,
 )
 from ttt_svcbench_qwen.model import (
     BankWriteOutput,
@@ -61,8 +62,15 @@ from ttt_svcbench_qwen.observation_heads import (
     ObservationOutputs,
 )
 from ttt_svcbench_qwen.query_encoder import (
+    OPERATOR_TO_HEAD_TYPE,
     Operator,
+    OperatorRouterOutput,
+    QueryEmbeddingOutput,
     QueryEncoderOutput,
+    TimeResolution,
+    TimeResolutionStatus,
+    TimeResolverLogits,
+    TimeResolverOutput,
     TimeWindow,
     TimeWindowMode,
 )
@@ -94,71 +102,34 @@ def dependencies() -> _Dependencies:
     )
 
 
-def _manager(
-    dependencies: _Dependencies,
-    audit_level: AuditLevel = AuditLevel.BOUNDARY,
-) -> PerVideoRuntimeManager:
+def _manager(dependencies: _Dependencies) -> PerVideoRuntimeManager:
     return PerVideoRuntimeManager(
         fast_adapter=dependencies.fast_adapter,
         state_bank=dependencies.state_bank,
         identity_bank=dependencies.identity_bank,
-        audit_level=audit_level,
         hot_cache_enabled=False,
     )
 
 
 def _reader_result(status: ReaderStatus) -> ReaderResult:
+    """Reader result carrying the exact_count / number-token payload for each status."""
+
     count_bearing = status in (ReaderStatus.OK, ReaderStatus.EMPTY)
     selected_ids = ("record-0",) if status is ReaderStatus.OK else ()
     exact_count = 2 if status is ReaderStatus.OK else 0 if status is ReaderStatus.EMPTY else None
     operator = Operator.O1_SNAP if status is not ReaderStatus.UNSUPPORTED else Operator.UNSUPPORTED
-    valid_window = count_bearing
-    audit: list[tuple[str, str | int | float | bool | None]] = [
-        ("source", "retrieved_typed_records"),
-        ("operator", operator.value),
-        ("retrieval_status", status.value),
-        ("retrieval_reason", f"synthetic_{status.value}"),
-        ("n_state", len(selected_ids)),
-        ("n_retrieved", len(selected_ids)),
-        ("input_record_count", len(selected_ids)),
-        ("bank_version", 1),
-        ("time_resolution_status", "ok" if valid_window else status.value),
-        ("window_start", None if operator is Operator.UNSUPPORTED else 0.0),
-        ("window_end", 2.0),
-        ("reader_reason", f"synthetic_{status.value}"),
-    ]
-    if count_bearing:
-        audit.extend(
-            (
-                ("arithmetic", "synthetic_o1_snap"),
-                ("contributing_count", len(selected_ids)),
-                ("computed_exact_count", cast(int, exact_count)),
-                ("number_text", str(exact_count)),
-            )
-        )
-    if status is ReaderStatus.OK:
-        audit.extend(
-            (
-                ("operand_current_visible_count", 2),
-                ("operand_baseline_count", 0),
-                ("operand_baseline_initialized", True),
-                ("operand_baseline_position_id", 0),
-            )
-        )
     return ReaderResult(
         status=status,
         exact_count=exact_count,
         number_token_ids=() if exact_count is None else (48 + exact_count,),
         selected_record_ids=selected_ids,
         operator=operator,
-        time_window=TimeWindow(
-            TimeWindowMode.HISTORY,
-            2.0,
-            0.0,
-            2.0,
-            valid_window,
+        time_window=TimeWindow(TimeWindowMode.HISTORY, 2.0, 0.0, 2.0, count_bearing),
+        audit_fields=(
+            ("retrieval_status", status.value),
+            ("n_state", len(selected_ids)),
+            ("number_text", str(exact_count)),
         ),
-        audit_fields=tuple(audit),
     )
 
 
@@ -166,13 +137,12 @@ class _FakeSuite:
     def __init__(self, status: ReaderStatus = ReaderStatus.OK) -> None:
         self.status = status
         self.fast_adapter: FastTTTAdapter | None = None
-        self.fast_mode = "consume"
         self.fast_versions: list[int] = []
         self.answer_fast_versions: list[tuple[int, ...]] = []
         self.seen_frames: list[tuple[object, ...]] = []
         self.prefill_calls = 0
         self.generate_calls = 0
-        self.mutate_manager: PerVideoRuntimeManager | None = None
+        self.raise_in_generate = False
 
     def visual(self, request: ObservationChunkRequest) -> VisualStageOutput:
         batch = cast(BatchRuntimeState, request.runtime_state)
@@ -196,18 +166,10 @@ class _FakeSuite:
         self,
         visual: VisualStageOutput,
         _query: object,
-        request: ObservationChunkRequest,
+        _request: ObservationChunkRequest,
     ) -> VisualStageOutput:
         if self.fast_adapter is None:
             raise RuntimeError("test suite Fast Adapter was not installed")
-        if self.fast_mode == "skip":
-            return visual
-        if self.fast_mode == "reenter":
-            runtime = cast(BatchRuntimeState, request.runtime_state).rows[0]
-            assert runtime.fast_weights is not None
-            with self.fast_adapter.use_fast_state(runtime.fast_weights):
-                pass
-            return visual
         dtype = self.fast_adapter.w0_1.dtype
         device = self.fast_adapter.w0_1.device
         self.fast_adapter(torch.zeros((1, 1, 4096), dtype=dtype, device=device))
@@ -221,8 +183,8 @@ class _FakeSuite:
     ) -> object:
         return "spatial"
 
-    @staticmethod
     def temporal(
+        self,
         _visual: VisualStageOutput,
         _query: object,
         _request: ObservationChunkRequest,
@@ -264,9 +226,6 @@ class _FakeSuite:
             audit=("retrieval", self.status.value),
         )
 
-    def read(self, _retrieval: object) -> tuple[ReaderResult, ...]:
-        return (_reader_result(self.status),)
-
     def read_bank(
         self,
         _state_bank: object,
@@ -279,10 +238,6 @@ class _FakeSuite:
         assert tuple(cast(Sequence[str], video_ids)) == ("video-a",)
         assert tuple(cast(Sequence[str], trajectory_ids)) == ("trajectory-a",)
         return (_reader_result(self.status),)
-
-    @staticmethod
-    def audit_number_tokens(result: ReaderResult) -> int | None:
-        return result.exact_count
 
     def resample(self, _q_target: object, _retrieval: object) -> object:
         result = _reader_result(self.status)
@@ -316,6 +271,8 @@ class _FakeSuite:
 
     def generate(self, request: QwenGenerateRequest) -> QwenGenerateOutput:
         self.generate_calls += 1
+        if self.raise_in_generate:
+            raise RuntimeError("synthetic generation failure")
         if self.fast_adapter is None or self.fast_adapter._active_fast_states is None:
             raise RuntimeError("tiny Answer generation requires one managed fast-state binding")
         active = self.fast_adapter._active_fast_states
@@ -323,11 +280,6 @@ class _FakeSuite:
         dtype = self.fast_adapter.w0_1.dtype
         device = self.fast_adapter.w0_1.device
         self.fast_adapter(torch.zeros((len(active), 1, 4096), dtype=dtype, device=device))
-        if self.mutate_manager is not None:
-            state = self.mutate_manager.active_runtime
-            assert state is not None and state.fast_weights is not None
-            with torch.no_grad():
-                state.fast_weights.m.add_(0.5)
         signature = (
             request.prefill.pixel_values_videos.shape[0],
             tuple(int(value) for value in request.prefill.video_grid_thw[0].tolist()),
@@ -339,7 +291,51 @@ class _FakeSuite:
 
 
 def _typed_query() -> QueryEncoderOutput:
-    return make_query_output((Operator.O1_SNAP,), q_target=torch.zeros((1, 512)))
+    """Build a confidently routed O1 query whose window is a valid 0..2s history span.
+
+    Built locally rather than through ``tests.support.runtime_factories`` because that
+    factory still passes the deleted ``TimeResolution``/``QueryEmbeddingOutput`` fields.
+    """
+
+    operators = (Operator.O1_SNAP,)
+    q_target = torch.zeros((1, 512))
+    raw_indices = torch.tensor([tuple(Operator).index(operators[0])], dtype=torch.int64)
+    logits = torch.full((1, len(tuple(Operator))), -5.0)
+    logits[0, raw_indices[0]] = 5.0
+    route = OperatorRouterOutput(
+        logits=logits,
+        confidence=torch.ones(1),
+        raw_indices=raw_indices,
+        hard_operators=operators,
+        head_types=tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in operators),
+    )
+    time_logits = TimeResolverLogits(
+        mode_logits=torch.zeros((1, 4)),
+        mode_confidence=torch.ones(1),
+        mode_indices=torch.ones(1, dtype=torch.int64),
+        span_start_logits=torch.zeros((1, 1)),
+        span_end_logits=torch.zeros((1, 1)),
+        padding_mask=torch.zeros((1, 1), dtype=torch.bool),
+    )
+    resolutions = (
+        TimeResolution(
+            window=TimeWindow(TimeWindowMode.HISTORY, 2.0, 0.0, 2.0, True),
+            status=TimeResolutionStatus.OK,
+        ),
+    )
+    return QueryEncoderOutput(
+        embeddings=QueryEmbeddingOutput(
+            token_states=torch.zeros((1, 1, 768)),
+            q_target=q_target,
+            q_operator=q_target.clone(),
+            q_time=q_target.clone(),
+            padding_mask=torch.zeros((1, 1), dtype=torch.bool),
+        ),
+        route=route,
+        time=TimeResolverOutput(time_logits, resolutions),
+        hard_operators=operators,
+        head_types=route.head_types,
+    )
 
 
 def _typed_cache(hidden: Tensor, query: Tensor) -> TemporalCache:
@@ -451,8 +447,8 @@ class _TypedStageSuite(_FakeSuite):
     ) -> SpatialEncoderOutput:
         return _typed_spatial()
 
-    @staticmethod
     def temporal(
+        self,
         _visual: VisualStageOutput,
         query: object,
         request: ObservationChunkRequest,
@@ -460,6 +456,9 @@ class _TypedStageSuite(_FakeSuite):
         output = _typed_temporal(cast(QueryEncoderOutput, query))
         runtime = cast(BatchRuntimeState, request.runtime_state).rows[0]
         assert runtime.fast_weights is not None
+        # Record which M_t the chunk observed and make the output depend on it, so the
+        # recurrence order (chunk t reads M_(t-1)) is observable from the stage itself.
+        self.fast_versions.append(runtime.fast_weights.write_version)
         fast_dependency = 1000.0 * runtime.fast_weights.m[0, 0]
         return replace(output, hidden=output.hidden + fast_dependency)
 
@@ -495,7 +494,7 @@ class _FakeFastStage:
     ) -> AbstractContextManager[FastTTTAdapter]:
         return self._adapter().use_associative_context(context)
 
-    def consume_associative_intermediates(self) -> AssociativeTTTIntermediates:
+    def consume_associative_intermediates(self) -> AssociativeTTTIntermediates | None:
         return self._adapter().consume_associative_intermediates()
 
     def __call__(
@@ -573,14 +572,13 @@ class _Updater:
         fast = runtime.fast_weights
         assert fast is not None
         if call in self.skip_calls:
-            reason = "no_valid_slot"
             return TTTUpdateOutcome(
                 runtime_state=replace(
                     runtime,
                     fast_weights=replace(fast, skip_count=fast.skip_count + 1),
                 ),
                 did_update=False,
-                skip_reason=reason,
+                skip_reason="no_valid_slot",
                 valid_token_count=0,
             )
         with torch.no_grad():
@@ -596,7 +594,6 @@ class _Updater:
             did_update=True,
             skip_reason=None,
             valid_token_count=1,
-            pre_write_cosine=0.25,
         )
 
 
@@ -612,16 +609,22 @@ def _answer_inputs() -> AnswerInputs:
     )
 
 
-def _request(*, future_frame: object = "future") -> InferenceRequest:
-    return InferenceRequest.from_payload(
+def _query_input() -> RuntimeQueryInput:
+    return RuntimeQueryInput(
         video_id="video-a",
         trajectory_id="trajectory-a",
-        payload={
-            "video": "video-a.mp4",
-            "question": "How many?",
-            "query_time": 2.0,
-            "explicit_time_values": (),
-        },
+        query_id="query-a",
+        query_index=0,
+        video=Path("video-a.mp4"),
+        question="How many?",
+        query_time=2.0,
+        explicit_time_values=(),
+    )
+
+
+def _request(*, future_frame: object = "future") -> InferenceRequest:
+    return InferenceRequest(
+        query_input=_query_input(),
         query_signature=torch.zeros(512),
         chunks=(
             CausalChunk("chunk-0", ("a", "b"), (0.0, 1.0), (0, 1)),
@@ -633,37 +636,75 @@ def _request(*, future_frame: object = "future") -> InferenceRequest:
     )
 
 
-def test_reset_isolates_consecutive_videos_and_matches_pristine_stamp(
-    dependencies: _Dependencies,
-) -> None:
+def test_reset_isolates_consecutive_videos(dependencies: _Dependencies) -> None:
+    """Per-video isolation: a second reset shares no storage and inherits no state.
+
+    This is the mainline replacement for the removed ``tensor_contracts`` runtime
+    storage-isolation checks, so the ``data_ptr`` comparison is load bearing.
+    """
+
     manager = _manager(dependencies)
-    first = manager.reset("video-a", "trajectory-a", torch.zeros(512))
+    manager.reset("video-a", "trajectory-a", torch.zeros(512))
     first_state = manager.active_runtime
-    assert first_state is not None
+    assert first_state is not None and first_state.fast_weights is not None
     first_pointer = first_state.fast_weights.m.untyped_storage().data_ptr()
+    first_cache = cast(TemporalCache, first_state.temporal_cache)
+    first_signature_pointer = first_cache.query_signatures.untyped_storage().data_ptr()
 
-    second = manager.reset("video-b", "trajectory-b", torch.ones(512))
+    manager.reset("video-b", "trajectory-b", torch.ones(512))
     second_state = manager.active_runtime
-    assert second_state is not None
+    assert second_state is not None and second_state.fast_weights is not None
+    second_cache = cast(TemporalCache, second_state.temporal_cache)
 
-    assert first.pristine == second.pristine
-    assert second.previous_runtime is not None
-    assert second.previous_release is not None
-    assert second.reset.boundary is not None
-    assert second.reset.content_sha256 is None
+    assert second_state.owner.video_ids == ("video-b",)
+    assert second_state.owner.trajectory_ids == ("trajectory-b",)
     assert second_state.fast_weights.write_version == 0
+    assert second_state.fast_weights.write_count == 0
+    assert second_state.fast_weights.skip_count == 0
     assert torch.count_nonzero(second_state.fast_weights.m.detach()) == 0
-    assert second_state.temporal_cache.hidden.shape[1] == 0
+    assert second_cache.hidden.shape[1] == 0
     assert second_state.slot_state is None
     assert second_state.e1_state is None and second_state.e2_state is None
     assert second_state.state_bank.records == ()
     assert second_state.identity_bank.candidates == ()
+    assert second_state.identity_bank.confirmed == ()
+    assert second_state.identity_bank.video_id == "video-b"
     assert second_state.reader_audit == ()
+    assert not second_state.released
+    # Storage isolation: neither the memory nor the query signature is shared or reused.
     assert second_state.fast_weights.m.untyped_storage().data_ptr() != first_pointer
+    assert second_cache.query_signatures.untyped_storage().data_ptr() != first_signature_pointer
+    assert torch.count_nonzero(second_cache.query_signatures) == 512
     manager.release()
+    assert manager.active_runtime is None
 
 
-def test_causal_chunks_next_only_updates_and_generation_immutability(
+def test_release_returns_a_released_state_and_is_idempotent(
+    dependencies: _Dependencies,
+) -> None:
+    manager = _manager(dependencies)
+    manager.reset("video-a", "trajectory-a", torch.zeros(512))
+    released = manager.release()
+
+    assert released is not None
+    assert released.released
+    assert released.state_bank.released
+    assert released.identity_bank.released
+    assert released.slot_state is None
+    assert released.e1_state is None and released.e2_state is None
+    assert released.reader_audit == ()
+    assert manager.active_runtime is None
+    assert manager.release() is None
+    with pytest.raises(RuntimeError, match="live per-video runtime"):
+        manager.answer_query(
+            model=_model(dependencies, _FakeSuite()),
+            observation=cast(ObservationChunkOutput, None),
+            answer_inputs=_answer_inputs(),
+            attempt=QueryAttempt("query-a"),
+        )
+
+
+def test_causal_chunks_read_previous_memory_and_publish_next_only_updates(
     dependencies: _Dependencies,
 ) -> None:
     suite = _FakeSuite()
@@ -674,25 +715,29 @@ def test_causal_chunks_next_only_updates_and_generation_immutability(
         request=_request(),
         updater=_Updater(skip_calls={1}),
     )
+    audits = dict(result.audit_fields)
 
+    # Chunk t observes M_(t-1): chunk-0 sees version 0, chunk-1 sees the version 1
+    # published by chunk-0's write and never its own.
     assert suite.fast_versions == [0, 1]
+    # The frame at t=4.0 is beyond query_time=2.0 and is cropped before handoff.
     assert suite.seen_frames == [("a", "b"), ("c",)]
-    assert tuple(audit.write_version_used for audit in result.chunk_audit) == (0, 1)
-    assert tuple(audit.next_write_version for audit in result.chunk_audit) == (1, 1)
-    assert result.chunk_audit[1].future_frame_count == 1
-    assert result.chunk_audit[1].skip_reason == "no_valid_slot"
-    assert result.generate_audit.prefill_count == 1
-    assert result.generate_audit.decode_count == 0
-    assert result.generate_audit.state_before == result.generate_audit.state_after
+    assert suite.prefill_calls == 0
+    assert suite.generate_calls == 1
+    assert result.answer_text == "answer:(8, (2, 2, 2))"
     assert result.reader_result.status is ReaderStatus.OK
     assert result.selected_record_ids == ("record-0",)
-    assert result.state_attention is not None
+    assert result.chunk_count == 2
+    assert result.released
     assert result.runtime_state.released
-    assert result.release_audit is not None
+    assert audits["final_write_version"] == 1
+    assert audits["final_write_count"] == 1
+    assert audits["final_skip_count"] == 1
+    assert audits["prefill_count"] == 1
     assert manager.active_runtime is None
 
 
-def test_future_only_chunks_are_skipped_without_update_state(
+def test_future_only_chunks_are_skipped_without_update_or_state(
     dependencies: _Dependencies,
 ) -> None:
     chunks = (
@@ -701,93 +746,21 @@ def test_future_only_chunks_are_skipped_without_update_state(
         CausalChunk("future", ("d", "e"), (3.0, 5.0), (4, 5)),
     )
     updater = _Updater()
-    request = replace(_request(), chunks=chunks)
+    suite = _FakeSuite()
     manager = _manager(dependencies)
     result = run_inference(
         manager=manager,
-        model=_model(dependencies, _FakeSuite()),
-        request=request,
+        model=_model(dependencies, suite),
+        request=replace(_request(), chunks=chunks),
         updater=updater,
     )
 
+    # The wholly-future chunk never reaches the model and never drives an update.
     assert updater.calls == 2
-    assert tuple(audit.update_attempted for audit in result.chunk_audit) == (True, True, False)
-    assert result.state_attention is not None
-    assert result.runtime_state.released
-    assert result.release_audit is not None
+    assert suite.seen_frames == [("a", "b"), ("c",)]
+    assert result.chunk_count == 2
+    assert result.released
     assert manager.active_runtime is None
-
-
-def test_fullprefix_query_observation_is_read_only_and_uses_current_fast_state(
-    dependencies: _Dependencies,
-) -> None:
-    suite = _FakeSuite()
-    request = replace(
-        _request(),
-        query_observation=CausalChunk(
-            "query-full-prefix",
-            ("q0", "q1", "q2"),
-            (0.0, 1.0, 2.0),
-            (0, 1, 2),
-        ),
-    )
-    result = run_inference(
-        manager=_manager(dependencies),
-        model=_model(dependencies, suite),
-        request=request,
-        updater=_Updater(skip_calls={1}),
-    )
-
-    assert suite.seen_frames == [("a", "b"), ("c",), ("q0", "q1", "q2")]
-    assert suite.fast_versions == [0, 1, 1]
-    assert len(result.chunk_audit) == 2
-    assert result.release_audit is not None
-    assert result.release_audit.before.boundary is not None
-    assert result.release_audit.before.boundary.state_bank_version == 2
-
-
-@pytest.mark.parametrize("audit_level", tuple(AuditLevel))
-def test_audit_levels_preserve_runtime_results(
-    dependencies: _Dependencies,
-    audit_level: AuditLevel,
-) -> None:
-    suite = _FakeSuite()
-    result = run_inference(
-        manager=_manager(dependencies, audit_level),
-        model=_model(dependencies, suite),
-        request=_request(),
-        updater=_Updater(skip_calls={1}),
-    )
-
-    snapshot = result.generate_audit.state_after
-    assert result.answer_text == "answer:(8, (2, 2, 2))"
-    assert snapshot.level is audit_level
-    assert (snapshot.boundary is None) is (audit_level is AuditLevel.OFF)
-    assert (snapshot.content_sha256 is not None) is (audit_level is AuditLevel.FULL)
-
-
-def test_boundary_stamp_never_moves_tensor_contents_to_cpu(
-    dependencies: _Dependencies,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = _manager(dependencies)
-    manager.reset("video-a", "trajectory-a", torch.zeros(512))
-    runtime = manager.active_runtime
-    assert runtime is not None
-    original_to = Tensor.to
-
-    def reject_cpu(self: Tensor, *args: object, **kwargs: object) -> Tensor:
-        device = kwargs.get("device", args[0] if args else None)
-        if device == "cpu" or device == torch.device("cpu"):
-            raise AssertionError("boundary audit attempted a CPU Tensor copy")
-        return original_to(self, *args, **kwargs)
-
-    monkeypatch.setattr(Tensor, "cpu", lambda _self: pytest.fail("Tensor.cpu was called"))
-    monkeypatch.setattr(Tensor, "to", reject_cpu)
-    stamp = runtime_boundary_stamp(runtime)
-
-    assert stamp.write_version == 0
-    assert stamp.tensor_versions
 
 
 def test_future_frame_perturbation_does_not_change_answer_or_model_input(
@@ -807,7 +780,109 @@ def test_future_frame_perturbation_does_not_change_answer_or_model_input(
     assert outputs[0] == outputs[1]
 
 
-def test_reader_statuses_and_explicit_retry_use_one_prefill_each(
+def test_query_observation_is_read_only_and_uses_the_current_fast_state(
+    dependencies: _Dependencies,
+) -> None:
+    suite = _FakeSuite()
+    manager = _manager(dependencies)
+    request = replace(
+        _request(),
+        query_observation=CausalChunk(
+            "query-full-prefix",
+            ("q0", "q1", "q2"),
+            (0.0, 1.0, 2.0),
+            (0, 1, 2),
+        ),
+    )
+    result = run_inference(
+        manager=manager,
+        model=_model(dependencies, suite),
+        request=request,
+        updater=_Updater(skip_calls={1}),
+    )
+
+    assert suite.seen_frames == [("a", "b"), ("c",), ("q0", "q1", "q2")]
+    # The Query observation reuses M_1 and never publishes M_2.
+    assert suite.fast_versions == [0, 1, 1]
+    assert result.chunk_count == 2
+    assert dict(result.audit_fields)["final_write_version"] == 1
+
+
+def test_observe_query_readonly_commits_no_bank_or_runtime_state(
+    dependencies: _Dependencies,
+) -> None:
+    suite = _FakeSuite()
+    manager = _manager(dependencies)
+    model = _model(dependencies, suite)
+    manager.reset("video-a", "trajectory-a", torch.zeros(512))
+    manager.observe_chunk(
+        model=model,
+        chunk=CausalChunk("chunk-0", ("a", "b"), (0.0, 1.0), (0, 1)),
+        query_input=_query_input(),
+        query_time=2.0,
+        updater=_Updater(),
+    )
+    before = manager.active_runtime
+    assert before is not None
+
+    observation = manager.observe_query_readonly(
+        model=model,
+        chunk=CausalChunk("query", ("q0", "q1"), (0.0, 1.0), (0, 1)),
+        query_input=_query_input(),
+        query_time=2.0,
+    )
+
+    assert manager.active_runtime is before
+    assert observation.runtime_state.rows[0] is before
+    assert observation.bank_states == (before.state_bank,)
+    manager.release()
+
+
+def test_generate_does_not_mutate_memory_bank_fsm_or_temporal_state(
+    dependencies: _Dependencies,
+) -> None:
+    suite = _TypedStageSuite()
+    manager = _manager(dependencies)
+    manager.reset("video-a", "trajectory-a", torch.zeros(512))
+    execution = manager.observe_chunk(
+        model=_stage_a_model(dependencies, suite),
+        chunk=CausalChunk("chunk-0", ("a", "b"), (0.0, 1.0), (0, 1)),
+        query_input=_query_input(),
+        query_time=2.0,
+        updater=_Updater(),
+    )
+    assert execution.observation is not None
+    before = manager.active_runtime
+    assert before is not None and before.fast_weights is not None
+    memory_before = before.fast_weights.m.detach().clone()
+
+    result = manager.answer_query(
+        model=_stage_a_model(dependencies, suite),
+        observation=execution.observation,
+        answer_inputs=_answer_inputs(),
+        attempt=QueryAttempt("query-a"),
+        max_new_tokens=16,
+    )
+
+    after = manager.active_runtime
+    assert after is not None and after.fast_weights is not None
+    assert torch.equal(after.fast_weights.m.detach(), memory_before)
+    assert after.fast_weights.write_version == before.fast_weights.write_version
+    assert after.fast_weights.write_count == before.fast_weights.write_count
+    assert after.fast_weights.skip_count == before.fast_weights.skip_count
+    assert after.state_bank is before.state_bank
+    assert after.identity_bank is before.identity_bank
+    assert after.temporal_cache is before.temporal_cache
+    assert after.slot_state is before.slot_state
+    assert after.e1_state is before.e1_state and after.e2_state is before.e2_state
+    assert after.next_chunk_index == before.next_chunk_index
+    # The only permitted mutation is appending the Reader result of this query.
+    assert after.reader_audit == (result.reader_result,)
+    assert dependencies.fast_adapter._active_fast_states is None
+    manager.release()
+
+
+def test_reader_statuses_each_use_one_prefill_and_the_current_fast_state(
     dependencies: _Dependencies,
 ) -> None:
     suite = _FakeSuite()
@@ -816,7 +891,7 @@ def test_reader_statuses_and_explicit_retry_use_one_prefill_each(
     execution = manager.observe_chunk(
         model=_model(dependencies, suite),
         chunk=CausalChunk("chunk", ("a",), (0.0,), (0,)),
-        query_input=_request().query_input,
+        query_input=_query_input(),
         query_time=2.0,
         updater=_Updater(),
     )
@@ -830,25 +905,23 @@ def test_reader_statuses_and_explicit_retry_use_one_prefill_each(
     results = []
     for index, status in enumerate(statuses):
         suite.status = status
-        attempt = (
-            QueryAttempt("query-retry", QueryAttemptKind.RETRY, retry_of="query-ok")
-            if status is ReaderStatus.EMPTY
-            else QueryAttempt(f"query-{status.value}")
-        )
         result = manager.answer_query(
             model=_model(dependencies, suite),
             observation=execution.observation,
             answer_inputs=_answer_inputs(),
-            attempt=attempt,
+            attempt=QueryAttempt(f"query-{status.value}"),
             max_new_tokens=16,
         )
         results.append(result)
-        assert result.generate_audit.prefill_count == 1, index
+        assert dict(result.audit_fields)["prefill_count"] == 1, index
+        assert dict(result.audit_fields)["query_id"] == f"query-{status.value}"
         assert result.answer_text
 
     assert tuple(result.reader_result.status for result in results) == statuses
-    assert results[1].generate_audit.query_kind is QueryAttemptKind.RETRY
-    assert results[1].generate_audit.retry_of == "query-ok"
+    # Reader exact_count and the number-token payload survive per status.
+    assert tuple(result.reader_result.exact_count for result in results) == (2, 0, None, None)
+    assert results[0].reader_result.number_token_ids == (50,)
+    assert results[2].reader_result.number_token_ids == ()
     runtime = manager.active_runtime
     assert runtime is not None and runtime.fast_weights is not None
     assert suite.answer_fast_versions == [
@@ -859,58 +932,55 @@ def test_reader_statuses_and_explicit_retry_use_one_prefill_each(
     manager.release()
 
 
-def test_generation_mutation_fails_closed_and_exception_releases_runtime(
+def test_generation_exception_releases_the_runtime_and_unbinds_fast_state(
     dependencies: _Dependencies,
 ) -> None:
     suite = _FakeSuite()
+    suite.raise_in_generate = True
     manager = _manager(dependencies)
-    suite.mutate_manager = manager
-    with pytest.raises(InferenceProtocolError, match="prefill/generation mutated"):
+    with pytest.raises(RuntimeError, match="synthetic generation failure"):
         run_inference(
             manager=manager,
             model=_model(dependencies, suite),
             request=_request(),
             updater=_Updater(skip_calls={1}),
         )
+
     assert manager.active_runtime is None
     assert suite.fast_adapter is not None
     assert suite.fast_adapter._active_fast_states is None
+    # The manager is reusable after the exception path released the runtime.
+    manager.reset("video-b", "trajectory-b", torch.zeros(512))
+    assert manager.active_runtime is not None
+    manager.release()
 
 
-def test_fast_binding_is_fail_closed_and_not_reentrant(dependencies: _Dependencies) -> None:
-    for mode, error, message in (
-        ("skip", RuntimeError, "no associative intermediates"),
-        ("reenter", RuntimeError, "not re-entrant"),
-    ):
-        suite = _FakeSuite()
-        suite.fast_mode = mode
-        manager = _manager(dependencies)
-        manager.reset("video-a", "trajectory-a", torch.zeros(512))
-        with pytest.raises(error, match=message):
-            manager.observe_chunk(
-                model=_model(dependencies, suite),
-                chunk=CausalChunk("chunk", ("a",), (0.0,), (0,)),
-                query_input=_request().query_input,
-                query_time=2.0,
-                updater=_Updater(),
-            )
-        manager.release()
-        assert manager.active_runtime is None
+def test_no_causal_frame_before_query_time_fails_and_releases(
+    dependencies: _Dependencies,
+) -> None:
+    manager = _manager(dependencies)
+    request = replace(
+        _request(),
+        chunks=(CausalChunk("future", ("a", "b"), (5.0, 6.0), (0, 1)),),
+    )
+    with pytest.raises(RuntimeError, match="no causal frame"):
+        run_inference(
+            manager=manager,
+            model=_model(dependencies, _FakeSuite()),
+            request=request,
+            updater=_Updater(),
+        )
+    assert manager.active_runtime is None
 
 
 def test_unified_runtime_commits_real_hard_state(dependencies: _Dependencies) -> None:
     suite = _TypedStageSuite()
-    manager = PerVideoRuntimeManager(
-        fast_adapter=dependencies.fast_adapter,
-        state_bank=dependencies.state_bank,
-        identity_bank=dependencies.identity_bank,
-        hot_cache_enabled=False,
-    )
+    manager = _manager(dependencies)
     manager.reset("video-a", "trajectory-a", torch.zeros(512))
     execution = manager.observe_chunk(
         model=_stage_a_model(dependencies, suite),
         chunk=CausalChunk("chunk", ("a", "b"), (0.0, 1.0), (0, 1)),
-        query_input=_request().query_input,
+        query_input=_query_input(),
         query_time=2.0,
         updater=_Updater(),
     )
@@ -930,7 +1000,7 @@ def test_unified_runtime_commits_real_hard_state(dependencies: _Dependencies) ->
     manager.release()
 
 
-def test_online_updater_uses_association_and_publishes_next_only_fast_state(
+def test_online_updater_publishes_next_only_fast_state(
     dependencies: _Dependencies,
 ) -> None:
     torch.manual_seed(15)
@@ -943,28 +1013,74 @@ def test_online_updater_uses_association_and_publishes_next_only_fast_state(
     first = manager.observe_chunk(
         model=model,
         chunk=CausalChunk("chunk-0", ("a", "b"), (0.0, 1.0), (0, 1)),
-        query_input=_request().query_input,
+        query_input=_query_input(),
         query_time=3.0,
         updater=updater,
     )
-    assert first.audit.write_version_used == 0
-    assert first.audit.did_update, first.audit.skip_reason
-    assert first.audit.next_write_version == 1
-    assert first.audit.pre_write_cosine is not None
-    assert first.audit.valid_token_count > 0
+    first_fast = first.runtime_state.fast_weights
+    assert first_fast is not None
+    assert first_fast.write_version == 1
+    assert first_fast.write_count == 1
+    assert torch.count_nonzero(first_fast.m.detach()) > 0
 
     second = manager.observe_chunk(
         model=model,
         chunk=CausalChunk("chunk-1", ("c", "d"), (2.0, 3.0), (2, 3)),
-        query_input=_request().query_input,
+        query_input=_query_input(),
         query_time=3.0,
         updater=updater,
     )
-    assert second.audit.write_version_used == 1
-    assert second.audit.next_write_version == 2
-    assert second.audit.pre_write_cosine is not None
-    assert second.audit.valid_token_count > 0
+    second_fast = second.runtime_state.fast_weights
+    assert second_fast is not None
+    assert second_fast.write_version == 2
+    assert second_fast.write_count == 2
+    # Each chunk observed the memory published before it, never its own write.
+    assert suite.fast_versions == [0, 1]
     manager.release()
+
+
+def test_inference_json_output_contract(dependencies: _Dependencies) -> None:
+    """Exercise the same fixed serializer used by the production CLI."""
+
+    suite = _FakeSuite()
+    result = run_inference(
+        manager=_manager(dependencies),
+        model=_model(dependencies, suite),
+        request=_request(),
+        updater=_Updater(skip_calls={1}),
+    )
+    audits = dict(result.audit_fields)
+    query = _query_input()
+    materialized = SimpleNamespace(
+        frames=torch.zeros((2, 3, 4, 4)),
+        frame_timestamps=torch.tensor((0.0, 2.0), dtype=torch.float64),
+        pixel_values_videos=torch.zeros((8, 4)),
+        video_grid_thw=torch.tensor(((2, 2, 2),), dtype=torch.int64),
+    )
+    output = _inference_output(
+        query=query,
+        result=result,
+        audit_level="boundary",
+        state_materialized=materialized,
+        answer_materialized=materialized,
+    )
+    text = json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+    assert text.endswith("\n")
+    assert json.loads(text) == output
+    assert output["write_version"] == audits["final_write_version"]
+    assert output["write_count"] == audits["final_write_count"]
+    assert output["skip_count"] == audits["final_skip_count"]
+    output_audit = cast(dict[str, object], output["audit"])
+    assert output_audit["prefill_count"] == audits["prefill_count"]
+    assert output_audit["state_query_frame_count"] == 2
+    assert output_audit["answer_query_visual_token_count"] == 8
+    assert audits["video_id"] == "video-a"
+    assert audits["trajectory_id"] == "trajectory-a"
+    assert audits["query_id"] == "query-a"
+    assert audits["reader_status"] == ReaderStatus.OK.value
+    assert audits["selected_record_count"] == 1
+    assert audits["released"] is True
 
 
 def test_inference_payload_recursively_rejects_labels() -> None:

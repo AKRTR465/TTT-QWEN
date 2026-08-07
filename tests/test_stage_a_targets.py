@@ -15,7 +15,7 @@ from tests.support.runtime_factories import (
     make_state_record,
 )
 from ttt_svcbench_qwen.config import load_config
-from ttt_svcbench_qwen.identity_bank import ConfirmedChunk, IdentityBankRuntimeState
+from ttt_svcbench_qwen.identity_bank import ConfirmedIdentity, IdentityBankRuntimeState
 from ttt_svcbench_qwen.losses import compute_state_loss
 from ttt_svcbench_qwen.observation_heads import (
     E1RuntimeState,
@@ -59,7 +59,7 @@ from ttt_svcbench_qwen.stage_a_targets import (
     _o2_dedup_prediction,
     _official_weak_task_result,
     _official_weak_term,
-    _record_matches_causal_occurrence,
+    _retrieval_occurrence_mask,
     _robust_count_loss,
 )
 from ttt_svcbench_qwen.state_bank import (
@@ -122,11 +122,6 @@ def _resolution(row: int) -> TimeResolution:
             valid=True,
         ),
         status=TimeResolutionStatus.OK,
-        reason="synthetic-history",
-        mode_confidence=1.0,
-        numeric_span=None,
-        parsed_values_seconds=(),
-        used_operator_default=True,
     )
 
 
@@ -150,11 +145,8 @@ def _typed_predictions(
     spatial_width: int = 2,
     temporal_width: int = 3,
     query_width: int = 5,
-    last_spatial_invalid: bool = False,
 ) -> tuple[ObservationOutputs, QueryEncoderOutput, RetrieverOutput, dict[str, Tensor]]:
     spatial_mask = torch.ones(batch_size, spatial_width, dtype=torch.bool)
-    if last_spatial_invalid:
-        spatial_mask[:, -1] = False
     temporal_mask = torch.ones(batch_size, temporal_width, dtype=torch.bool)
 
     spatial_times = torch.arange(spatial_width, dtype=torch.float64).expand(batch_size, -1).clone()
@@ -229,7 +221,6 @@ def _typed_predictions(
     observations = ObservationOutputs(o1=o1, o2=o2, e1=e1, e2=e2)
 
     token_states = torch.zeros(batch_size, query_width, 8)
-    pooling = torch.full((batch_size, query_width), 1.0 / query_width)
     q_target = torch.zeros(batch_size, 512)
     q_operator = torch.zeros_like(q_target)
     q_time = torch.zeros_like(q_target)
@@ -239,7 +230,6 @@ def _typed_predictions(
     padding_mask = torch.zeros(batch_size, query_width, dtype=torch.bool)
     embeddings = QueryEmbeddingOutput(
         token_states=token_states,
-        pooling_weights=pooling,
         q_target=q_target,
         q_operator=q_operator,
         q_time=q_time,
@@ -254,7 +244,6 @@ def _typed_predictions(
         raw_indices=raw_indices,
         hard_operators=hard_operators,
         head_types=tuple(OPERATOR_TO_HEAD_TYPE[operator] for operator in hard_operators),
-        confidence_gate_applied=False,
     )
     mode_logits = _leaf((batch_size, 4))
     span_start_logits = _leaf((batch_size, query_width))
@@ -311,21 +300,7 @@ def _typed_predictions(
         time_resolutions=resolutions,
         n_state=torch.full((batch_size,), 2, dtype=torch.int64),
         n_retrieved=torch.ones(batch_size, dtype=torch.int64),
-        audit=tuple(
-            RetrievalFilterAudit(
-                n_state=2,
-                head_partition_excluded_count=0,
-                query_rejected_count=0,
-                owner_mismatch_count=0,
-                invalid_count=0,
-                retrieval_ineligible_count=0,
-                future_count=0,
-                outside_window_count=0,
-                below_similarity_count=1,
-                selected_count=1,
-            )
-            for _ in range(batch_size)
-        ),
+        audit=tuple(RetrievalFilterAudit(n_state=2, selected_count=1) for _ in range(batch_size)),
         video_ids=tuple(f"video-{row}" for row in range(batch_size)),
         trajectory_ids=tuple(f"trajectory-{row}" for row in range(batch_size)),
         bank_video_ids=tuple(f"video-{row}" for row in range(batch_size)),
@@ -471,166 +446,6 @@ def test_query_labels_cover_all_nine_operators_and_four_time_modes() -> None:
     assert set(state_input.time.mode_targets.tolist()) == {0, 1, 2, 3}
     assert state_input.operator.valid_mask.all()
     assert state_input.time.mode_valid_mask.all()
-
-
-def test_missing_provenance_never_constructs_a_loss_component() -> None:
-    observations, query, retrieval, _ = _typed_predictions(2)
-    query_labels = QueryTargetLabels(
-        operator_targets=torch.full((2,), -100, dtype=torch.int64),
-        time_mode_targets=torch.full((2,), -100, dtype=torch.int64),
-        span_start_targets=torch.full((2,), -100, dtype=torch.int64),
-        span_end_targets=torch.full((2,), -100, dtype=torch.int64),
-        operator_provenance=(MISSING, MISSING),
-        time_provenance=(MISSING, MISSING),
-        span_provenance=(MISSING, MISSING),
-    )
-    missing_o1 = O1TargetLabels(
-        row_indices=torch.tensor([0]),
-        targets=torch.zeros(1, 2, 6),
-        slot_mask=torch.zeros(1, 2, dtype=torch.bool),
-        provenance=(MISSING,),
-    )
-    missing_retrieval = RetrievalTargetLabels(
-        relevant_record_ids=(None, None),
-        provenance=(MISSING, MISSING),
-    )
-
-    with pytest.raises(ValueError, match="no explicit supervised component"):
-        StageATargetBuilder().build(
-            observations,
-            query,
-            retrieval,
-            StageATargetBatch(
-                o1=missing_o1,
-                query=query_labels,
-                retrieval=missing_retrieval,
-            ),
-        )
-
-
-def test_retrieval_relevant_ids_must_exist_on_present_candidate_axis() -> None:
-    observations, query, retrieval, _ = _typed_predictions(2)
-    labels = RetrievalTargetLabels(
-        relevant_record_ids=(("record-0-1",), ("forged-record",)),
-        provenance=(OFFICIAL, SYNTHETIC),
-    )
-
-    with pytest.raises(ValueError, match="absent from the present candidate axis"):
-        StageATargetBuilder().build(
-            observations,
-            query,
-            retrieval,
-            StageATargetBatch(retrieval=labels),
-        )
-
-
-def test_head_masks_rows_and_operator_provenance_fail_closed() -> None:
-    observations, query, retrieval, _ = _typed_predictions(4, last_spatial_invalid=True)
-    labels = _four_head_labels()
-    assert labels.o1 is not None
-    bad_o1 = O1TargetLabels(
-        row_indices=labels.o1.row_indices,
-        targets=labels.o1.targets,
-        slot_mask=labels.o1.slot_mask,
-        provenance=labels.o1.provenance,
-    )
-    with pytest.raises(ValueError, match="invalid prediction positions"):
-        StageATargetBuilder().build(
-            observations,
-            query,
-            retrieval,
-            StageATargetBatch(o1=bad_o1),
-        )
-
-    duplicate = StageATargetBatch(
-        o1=O1TargetLabels(
-            torch.tensor([0]),
-            torch.ones(1, 2, 6),
-            torch.ones(1, 2, dtype=torch.bool),
-            (OFFICIAL,),
-        ),
-        e1=E1TargetLabels(
-            torch.tensor([0]),
-            torch.ones(1, 3, 3),
-            torch.ones(1, 3, dtype=torch.bool),
-            (OFFICIAL,),
-        ),
-    )
-    clean_observations, clean_query, clean_retrieval, _ = _typed_predictions(4)
-    with pytest.raises(ValueError, match="only one observation head"):
-        StageATargetBuilder().build(
-            clean_observations,
-            clean_query,
-            clean_retrieval,
-            duplicate,
-        )
-
-    mismatched_query = QueryTargetLabels(
-        operator_targets=torch.tensor([2, -100, -100, -100]),
-        time_mode_targets=torch.full((4,), -100, dtype=torch.int64),
-        span_start_targets=torch.full((4,), -100, dtype=torch.int64),
-        span_end_targets=torch.full((4,), -100, dtype=torch.int64),
-        operator_provenance=(OFFICIAL, MISSING, MISSING, MISSING),
-        time_provenance=(MISSING,) * 4,
-        span_provenance=(MISSING,) * 4,
-    )
-    with pytest.raises(ValueError, match="does not match.*head"):
-        StageATargetBuilder().build(
-            clean_observations,
-            clean_query,
-            clean_retrieval,
-            StageATargetBatch(o1=duplicate.o1, query=mismatched_query),
-        )
-
-
-@pytest.mark.parametrize(
-    ("factory", "message"),
-    [
-        (
-            lambda: O1TargetLabels(
-                torch.tensor([0]),
-                torch.ones(1, 2, 6, requires_grad=True),
-                torch.ones(1, 2, dtype=torch.bool),
-                (OFFICIAL,),
-            ),
-            "detached pure labels",
-        ),
-        (
-            lambda: E1TargetLabels(
-                torch.tensor([0]),
-                torch.tensor([[[1.0, float("nan"), 0.0]]]),
-                torch.ones(1, 1, dtype=torch.bool),
-                (OFFICIAL,),
-            ),
-            "finite",
-        ),
-        (
-            lambda: E2TargetLabels(
-                torch.tensor([0]),
-                torch.ones(1, 1, 4),
-                torch.tensor([[4]]),
-                torch.ones(1, 1, dtype=torch.bool),
-                (OFFICIAL,),
-            ),
-            "within",
-        ),
-        (
-            lambda: O1TargetLabels(
-                torch.tensor([0], device="meta"),
-                torch.ones(1, 1, 6, device="meta"),
-                torch.ones(1, 1, dtype=torch.bool, device="meta"),
-                (OFFICIAL,),
-            ),
-            "materialized",
-        ),
-    ],
-)
-def test_label_shape_finite_detach_and_device_contracts_fail_closed(
-    factory: object,
-    message: str,
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        factory()  # type: ignore[operator]
 
 
 def test_closed_provenance_and_training_only_api_cannot_accept_answer_derived_fields() -> None:
@@ -830,23 +645,10 @@ def test_official_retrieval_rescues_valid_target_bag_from_wrong_hard_route() -> 
         predicted_head_mask=torch.zeros_like(retrieval.predicted_head_mask),
         selected_mask=torch.zeros_like(retrieval.selected_mask),
         status=(RetrievalStatus.EMPTY,),
-        reason=(RetrievalReason.EMPTY_HEAD_PARTITION,),
+        reason=(RetrievalReason.NO_MATCH,),
         hard_operators=(Operator.O2_UNIQUE,),
         n_retrieved=torch.zeros_like(retrieval.n_retrieved),
-        audit=(
-            RetrievalFilterAudit(
-                n_state=2,
-                head_partition_excluded_count=2,
-                query_rejected_count=0,
-                owner_mismatch_count=0,
-                invalid_count=0,
-                retrieval_ineligible_count=0,
-                future_count=0,
-                outside_window_count=0,
-                below_similarity_count=0,
-                selected_count=0,
-            ),
-        ),
+        audit=(RetrievalFilterAudit(n_state=2, selected_count=0),),
     )
     label = OfficialWeakSupervision(
         query_id="retrieval-wrong-route-rescue",
@@ -1050,15 +852,11 @@ def test_o2_dedup_novelty_log_domain_stability() -> None:
     # Empty bank: the bank factor drops out; only the in-chunk peer factor remains.
     # The fixture relevance defaults to 0.5 per valid slot and scales the novelty mass.
     empty = torch.zeros((0, 256))
-    prediction_empty, novelty_empty, base_empty = _o2_dedup_prediction(
-        observations.o2, 0, empty, 0
-    )
+    prediction_empty, novelty_empty, base_empty = _o2_dedup_prediction(observations.o2, 0, empty, 0)
     assert base_empty == 0.0
     sigmoid_at_full_match = 1.0 / (1.0 + math.exp(2.0))
     assert novelty_empty == pytest.approx(0.5 * (1.0 + sigmoid_at_full_match), abs=1.0e-4)
-    assert float(prediction_empty.detach().item()) == pytest.approx(
-        novelty_empty, abs=1.0e-5
-    )
+    assert float(prediction_empty.detach().item()) == pytest.approx(novelty_empty, abs=1.0e-5)
 
 
 def test_o2_gain_rows_keep_pooled_fallback() -> None:
@@ -1081,29 +879,17 @@ def test_o2_gain_rows_keep_pooled_fallback() -> None:
     assert torch.allclose(with_dedup.loss, without_dedup.loss)
 
 
-def _confirmed_chunk_with(prototypes: Tensor) -> ConfirmedChunk:
-    capacity = 256
-    count = int(prototypes.shape[0])
-    full = torch.zeros((capacity, 256), dtype=torch.float32)
-    full[:count] = prototypes
-    occupied = torch.zeros(capacity, dtype=torch.bool)
-    occupied[:count] = True
-    return ConfirmedChunk(
-        prototypes=full,
-        occupied=occupied,
-        identity_ids=tuple(
-            f"identity-{index}" if index < count else None for index in range(capacity)
-        ),
-        first_seen=torch.zeros(capacity, dtype=torch.float64),
-        last_seen=torch.zeros(capacity, dtype=torch.float64),
-        observation_counts=torch.ones(capacity, dtype=torch.int64),
-        first_seen_position_ids=torch.zeros(capacity, dtype=torch.int64),
-        last_seen_position_ids=torch.zeros(capacity, dtype=torch.int64),
-        semantic_record_ids=tuple(
-            f"record-{index}" if index < count else None for index in range(capacity)
-        ),
-        prototype_versions=torch.zeros(capacity, dtype=torch.int64),
-        relevance=torch.full((capacity,), 0.5, dtype=torch.float32),
+def _confirmed_identities(prototypes: Tensor) -> tuple[ConfirmedIdentity, ...]:
+    return tuple(
+        ConfirmedIdentity(
+            identity_id=f"identity-{index}",
+            identity_prototype=prototypes[index].clone(),
+            first_seen=0.0,
+            last_seen=0.0,
+            observation_count=1,
+            semantic_record_id=f"record-{index}",
+        )
+        for index in range(int(prototypes.shape[0]))
     )
 
 
@@ -1112,7 +898,7 @@ def test_o2_dedup_context_from_identity_states() -> None:
     state = IdentityBankRuntimeState(
         video_id="video-a",
         trajectory_id="trajectory-a",
-        confirmed_chunks=(_confirmed_chunk_with(prototypes),),
+        confirmed=_confirmed_identities(prototypes),
         issued_identity_ids=("identity-0", "identity-1", "identity-2"),
         next_identity_sequence=3,
     )
@@ -1165,14 +951,9 @@ def test_historical_occurrences_outside_state_tail_do_not_create_dense_targets()
 
 def test_e1_dense_targets_follow_the_two_position_hard_fsm_contract() -> None:
     timestamps = torch.tensor([0.0, 1.0, 2.0], dtype=torch.float64)
-    targets, mask, representable, unrepresentable = _build_e1_fsm_targets(
-        timestamps,
-        (1.0,),
-        2.0,
-    )
+    targets, mask = _build_e1_fsm_targets(timestamps, (1.0,), 2.0)
     assert targets.tolist() == [[1.0, 0.0, 0.0], [0.0, 1.0, 1.0], [0.0, 0.0, 0.0]]
     assert bool(mask.all())
-    assert (representable, unrepresentable) == (1, 0)
 
     logits = torch.where(
         targets.bool(),
@@ -1205,20 +986,10 @@ def test_e1_dense_targets_follow_the_two_position_hard_fsm_contract() -> None:
 
 def test_e1_unrepresentable_boundary_and_collision_are_masked() -> None:
     timestamps = torch.tensor([0.0, 1.0, 2.0], dtype=torch.float64)
-    _, boundary_mask, representable, unrepresentable = _build_e1_fsm_targets(
-        timestamps,
-        (0.0,),
-        2.0,
-    )
-    assert (representable, unrepresentable) == (0, 1)
+    _, boundary_mask = _build_e1_fsm_targets(timestamps, (0.0,), 2.0)
     assert not bool(boundary_mask[0].any())
 
-    _, collision_mask, representable, unrepresentable = _build_e1_fsm_targets(
-        timestamps,
-        (1.0, 2.0),
-        2.0,
-    )
-    assert (representable, unrepresentable) == (1, 1)
+    _, collision_mask = _build_e1_fsm_targets(timestamps, (1.0, 2.0), 2.0)
     assert not bool(collision_mask[1, 0])
     assert not bool(collision_mask[2, 1:].any())
 
@@ -1226,21 +997,20 @@ def test_e1_unrepresentable_boundary_and_collision_are_masked() -> None:
 def test_balanced_dense_bce_preserves_positive_and_negative_gradients() -> None:
     logits = torch.zeros(4, 2, requires_grad=True)
     targets = torch.tensor([[1.0, 0.0], [0.0, 0.0], [0.0, 1.0], [0.0, 0.0]])
-    loss, stats = _balanced_dense_bce(logits, targets, torch.ones_like(targets).bool())
+    loss = _balanced_dense_bce(logits, targets, torch.ones_like(targets).bool())
     loss.backward()
-    assert stats.positive_counts == (1, 1)
-    assert stats.negative_counts == (3, 3)
     assert logits.grad is not None
     assert bool((logits.grad[targets.bool()] < 0.0).all())
     assert bool((logits.grad[~targets.bool()] > 0.0).all())
 
 
 def test_e2_retrieval_uses_interval_overlap_without_special_negative_generation() -> None:
-    record = type(
-        "SyntheticHistoryRecord",
-        (),
-        {"timestamp": None, "time_range": (0.0, 2.0)},
-    )()
+    _, _, retrieval, _ = _typed_predictions(1)
+    interval_retrieval = replace(
+        retrieval,
+        candidate_timestamps=torch.full((1, 2), -1.0, dtype=torch.float64),
+        candidate_time_ranges=torch.tensor([[[0.0, 2.0], [0.0, 2.0]]], dtype=torch.float64),
+    )
     overlap = OfficialWeakSupervision(
         query_id="weak-e2-overlap",
         operator=Operator.E2_EPISODE,
@@ -1252,5 +1022,5 @@ def test_e2_retrieval_uses_interval_overlap_without_special_negative_generation(
     )
     disjoint = replace(overlap, occurrence_intervals=((2.1, 3.0),))
 
-    assert _record_matches_causal_occurrence(record, overlap)
-    assert not _record_matches_causal_occurrence(record, disjoint)
+    assert bool(_retrieval_occurrence_mask(interval_retrieval, 0, overlap).all())
+    assert not bool(_retrieval_occurrence_mask(interval_retrieval, 0, disjoint).any())
